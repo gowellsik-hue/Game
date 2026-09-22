@@ -8,43 +8,121 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout patch repo
+      - name: Checkout Game repo
         uses: actions/checkout@v4
 
       - name: Checkout DevilutionX
         uses: actions/checkout@v4
         with:
           repository: diasurgical/DevilutionX
+          ref: 4138a829e991a7d528c7d8240e0c7a73c5b22948
           path: DevilutionX
 
-      - name: Apply patches
-        working-directory: DevilutionX
+      - name: Apply auto-attack and mobile controls
         run: |
-          git apply ../patches/0001-mobile-autoattack.patch
-          git apply ../patches/0002-web-mobile-touch-layout.patch
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # ---- Auto attack ---------------------------------------------------
+          p = Path("DevilutionX/Source/diablo.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          anchor = "bool gbShowIntro = true;\n"
+          inject = """bool gbShowIntro = true;
+
+bool MobileAutoAttackLatched = false;
+
+void TryMobileAutoAttack()
+{
+	if (MyPlayer == nullptr || leveltype == DTYPE_TOWN || PauseMode == 2) {
+		MobileAutoAttackLatched = false;
+		return;
+	}
+
+	Player &player = *MyPlayer;
+
+	// Never interrupt walking, spellcasting, hit recovery, or an attack animation.
+	if (player._pmode != PM_STAND) {
+		MobileAutoAttackLatched = false;
+		return;
+	}
+
+	if (MobileAutoAttackLatched || pcursmonst == -1)
+		return;
+
+	// Reuse Diablo's native selected-monster attack commands.
+	NetSendCmdParam1(true, player.UsesRangedWeapon() ? CMD_RATTACKID : CMD_ATTACKID, pcursmonst);
+	LastPlayerAction = PlayerActionType::AttackMonsterTarget;
+	MobileAutoAttackLatched = true;
+}
+"""
+          if anchor not in s:
+              raise SystemExit("ERROR: diablo auto-attack insertion anchor not found")
+          s = s.replace(anchor, inject, 1)
+
+          anchor = "\t\tCheckCursMove();\n\t\tplrctrls_after_check_curs_move();\n\t\tRepeatPlayerAction();"
+          replacement = "\t\tCheckCursMove();\n\t\tplrctrls_after_check_curs_move();\n\t\tTryMobileAutoAttack();\n\t\tRepeatPlayerAction();"
+          if anchor not in s:
+              raise SystemExit("ERROR: ProcessInput insertion anchor not found")
+          s = s.replace(anchor, replacement, 1)
+          p.write_text(s, encoding="utf-8")
+
+          # ---- Mobile web controls -------------------------------------------
+          p = Path("DevilutionX/Source/controls/touch/gamepad.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          # Apply web-specific sizing AFTER the normal DPI calculation, so it
+          # cannot be overwritten by SDL's reported DPI.
+          anchor = """\tif (dpi != 0.0F) {
+\t\tinputMargin = roundToInt(0.25F * dpi);
+\t\tmenuButtonWidth = roundToInt(0.2F * dpi);
+\t\tdirectionPadSize = roundToInt(dpi);
+\t\tpadButtonSize = roundToInt(0.3F * dpi);
+\t\tpadButtonSpacing = roundToInt(0.1F * dpi);
+\t}
+"""
+          replacement = anchor + """
+#ifdef __EMSCRIPTEN__
+\t// Larger controls for landscape mobile browsers.
+\tinputMargin = std::max(16, screenPixels / 20);
+\tmenuButtonWidth = std::max(44, screenPixels / 11);
+\tdirectionPadSize = roundToInt(screenPixels * 0.32F);
+\tpadButtonSize = roundToInt(screenPixels * 0.135F);
+\tpadButtonSpacing = std::max(8, screenPixels / 45);
+#endif
+"""
+          if anchor not in s:
+              raise SystemExit("ERROR: touch sizing anchor not found")
+          s = s.replace(anchor, replacement, 1)
+          p.write_text(s, encoding="utf-8")
+
+          print("Auto-attack and mobile-control source edits applied.")
+          PY
 
       - name: Setup Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: latest
 
-      - name: Configure
+      - name: Configure web build
         working-directory: DevilutionX
         run: |
-          emcmake cmake -S . -B build-em -DCMAKE_BUILD_TYPE=Release
+          emcmake cmake -S . -B build-em \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF
 
-      - name: Build
+      - name: Build web version
         working-directory: DevilutionX
-        run: |
-          cmake --build build-em -j2
+        run: cmake --build build-em -j2
 
-      - name: Copy mobile files
+      - name: Add mobile launcher and Korean preset
         run: |
           cp mobile-index.html DevilutionX/build-em/mobile-index.html
           cp preset/diablo-mobile-ko.ini DevilutionX/build-em/diablo-mobile-ko.ini
 
-      - name: Upload web build
+      - name: Upload playable web build
         uses: actions/upload-artifact@v4
         with:
           name: diablo-mobile-autoattack-web
           path: DevilutionX/build-em/
+          if-no-files-found: error
