@@ -1,4 +1,4 @@
-name: Deploy Original DiabloWeb
+name: Build DiabloWeb Auto Attack
 
 on:
   workflow_dispatch:
@@ -24,51 +24,210 @@ jobs:
       - name: Checkout Game repo
         uses: actions/checkout@v4
 
-      - name: Checkout original DiabloWeb production site
+      - name: Checkout original DiabloWeb source
         uses: actions/checkout@v4
         with:
           repository: d07RiV/diabloweb
-          ref: gh-pages
-          path: diabloweb-original
+          ref: master
+          path: diabloweb
 
-      - name: Prepare site for /Game/ path
+      - name: Checkout DiabloWeb engine source
+        uses: actions/checkout@v4
+        with:
+          repository: d07RiV/devilution
+          ref: master
+          path: devilution
+
+      - name: Add automatic normal attack
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("devilution/Source/diablo.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          anchor = """BOOL LeftMouseCmd(BOOL bShift)
+          {
+          """
+
+          patch = r"""
+          static int AutoAttackTarget = -1;
+
+          void TryAutoAttack()
+          {
+              if (leveltype == DTYPE_TOWN
+                  || PauseMode == 2
+                  || deathflag
+                  || stextflag
+                  || qtextflag
+                  || doomflag
+                  || invflag
+                  || chrflag
+                  || sbookflag
+                  || pcurs >= CURSOR_FIRSTITEM) {
+                  AutoAttackTarget = -1;
+                  return;
+              }
+
+              if (pcursmonst == -1) {
+                  AutoAttackTarget = -1;
+                  return;
+              }
+
+              if (plr[myplr]._pmode != PM_STAND) {
+                  return;
+              }
+
+              if (AutoAttackTarget == pcursmonst) {
+                  return;
+              }
+
+              if (plr[myplr]._pwtype == WT_RANGED) {
+                  if (CanTalkToMonst(pcursmonst)) {
+                      NetSendCmdParam1(TRUE, CMD_ATTACKID, pcursmonst);
+                  } else {
+                      NetSendCmdParam1(TRUE, CMD_RATTACKID, pcursmonst);
+                  }
+              } else {
+                  NetSendCmdParam1(TRUE, CMD_ATTACKID, pcursmonst);
+              }
+
+              AutoAttackTarget = pcursmonst;
+          }
+
+          """
+
+          if anchor not in s:
+              raise SystemExit("ERROR: LeftMouseCmd anchor not found")
+
+          s = s.replace(anchor, patch + anchor, 1)
+
+          loop_anchor = """void run_game_loop(unsigned int uMsg)
+          {
+          }
+          """
+
+          loop_patch = """void run_game_loop(unsigned int uMsg)
+          {
+              TryAutoAttack();
+          }
+          """
+
+          if loop_anchor not in s:
+              raise SystemExit("ERROR: run_game_loop anchor not found")
+
+          s = s.replace(loop_anchor, loop_patch, 1)
+
+          p.write_text(s, encoding="utf-8")
+          print("AUTO_ATTACK_PATCH_OK")
+          PY
+
+          grep -n "TryAutoAttack" devilution/Source/diablo.cpp
+
+      - name: Enable DiabloSpawn WASM build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("devilution/build.js")
+          s = p.read_text(encoding="utf-8")
+
+          old = "//run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => console.error(e.message));"
+          new = "run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => { console.error(e); process.exitCode = 1; });"
+
+          if old not in s:
+              raise SystemExit("ERROR: DiabloSpawn build line not found")
+
+          s = s.replace(old, new, 1)
+
+          old_mpq = "run_build('-O3 -g -DZ_SOLO', 'MpqCmp', ['Source/rmpq', 'Source/zlib', 'mpqcmp']).catch(e => console.error(e.message));"
+          s = s.replace(old_mpq, "// " + old_mpq, 1)
+
+          p.write_text(s, encoding="utf-8")
+          PY
+
+          tail -n 8 devilution/build.js
+
+      - name: Setup compatible Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 1.39.20
+
+      - name: Build modified DiabloSpawn WASM
+        working-directory: devilution
+        run: |
+          node build.js
+
+          test -s DiabloSpawn.wasm
+          test -s DiabloSpawn.jscc
+
+          echo "=== Modified engine ==="
+          ls -lh DiabloSpawn.wasm DiabloSpawn.jscc
+
+      - name: Replace DiabloWeb SPAWN engine
+        run: |
+          cp devilution/DiabloSpawn.wasm diabloweb/src/api/DiabloSpawn.wasm
+          cp devilution/DiabloSpawn.jscc diabloweb/src/api/DiabloSpawn.jscc
+
+          echo "=== Replaced SPAWN engine ==="
+          ls -lh diabloweb/src/api/DiabloSpawn.wasm
+          ls -lh diabloweb/src/api/DiabloSpawn.jscc
+
+      - name: Add SPAWN.MPQ
+        run: |
+          curl -L --fail --retry 3 \
+            https://d07riv.github.io/diabloweb/spawn.mpq \
+            -o diabloweb/public/spawn.mpq
+
+          test -s diabloweb/public/spawn.mpq
+          stat -c "%n : %s bytes" diabloweb/public/spawn.mpq
+
+      - name: Fix GitHub Pages base path
+        run: |
+          sed -i 's#"homepage": "https://d07riv.github.io/diabloweb"#"homepage": "https://gowellsik-hue.github.io/Game"#' diabloweb/package.json
+
+          grep '"homepage"' diabloweb/package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 16
+          cache: npm
+          cache-dependency-path: diabloweb/package-lock.json
+
+      - name: Install DiabloWeb dependencies
+        working-directory: diabloweb
+        run: |
+          npm ci --legacy-peer-deps
+
+      - name: Build DiabloWeb
+        working-directory: diabloweb
+        env:
+          CI: false
+        run: |
+          npm run build
+
+      - name: Prepare Pages site
         run: |
           rm -rf _site
           mkdir -p _site
 
-          cp -a diabloweb-original/. _site/
+          cp -a diabloweb/build/. _site/
 
-          rm -rf _site/.git
-          rm -rf _site/.github
+          echo "=== Final Pages files ==="
+          ls -lah _site | head -40
 
-          echo "Replacing /diabloweb/ with /Game/ ..."
-
-          grep -RIl "/diabloweb/" _site | while read -r file; do
-            sed -i 's#/diabloweb/#/Game/#g' "$file"
-          done
-
-          echo "=== Remaining /diabloweb/ references ==="
-          if grep -RIn "/diabloweb/" _site; then
-            echo "ERROR: old path still exists"
-            exit 1
-          else
-            echo "OK: all paths rewritten"
-          fi
-
-          echo "=== SPAWN.MPQ check ==="
+          echo "=== SPAWN.MPQ ==="
           test -s _site/spawn.mpq
           stat -c "%n : %s bytes" _site/spawn.mpq
 
-          echo "=== index.html preview ==="
+          echo "=== Path check ==="
           grep -o "/Game/[^\"']*" _site/index.html | head -20
 
-          echo "=== site files ==="
-          ls -lah _site
-
-      - name: Upload downloadable copy
+      - name: Upload downloadable build
         uses: actions/upload-artifact@v4
         with:
-          name: original-diabloweb-game-path
+          name: diabloweb-autoattack
           path: _site/
           if-no-files-found: error
 
