@@ -1,20 +1,42 @@
-name: Build DiabloWeb AutoAttack Engine
+name: Build and Deploy DiabloWeb AutoAttack
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
 
 jobs:
-  build:
+  web:
     runs-on: ubuntu-22.04
 
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - name: Checkout DiabloWeb
+      - name: Checkout Game repo
+        uses: actions/checkout@v4
+
+      - name: Checkout original DiabloWeb source
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          repository: d07RiV/diabloweb
+          ref: master
+          path: diabloweb
+
+      - name: Checkout original DiabloWeb production files
+        uses: actions/checkout@v4
+        with:
+          repository: d07RiV/diabloweb
+          ref: gh-pages
+          path: production
 
       - name: Checkout original DiabloWeb engine
         uses: actions/checkout@v4
@@ -36,10 +58,6 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-
-          # ------------------------------------------------------------
-          # Patch Source/diablo.cpp
-          # ------------------------------------------------------------
 
           path = Path("engine/Source/diablo.cpp")
           src = path.read_text(encoding="utf-8")
@@ -119,11 +137,6 @@ jobs:
 
           	PlayerStruct &player = plr[myplr];
 
-          	/*
-          	 * Only issue a new command when the player is standing.
-          	 * This prevents auto attack from interrupting walking,
-          	 * attack animations, hit recovery and spell actions.
-          	 */
           	if (player._pmode != PM_STAND)
           		return;
 
@@ -161,20 +174,11 @@ jobs:
               raise SystemExit("ERROR: game_logic anchor not found")
 
           src = src.replace(old_logic, new_logic, 1)
-
           path.write_text(src, encoding="utf-8")
-
-          print("diablo.cpp patched")
-
-
-          # ------------------------------------------------------------
-          # Patch build.js
-          # ------------------------------------------------------------
 
           path = Path("engine/build.js")
           src = path.read_text(encoding="utf-8")
 
-          # Removed from later Emscripten versions and unnecessary here.
           src = src.replace(
               " -s BINARYEN_TRAP_MODE='clamp'",
               ""
@@ -198,18 +202,10 @@ jobs:
               raise SystemExit("ERROR: build.js build target anchor not found")
 
           src = src.replace(old_tail, new_tail, 1)
-
           path.write_text(src, encoding="utf-8")
 
-          print("build.js patched")
           print("PATCH_OK")
           PY
-
-      - name: Show patched auto attack code
-        run: |
-          grep -n "FindMobileAutoAttackTarget" engine/Source/diablo.cpp
-          grep -n "TryMobileAutoAttack" engine/Source/diablo.cpp
-          grep -n "DiabloSpawn" engine/build.js | tail -10
 
       - name: Build Diablo and DiabloSpawn
         working-directory: engine
@@ -217,10 +213,9 @@ jobs:
         run: |
           set -e
           emcc --version
-          node --version
           node build.js
 
-      - name: Verify build outputs
+      - name: Verify engine build
         shell: bash
         run: |
           set -e
@@ -236,51 +231,153 @@ jobs:
             engine/Diablo.jscc \
             engine/DiabloSpawn.jscc
 
-      - name: Replace DiabloWeb engine
+      - name: Replace DiabloWeb engine source
         shell: bash
         run: |
           set -e
 
-          if [ ! -d src/api ]; then
-            echo "ERROR: src/api does not exist"
-            echo "This workflow must run inside the DiabloWeb repository."
+          test -d diabloweb/src/api
+
+          cp engine/Diablo.wasm \
+            diabloweb/src/api/Diablo.wasm
+
+          cp engine/DiabloSpawn.wasm \
+            diabloweb/src/api/DiabloSpawn.wasm
+
+          cp engine/Diablo.jscc \
+            diabloweb/src/api/Diablo.jscc
+
+          cp engine/DiabloSpawn.jscc \
+            diabloweb/src/api/DiabloSpawn.jscc
+
+          ls -lh \
+            diabloweb/src/api/Diablo.wasm \
+            diabloweb/src/api/DiabloSpawn.wasm \
+            diabloweb/src/api/Diablo.jscc \
+            diabloweb/src/api/DiabloSpawn.jscc
+
+      - name: Add SPAWN.MPQ
+        shell: bash
+        run: |
+          set -e
+
+          test -s production/spawn.mpq
+
+          cp production/spawn.mpq \
+            diabloweb/public/spawn.mpq
+
+          stat -c "%n : %s bytes" \
+            diabloweb/public/spawn.mpq
+
+      - name: Set GitHub Pages path
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("diabloweb/package.json")
+
+          data = json.loads(
+              p.read_text(encoding="utf-8")
+          )
+
+          data["homepage"] = \
+              "https://gowellsik-hue.github.io/Game"
+
+          p.write_text(
+              json.dumps(
+                  data,
+                  ensure_ascii=False,
+                  indent=2
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(data["homepage"])
+          PY
+
+      - name: Setup Node for original DiabloWeb
+        uses: actions/setup-node@v4
+        with:
+          node-version: 14.21.3
+          cache: npm
+          cache-dependency-path: diabloweb/package-lock.json
+
+      - name: Install DiabloWeb dependencies
+        working-directory: diabloweb
+        run: npm ci
+
+      - name: Build DiabloWeb
+        working-directory: diabloweb
+        env:
+          CI: false
+        run: npm run build
+
+      - name: Prepare Pages site
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf _site
+          mkdir -p _site
+
+          cp -a diabloweb/build/. _site/
+
+          while IFS= read -r file; do
+            sed -i \
+              's#/diabloweb/#/Game/#g' \
+              "$file"
+          done < <(
+            grep -RIl "/diabloweb/" _site || true
+          )
+
+          if grep -RIn "/diabloweb/" _site; then
+            echo "ERROR: old /diabloweb/ path remains"
             exit 1
           fi
 
-          cp engine/Diablo.wasm src/api/Diablo.wasm
-          cp engine/DiabloSpawn.wasm src/api/DiabloSpawn.wasm
+          test -s _site/spawn.mpq
 
-          cp engine/Diablo.jscc src/api/Diablo.jscc
-          cp engine/DiabloSpawn.jscc src/api/DiabloSpawn.jscc
+          echo "=== WASM files ==="
 
-      - name: Commit rebuilt engine
-        shell: bash
-        run: |
-          set -e
+          find _site \
+            -type f \
+            -name '*.wasm' \
+            -exec ls -lh {} \;
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "=== DiabloSpawn check ==="
 
-          git add \
-            src/api/Diablo.wasm \
-            src/api/DiabloSpawn.wasm \
-            src/api/Diablo.jscc \
-            src/api/DiabloSpawn.jscc
+          find _site \
+            -type f \
+            -name 'DiabloSpawn*.wasm' \
+            -exec ls -lh {} \;
 
-          if git diff --cached --quiet; then
-            echo "No engine changes to commit."
-          else
-            git commit -m "Build mobile auto-attack engine"
-            git push
-          fi
+          echo "=== Game paths ==="
 
-      - name: Upload build artifact
+          grep -o \
+            "/Game/[^\"']*" \
+            _site/index.html \
+            | head -20 \
+            || true
+
+      - name: Upload downloadable build
         uses: actions/upload-artifact@v4
         with:
-          name: DiabloWeb-autoattack
-          path: |
-            engine/Diablo.wasm
-            engine/DiabloSpawn.wasm
-            engine/Diablo.jscc
-            engine/DiabloSpawn.jscc
+          name: diabloweb-autoattack
+          path: _site/
           if-no-files-found: error
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
