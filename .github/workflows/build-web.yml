@@ -1,258 +1,286 @@
-name: Build DiabloWeb Auto Attack
+name: Build DiabloWeb AutoAttack Engine
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: github-pages
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  web:
-    runs-on: ubuntu-latest
-
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout Game repo
-        uses: actions/checkout@v4
-
-      - name: Checkout original DiabloWeb source
+      - name: Checkout DiabloWeb
         uses: actions/checkout@v4
         with:
-          repository: d07RiV/diabloweb
-          ref: master
-          path: diabloweb
+          fetch-depth: 0
 
-      - name: Checkout DiabloWeb engine source
+      - name: Checkout original DiabloWeb engine
         uses: actions/checkout@v4
         with:
           repository: d07RiV/devilution
-          ref: master
-          path: devilution
+          ref: 798b5122731ae4b5e0c91348e5c44cf79354a94e
+          path: engine
 
-      - name: Add automatic normal attack
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("devilution/Source/diablo.cpp")
-          s = p.read_text(encoding="utf-8")
-
-          # Forward declaration so run_game_loop can call it.
-          decl_anchor = """BOOL StartGame(BOOL bNewGame, BOOL bSinglePlayer)
-          {
-            return TRUE;
-          }
-
-          """
-
-          declaration = """BOOL StartGame(BOOL bNewGame, BOOL bSinglePlayer)
-          {
-            return TRUE;
-          }
-
-          void TryAutoAttack();
-
-          """
-
-          if decl_anchor not in s:
-              raise SystemExit("ERROR: StartGame anchor not found")
-
-          s = s.replace(decl_anchor, declaration, 1)
-
-          loop_anchor = """void run_game_loop(unsigned int uMsg)
-          {
-          }
-          """
-
-          loop_patch = """void run_game_loop(unsigned int uMsg)
-          {
-              TryAutoAttack();
-          }
-          """
-
-          if loop_anchor not in s:
-              raise SystemExit("ERROR: run_game_loop anchor not found")
-
-          s = s.replace(loop_anchor, loop_patch, 1)
-
-          function_anchor = """BOOL LeftMouseCmd(BOOL bShift)
-          {
-          """
-
-          auto_attack = r"""
-          static int AutoAttackTarget = -1;
-
-          void TryAutoAttack()
-          {
-              if (leveltype == DTYPE_TOWN
-                  || PauseMode == 2
-                  || deathflag
-                  || stextflag
-                  || qtextflag
-                  || doomflag
-                  || invflag
-                  || chrflag
-                  || sbookflag
-                  || pcurs >= CURSOR_FIRSTITEM) {
-                  AutoAttackTarget = -1;
-                  return;
-              }
-
-              if (pcursmonst == -1) {
-                  AutoAttackTarget = -1;
-                  return;
-              }
-
-              if (plr[myplr]._pmode != PM_STAND) {
-                  return;
-              }
-
-              if (AutoAttackTarget == pcursmonst) {
-                  return;
-              }
-
-              if (plr[myplr]._pwtype == WT_RANGED) {
-                  if (CanTalkToMonst(pcursmonst)) {
-                      NetSendCmdParam1(TRUE, CMD_ATTACKID, pcursmonst);
-                  } else {
-                      NetSendCmdParam1(TRUE, CMD_RATTACKID, pcursmonst);
-                  }
-              } else {
-                  NetSendCmdParam1(TRUE, CMD_ATTACKID, pcursmonst);
-              }
-
-              AutoAttackTarget = pcursmonst;
-          }
-
-          """
-
-          if function_anchor not in s:
-              raise SystemExit("ERROR: LeftMouseCmd anchor not found")
-
-          s = s.replace(function_anchor, auto_attack + function_anchor, 1)
-
-          p.write_text(s, encoding="utf-8")
-
-          print("AUTO_ATTACK_PATCH_OK")
-          PY
-
-          grep -n "TryAutoAttack" devilution/Source/diablo.cpp
-
-      - name: Enable DiabloSpawn WASM build
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("devilution/build.js")
-          s = p.read_text(encoding="utf-8")
-
-          old = "//run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => console.error(e.message));"
-          new = "run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => { console.error(e); process.exitCode = 1; });"
-
-          if old not in s:
-              raise SystemExit("ERROR: DiabloSpawn build line not found")
-
-          s = s.replace(old, new, 1)
-
-          old_mpq = "run_build('-O3 -g -DZ_SOLO', 'MpqCmp', ['Source/rmpq', 'Source/zlib', 'mpqcmp']).catch(e => console.error(e.message));"
-          s = s.replace(old_mpq, "// " + old_mpq, 1)
-
-          p.write_text(s, encoding="utf-8")
-          PY
-
-          tail -n 8 devilution/build.js
-
-      - name: Setup Emscripten
+      - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: 1.39.20
+          actions-cache-folder: emsdk-cache
 
-      - name: Build modified DiabloSpawn WASM
-        working-directory: devilution
+      - name: Patch engine for mobile auto attack
+        shell: bash
         run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # ------------------------------------------------------------
+          # Patch Source/diablo.cpp
+          # ------------------------------------------------------------
+
+          path = Path("engine/Source/diablo.cpp")
+          src = path.read_text(encoding="utf-8")
+
+          anchor = """void game_loop(BOOL bStartup)
+          {
+          """
+
+          if anchor not in src:
+              raise SystemExit("ERROR: game_loop anchor not found")
+
+          auto_attack = r'''
+          static int FindMobileAutoAttackTarget()
+          {
+          	int best = -1;
+          	int bestDistance = 9999;
+
+          	const int px = plr[myplr].WorldX;
+          	const int py = plr[myplr].WorldY;
+
+          	for (int n = 0; n < nummonsters; n++) {
+          		const int mi = monstactive[n];
+
+          		if (mi < 0 || mi >= MAXMONSTERS)
+          			continue;
+
+          		MonsterStruct &m = monster[mi];
+
+          		if (m._mDelFlag)
+          			continue;
+
+          		if (m._mhitpoints <= 0)
+          			continue;
+
+          		if (CanTalkToMonst(mi))
+          			continue;
+
+          		const int dx = abs(m._mx - px);
+          		const int dy = abs(m._my - py);
+          		const int distance = dx > dy ? dx : dy;
+
+          		if (distance > 8)
+          			continue;
+
+          		if (distance >= bestDistance)
+          			continue;
+
+          		best = mi;
+          		bestDistance = distance;
+          	}
+
+          	return best;
+          }
+
+          static void TryMobileAutoAttack()
+          {
+          	if (leveltype == DTYPE_TOWN)
+          		return;
+
+          	if (PauseMode == 2)
+          		return;
+
+          	if (deathflag)
+          		return;
+
+          	if (gmenu_exception())
+          		return;
+
+          	if (stextflag || spselflag || qtextflag)
+          		return;
+
+          	if (questlog || doomflag || dropGoldFlag)
+          		return;
+
+          	if (track_isscrolling())
+          		return;
+
+          	PlayerStruct &player = plr[myplr];
+
+          	/*
+          	 * Only issue a new command when the player is standing.
+          	 * This prevents auto attack from interrupting walking,
+          	 * attack animations, hit recovery and spell actions.
+          	 */
+          	if (player._pmode != PM_STAND)
+          		return;
+
+          	const int target = FindMobileAutoAttackTarget();
+
+          	if (target < 0)
+          		return;
+
+          	if (player._pwtype == WT_RANGED)
+          		NetSendCmdParam1(TRUE, CMD_RATTACKID, target);
+          	else
+          		NetSendCmdParam1(TRUE, CMD_ATTACKID, target);
+          }
+
+          '''
+
+          src = src.replace(anchor, auto_attack + anchor, 1)
+
+          old_logic = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
+          		CheckCursMove();
+          		track_process();
+          	}
+          	if (gbProcessPlayers) {
+          """
+
+          new_logic = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
+          		CheckCursMove();
+          		track_process();
+          		TryMobileAutoAttack();
+          	}
+          	if (gbProcessPlayers) {
+          """
+
+          if old_logic not in src:
+              raise SystemExit("ERROR: game_logic anchor not found")
+
+          src = src.replace(old_logic, new_logic, 1)
+
+          path.write_text(src, encoding="utf-8")
+
+          print("diablo.cpp patched")
+
+
+          # ------------------------------------------------------------
+          # Patch build.js
+          # ------------------------------------------------------------
+
+          path = Path("engine/build.js")
+          src = path.read_text(encoding="utf-8")
+
+          # Removed from later Emscripten versions and unnecessary here.
+          src = src.replace(
+              " -s BINARYEN_TRAP_MODE='clamp'",
+              ""
+          )
+
+          old_tail = """//run_build('-O3 -g -DZ_SOLO', 'Diablo', ['Source']).catch(e => console.error(e.message));
+          //run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => console.error(e.message));
+          run_build('-O3 -g -DZ_SOLO', 'MpqCmp', ['Source/rmpq', 'Source/zlib', 'mpqcmp']).catch(e => console.error(e.message));
+          """
+
+          new_tail = """(async () => {
+            await run_build('-O3 -g -DZ_SOLO', 'Diablo', ['Source']);
+            await run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']);
+          })().catch(e => {
+            console.error(e);
+            process.exitCode = 1;
+          });
+          """
+
+          if old_tail not in src:
+              raise SystemExit("ERROR: build.js build target anchor not found")
+
+          src = src.replace(old_tail, new_tail, 1)
+
+          path.write_text(src, encoding="utf-8")
+
+          print("build.js patched")
+          print("PATCH_OK")
+          PY
+
+      - name: Show patched auto attack code
+        run: |
+          grep -n "FindMobileAutoAttackTarget" engine/Source/diablo.cpp
+          grep -n "TryMobileAutoAttack" engine/Source/diablo.cpp
+          grep -n "DiabloSpawn" engine/build.js | tail -10
+
+      - name: Build Diablo and DiabloSpawn
+        working-directory: engine
+        shell: bash
+        run: |
+          set -e
+          emcc --version
+          node --version
           node build.js
 
-          test -s DiabloSpawn.wasm
-          test -s DiabloSpawn.jscc
-
-          ls -lh DiabloSpawn.wasm DiabloSpawn.jscc
-
-      - name: Replace DiabloWeb SPAWN engine
+      - name: Verify build outputs
+        shell: bash
         run: |
-          cp devilution/DiabloSpawn.wasm diabloweb/src/api/DiabloSpawn.wasm
-          cp devilution/DiabloSpawn.jscc diabloweb/src/api/DiabloSpawn.jscc
+          set -e
 
-          ls -lh diabloweb/src/api/DiabloSpawn.wasm
-          ls -lh diabloweb/src/api/DiabloSpawn.jscc
+          test -s engine/Diablo.wasm
+          test -s engine/DiabloSpawn.wasm
+          test -s engine/Diablo.jscc
+          test -s engine/DiabloSpawn.jscc
 
-      - name: Add SPAWN.MPQ
+          ls -lh \
+            engine/Diablo.wasm \
+            engine/DiabloSpawn.wasm \
+            engine/Diablo.jscc \
+            engine/DiabloSpawn.jscc
+
+      - name: Replace DiabloWeb engine
+        shell: bash
         run: |
-          curl -L --fail --retry 3 \
-            https://d07riv.github.io/diabloweb/spawn.mpq \
-            -o diabloweb/public/spawn.mpq
+          set -e
 
-          test -s diabloweb/public/spawn.mpq
-          stat -c "%n : %s bytes" diabloweb/public/spawn.mpq
+          if [ ! -d src/api ]; then
+            echo "ERROR: src/api does not exist"
+            echo "This workflow must run inside the DiabloWeb repository."
+            exit 1
+          fi
 
-      - name: Fix GitHub Pages base path
+          cp engine/Diablo.wasm src/api/Diablo.wasm
+          cp engine/DiabloSpawn.wasm src/api/DiabloSpawn.wasm
+
+          cp engine/Diablo.jscc src/api/Diablo.jscc
+          cp engine/DiabloSpawn.jscc src/api/DiabloSpawn.jscc
+
+      - name: Commit rebuilt engine
+        shell: bash
         run: |
-          sed -i 's#"homepage": "https://d07riv.github.io/diabloweb"#"homepage": "https://gowellsik-hue.github.io/Game"#' diabloweb/package.json
+          set -e
 
-          grep '"homepage"' diabloweb/package.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 16
-          cache: npm
-          cache-dependency-path: diabloweb/package-lock.json
+          git add \
+            src/api/Diablo.wasm \
+            src/api/DiabloSpawn.wasm \
+            src/api/Diablo.jscc \
+            src/api/DiabloSpawn.jscc
 
-      - name: Install DiabloWeb dependencies
-        working-directory: diabloweb
-        run: npm ci --legacy-peer-deps
+          if git diff --cached --quiet; then
+            echo "No engine changes to commit."
+          else
+            git commit -m "Build mobile auto-attack engine"
+            git push
+          fi
 
-      - name: Build DiabloWeb
-        working-directory: diabloweb
-        env:
-          CI: false
-        run: npm run build
-
-      - name: Prepare Pages site
-        run: |
-          rm -rf _site
-          mkdir -p _site
-
-          cp -a diabloweb/build/. _site/
-
-          test -s _site/spawn.mpq
-          stat -c "%n : %s bytes" _site/spawn.mpq
-
-          grep -o "/Game/[^\"']*" _site/index.html | head -20
-
-      - name: Upload downloadable build
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: diabloweb-autoattack
-          path: _site/
+          name: DiabloWeb-autoattack
+          path: |
+            engine/Diablo.wasm
+            engine/DiabloSpawn.wasm
+            engine/Diablo.jscc
+            engine/DiabloSpawn.jscc
           if-no-files-found: error
-
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
