@@ -24,26 +24,45 @@ jobs:
       - name: Checkout Game repo
         uses: actions/checkout@v4
 
-      - name: Checkout original working DiabloWeb site
+      # ------------------------------------------------------------
+      # DiabloWeb source pinned to the version used around the
+      # current working gh-pages production build.
+      # ------------------------------------------------------------
+      - name: Checkout DiabloWeb source
+        uses: actions/checkout@v4
+        with:
+          repository: d07RiV/diabloweb
+          ref: 998629fd5d9f87ba9693cf1409cf2acea603c06e
+          path: diabloweb
+
+      # We only need the original SPAWN.MPQ from the working site.
+      - name: Checkout original DiabloWeb production
         uses: actions/checkout@v4
         with:
           repository: d07RiV/diabloweb
           ref: gh-pages
           path: production
 
-      - name: Checkout DiabloWeb engine source
+      # Exact old web engine used by DiabloWeb.
+      - name: Checkout DiabloWeb engine
         uses: actions/checkout@v4
         with:
           repository: d07RiV/devilution
           ref: 798b5122731ae4b5e0c91348e5c44cf79354a94e
           path: engine
 
+      # ------------------------------------------------------------
+      # Emscripten
+      # ------------------------------------------------------------
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: 1.39.20
           actions-cache-folder: emsdk-cache
 
+      # ------------------------------------------------------------
+      # Add automatic attack to the original engine
+      # ------------------------------------------------------------
       - name: Patch engine for automatic attack
         shell: bash
         run: |
@@ -52,14 +71,14 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("engine/Source/diablo.cpp")
-          src = path.read_text(encoding="utf-8")
+          p = Path("engine/Source/diablo.cpp")
+          s = p.read_text(encoding="utf-8")
 
-          anchor = """void game_loop(BOOL bStartup)
+          insert_anchor = """void game_loop(BOOL bStartup)
           {
           """
 
-          if anchor not in src:
+          if insert_anchor not in s:
               raise SystemExit(
                   "ERROR: game_loop anchor not found"
               )
@@ -96,6 +115,11 @@ jobs:
           		const int distance =
           		    dx > dy ? dx : dy;
 
+          		/*
+          		 * Maximum scan radius.
+          		 * Melee attacks still obey the game's own
+          		 * attack/path rules.
+          		 */
           		if (distance > 8)
           			continue;
 
@@ -143,9 +167,8 @@ jobs:
           	PlayerStruct &player = plr[myplr];
 
           	/*
-          	 * 이동 중에는 자동공격하지 않는다.
-          	 * 공격 애니메이션이 끝나고 다시
-          	 * PM_STAND가 되면 다음 공격을 한다.
+          	 * Do not interrupt movement, attack animation,
+          	 * hit recovery, spell casting, etc.
           	 */
           	if (player._pmode != PM_STAND)
           		return;
@@ -173,9 +196,9 @@ jobs:
 
           '''
 
-          src = src.replace(
-              anchor,
-              auto_attack + anchor,
+          s = s.replace(
+              insert_anchor,
+              auto_attack + insert_anchor,
               1
           )
 
@@ -194,26 +217,29 @@ jobs:
           	if (gbProcessPlayers) {
           """
 
-          if old_logic not in src:
+          if old_logic not in s:
               raise SystemExit(
                   "ERROR: game_logic anchor not found"
               )
 
-          src = src.replace(
+          s = s.replace(
               old_logic,
               new_logic,
               1
           )
 
-          path.write_text(
-              src,
+          p.write_text(
+              s,
               encoding="utf-8"
           )
 
           print("AUTO_ATTACK_PATCH_OK")
           PY
 
-      - name: Enable Diablo and DiabloSpawn WASM build
+      # ------------------------------------------------------------
+      # Enable Diablo + DiabloSpawn web builds.
+      # ------------------------------------------------------------
+      - name: Patch engine build script
         shell: bash
         run: |
           set -e
@@ -221,10 +247,10 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("engine/build.js")
-          src = path.read_text(encoding="utf-8")
+          p = Path("engine/build.js")
+          s = p.read_text(encoding="utf-8")
 
-          src = src.replace(
+          s = s.replace(
               " -s BINARYEN_TRAP_MODE='clamp'",
               ""
           )
@@ -236,13 +262,13 @@ jobs:
 
           new = """(async () => {
             await run_build(
-              '-O3 -g0 -DZ_SOLO',
+              '-O3 -g -DZ_SOLO',
               'Diablo',
               ['Source']
             );
 
             await run_build(
-              '-O3 -g0 -DZ_SOLO -DSPAWN',
+              '-O3 -g -DZ_SOLO -DSPAWN',
               'DiabloSpawn',
               ['Source']
             );
@@ -252,31 +278,29 @@ jobs:
           });
           """
 
-          if old not in src:
+          if old not in s:
               raise SystemExit(
                   "ERROR: build.js target block not found"
               )
 
-          src = src.replace(
+          s = s.replace(
               old,
               new,
               1
           )
 
-          path.write_text(
-              src,
+          p.write_text(
+              s,
               encoding="utf-8"
           )
 
-          print("BUILD_JS_PATCH_OK")
+          print("BUILD_SCRIPT_PATCH_OK")
           PY
 
-      - name: Verify source patch
+      - name: Verify engine patch
         shell: bash
         run: |
           set -e
-
-          echo "=== Auto attack ==="
 
           grep -n \
             "FindMobileAutoAttackTarget" \
@@ -286,40 +310,285 @@ jobs:
             "TryMobileAutoAttack" \
             engine/Source/diablo.cpp
 
-          echo "=== Build targets ==="
-
           grep -n \
             "DiabloSpawn" \
             engine/build.js \
             | tail -10
 
+      # ------------------------------------------------------------
+      # Compile the engine.
+      # This produces matching WASM + JSCC pairs.
+      # ------------------------------------------------------------
       - name: Build modified engine
         working-directory: engine
         shell: bash
         run: |
           set -e
 
-          echo "=== Emscripten ==="
           emcc --version
+          node --version
 
-          echo "=== Build ==="
           node build.js
 
-      - name: Verify engine output
+      - name: Verify modified engine
         shell: bash
         run: |
           set -e
 
           test -s engine/Diablo.wasm
           test -s engine/DiabloSpawn.wasm
+          test -s engine/Diablo.jscc
+          test -s engine/DiabloSpawn.jscc
 
-          echo "=== New WASM ==="
+          echo "=== ENGINE BUILD OK ==="
 
           ls -lh \
             engine/Diablo.wasm \
-            engine/DiabloSpawn.wasm
+            engine/DiabloSpawn.wasm \
+            engine/Diablo.jscc \
+            engine/DiabloSpawn.jscc
 
-      - name: Prepare original production site
+      # ------------------------------------------------------------
+      # Put the matching engine pair into DiabloWeb source.
+      # ------------------------------------------------------------
+      - name: Replace DiabloWeb engine
+        shell: bash
+        run: |
+          set -e
+
+          test -d diabloweb/src/api
+
+          cp \
+            engine/Diablo.wasm \
+            diabloweb/src/api/Diablo.wasm
+
+          cp \
+            engine/DiabloSpawn.wasm \
+            diabloweb/src/api/DiabloSpawn.wasm
+
+          cp \
+            engine/Diablo.jscc \
+            diabloweb/src/api/Diablo.jscc
+
+          cp \
+            engine/DiabloSpawn.jscc \
+            diabloweb/src/api/DiabloSpawn.jscc
+
+          echo "=== ENGINE REPLACED ==="
+
+          ls -lh \
+            diabloweb/src/api/Diablo.wasm \
+            diabloweb/src/api/DiabloSpawn.wasm \
+            diabloweb/src/api/Diablo.jscc \
+            diabloweb/src/api/DiabloSpawn.jscc
+
+      # ------------------------------------------------------------
+      # Restore the original shareware MPQ.
+      # ------------------------------------------------------------
+      - name: Add SPAWN.MPQ
+        shell: bash
+        run: |
+          set -e
+
+          test -s production/spawn.mpq
+
+          cp \
+            production/spawn.mpq \
+            diabloweb/public/spawn.mpq
+
+          test -s diabloweb/public/spawn.mpq
+
+          stat -c \
+            "%n : %s bytes" \
+            diabloweb/public/spawn.mpq
+
+      # ------------------------------------------------------------
+      # The package-lock at this historical source commit contains
+      # four unresolved git-conflict blocks.
+      #
+      # At commit 998629fd the LOWER/Stashed side matches package.json:
+      # node-sass 4.14.1
+      # react-dev-utils 11.0.4
+      # @babel/core 7.4.3
+      # ------------------------------------------------------------
+      - name: Repair historical package-lock
+        working-directory: diabloweb
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+
+          p = Path("package-lock.json")
+
+          lines = p.read_text(
+              encoding="utf-8"
+          ).splitlines(True)
+
+          out = []
+          state = "normal"
+          conflicts = 0
+
+          for line in lines:
+
+              if line.startswith("<<<<<<< "):
+                  if state != "normal":
+                      raise SystemExit(
+                          "ERROR: nested conflict"
+                      )
+
+                  conflicts += 1
+                  state = "upper"
+                  continue
+
+              if state == "upper":
+
+                  if line.startswith("======="):
+                      state = "lower"
+
+                  continue
+
+              if state == "lower":
+
+                  if line.startswith(">>>>>>> "):
+                      state = "normal"
+                      continue
+
+                  # Keep the Stashed changes side.
+                  out.append(line)
+                  continue
+
+              out.append(line)
+
+          if state != "normal":
+              raise SystemExit(
+                  "ERROR: unterminated conflict"
+              )
+
+          fixed = "".join(out)
+
+          data = json.loads(fixed)
+
+          p.write_text(
+              json.dumps(
+                  data,
+                  indent=2
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              "Resolved conflicts:",
+              conflicts
+          )
+
+          print(
+              "node-sass:",
+              data["dependencies"]["node-sass"]["version"]
+          )
+
+          print(
+              "react-dev-utils:",
+              data["dependencies"]["react-dev-utils"]["version"]
+          )
+
+          print(
+              "@babel/core:",
+              data["dependencies"]["@babel/core"]["version"]
+          )
+
+          print("LOCKFILE_REPAIR_OK")
+          PY
+
+          if grep -nE \
+            '^(<<<<<<<|=======|>>>>>>>)' \
+            package-lock.json
+          then
+            echo "ERROR: conflict markers remain"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # Point React build directly at /Game/.
+      # ------------------------------------------------------------
+      - name: Set GitHub Pages path
+        working-directory: diabloweb
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("package.json")
+
+          data = json.loads(
+              p.read_text(encoding="utf-8")
+          )
+
+          data["homepage"] = (
+              "https://gowellsik-hue.github.io/Game"
+          )
+
+          p.write_text(
+              json.dumps(
+                  data,
+                  indent=2
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              "homepage:",
+              data["homepage"]
+          )
+          PY
+
+      # node-sass 4.14.1 supports Node 14.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 14.21.3
+
+      - name: Show Node versions
+        shell: bash
+        run: |
+          node --version
+          npm --version
+
+      # package.json and repaired package-lock are from
+      # the same historical DiabloWeb version.
+      - name: Install DiabloWeb dependencies
+        working-directory: diabloweb
+        shell: bash
+        run: |
+          set -e
+
+          npm ci \
+            --no-audit \
+            --no-fund
+
+      # ------------------------------------------------------------
+      # Rebuild frontend so webpack bundles the NEW JSCC together
+      # with the NEW WASM.
+      # ------------------------------------------------------------
+      - name: Build DiabloWeb
+        working-directory: diabloweb
+        shell: bash
+        env:
+          CI: false
+        run: |
+          set -e
+
+          npm run build
+
+      # ------------------------------------------------------------
+      # Final deployment site.
+      # ------------------------------------------------------------
+      - name: Prepare Pages site
         shell: bash
         run: |
           set -e
@@ -327,350 +596,62 @@ jobs:
           rm -rf _site
           mkdir -p _site
 
-          cp -a production/. _site/
-
-          rm -rf _site/.git
-          rm -rf _site/.github
+          cp -a \
+            diabloweb/build/. \
+            _site/
 
           test -s _site/index.html
           test -s _site/spawn.mpq
 
-          echo "ORIGINAL_SITE_OK"
-
-      - name: Locate original WASM files
-        shell: bash
-        run: |
-          set -e
-
-          DIABLO_FILE="$(
-            find _site/static/media \
-              -maxdepth 1 \
-              -type f \
-              -name 'Diablo.*.wasm' \
-              | head -1
-          )"
-
-          SPAWN_FILE="$(
-            find _site/static/media \
-              -maxdepth 1 \
-              -type f \
-              -name 'DiabloSpawn.*.wasm' \
-              | head -1
-          )"
-
-          if [ -z "$DIABLO_FILE" ]; then
-            echo "ERROR: original Diablo wasm not found"
-            exit 1
-          fi
-
-          if [ -z "$SPAWN_FILE" ]; then
-            echo "ERROR: original DiabloSpawn wasm not found"
-            exit 1
-          fi
-
-          echo "DIABLO_FILE=$DIABLO_FILE" \
-            >> "$GITHUB_ENV"
-
-          echo "SPAWN_FILE=$SPAWN_FILE" \
-            >> "$GITHUB_ENV"
-
-          echo "=== Original WASM ==="
-
-          ls -lh \
-            "$DIABLO_FILE" \
-            "$SPAWN_FILE"
-
-      - name: Check WASM JS compatibility
-        shell: bash
-        run: |
-          set -e
-
-          node <<'NODE'
-          const fs = require("fs");
-
-          function info(path) {
-            const bytes = fs.readFileSync(path);
-            const mod = new WebAssembly.Module(bytes);
-
-            return {
-              imports:
-                WebAssembly.Module
-                  .imports(mod)
-                  .map(x =>
-                    x.module + ":" +
-                    x.name + ":" +
-                    x.kind
-                  )
-                  .sort(),
-
-              exports:
-                WebAssembly.Module
-                  .exports(mod)
-                  .map(x =>
-                    x.name + ":" +
-                    x.kind
-                  )
-                  .sort()
-            };
-          }
-
-          function compare(oldFile, newFile, label) {
-            const a = info(oldFile);
-            const b = info(newFile);
-
-            const oldImports =
-              new Set(a.imports);
-
-            const newImports =
-              new Set(b.imports);
-
-            const missingImports =
-              b.imports.filter(
-                x => !oldImports.has(x)
-              );
-
-            console.log(
-              label,
-              "old imports:",
-              a.imports.length
-            );
-
-            console.log(
-              label,
-              "new imports:",
-              b.imports.length
-            );
-
-            console.log(
-              label,
-              "old exports:",
-              a.exports.length
-            );
-
-            console.log(
-              label,
-              "new exports:",
-              b.exports.length
-            );
-
-            /*
-             * New WASM must not suddenly require
-             * JS imports that the original worker
-             * does not provide.
-             */
-            if (missingImports.length) {
-              console.error(
-                "ERROR:",
-                label,
-                "requires new JS imports:"
-              );
-
-              console.error(
-                missingImports.join("\n")
-              );
-
-              process.exit(1);
-            }
-          }
-
-          compare(
-            process.env.DIABLO_FILE,
-            "engine/Diablo.wasm",
-            "Diablo"
-          );
-
-          compare(
-            process.env.SPAWN_FILE,
-            "engine/DiabloSpawn.wasm",
-            "DiabloSpawn"
-          );
-
-          console.log(
-            "WASM_IMPORT_COMPATIBILITY_OK"
-          );
-          NODE
-
-      - name: Replace only WASM engine
-        shell: bash
-        run: |
-          set -e
-
-          cp \
-            engine/Diablo.wasm \
-            "$DIABLO_FILE"
-
-          cp \
-            engine/DiabloSpawn.wasm \
-            "$SPAWN_FILE"
-
-          echo "=== Replaced WASM ==="
-
-          ls -lh \
-            "$DIABLO_FILE" \
-            "$SPAWN_FILE"
-
-      - name: Rewrite site path for Game
-        shell: bash
-        run: |
-          set -e
-
-          echo \
-            "Replacing /diabloweb/ with /Game/ ..."
-
-          while IFS= read -r file
-          do
-            sed -i \
-              's#/diabloweb/#/Game/#g' \
-              "$file"
-          done < <(
-            grep -RIl \
-              "/diabloweb/" \
-              _site \
-              || true
-          )
-
-          echo \
-            "=== Remaining old paths ==="
-
-          if grep -RIn \
-            "/diabloweb/" \
-            _site
-          then
-            echo \
-              "ERROR: old path still exists"
-            exit 1
-          fi
-
-          echo "PATH_REWRITE_OK"
-
-      - name: Refresh WASM precache revisions
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib
-          import re
-
-          site = Path("_site")
-
-          manifests = list(
-              site.glob(
-                  "precache-manifest*.js"
-              )
-          )
-
-          if not manifests:
-              raise SystemExit(
-                  "ERROR: precache manifest not found"
-              )
-
-          manifest = manifests[0]
-
-          text = manifest.read_text(
-              encoding="utf-8"
-          )
-
-          wasm_files = [
-              p
-              for p in (
-                  site /
-                  "static" /
-                  "media"
-              ).glob("*.wasm")
-              if (
-                  p.name.startswith("Diablo.")
-                  or
-                  p.name.startswith(
-                      "DiabloSpawn."
-                  )
-              )
-          ]
-
-          for wasm in wasm_files:
-              revision = hashlib.md5(
-                  wasm.read_bytes()
-              ).hexdigest()
-
-              name = re.escape(
-                  wasm.name
-              )
-
-              pattern = (
-                  r'("revision":\s*")'
-                  r'[^"]+'
-                  r'(",\s*"url":\s*"'
-                  r'[^"]*'
-                  + name +
-                  r'")'
-              )
-
-              text, count = re.subn(
-                  pattern,
-                  r'\g<1>' +
-                  revision +
-                  r'\g<2>',
-                  text,
-                  count=1
-              )
-
-              if count != 1:
-                  raise SystemExit(
-                      "ERROR: could not update "
-                      + wasm.name
-                      + " precache revision"
-                  )
-
-              print(
-                  wasm.name,
-                  revision
-              )
-
-          manifest.write_text(
-              text,
-              encoding="utf-8"
-          )
-
-          print(
-              "PRECACHE_REFRESH_OK"
-          )
-          PY
-
-      - name: Final site verification
-        shell: bash
-        run: |
-          set -e
-
           echo "=== SPAWN.MPQ ==="
-
-          test -s _site/spawn.mpq
 
           stat -c \
             "%n : %s bytes" \
             _site/spawn.mpq
 
-          echo "=== WASM files ==="
+          echo "=== WASM ==="
 
           find \
-            _site/static/media \
-            -maxdepth 1 \
+            _site \
             -type f \
             -name '*.wasm' \
             -exec ls -lh {} \;
 
-          echo "=== AutoAttack WASM size ==="
+          echo "=== DiabloSpawn ==="
 
-          test -s "$DIABLO_FILE"
-          test -s "$SPAWN_FILE"
+          SPAWN_WASM="$(
+            find _site \
+              -type f \
+              -name 'DiabloSpawn*.wasm' \
+              | head -1
+          )"
 
-          echo "=== /Game/ references ==="
+          if [ -z "$SPAWN_WASM" ]; then
+            echo "ERROR: built DiabloSpawn WASM missing"
+            exit 1
+          fi
+
+          test -s "$SPAWN_WASM"
+
+          echo \
+            "DiabloSpawn = $SPAWN_WASM"
+
+          echo "=== /Game/ path ==="
 
           grep -o \
             "/Game/[^\"']*" \
             _site/index.html \
             | head -20 \
             || true
+
+          if grep -RIn \
+            "/diabloweb/" \
+            _site
+          then
+            echo \
+              "ERROR: old /diabloweb/ path remains"
+            exit 1
+          fi
 
           echo "FINAL_SITE_OK"
 
