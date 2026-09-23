@@ -1,6 +1,11 @@
-name: Build and Deploy DiabloWeb AutoAttack
+name: Deploy proven DiabloWebAI base
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-web.yml"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  web:
+  build-and-deploy:
     runs-on: ubuntu-22.04
 
     environment:
@@ -21,651 +26,74 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Checkout Game repo
-        uses: actions/checkout@v4
-
-      - name: Checkout DiabloWeb source
+      - name: Checkout proven DiabloWebAI base
         uses: actions/checkout@v4
         with:
-          repository: d07RiV/diabloweb
-          ref: 998629fd5d9f87ba9693cf1409cf2acea603c06e
-          path: diabloweb
-
-      - name: Checkout original DiabloWeb production
-        uses: actions/checkout@v4
-        with:
-          repository: d07RiV/diabloweb
-          ref: gh-pages
-          path: production
-
-      - name: Checkout DiabloWeb engine
-        uses: actions/checkout@v4
-        with:
-          repository: d07RiV/devilution
-          ref: 798b5122731ae4b5e0c91348e5c44cf79354a94e
-          path: engine
-
-      - name: Install Emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: 1.39.20
-          actions-cache-folder: emsdk-cache
-
-      - name: Patch engine for automatic attack
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("engine/Source/diablo.cpp")
-          s = p.read_text(encoding="utf-8")
-
-          insert_anchor = """void game_loop(BOOL bStartup)
-          {
-          """
-
-          if insert_anchor not in s:
-              raise SystemExit(
-                  "ERROR: game_loop anchor not found"
-              )
-
-          auto_attack = r'''
-          static int FindMobileAutoAttackTarget()
-          {
-          	int best = -1;
-          	int bestDistance = 9999;
-
-          	const int px = plr[myplr].WorldX;
-          	const int py = plr[myplr].WorldY;
-
-          	for (int n = 0; n < nummonsters; n++) {
-          		const int mi = monstactive[n];
-
-          		if (mi < 0 || mi >= MAXMONSTERS)
-          			continue;
-
-          		MonsterStruct &m = monster[mi];
-
-          		if (m._mDelFlag)
-          			continue;
-
-          		if (m._mhitpoints <= 0)
-          			continue;
-
-          		if (CanTalkToMonst(mi))
-          			continue;
-
-          		const int dx = abs(m._mx - px);
-          		const int dy = abs(m._my - py);
-
-          		const int distance =
-          		    dx > dy ? dx : dy;
-
-          		if (distance > 8)
-          			continue;
-
-          		if (distance >= bestDistance)
-          			continue;
-
-          		best = mi;
-          		bestDistance = distance;
-          	}
-
-          	return best;
-          }
-
-          static void TryMobileAutoAttack()
-          {
-          	if (leveltype == DTYPE_TOWN)
-          		return;
-
-          	if (PauseMode == 2)
-          		return;
-
-          	if (deathflag)
-          		return;
-
-          	if (gmenu_exception())
-          		return;
-
-          	if (
-          	    stextflag ||
-          	    spselflag ||
-          	    qtextflag
-          	)
-          		return;
-
-          	if (
-          	    questlog ||
-          	    doomflag ||
-          	    dropGoldFlag
-          	)
-          		return;
-
-          	if (track_isscrolling())
-          		return;
-
-          	PlayerStruct &player = plr[myplr];
-
-          	if (player._pmode != PM_STAND)
-          		return;
-
-          	const int target =
-          	    FindMobileAutoAttackTarget();
-
-          	if (target < 0)
-          		return;
-
-          	if (player._pwtype == WT_RANGED) {
-          		NetSendCmdParam1(
-          		    TRUE,
-          		    CMD_RATTACKID,
-          		    target
-          		);
-          	} else {
-          		NetSendCmdParam1(
-          		    TRUE,
-          		    CMD_ATTACKID,
-          		    target
-          		);
-          	}
-          }
-
-          '''
-
-          s = s.replace(
-              insert_anchor,
-              auto_attack + insert_anchor,
-              1
-          )
-
-          old_logic = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
-          		CheckCursMove();
-          		track_process();
-          	}
-          	if (gbProcessPlayers) {
-          """
-
-          new_logic = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
-          		CheckCursMove();
-          		track_process();
-          		TryMobileAutoAttack();
-          	}
-          	if (gbProcessPlayers) {
-          """
-
-          if old_logic not in s:
-              raise SystemExit(
-                  "ERROR: game_logic anchor not found"
-              )
-
-          s = s.replace(
-              old_logic,
-              new_logic,
-              1
-          )
-
-          p.write_text(
-              s,
-              encoding="utf-8"
-          )
-
-          print("AUTO_ATTACK_PATCH_OK")
-          PY
-
-      - name: Patch engine build script
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("engine/build.js")
-          s = p.read_text(encoding="utf-8")
-
-          s = s.replace(
-              " -s BINARYEN_TRAP_MODE='clamp'",
-              ""
-          )
-
-          old = """//run_build('-O3 -g -DZ_SOLO', 'Diablo', ['Source']).catch(e => console.error(e.message));
-          //run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => console.error(e.message));
-          run_build('-O3 -g -DZ_SOLO', 'MpqCmp', ['Source/rmpq', 'Source/zlib', 'mpqcmp']).catch(e => console.error(e.message));
-          """
-
-          new = """(async () => {
-            await run_build(
-              '-O3 -g -DZ_SOLO',
-              'Diablo',
-              ['Source']
-            );
-
-            await run_build(
-              '-O3 -g -DZ_SOLO -DSPAWN',
-              'DiabloSpawn',
-              ['Source']
-            );
-          })().catch(e => {
-            console.error(e);
-            process.exitCode = 1;
-          });
-          """
-
-          if old not in s:
-              raise SystemExit(
-                  "ERROR: build.js target block not found"
-              )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
-
-          p.write_text(
-              s,
-              encoding="utf-8"
-          )
-
-          print("BUILD_SCRIPT_PATCH_OK")
-          PY
-
-      - name: Verify engine patch
-        shell: bash
-        run: |
-          set -e
-
-          echo "=== Auto attack patch ==="
-
-          grep -n \
-            "FindMobileAutoAttackTarget" \
-            engine/Source/diablo.cpp
-
-          grep -n \
-            "TryMobileAutoAttack" \
-            engine/Source/diablo.cpp
-
-          echo "=== Build targets ==="
-
-          grep -n \
-            "DiabloSpawn" \
-            engine/build.js \
-            | tail -10
-
-      - name: Build modified engine
-        working-directory: engine
-        shell: bash
-        run: |
-          set -e
-
-          echo "=== Emscripten ==="
-          emcc --version
-
-          echo "=== Node ==="
-          node --version
-
-          echo "=== Build engine ==="
-          node build.js
-
-      - name: Verify modified engine
-        shell: bash
-        run: |
-          set -e
-
-          test -s engine/Diablo.wasm
-          test -s engine/DiabloSpawn.wasm
-          test -s engine/Diablo.jscc
-          test -s engine/DiabloSpawn.jscc
-
-          echo "=== ENGINE BUILD OK ==="
-
-          ls -lh \
-            engine/Diablo.wasm \
-            engine/DiabloSpawn.wasm \
-            engine/Diablo.jscc \
-            engine/DiabloSpawn.jscc
-
-      - name: Replace DiabloWeb engine
-        shell: bash
-        run: |
-          set -e
-
-          test -d diabloweb/src/api
-
-          cp \
-            engine/Diablo.wasm \
-            diabloweb/src/api/Diablo.wasm
-
-          cp \
-            engine/DiabloSpawn.wasm \
-            diabloweb/src/api/DiabloSpawn.wasm
-
-          cp \
-            engine/Diablo.jscc \
-            diabloweb/src/api/Diablo.jscc
-
-          cp \
-            engine/DiabloSpawn.jscc \
-            diabloweb/src/api/DiabloSpawn.jscc
-
-          echo "=== ENGINE REPLACED ==="
-
-          ls -lh \
-            diabloweb/src/api/Diablo.wasm \
-            diabloweb/src/api/DiabloSpawn.wasm \
-            diabloweb/src/api/Diablo.jscc \
-            diabloweb/src/api/DiabloSpawn.jscc
-
-      - name: Add SPAWN.MPQ
-        shell: bash
-        run: |
-          set -e
-
-          test -s production/spawn.mpq
-
-          cp \
-            production/spawn.mpq \
-            diabloweb/public/spawn.mpq
-
-          test -s diabloweb/public/spawn.mpq
-
-          echo "=== SPAWN.MPQ ==="
-
-          stat -c \
-            "%n : %s bytes" \
-            diabloweb/public/spawn.mpq
-
-      - name: Repair historical package-lock
-        working-directory: diabloweb
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import json
-
-          p = Path("package-lock.json")
-
-          lines = p.read_text(
-              encoding="utf-8"
-          ).splitlines(True)
-
-          out = []
-          state = "normal"
-          conflicts = 0
-
-          for line in lines:
-
-              if line.startswith("<<<<<<< "):
-                  if state != "normal":
-                      raise SystemExit(
-                          "ERROR: nested conflict"
-                      )
-
-                  conflicts += 1
-                  state = "upper"
-                  continue
-
-              if state == "upper":
-
-                  if line.startswith("======="):
-                      state = "lower"
-
-                  continue
-
-              if state == "lower":
-
-                  if line.startswith(">>>>>>> "):
-                      state = "normal"
-                      continue
-
-                  out.append(line)
-                  continue
-
-              out.append(line)
-
-          if state != "normal":
-              raise SystemExit(
-                  "ERROR: unterminated conflict"
-              )
-
-          fixed = "".join(out)
-
-          data = json.loads(fixed)
-
-          p.write_text(
-              json.dumps(
-                  data,
-                  indent=2
-              ) + "\n",
-              encoding="utf-8"
-          )
-
-          print(
-              "Resolved conflicts:",
-              conflicts
-          )
-
-          print(
-              "node-sass:",
-              data["dependencies"]["node-sass"]["version"]
-          )
-
-          print(
-              "react-dev-utils:",
-              data["dependencies"]["react-dev-utils"]["version"]
-          )
-
-          print(
-              "@babel/core:",
-              data["dependencies"]["@babel/core"]["version"]
-          )
-
-          print("LOCKFILE_REPAIR_OK")
-          PY
-
-          if grep -nE \
-            '^(<<<<<<<|=======|>>>>>>>)' \
-            package-lock.json
-          then
-            echo "ERROR: conflict markers remain"
-            exit 1
-          fi
-
-      - name: Set GitHub Pages path
-        working-directory: diabloweb
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          p = Path("package.json")
-
-          data = json.loads(
-              p.read_text(encoding="utf-8")
-          )
-
-          data["homepage"] = (
-              "https://gowellsik-hue.github.io/Game"
-          )
-
-          p.write_text(
-              json.dumps(
-                  data,
-                  indent=2
-              ) + "\n",
-              encoding="utf-8"
-          )
-
-          print(
-              "homepage:",
-              data["homepage"]
-          )
-          PY
+          repository: levidehaan/diablowebai
+          ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
+          path: app
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 14.21.3
+          node-version: "18"
 
-      - name: Show Node versions
-        shell: bash
-        run: |
-          node --version
-          npm --version
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
 
-      - name: Install DiabloWeb dependencies
-        working-directory: diabloweb
-        shell: bash
-        run: |
-          set -e
+      - name: Install dependencies
+        working-directory: app
+        run: npm install --legacy-peer-deps
 
-          npm ci \
-            --no-audit \
-            --no-fund
-
-      - name: Build DiabloWeb
-        working-directory: diabloweb
-        shell: bash
+      - name: Build proven base
+        working-directory: app
         env:
+          PUBLIC_URL: .
+          NODE_ENV: production
           CI: false
-        run: |
-          set -e
+          NODE_OPTIONS: --openssl-legacy-provider
+        run: npm run build
 
-          npm run build
-
-      - name: Prepare Pages site
+      - name: Verify playable build
         shell: bash
         run: |
           set -e
 
-          rm -rf _site
-          mkdir -p _site
+          test -s app/build/index.html
+          test -s app/build/spawn.mpq
 
-          cp -a \
-            diabloweb/build/. \
-            _site/
+          echo "=== index ==="
+          ls -lh app/build/index.html
 
-          test -s _site/index.html
-          test -s _site/spawn.mpq
+          echo "=== spawn.mpq ==="
+          ls -lh app/build/spawn.mpq
 
-          echo "=== SPAWN.MPQ ==="
-
-          stat -c \
-            "%n : %s bytes" \
-            _site/spawn.mpq
-
-          echo "=== WASM files ==="
-
-          find \
-            _site \
+          echo "=== wasm ==="
+          find app/build \
             -type f \
             -name '*.wasm' \
             -exec ls -lh {} \;
 
-          echo "=== Diablo WASM ==="
-
-          DIABLO_WASM="$(
-            find _site \
-              -type f \
-              -name 'Diablo.*.wasm' \
-              | head -1
-          )"
-
-          if [ -z "$DIABLO_WASM" ]; then
-            echo "ERROR: Diablo WASM missing"
-            exit 1
-          fi
-
-          test -s "$DIABLO_WASM"
-
-          echo \
-            "Diablo = $DIABLO_WASM"
-
-          echo "=== DiabloSpawn WASM ==="
-
-          SPAWN_WASM="$(
-            find _site \
-              -type f \
-              -name 'DiabloSpawn*.wasm' \
-              | head -1
-          )"
-
-          if [ -z "$SPAWN_WASM" ]; then
-            echo "ERROR: DiabloSpawn WASM missing"
-            exit 1
-          fi
-
-          test -s "$SPAWN_WASM"
-
-          echo \
-            "DiabloSpawn = $SPAWN_WASM"
-
-          echo "=== GitHub Pages paths ==="
-
-          grep -o \
-            "/Game/[^\"']*" \
-            _site/index.html \
-            | head -20 \
-            || true
-
-          if ! grep -q \
-            "/Game/" \
-            _site/index.html
-          then
-            echo "ERROR: /Game/ asset path missing from index.html"
-            exit 1
-          fi
-
-          echo "=== Worker files ==="
-
-          find \
-            _site \
+          echo "=== workers ==="
+          find app/build \
             -maxdepth 1 \
             -type f \
             -name '*.worker.js' \
             -exec ls -lh {} \;
 
-          echo "=== Service worker files ==="
-
-          find \
-            _site \
-            -maxdepth 1 \
-            -type f \
-            \( \
-              -name 'precache-manifest*.js' \
-              -o \
-              -name 'service-worker.js' \
-            \) \
-            -print
-
-          echo "=== Site root ==="
-
-          ls -lah _site
-
-          echo "FINAL_SITE_OK"
+          echo "PROVEN_BASE_BUILD_OK"
 
       - name: Upload downloadable build
         uses: actions/upload-artifact@v4
         with:
-          name: diabloweb-autoattack
-          path: _site/
+          name: diabloweb-proven-base
+          path: app/build/
           if-no-files-found: error
-
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v5
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: app/build
 
       - name: Deploy to GitHub Pages
         id: deployment
