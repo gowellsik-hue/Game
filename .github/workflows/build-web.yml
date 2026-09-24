@@ -1,4 +1,4 @@
-name: Deploy DiabloWeb playable baseline
+name: Deploy DiabloWeb AutoAttack
 
 on:
   push:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout frontend
@@ -30,14 +30,291 @@ jobs:
           ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
           path: app
 
-      - name: Checkout proven engine
+      - name: Checkout Devilution engine
         uses: actions/checkout@v4
         with:
-          repository: d07RiV/diabloweb
-          ref: 998629fd5d9f87ba9693cf1409cf2acea603c06e
-          path: proven
+          repository: d07RiV/devilution
+          ref: 798b5122731ae4b5e0c91348e5c44cf79354a94e
+          path: engine
 
-      - name: Patch application
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 1.39.20
+          actions-cache-folder: emsdk-cache
+
+      - name: Add auto attack to engine
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("engine/Source/diablo.cpp")
+          text = p.read_text(encoding="utf-8")
+
+          anchor = """void game_loop(BOOL bStartup)
+          {
+          """
+
+          if anchor not in text:
+              raise SystemExit(
+                  "ERROR: game_loop anchor missing"
+              )
+
+          autoattack = r'''
+          static int FindMobileAutoAttackTarget()
+          {
+          	int best = -1;
+          	int bestDistance = 9999;
+
+          	PlayerStruct &player = plr[myplr];
+
+          	const int px = player.WorldX;
+          	const int py = player.WorldY;
+
+          	const int maxDistance =
+          	    player._pwtype == WT_RANGED
+          	        ? 8
+          	        : 1;
+
+          	for (int n = 0; n < nummonsters; n++) {
+          		const int mi = monstactive[n];
+
+          		if (mi < 0 || mi >= MAXMONSTERS)
+          			continue;
+
+          		MonsterStruct &m = monster[mi];
+
+          		if (m._mDelFlag)
+          			continue;
+
+          		if (m._mhitpoints <= 0)
+          			continue;
+
+          		if (CanTalkToMonst(mi))
+          			continue;
+
+          		const int dx = abs(m._mx - px);
+          		const int dy = abs(m._my - py);
+
+          		const int distance =
+          		    dx > dy ? dx : dy;
+
+          		if (distance > maxDistance)
+          			continue;
+
+          		if (distance >= bestDistance)
+          			continue;
+
+          		best = mi;
+          		bestDistance = distance;
+          	}
+
+          	return best;
+          }
+
+          static void TryMobileAutoAttack()
+          {
+          	if (leveltype == DTYPE_TOWN)
+          		return;
+
+          	if (PauseMode == 2)
+          		return;
+
+          	if (deathflag)
+          		return;
+
+          	if (gmenu_exception())
+          		return;
+
+          	if (stextflag || spselflag || qtextflag)
+          		return;
+
+          	if (questlog || doomflag || dropGoldFlag)
+          		return;
+
+          	if (track_isscrolling())
+          		return;
+
+          	if (sgbMouseDown != 0)
+          		return;
+
+          	PlayerStruct &player = plr[myplr];
+
+          	/*
+          	 * Never interrupt movement, attacks,
+          	 * hit recovery or spell animations.
+          	 */
+          	if (player._pmode != PM_STAND)
+          		return;
+
+          	const int target =
+          	    FindMobileAutoAttackTarget();
+
+          	if (target < 0)
+          		return;
+
+          	if (player._pwtype == WT_RANGED) {
+          		NetSendCmdParam1(
+          		    TRUE,
+          		    CMD_RATTACKID,
+          		    target
+          		);
+          	} else {
+          		NetSendCmdParam1(
+          		    TRUE,
+          		    CMD_ATTACKID,
+          		    target
+          		);
+          	}
+          }
+
+          '''
+
+          text = text.replace(
+              anchor,
+              autoattack + anchor,
+              1
+          )
+
+          old = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
+          		CheckCursMove();
+          		track_process();
+          	}
+          	if (gbProcessPlayers) {
+          """
+
+          new = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
+          		CheckCursMove();
+          		track_process();
+          		TryMobileAutoAttack();
+          	}
+          	if (gbProcessPlayers) {
+          """
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: game loop logic anchor missing"
+              )
+
+          text = text.replace(
+              old,
+              new,
+              1
+          )
+
+          p.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+          print("AUTOATTACK_PATCH_OK")
+
+          p = Path("engine/build.js")
+          text = p.read_text(encoding="utf-8")
+
+          text = text.replace(
+              " -s BINARYEN_TRAP_MODE='clamp'",
+              ""
+          )
+
+          old = """//run_build('-O3 -g -DZ_SOLO', 'Diablo', ['Source']).catch(e => console.error(e.message));
+          //run_build('-O3 -g -DZ_SOLO -DSPAWN', 'DiabloSpawn', ['Source']).catch(e => console.error(e.message));
+          run_build('-O3 -g -DZ_SOLO', 'MpqCmp', ['Source/rmpq', 'Source/zlib', 'mpqcmp']).catch(e => console.error(e.message));
+          """
+
+          new = """(async () => {
+            await run_build(
+              '-O3 -g -DZ_SOLO',
+              'Diablo',
+              ['Source']
+            );
+
+            await run_build(
+              '-O3 -g -DZ_SOLO -DSPAWN',
+              'DiabloSpawn',
+              ['Source']
+            );
+          })().catch(e => {
+            console.error(e);
+            process.exitCode = 1;
+          });
+          """
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: build targets anchor missing"
+              )
+
+          text = text.replace(
+              old,
+              new,
+              1
+          )
+
+          p.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+          print("ENGINE_BUILD_PATCH_OK")
+          PY
+
+      - name: Verify auto attack source
+        shell: bash
+        run: |
+          set -e
+
+          grep -n \
+            "FindMobileAutoAttackTarget" \
+            engine/Source/diablo.cpp
+
+          grep -n \
+            "TryMobileAutoAttack" \
+            engine/Source/diablo.cpp
+
+          grep -n \
+            "CMD_ATTACKID" \
+            engine/Source/diablo.cpp
+
+          grep -n \
+            "CMD_RATTACKID" \
+            engine/Source/diablo.cpp
+
+          echo "AUTOATTACK_SOURCE_OK"
+
+      - name: Build auto attack engine
+        working-directory: engine
+        shell: bash
+        run: |
+          set -e
+
+          emcc --version
+          node --version
+
+          node build.js
+
+      - name: Verify engine build
+        shell: bash
+        run: |
+          set -e
+
+          test -s engine/Diablo.wasm
+          test -s engine/DiabloSpawn.wasm
+          test -s engine/Diablo.jscc
+          test -s engine/DiabloSpawn.jscc
+
+          ls -lh \
+            engine/Diablo.wasm \
+            engine/DiabloSpawn.wasm \
+            engine/Diablo.jscc \
+            engine/DiabloSpawn.jscc
+
+          echo "AUTOATTACK_ENGINE_BUILT"
+
+      - name: Patch frontend
         shell: bash
         run: |
           set -e
@@ -49,14 +326,25 @@ jobs:
           from pathlib import Path
 
           app = Path("app")
-          proven = Path("proven")
+          engine = Path("engine")
 
           def replace_once(text, old, new, name):
               if old not in text:
-                  raise SystemExit("PATCH FAILED: " + name)
-              return text.replace(old, new, 1)
+                  raise SystemExit(
+                      "PATCH FAILED: " + name
+                  )
+              return text.replace(
+                  old,
+                  new,
+                  1
+              )
+
+          # --------------------------------
+          # package mismatch
+          # --------------------------------
 
           p = app / "package.json"
+
           data = json.loads(
               p.read_text(
                   encoding="utf-8"
@@ -79,7 +367,12 @@ jobs:
               encoding="utf-8"
           )
 
+          # --------------------------------
+          # service worker off
+          # --------------------------------
+
           p = app / "src/index.js"
+
           text = p.read_text(
               encoding="utf-8"
           )
@@ -101,26 +394,66 @@ jobs:
               encoding="utf-8"
           )
 
+          # --------------------------------
+          # install paired rebuilt engine
+          # --------------------------------
+
           out = app / "public/wasm"
+
           out.mkdir(
               parents=True,
               exist_ok=True
           )
 
-          copies = {
-              "Diablo.jscc": "Diablo.js",
-              "Diablo.wasm": "Diablo.wasm",
-              "DiabloSpawn.jscc": "DiabloSpawn.js",
-              "DiabloSpawn.wasm": "DiabloSpawn.wasm",
-          }
+          shutil.copy2(
+              engine / "Diablo.jscc",
+              out / "Diablo.js"
+          )
 
-          for src, dst in copies.items():
-              shutil.copy2(
-                  proven / "src/api" / src,
-                  out / dst
-              )
+          shutil.copy2(
+              engine / "Diablo.wasm",
+              out / "Diablo.wasm"
+          )
 
-          p = app / "src/api/game.worker.js"
+          shutil.copy2(
+              engine / "DiabloSpawn.jscc",
+              out / "DiabloSpawn.js"
+          )
+
+          shutil.copy2(
+              engine / "DiabloSpawn.wasm",
+              out / "DiabloSpawn.wasm"
+          )
+
+          diablo_size = (
+              engine /
+              "Diablo.wasm"
+          ).stat().st_size
+
+          spawn_size = (
+              engine /
+              "DiabloSpawn.wasm"
+          ).stat().st_size
+
+          print(
+              "Diablo WASM:",
+              diablo_size
+          )
+
+          print(
+              "Spawn WASM:",
+              spawn_size
+          )
+
+          # --------------------------------
+          # game worker
+          # --------------------------------
+
+          p = (
+              app /
+              "src/api/game.worker.js"
+          )
+
           text = p.read_text(
               encoding="utf-8"
           )
@@ -137,8 +470,12 @@ jobs:
               )
 
           text = re.sub(
-              r"const DiabloSize = \d+;\s*const SpawnSize = \d+;",
-              "const DiabloSize = 1519717;\nconst SpawnSize = 1381584;",
+              r"const DiabloSize = \d+;\s*"
+              r"const SpawnSize = \d+;",
+              (
+                  f"const DiabloSize = {diablo_size};\n"
+                  f"const SpawnSize = {spawn_size};"
+              ),
               text,
               count=1
           )
@@ -189,8 +526,7 @@ jobs:
               worker[factoryName];
 
             if (
-              typeof factory
-              !== "function"
+              typeof factory !== "function"
             ) {
               throw new Error(
                 `Missing ${factoryName} factory`
@@ -223,10 +559,12 @@ jobs:
               typeof readyModule._DApi_Init
                 !== "function" ||
               typeof readyModule._DApi_Render
+                !== "function" ||
+              typeof readyModule._DApi_Mouse
                 !== "function"
             ) {
               throw new Error(
-                "Diablo engine initialization failed"
+                "AutoAttack Diablo engine initialization failed"
               );
             }
 
@@ -244,6 +582,10 @@ jobs:
               + new_loader
               + text[end:]
           )
+
+          # --------------------------------
+          # disable expensive AI scanning
+          # --------------------------------
 
           detector = r'''  // Initialize Game Event Detector for AI quest system
             try {
@@ -303,7 +645,15 @@ jobs:
               encoding="utf-8"
           )
 
-          p = app / "src/api/loader.js"
+          # --------------------------------
+          # loader: no memory scan
+          # --------------------------------
+
+          p = (
+              app /
+              "src/api/loader.js"
+          )
+
           text = p.read_text(
               encoding="utf-8"
           )
@@ -352,7 +702,7 @@ jobs:
               text,
               marker,
               replacement,
-              "worker handler"
+              "worker error handler"
           )
 
           p.write_text(
@@ -360,10 +710,10 @@ jobs:
               encoding="utf-8"
           )
 
-          print("APP_PATCH_OK")
+          print("FRONTEND_PATCH_OK")
           PY
 
-      - name: Patch webpack
+      - name: Patch webpack output
         shell: bash
         run: |
           set -e
@@ -413,11 +763,6 @@ jobs:
             const names =
               Object.keys(assets);
 
-            console.log(
-              "[FORCE-EMIT]",
-              names.length
-            );
-
             if (!names.length) {
               throw new Error(
                 "No webpack assets"
@@ -451,7 +796,7 @@ jobs:
                 );
 
               fs.ensureDirSync(
-                path.dirname(output)
+                  path.dirname(output)
               );
 
               fs.writeFileSync(
@@ -504,25 +849,40 @@ jobs:
           print("WEBPACK_PATCH_OK")
           PY
 
-      - name: Verify source
+      - name: Verify patched runtime source
         shell: bash
         run: |
           set -e
 
-          test -s app/public/wasm/Diablo.js
-          test -s app/public/wasm/Diablo.wasm
-          test -s app/public/wasm/DiabloSpawn.js
-          test -s app/public/wasm/DiabloSpawn.wasm
+          grep -Fq \
+            "TryMobileAutoAttack" \
+            engine/Source/diablo.cpp
+
+          grep -Fq \
+            "CMD_ATTACKID" \
+            engine/Source/diablo.cpp
+
+          grep -Fq \
+            "CMD_RATTACKID" \
+            engine/Source/diablo.cpp
+
+          test -s \
+            app/public/wasm/Diablo.js
+
+          test -s \
+            app/public/wasm/Diablo.wasm
+
+          test -s \
+            app/public/wasm/DiabloSpawn.js
+
+          test -s \
+            app/public/wasm/DiabloSpawn.wasm
 
           grep -Fq \
             "NEURAL_STARTUP_DISABLED" \
             app/src/api/loader.js
 
-          grep -Fq \
-            "NEURAL_EVENT_DETECTOR_DISABLED" \
-            app/src/api/game.worker.js
-
-          echo "SOURCE_OK"
+          echo "AUTOATTACK_RUNTIME_SOURCE_OK"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -531,20 +891,21 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
-      - name: Install dependencies
+      - name: Install frontend dependencies
         working-directory: app
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
         run: |
           set -e
+
           npm ci \
             --legacy-peer-deps \
             --no-audit \
             --no-fund \
             --ignore-scripts
 
-      - name: Build
+      - name: Build frontend
         working-directory: app
         env:
           PUBLIC_URL: /Game
@@ -567,8 +928,16 @@ jobs:
 
           build = Path("app/build")
           public = Path("app/public")
-          js = build / "static/js"
-          css = build / "static/css"
+
+          js = (
+              build /
+              "static/js"
+          )
+
+          css = (
+              build /
+              "static/css"
+          )
 
           runtime = sorted(
               js.glob(
@@ -626,17 +995,19 @@ jobs:
               for p in styles
           )
 
+          scripts = (
+              runtime +
+              chunks +
+              main
+          )
+
           js_tags = "\n".join(
               (
                   '<script '
                   f'src="/Game/static/js/{p.name}">'
                   '</script>'
               )
-              for p in (
-                  runtime +
-                  chunks +
-                  main
-              )
+              for p in scripts
           )
 
           html = html.replace(
@@ -679,12 +1050,23 @@ jobs:
           touch \
             app/build/.nojekyll
 
-          test -s app/build/index.html
-          test -s app/build/spawn.mpq
-          test -s app/build/wasm/Diablo.js
-          test -s app/build/wasm/Diablo.wasm
-          test -s app/build/wasm/DiabloSpawn.js
-          test -s app/build/wasm/DiabloSpawn.wasm
+          test -s \
+            app/build/index.html
+
+          test -s \
+            app/build/spawn.mpq
+
+          test -s \
+            app/build/wasm/Diablo.js
+
+          test -s \
+            app/build/wasm/Diablo.wasm
+
+          test -s \
+            app/build/wasm/DiabloSpawn.js
+
+          test -s \
+            app/build/wasm/DiabloSpawn.wasm
 
           find \
             app/build/static/js \
@@ -701,7 +1083,7 @@ jobs:
             -size +0c \
             | grep -q .
 
-          echo "SITE_READY"
+          echo "AUTOATTACK_SITE_READY"
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
