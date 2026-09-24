@@ -1,4 +1,4 @@
-name: Deploy DiabloWebAI proven engine
+name: Deploy DiabloWeb playable baseline
 
 on:
   push:
@@ -30,14 +30,14 @@ jobs:
           ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
           path: app
 
-      - name: Checkout proven production engine
+      - name: Checkout proven DiabloWeb engine
         uses: actions/checkout@v4
         with:
           repository: d07RiV/diabloweb
           ref: 998629fd5d9f87ba9693cf1409cf2acea603c06e
           path: proven
 
-      - name: Patch frontend and install proven engine
+      - name: Patch application
         shell: bash
         run: |
           set -e
@@ -51,9 +51,9 @@ jobs:
           app = Path("app")
           proven = Path("proven")
 
-          # ---------------------------------
-          # package-lock mismatch
-          # ---------------------------------
+          # ==================================================
+          # 1. Fix upstream package mismatch
+          # ==================================================
 
           package = app / "package.json"
 
@@ -79,9 +79,11 @@ jobs:
               encoding="utf-8"
           )
 
-          # ---------------------------------
-          # disable service worker
-          # ---------------------------------
+          print("PACKAGE_FIXED")
+
+          # ==================================================
+          # 2. Disable service worker
+          # ==================================================
 
           index = app / "src/index.js"
 
@@ -96,7 +98,7 @@ jobs:
 
           if old not in text:
               raise SystemExit(
-                  "service worker block not found"
+                  "ERROR: service worker block not found"
               )
 
           text = text.replace(
@@ -110,9 +112,11 @@ jobs:
               encoding="utf-8"
           )
 
-          # ---------------------------------
-          # install exact production engine
-          # ---------------------------------
+          print("SERVICE_WORKER_DISABLED")
+
+          # ==================================================
+          # 3. Install proven Diablo engine pair
+          # ==================================================
 
           wasm_dir = app / "public/wasm"
 
@@ -138,10 +142,11 @@ jobs:
                   wasm_dir / dst
               )
 
-          # ---------------------------------
-          # worker: stop bundling broken
-          # rebuilt WASM/JSCC
-          # ---------------------------------
+          print("PROVEN_ENGINE_INSTALLED")
+
+          # ==================================================
+          # 4. Patch game worker
+          # ==================================================
 
           worker = (
               app /
@@ -152,6 +157,7 @@ jobs:
               encoding="utf-8"
           )
 
+          # Do not let Webpack parse JSCC.
           imports = [
               "import DiabloBinary from './Diablo.wasm';\n",
               "import DiabloModule from './Diablo.jscc';\n",
@@ -165,6 +171,7 @@ jobs:
                   ""
               )
 
+          # Exact proven engine binary sizes.
           text = re.sub(
               r"const DiabloSize = \d+;\s*"
               r"const SpawnSize = \d+;",
@@ -176,6 +183,7 @@ jobs:
               count=1
           )
 
+          # Replace modern JSCC loader with direct proven-engine loader.
           start = text.find(
               "async function initWasm("
           )
@@ -187,7 +195,7 @@ jobs:
 
           if start < 0 or end < 0:
               raise SystemExit(
-                  "initWasm block not found"
+                  "ERROR: initWasm block not found"
               )
 
           new_loader = r'''async function initWasm(spawn, progress) {
@@ -240,30 +248,26 @@ jobs:
                   progress,
               });
 
-            let module =
+            const module =
               factory({
                 wasmBinary:
                   binary.data,
               });
 
-            if (
-              module &&
-              module.ready
-            ) {
-              module =
-                await module.ready;
-            } else {
-              module =
-                await module;
-            }
+            const readyModule =
+              module && module.ready
+                ? await module.ready
+                : await module;
 
             if (
-              !module ||
-              typeof module._DApi_Init
+              !readyModule ||
+              typeof readyModule._DApi_Init
                 !== "function" ||
-              typeof module._DApi_Render
+              typeof readyModule._DApi_Render
                 !== "function" ||
-              typeof module._DApi_Mouse
+              typeof readyModule._DApi_Mouse
+                !== "function" ||
+              typeof readyModule._DApi_Key
                 !== "function"
             ) {
               throw new Error(
@@ -276,7 +280,7 @@ jobs:
                 binary.data.byteLength
             });
 
-            return module;
+            return readyModule;
           }
           '''
 
@@ -286,14 +290,96 @@ jobs:
               + text[end:]
           )
 
+          # ==================================================
+          # 5. Disable GameEventDetector startup
+          # ==================================================
+
+          detector_init = r'''  // Initialize Game Event Detector for AI quest system
+            try {
+              gameEventDetector.initialize(wasm);
+              console.log('[Worker] Game Event Detector initialized');
+            } catch (e) {
+              console.warn('[Worker] Game Event Detector init failed:', e);
+            }
+          '''
+
+          if detector_init in text:
+              text = text.replace(
+                  detector_init,
+                  """  // Neural event detector disabled for baseline gameplay.
+            console.log('[Worker] Neural event detector disabled');
+          """,
+                  1
+              )
+          else:
+              print(
+                  "NOTE: detector init block not found"
+              )
+
+          # ==================================================
+          # 6. PURE render loop.
+          #
+          # Remove neural processFrame from the 50ms game loop.
+          # ==================================================
+
+          old_render = r'''  setInterval(() => {
+              call_api("DApi_Render", Math.floor(performance.now()));
+
+              // Process game events for AI/quest system
+              try {
+                gameEventDetector.processFrame();
+
+                // Flush and send events to main thread
+                if (gameEventDetector.hasPendingEvents()) {
+                  const events = gameEventDetector.flushEvents();
+                  worker.postMessage({
+                    action: 'game_events',
+                    events: events
+                  });
+                }
+              } catch (e) {
+                // Don't spam errors - event detection is non-critical
+              }
+            }, 50);
+          '''
+
+          new_render = r'''  setInterval(() => {
+              call_api(
+                "DApi_Render",
+                Math.floor(performance.now())
+              );
+            }, 50);
+          '''
+
+          if old_render not in text:
+              raise SystemExit(
+                  "ERROR: render loop block not found"
+              )
+
+          text = text.replace(
+              old_render,
+              new_render,
+              1
+          )
+
           worker.write_text(
               text,
               encoding="utf-8"
           )
 
-          # ---------------------------------
-          # catch worker crashes
-          # ---------------------------------
+          print("GAME_WORKER_BASELINE_OK")
+
+          # ==================================================
+          # 7. Disable automatic NeuralGameController startup
+          #
+          # THIS is the mobile freeze culprit:
+          #
+          # loaded
+          # -> NeuralGameController
+          # -> LevelInjector
+          # -> scanMemory
+          # -> 128 MB heap scan
+          # ==================================================
 
           loader = (
               app /
@@ -303,6 +389,39 @@ jobs:
           text = loader.read_text(
               encoding="utf-8"
           )
+
+          neural_block = r'''          // Initialize NeuralGameController with the worker
+                    // Note: WASM module is not directly accessible here, controller will
+                    // work through worker messages
+                    neuralGameController.initialize(null, worker).then(() => {
+                      console.log('[Loader] NeuralGameController initialized');
+                    }).catch(err => {
+                      console.warn('[Loader] NeuralGameController init failed:', err);
+                    });
+
+          '''
+
+          if neural_block not in text:
+              raise SystemExit(
+                  "ERROR: NeuralGameController startup block not found"
+              )
+
+          text = text.replace(
+              neural_block,
+              """          // Neural startup deliberately disabled.
+                    // Automatic memory scanning freezes the game worker
+                    // on mobile because the WASM heap is 128 MB.
+                    console.log(
+                      '[Loader] NEURAL_STARTUP_DISABLED'
+                    );
+
+          """,
+              1
+          )
+
+          # ==================================================
+          # 8. Add worker error reporting
+          # ==================================================
 
           marker = """      const worker = new Worker();
 
@@ -319,7 +438,7 @@ jobs:
                         : "Game worker crashed";
 
                     console.error(
-                      "[Loader] worker:",
+                      "[Loader] Game worker error:",
                       message
                     );
 
@@ -342,21 +461,24 @@ jobs:
 
                 let packetQueue = [];"""
 
-          if marker in text:
-              text = text.replace(
-                  marker,
-                  replacement,
-                  1
+          if marker not in text:
+              raise SystemExit(
+                  "ERROR: worker creation block not found"
               )
+
+          text = text.replace(
+              marker,
+              replacement,
+              1
+          )
 
           loader.write_text(
               text,
               encoding="utf-8"
           )
 
-          print(
-              "PROVEN_ENGINE_PATCH_OK"
-          )
+          print("NEURAL_STARTUP_DISABLED")
+          print("PATCH_COMPLETE")
           PY
 
       - name: Patch webpack output
@@ -409,16 +531,16 @@ jobs:
             const names =
               Object.keys(assets);
 
+            console.log(
+              "[FORCE-EMIT]",
+              names.length
+            );
+
             if (!names.length) {
               throw new Error(
                 "No webpack assets"
               );
             }
-
-            console.log(
-              "[FORCE-EMIT]",
-              names.length
-            );
 
             for (const name of names) {
               let source =
@@ -460,7 +582,7 @@ jobs:
 
           if marker not in text:
               raise SystemExit(
-                  "build marker missing"
+                  "ERROR: build marker missing"
               )
 
           text = text.replace(
@@ -483,7 +605,7 @@ jobs:
 
           if marker2 not in text:
               raise SystemExit(
-                  "resolve marker missing"
+                  "ERROR: resolve marker missing"
               )
 
           text = text.replace(
@@ -496,9 +618,11 @@ jobs:
               text,
               encoding="utf-8"
           )
+
+          print("WEBPACK_OUTPUT_PATCH_OK")
           PY
 
-      - name: Verify proven engine
+      - name: Verify source patches
         shell: bash
         run: |
           set -e
@@ -532,15 +656,37 @@ jobs:
             app/public/wasm/DiabloSpawn.js
 
           grep -q \
-            "DiabloSpawn.js" \
+            "NEURAL_STARTUP_DISABLED" \
+            app/src/api/loader.js
+
+          if grep -q \
+            "neuralGameController.initialize(null, worker)" \
+            app/src/api/loader.js
+          then
+            echo \
+              "ERROR: neural startup still enabled"
+            exit 1
+          fi
+
+          if grep -q \
+            "gameEventDetector.processFrame()" \
+            app/src/api/game.worker.js
+          then
+            echo \
+              "ERROR: neural frame processing still enabled"
+            exit 1
+          fi
+
+          grep -q \
+            'call_api(' \
             app/src/api/game.worker.js
 
           grep -q \
-            "module.ready" \
+            '"DApi_Render"' \
             app/src/api/game.worker.js
 
           echo \
-            "PROVEN_ENGINE_OK"
+            "BASELINE_SOURCE_OK"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -587,8 +733,13 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          build = Path("app/build")
-          public = Path("app/public")
+          build = Path(
+              "app/build"
+          )
+
+          public = Path(
+              "app/public"
+          )
 
           jsdir = (
               build /
@@ -628,9 +779,14 @@ jobs:
               )
           )
 
-          if not runtime or not main:
+          if not runtime:
               raise SystemExit(
-                  "main JS missing"
+                  "ERROR: runtime JS missing"
+              )
+
+          if not main:
+              raise SystemExit(
+                  "ERROR: main JS missing"
               )
 
           html = (
@@ -684,12 +840,10 @@ jobs:
               encoding="utf-8"
           )
 
-          print(
-              "INDEX_OK"
-          )
+          print("INDEX_OK")
           PY
 
-      - name: Clean cache and verify build
+      - name: Clean cache files
         shell: bash
         run: |
           set -e
@@ -706,6 +860,11 @@ jobs:
           touch \
             app/build/.nojekyll
 
+      - name: Verify final runtime
+        shell: bash
+        run: |
+          set -e
+
           test -s \
             app/build/index.html
 
@@ -713,7 +872,13 @@ jobs:
             app/build/spawn.mpq
 
           test -s \
+            app/build/wasm/Diablo.js
+
+          test -s \
             app/build/wasm/Diablo.wasm
+
+          test -s \
+            app/build/wasm/DiabloSpawn.js
 
           test -s \
             app/build/wasm/DiabloSpawn.wasm
@@ -730,6 +895,7 @@ jobs:
 
           find \
             app/build/static/js \
+            -type f \
             -name 'main.*.js' \
             -size +0c \
             | grep -q .
@@ -756,11 +922,46 @@ jobs:
             exit 1
           fi
 
+          if grep -Fq \
+            "Game Event Detector initialized" \
+            "$GAME_WORKER"
+          then
+            echo \
+              "ERROR: neural detector remains enabled"
+            exit 1
+          fi
+
+          if grep -Fq \
+            "processFrame()" \
+            "$GAME_WORKER"
+          then
+            echo \
+              "ERROR: neural frame loop remains enabled"
+            exit 1
+          fi
+
+          MAIN_JS="$(
+            find \
+              app/build/static/js \
+              -type f \
+              -name 'main.*.js' \
+              | head -1
+          )"
+
+          if grep -Fq \
+            "NeuralGameController initialized" \
+            "$MAIN_JS"
+          then
+            echo \
+              "ERROR: neural startup code remains"
+            exit 1
+          fi
+
           echo \
             "GAME_WORKER=$GAME_WORKER"
 
           echo \
-            "PROVEN_RUNTIME_BUILD_OK"
+            "PURE_GAME_BASELINE_OK"
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
@@ -768,7 +969,7 @@ jobs:
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: diablowebai-proven-engine
+          name: diabloweb-playable-baseline
           path: app/build/
           if-no-files-found: error
 
