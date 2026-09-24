@@ -1,4 +1,4 @@
-name: Deploy proven DiabloWebAI base
+name: Deploy proven DiabloWebAI prebuilt
 
 on:
   push:
@@ -18,7 +18,281 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout proven prebuilt DiabloWebAI
+        uses: actions/checkout@v4
+        with:
+          repository: levidehaan/diablowebai
+          ref: gh-pages
+          path: site
+
+      - name: Remove source repository metadata
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf site/.git
+          rm -rf site/.github
+
+          echo "=== PREBUILT SITE ==="
+          ls -lah site
+
+      - name: Rewrite /diabloweb path to /Game
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("site")
+
+          extensions = {
+              ".html",
+              ".js",
+              ".json",
+              ".css",
+              ".txt",
+              ".xml",
+              ".webmanifest",
+          }
+
+          changed = []
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              if (
+                  path.suffix.lower() not in extensions
+                  and "precache-manifest" not in path.name
+                  and path.name != "service-worker.js"
+              ):
+                  continue
+
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+
+              original = text
+
+              # Only replace root-site asset references.
+              # Do not rewrite GitHub URLs containing
+              # github.com/.../diabloweb/...
+              text = text.replace(
+                  '"/diabloweb/',
+                  '"/Game/'
+              )
+
+              text = text.replace(
+                  "'/diabloweb/",
+                  "'/Game/"
+              )
+
+              text = text.replace(
+                  '"/diabloweb"',
+                  '"/Game"'
+              )
+
+              text = text.replace(
+                  "'/diabloweb'",
+                  "'/Game'"
+              )
+
+              text = text.replace(
+                  "(/diabloweb/",
+                  "(/Game/"
+              )
+
+              text = text.replace(
+                  "=/diabloweb/",
+                  "=/Game/"
+              )
+
+              if text != original:
+                  path.write_text(
+                      text,
+                      encoding="utf-8"
+                  )
+                  changed.append(str(path))
+
+          print("Changed files:")
+
+          for name in changed:
+              print(" -", name)
+
+          print(
+              "PATH_REWRITE_COUNT=",
+              len(changed)
+          )
+          PY
+
+      - name: Disable Jekyll
+        shell: bash
+        run: |
+          touch site/.nojekyll
+
+      - name: Verify game assets
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== INDEX ==="
+
+          test -s site/index.html
+          ls -lh site/index.html
+
+          echo "=== SPAWN.MPQ ==="
+
+          test -s site/spawn.mpq
+          ls -lh site/spawn.mpq
+
+          echo "=== WASM ==="
+
+          DIABLO_WASM="$(
+            find site \
+              -type f \
+              -name 'Diablo.*.wasm' \
+              | head -1
+          )"
+
+          SPAWN_WASM="$(
+            find site \
+              -type f \
+              -name 'DiabloSpawn.*.wasm' \
+              | head -1
+          )"
+
+          if [ -z "$DIABLO_WASM" ]; then
+            echo "ERROR: Diablo WASM missing"
+            exit 1
+          fi
+
+          if [ -z "$SPAWN_WASM" ]; then
+            echo "ERROR: DiabloSpawn WASM missing"
+            exit 1
+          fi
+
+          test -s "$DIABLO_WASM"
+          test -s "$SPAWN_WASM"
+
+          ls -lh \
+            "$DIABLO_WASM" \
+            "$SPAWN_WASM"
+
+          echo "=== WORKERS ==="
+
+          find site \
+            -maxdepth 1 \
+            -type f \
+            -name '*.worker.js' \
+            -exec ls -lh {} \;
+
+          echo "=== SERVICE WORKER ==="
+
+          if [ -f site/service-worker.js ]; then
+            ls -lh site/service-worker.js
+          fi
+
+          echo "=== /Game/ REFERENCES ==="
+
+          grep -o \
+            '/Game/[^"'"'"']*' \
+            site/index.html \
+            | head -20 \
+            || true
+
+          if ! grep -q \
+            '/Game/' \
+            site/index.html
+          then
+            echo "ERROR: /Game/ path not present"
+            exit 1
+          fi
+
+          echo "PREBUILT_GAME_OK"
+
+      - name: Check bad root paths
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("site")
+
+          bad_patterns = [
+              '"/diabloweb/',
+              "'/diabloweb/",
+              '"/diabloweb"',
+              "'/diabloweb'",
+              "(/diabloweb/",
+              "=/diabloweb/",
+          ]
+
+          problems = []
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              try:
+                  text = path.read_text(
+                      encoding="utf-8"
+                  )
+              except (UnicodeDecodeError, OSError):
+                  continue
+
+              for pattern in bad_patterns:
+                  if pattern in text:
+                      problems.append(
+                          (
+                              str(path),
+                              pattern
+                          )
+                      )
+
+          if problems:
+              print(
+                  "ERROR: old root paths remain"
+              )
+
+              for file, pattern in problems[:50]:
+                  print(
+                      file,
+                      "=>",
+                      pattern
+                  )
+
+              raise SystemExit(1)
+
+          print(
+              "ROOT_PATH_CHECK_OK"
+          )
+          PY
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: diablowebai-prebuilt
+          path: site/
+          if-no-files-found: error
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
     runs-on: ubuntu-22.04
 
     environment:
@@ -26,75 +300,6 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Checkout proven DiabloWebAI base
-        uses: actions/checkout@v4
-        with:
-          repository: levidehaan/diablowebai
-          ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
-          path: app
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "18"
-
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Install dependencies
-        working-directory: app
-        run: npm install --legacy-peer-deps
-
-      - name: Build proven base
-        working-directory: app
-        env:
-          PUBLIC_URL: .
-          NODE_ENV: production
-          CI: false
-          NODE_OPTIONS: --openssl-legacy-provider
-        run: npm run build
-
-      - name: Verify playable build
-        shell: bash
-        run: |
-          set -e
-
-          test -s app/build/index.html
-          test -s app/build/spawn.mpq
-
-          echo "=== index ==="
-          ls -lh app/build/index.html
-
-          echo "=== spawn.mpq ==="
-          ls -lh app/build/spawn.mpq
-
-          echo "=== wasm ==="
-          find app/build \
-            -type f \
-            -name '*.wasm' \
-            -exec ls -lh {} \;
-
-          echo "=== workers ==="
-          find app/build \
-            -maxdepth 1 \
-            -type f \
-            -name '*.worker.js' \
-            -exec ls -lh {} \;
-
-          echo "PROVEN_BASE_BUILD_OK"
-
-      - name: Upload downloadable build
-        uses: actions/upload-artifact@v4
-        with:
-          name: diabloweb-proven-base
-          path: app/build/
-          if-no-files-found: error
-
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: app/build
-
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
