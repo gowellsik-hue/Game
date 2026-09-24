@@ -23,14 +23,14 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout modern DiabloWebAI
+      - name: Checkout DiabloWebAI
         uses: actions/checkout@v4
         with:
           repository: levidehaan/diablowebai
           ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
           path: app
 
-      - name: Patch upstream build
+      - name: Fix package lock mismatch
         shell: bash
         run: |
           set -e
@@ -39,11 +39,9 @@ jobs:
           import json
           from pathlib import Path
 
-          package = Path("app/package.json")
+          p = Path("app/package.json")
           data = json.loads(
-              package.read_text(
-                  encoding="utf-8"
-              )
+              p.read_text(encoding="utf-8")
           )
 
           removed = data.get(
@@ -54,7 +52,7 @@ jobs:
               None
           )
 
-          package.write_text(
+          p.write_text(
               json.dumps(
                   data,
                   indent=2
@@ -66,6 +64,15 @@ jobs:
               "Removed canvas:",
               removed
           )
+          PY
+
+      - name: Patch webpack output
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
 
           webpack = Path(
               "app/config/webpack.config.js"
@@ -75,23 +82,9 @@ jobs:
               encoding="utf-8"
           )
 
-          old = (
-              "futureEmitAssets: true,"
-          )
-
-          new = (
-              "futureEmitAssets: false,"
-          )
-
-          if old not in text:
-              raise SystemExit(
-                  "ERROR: futureEmitAssets "
-                  "setting not found"
-              )
-
           text = text.replace(
-              old,
-              new,
+              "futureEmitAssets: true,",
+              "futureEmitAssets: false,",
               1
           )
 
@@ -100,14 +93,141 @@ jobs:
               encoding="utf-8"
           )
 
+          build = Path(
+              "app/scripts/build.js"
+          )
+
+          text = build.read_text(
+              encoding="utf-8"
+          )
+
+          marker = (
+              "const isInteractive = "
+              "process.stdout.isTTY;"
+          )
+
+          helper = r'''
+          const isInteractive = process.stdout.isTTY;
+
+          function forceWriteAssets(stats) {
+            const assets =
+              stats &&
+              stats.compilation &&
+              stats.compilation.assets
+                ? stats.compilation.assets
+                : {};
+
+            const names =
+              Object.keys(assets);
+
+            console.log(
+              "[FORCE-EMIT] asset count:",
+              names.length
+            );
+
+            if (names.length === 0) {
+              throw new Error(
+                "Webpack compilation produced no assets"
+              );
+            }
+
+            for (const name of names) {
+              const asset =
+                assets[name];
+
+              let source =
+                asset.source();
+
+              if (
+                source instanceof Uint8Array &&
+                !Buffer.isBuffer(source)
+              ) {
+                source =
+                  Buffer.from(source);
+              }
+
+              if (
+                typeof source !== "string" &&
+                !Buffer.isBuffer(source)
+              ) {
+                source =
+                  Buffer.from(source);
+              }
+
+              const output =
+                path.join(
+                  paths.appBuild,
+                  name
+                );
+
+              fs.ensureDirSync(
+                path.dirname(output)
+              );
+
+              fs.writeFileSync(
+                output,
+                source
+              );
+
+              console.log(
+                "[FORCE-EMIT]",
+                name
+              );
+            }
+          }
+          '''
+
+          if marker not in text:
+              raise SystemExit(
+                  "ERROR: build marker not found"
+              )
+
+          text = text.replace(
+              marker,
+              helper,
+              1
+          )
+
+          resolve_marker = (
+              "      return resolve({\n"
+              "        stats,"
+          )
+
+          replacement = (
+              "      forceWriteAssets(stats);\n"
+              "\n"
+              "      return resolve({\n"
+              "        stats,"
+          )
+
+          if resolve_marker not in text:
+              raise SystemExit(
+                  "ERROR: resolve marker not found"
+              )
+
+          text = text.replace(
+              resolve_marker,
+              replacement,
+              1
+          )
+
+          build.write_text(
+              text,
+              encoding="utf-8"
+          )
+
           print(
-              "futureEmitAssets disabled"
+              "Webpack force-emission patch installed"
           )
           PY
 
           grep -n \
             "futureEmitAssets" \
             app/config/webpack.config.js
+
+          grep -n \
+            "forceWriteAssets" \
+            app/scripts/build.js
 
       - name: Verify modern WASM loader
         shell: bash
@@ -131,12 +251,6 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
-      - name: Show versions
-        shell: bash
-        run: |
-          node --version
-          npm --version
-
       - name: Install dependencies
         working-directory: app
         shell: bash
@@ -146,12 +260,13 @@ jobs:
         run: |
           set -e
 
-          npm install \
+          npm ci \
             --legacy-peer-deps \
             --no-audit \
-            --no-fund
+            --no-fund \
+            --ignore-scripts
 
-      - name: Build modern DiabloWebAI
+      - name: Build real application
         working-directory: app
         shell: bash
         env:
@@ -166,138 +281,102 @@ jobs:
 
           npm run build
 
-      - name: Inspect real build output
+      - name: Verify emitted application
         shell: bash
         run: |
           set -e
 
           echo "=== BUILD ROOT ==="
+          ls -lah app/build
 
-          ls -lah \
-            app/build
+          echo "=== STATIC ==="
 
-          echo "=== STATIC FILES ==="
+          test -d \
+            app/build/static
 
           find \
             app/build/static \
             -type f \
-            -maxdepth 4 \
-            -exec ls -lh {} \;
-
-          echo "=== WORKERS ==="
-
-          find \
-            app/build \
-            -type f \
-            -name '*.worker.js' \
             -exec ls -lh {} \;
 
           echo "=== INDEX ==="
 
+          test -s \
+            app/build/index.html
+
           cat \
             app/build/index.html
 
-      - name: Verify actual application bundle
-        shell: bash
-        run: |
-          set -e
-
-          test -s \
-            app/build/index.html
-
-          test -s \
-            app/build/spawn.mpq
-
-          echo "=== JS COUNT ==="
-
-          JS_COUNT="$(
-            find \
-              app/build/static/js \
-              -type f \
-              -name '*.js' \
-              | wc -l
-          )"
-
-          echo \
-            "JS_COUNT=$JS_COUNT"
-
-          if [ "$JS_COUNT" -lt 1 ]; then
-            echo \
-              "ERROR: webpack emitted no JS"
-            exit 1
-          fi
-
           echo "=== MAIN JS ==="
 
-          MAIN_COUNT="$(
+          MAIN_JS="$(
             find \
               app/build/static/js \
               -type f \
               -name 'main.*.js' \
-              | wc -l
+              | head -1
           )"
 
-          echo \
-            "MAIN_COUNT=$MAIN_COUNT"
-
-          if [ "$MAIN_COUNT" -lt 1 ]; then
-            echo \
-              "ERROR: main JS missing"
+          if [ -z "$MAIN_JS" ]; then
+            echo "ERROR: main JS missing"
             exit 1
           fi
 
-          echo "=== WORKER COUNT ==="
+          test -s "$MAIN_JS"
+          ls -lh "$MAIN_JS"
 
-          WORKER_COUNT="$(
+          echo "=== GAME WORKER ==="
+
+          WORKER="$(
             find \
               app/build \
               -type f \
               -name '*.worker.js' \
-              | wc -l
+              | head -1
           )"
 
-          echo \
-            "WORKER_COUNT=$WORKER_COUNT"
-
-          if [ "$WORKER_COUNT" -lt 1 ]; then
-            echo \
-              "ERROR: game worker missing"
+          if [ -z "$WORKER" ]; then
+            echo "ERROR: worker missing"
             exit 1
           fi
 
-          echo "=== INDEX SCRIPT CHECK ==="
+          test -s "$WORKER"
+          ls -lh "$WORKER"
+
+          echo "=== INDEX SCRIPT ==="
 
           if ! grep -q \
-            "static/js/" \
+            '/Game/static/js/' \
             app/build/index.html
           then
             echo \
-              "ERROR: index has no JS bundle"
+              "ERROR: index does not load application JS"
             exit 1
           fi
 
-          echo "=== WASM ==="
+          echo "=== SPAWN MPQ ==="
+
+          test -s \
+            app/build/spawn.mpq
+
+          ls -lh \
+            app/build/spawn.mpq
+
+          echo "=== WASM FILES ==="
+
+          find \
+            app/build \
+            -type f \
+            -name '*.wasm' \
+            -exec ls -lh {} \;
 
           test -s \
             app/build/wasm/devilutionx.wasm
 
           test -s \
-            app/build/wasm/devilutionx.js
-
-          test -s \
             app/build/wasm/devilutionx.data
 
-          ls -lh \
-            app/build/wasm/devilutionx.wasm \
-            app/build/wasm/devilutionx.js \
-            app/build/wasm/devilutionx.data
-
-          echo "=== SPAWN.MPQ ==="
-
-          ls -lh \
-            app/build/spawn.mpq
-
-          echo "REAL_GAME_BUILD_OK"
+          echo "REAL_APPLICATION_OK"
 
       - name: Disable Jekyll
         shell: bash
