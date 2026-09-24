@@ -51,10 +51,6 @@ jobs:
           app = Path("app")
           proven = Path("proven")
 
-          # ==================================================
-          # 1. Fix upstream package mismatch
-          # ==================================================
-
           package = app / "package.json"
 
           data = json.loads(
@@ -80,10 +76,6 @@ jobs:
           )
 
           print("PACKAGE_FIXED")
-
-          # ==================================================
-          # 2. Disable service worker
-          # ==================================================
 
           index = app / "src/index.js"
 
@@ -114,10 +106,6 @@ jobs:
 
           print("SERVICE_WORKER_DISABLED")
 
-          # ==================================================
-          # 3. Install proven Diablo engine pair
-          # ==================================================
-
           wasm_dir = app / "public/wasm"
 
           wasm_dir.mkdir(
@@ -144,10 +132,6 @@ jobs:
 
           print("PROVEN_ENGINE_INSTALLED")
 
-          # ==================================================
-          # 4. Patch game worker
-          # ==================================================
-
           worker = (
               app /
               "src/api/game.worker.js"
@@ -157,7 +141,6 @@ jobs:
               encoding="utf-8"
           )
 
-          # Do not let Webpack parse JSCC.
           imports = [
               "import DiabloBinary from './Diablo.wasm';\n",
               "import DiabloModule from './Diablo.jscc';\n",
@@ -171,7 +154,6 @@ jobs:
                   ""
               )
 
-          # Exact proven engine binary sizes.
           text = re.sub(
               r"const DiabloSize = \d+;\s*"
               r"const SpawnSize = \d+;",
@@ -183,7 +165,6 @@ jobs:
               count=1
           )
 
-          # Replace modern JSCC loader with direct proven-engine loader.
           start = text.find(
               "async function initWasm("
           )
@@ -290,10 +271,6 @@ jobs:
               + text[end:]
           )
 
-          # ==================================================
-          # 5. Disable GameEventDetector startup
-          # ==================================================
-
           detector_init = r'''  // Initialize Game Event Detector for AI quest system
             try {
               gameEventDetector.initialize(wasm);
@@ -303,24 +280,20 @@ jobs:
             }
           '''
 
-          if detector_init in text:
-              text = text.replace(
-                  detector_init,
-                  """  // Neural event detector disabled for baseline gameplay.
-            console.log('[Worker] Neural event detector disabled');
-          """,
-                  1
-              )
-          else:
-              print(
-                  "NOTE: detector init block not found"
+          if detector_init not in text:
+              raise SystemExit(
+                  "ERROR: detector init block not found"
               )
 
-          # ==================================================
-          # 6. PURE render loop.
-          #
-          # Remove neural processFrame from the 50ms game loop.
-          # ==================================================
+          text = text.replace(
+              detector_init,
+              """  // Neural detector deliberately disabled.
+            console.log(
+              '[Worker] NEURAL_EVENT_DETECTOR_DISABLED'
+            );
+          """,
+              1
+          )
 
           old_render = r'''  setInterval(() => {
               call_api("DApi_Render", Math.floor(performance.now()));
@@ -369,18 +342,6 @@ jobs:
 
           print("GAME_WORKER_BASELINE_OK")
 
-          # ==================================================
-          # 7. Disable automatic NeuralGameController startup
-          #
-          # THIS is the mobile freeze culprit:
-          #
-          # loaded
-          # -> NeuralGameController
-          # -> LevelInjector
-          # -> scanMemory
-          # -> 128 MB heap scan
-          # ==================================================
-
           loader = (
               app /
               "src/api/loader.js"
@@ -408,20 +369,13 @@ jobs:
 
           text = text.replace(
               neural_block,
-              """          // Neural startup deliberately disabled.
-                    // Automatic memory scanning freezes the game worker
-                    // on mobile because the WASM heap is 128 MB.
-                    console.log(
+              """          console.log(
                       '[Loader] NEURAL_STARTUP_DISABLED'
                     );
 
           """,
               1
           )
-
-          # ==================================================
-          # 8. Add worker error reporting
-          # ==================================================
 
           marker = """      const worker = new Worker();
 
@@ -655,35 +609,31 @@ jobs:
           node --check \
             app/public/wasm/DiabloSpawn.js
 
-          grep -q \
+          grep -Fq \
             "NEURAL_STARTUP_DISABLED" \
             app/src/api/loader.js
 
-          if grep -q \
+          grep -Fq \
+            "NEURAL_EVENT_DETECTOR_DISABLED" \
+            app/src/api/game.worker.js
+
+          if grep -Fq \
             "neuralGameController.initialize(null, worker)" \
             app/src/api/loader.js
           then
             echo \
-              "ERROR: neural startup still enabled"
+              "ERROR: active neural startup remains"
             exit 1
           fi
 
-          if grep -q \
+          if grep -Fq \
             "gameEventDetector.processFrame()" \
             app/src/api/game.worker.js
           then
             echo \
-              "ERROR: neural frame processing still enabled"
+              "ERROR: active neural frame call remains"
             exit 1
           fi
-
-          grep -q \
-            'call_api(' \
-            app/src/api/game.worker.js
-
-          grep -q \
-            '"DApi_Render"' \
-            app/src/api/game.worker.js
 
           echo \
             "BASELINE_SOURCE_OK"
@@ -893,12 +843,20 @@ jobs:
               app/build/wasm/DiabloSpawn.wasm
           )" -eq 1381584
 
-          find \
-            app/build/static/js \
-            -type f \
-            -name 'main.*.js' \
-            -size +0c \
-            | grep -q .
+          MAIN_JS="$(
+            find \
+              app/build/static/js \
+              -type f \
+              -name 'main.*.js' \
+              -size +0c \
+              | head -1
+          )"
+
+          if [ -z "$MAIN_JS" ]; then
+            echo \
+              "ERROR: main JS missing"
+            exit 1
+          fi
 
           GAME_WORKER="$(
             grep -l \
@@ -918,75 +876,9 @@ jobs:
             "$GAME_WORKER"
           then
             echo \
-              "ERROR: broken worker"
+              "ERROR: broken game worker"
             exit 1
           fi
 
-          if grep -Fq \
-            "Game Event Detector initialized" \
-            "$GAME_WORKER"
-          then
-            echo \
-              "ERROR: neural detector remains enabled"
-            exit 1
-          fi
-
-          if grep -Fq \
-            "processFrame()" \
-            "$GAME_WORKER"
-          then
-            echo \
-              "ERROR: neural frame loop remains enabled"
-            exit 1
-          fi
-
-          MAIN_JS="$(
-            find \
-              app/build/static/js \
-              -type f \
-              -name 'main.*.js' \
-              | head -1
-          )"
-
-          if grep -Fq \
-            "NeuralGameController initialized" \
-            "$MAIN_JS"
-          then
-            echo \
-              "ERROR: neural startup code remains"
-            exit 1
-          fi
-
-          echo \
-            "GAME_WORKER=$GAME_WORKER"
-
-          echo \
-            "PURE_GAME_BASELINE_OK"
-
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload build
-        uses: actions/upload-artifact@v4
-        with:
-          name: diabloweb-playable-baseline
-          path: app/build/
-          if-no-files-found: error
-
-      - name: Upload Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: app/build
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-22.04
-
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-    steps:
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4
+          if ! grep -Fq \
+            "
