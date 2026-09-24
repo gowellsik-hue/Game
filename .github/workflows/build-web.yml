@@ -34,17 +34,34 @@ jobs:
         shell: bash
         run: |
           set -e
+
           python3 - <<'PY'
           import json
           from pathlib import Path
 
           p = Path("app/package.json")
-          data = json.loads(p.read_text(encoding="utf-8"))
-          data.get("devDependencies", {}).pop("canvas", None)
+          data = json.loads(
+              p.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          data.get(
+              "devDependencies",
+              {}
+          ).pop(
+              "canvas",
+              None
+          )
+
           p.write_text(
-              json.dumps(data, indent=2) + "\n",
+              json.dumps(
+                  data,
+                  indent=2
+              ) + "\n",
               encoding="utf-8"
           )
+
           print("PACKAGE_OK")
           PY
 
@@ -52,11 +69,17 @@ jobs:
         shell: bash
         run: |
           set -e
+
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path("app/src/index.js")
-          text = p.read_text(encoding="utf-8")
+          p = Path(
+              "app/src/index.js"
+          )
+
+          text = p.read_text(
+              encoding="utf-8"
+          )
 
           old = """serviceWorker.register({
             onUpdate() {
@@ -79,13 +102,182 @@ jobs:
               encoding="utf-8"
           )
 
-          print("SERVICE_WORKER_DISABLED")
+          print(
+              "SERVICE_WORKER_DISABLED"
+          )
+          PY
+
+      - name: Fix game worker WASM loader
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "app/src/api/game.worker.js"
+          )
+
+          text = p.read_text(
+              encoding="utf-8"
+          )
+
+          bad_imports = [
+              "import DiabloModule from './Diablo.jscc';\n",
+              "import SpawnModule from './DiabloSpawn.jscc';\n",
+          ]
+
+          for line in bad_imports:
+              if line not in text:
+                  raise SystemExit(
+                      "JSCC import not found: "
+                      + line.strip()
+                  )
+
+              text = text.replace(
+                  line,
+                  "",
+                  1
+              )
+
+          old = """  // Create the module and wait for it to be ready
+            // IMPORTANT: .ready resolves to undefined, so we must return the module object itself
+            const module = (spawn ? SpawnModule : DiabloModule)(moduleConfig);
+            await module.ready;
+            progress({loaded: 2000000});
+            return module;"""
+
+          new = """  // Load modern Emscripten glue directly in the worker.
+            // Webpack 4 cannot parse the modern JSCC syntax.
+            const glueUrl =
+              `${process.env.PUBLIC_URL}/wasm/devilutionx.js?v=${CACHE_VERSION}`;
+
+            if (typeof self.DiabloSpawn !== 'function') {
+              importScripts(glueUrl);
+            }
+
+            const moduleFactory =
+              self.DiabloSpawn;
+
+            if (typeof moduleFactory !== 'function') {
+              throw new Error(
+                'Failed to load Emscripten module factory'
+              );
+            }
+
+            const module =
+              await moduleFactory(
+                moduleConfig
+              );
+
+            progress({
+              loaded: 2000000
+            });
+
+            return module;"""
+
+          if old not in text:
+              raise SystemExit(
+                  "old initWasm block not found"
+              )
+
+          text = text.replace(
+              old,
+              new,
+              1
+          )
+
+          p.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+          print(
+              "GAME_WORKER_LOADER_FIXED"
+          )
+          PY
+
+      - name: Add worker crash handling
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "app/src/api/loader.js"
+          )
+
+          text = p.read_text(
+              encoding="utf-8"
+          )
+
+          old = """      const worker = new Worker();
+
+                let packetQueue = [];"""
+
+          new = """      const worker = new Worker();
+
+                worker.addEventListener(
+                  "error",
+                  event => {
+                    const message =
+                      event && event.message
+                        ? event.message
+                        : "Game worker crashed before initialization";
+
+                    console.error(
+                      "[Loader] Game worker error:",
+                      message
+                    );
+
+                    reject(
+                      new Error(message)
+                    );
+                  }
+                );
+
+                worker.addEventListener(
+                  "messageerror",
+                  () => {
+                    reject(
+                      new Error(
+                        "Game worker message error"
+                      )
+                    );
+                  }
+                );
+
+                let packetQueue = [];"""
+
+          if old not in text:
+              raise SystemExit(
+                  "worker creation block not found"
+              )
+
+          text = text.replace(
+              old,
+              new,
+              1
+          )
+
+          p.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+          print(
+              "WORKER_ERROR_HANDLER_OK"
+          )
           PY
 
       - name: Patch webpack emission
         shell: bash
         run: |
           set -e
+
           python3 - <<'PY'
           from pathlib import Path
 
@@ -224,22 +416,54 @@ jobs:
               encoding="utf-8"
           )
 
-          print("WEBPACK_PATCH_OK")
+          print(
+              "WEBPACK_PATCH_OK"
+          )
           PY
 
-      - name: Verify WASM loader
+      - name: Verify source patches
         shell: bash
         run: |
           set -e
+
+          if grep -q \
+            "Diablo.jscc" \
+            app/src/api/game.worker.js
+          then
+            echo \
+              "ERROR: Diablo.jscc import remains"
+            exit 1
+          fi
+
+          if grep -q \
+            "DiabloSpawn.jscc" \
+            app/src/api/game.worker.js
+          then
+            echo \
+              "ERROR: DiabloSpawn.jscc import remains"
+            exit 1
+          fi
+
           grep -q \
-            "await module.ready" \
+            "importScripts(glueUrl)" \
             app/src/api/game.worker.js
 
           grep -q \
-            "return module" \
+            "await moduleFactory" \
             app/src/api/game.worker.js
 
-          echo "LOADER_OK"
+          grep -q \
+            'worker.addEventListener' \
+            app/src/api/loader.js
+
+          test -s \
+            app/public/wasm/devilutionx.js
+
+          test -s \
+            app/public/wasm/devilutionx.wasm
+
+          echo \
+            "SOURCE_PATCHES_OK"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -256,6 +480,7 @@ jobs:
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
         run: |
           set -e
+
           npm ci \
             --legacy-peer-deps \
             --no-audit \
@@ -274,19 +499,36 @@ jobs:
           INLINE_RUNTIME_CHUNK: false
         run: |
           set -e
+
           npm run build
 
       - name: Create HTML
         shell: bash
         run: |
           set -e
+
           python3 - <<'PY'
           from pathlib import Path
 
-          build = Path("app/build")
-          public = Path("app/public")
-          jsdir = build / "static" / "js"
-          cssdir = build / "static" / "css"
+          build = Path(
+              "app/build"
+          )
+
+          public = Path(
+              "app/public"
+          )
+
+          jsdir = (
+              build /
+              "static" /
+              "js"
+          )
+
+          cssdir = (
+              build /
+              "static" /
+              "css"
+          )
 
           runtime = sorted(
               jsdir.glob(
@@ -295,8 +537,11 @@ jobs:
           )
 
           chunks = sorted(
-              p for p
-              in jsdir.glob("*.chunk.js")
+              p
+              for p in
+              jsdir.glob(
+                  "*.chunk.js"
+              )
               if p.name[0].isdigit()
           )
 
@@ -358,12 +603,14 @@ jobs:
 
           html = html.replace(
               "</head>",
-              css_tags + "\n</head>"
+              css_tags +
+              "\n</head>"
           )
 
           html = html.replace(
               "</body>",
-              js_tags + "\n</body>"
+              js_tags +
+              "\n</body>"
           )
 
           (
@@ -396,13 +643,25 @@ jobs:
           touch \
             app/build/.nojekyll
 
-      - name: Verify deploy files
+      - name: Verify runtime build
         shell: bash
         run: |
           set -e
 
-          test -s app/build/index.html
-          test -s app/build/spawn.mpq
+          test -s \
+            app/build/index.html
+
+          test -s \
+            app/build/spawn.mpq
+
+          test -s \
+            app/build/wasm/devilutionx.js
+
+          test -s \
+            app/build/wasm/devilutionx.wasm
+
+          test -s \
+            app/build/wasm/devilutionx.data
 
           find \
             app/build/static/js \
@@ -419,6 +678,24 @@ jobs:
             -size +0c \
             | grep -q .
 
+          if grep -Fq \
+            "Module parse failed" \
+            app/build/*.worker.js
+          then
+            echo \
+              "ERROR: broken JSCC module remains in worker"
+            exit 1
+          fi
+
+          if ! grep -Fq \
+            "devilutionx.js" \
+            app/build/*.worker.js
+          then
+            echo \
+              "ERROR: runtime glue loader missing"
+            exit 1
+          fi
+
           find \
             app/build/static/media \
             -type f \
@@ -433,37 +710,21 @@ jobs:
             -size +0c \
             | grep -q .
 
-          test -s \
-            app/build/wasm/devilutionx.wasm
-
-          test -s \
-            app/build/wasm/devilutionx.data
-
           grep -q \
             '/Game/static/js/main.' \
             app/build/index.html
 
-          echo "REAL_APPLICATION_OK"
+          echo \
+            "RUNTIME_BUILD_OK"
 
-          echo "=== JS ==="
-          find \
-            app/build/static/js \
-            -type f \
-            -exec ls -lh {} \;
+          echo \
+            "=== WORKERS ==="
 
-          echo "=== WORKERS ==="
           find \
             app/build \
             -maxdepth 1 \
             -type f \
             -name '*.worker.js' \
-            -exec ls -lh {} \;
-
-          echo "=== WASM ==="
-          find \
-            app/build/static/media \
-            -type f \
-            -name '*.wasm' \
             -exec ls -lh {} \;
 
       - name: Setup GitHub Pages
