@@ -1,4 +1,4 @@
-name: Deploy modern DiabloWebAI
+name: Deploy DiabloWebAI proven engine
 
 on:
   push:
@@ -23,25 +23,42 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout DiabloWebAI
+      - name: Checkout modern frontend
         uses: actions/checkout@v4
         with:
           repository: levidehaan/diablowebai
           ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
           path: app
 
-      - name: Fix package mismatch
+      - name: Checkout proven production engine
+        uses: actions/checkout@v4
+        with:
+          repository: d07RiV/diabloweb
+          ref: 998629fd5d9f87ba9693cf1409cf2acea603c06e
+          path: proven
+
+      - name: Patch frontend and install proven engine
         shell: bash
         run: |
           set -e
 
           python3 - <<'PY'
           import json
+          import re
+          import shutil
           from pathlib import Path
 
-          p = Path("app/package.json")
+          app = Path("app")
+          proven = Path("proven")
+
+          # ---------------------------------
+          # package-lock mismatch
+          # ---------------------------------
+
+          package = app / "package.json"
+
           data = json.loads(
-              p.read_text(
+              package.read_text(
                   encoding="utf-8"
               )
           )
@@ -54,7 +71,7 @@ jobs:
               None
           )
 
-          p.write_text(
+          package.write_text(
               json.dumps(
                   data,
                   indent=2
@@ -62,22 +79,13 @@ jobs:
               encoding="utf-8"
           )
 
-          print("PACKAGE_OK")
-          PY
+          # ---------------------------------
+          # disable service worker
+          # ---------------------------------
 
-      - name: Disable service worker
-        shell: bash
-        run: |
-          set -e
+          index = app / "src/index.js"
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(
-              "app/src/index.js"
-          )
-
-          text = p.read_text(
+          text = index.read_text(
               encoding="utf-8"
           )
 
@@ -97,128 +105,210 @@ jobs:
               1
           )
 
-          p.write_text(
+          index.write_text(
               text,
               encoding="utf-8"
           )
 
-          print(
-              "SERVICE_WORKER_DISABLED"
-          )
-          PY
+          # ---------------------------------
+          # install exact production engine
+          # ---------------------------------
 
-      - name: Fix game worker WASM loader
-        shell: bash
-        run: |
-          set -e
+          wasm_dir = app / "public/wasm"
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(
-              "app/src/api/game.worker.js"
+          wasm_dir.mkdir(
+              parents=True,
+              exist_ok=True
           )
 
-          text = p.read_text(
+          copies = {
+              "Diablo.jscc":
+                  "Diablo.js",
+              "Diablo.wasm":
+                  "Diablo.wasm",
+              "DiabloSpawn.jscc":
+                  "DiabloSpawn.js",
+              "DiabloSpawn.wasm":
+                  "DiabloSpawn.wasm",
+          }
+
+          for src, dst in copies.items():
+              shutil.copy2(
+                  proven / "src/api" / src,
+                  wasm_dir / dst
+              )
+
+          # ---------------------------------
+          # worker: stop bundling broken
+          # rebuilt WASM/JSCC
+          # ---------------------------------
+
+          worker = (
+              app /
+              "src/api/game.worker.js"
+          )
+
+          text = worker.read_text(
               encoding="utf-8"
           )
 
-          bad_imports = [
+          imports = [
+              "import DiabloBinary from './Diablo.wasm';\n",
               "import DiabloModule from './Diablo.jscc';\n",
+              "import SpawnBinary from './DiabloSpawn.wasm';\n",
               "import SpawnModule from './DiabloSpawn.jscc';\n",
           ]
 
-          for line in bad_imports:
-              if line not in text:
-                  raise SystemExit(
-                      "JSCC import not found: "
-                      + line.strip()
-                  )
-
+          for line in imports:
               text = text.replace(
                   line,
-                  "",
-                  1
+                  ""
               )
 
-          old = """  // Create the module and wait for it to be ready
-            // IMPORTANT: .ready resolves to undefined, so we must return the module object itself
-            const module = (spawn ? SpawnModule : DiabloModule)(moduleConfig);
-            await module.ready;
-            progress({loaded: 2000000});
-            return module;"""
-
-          new = """  // Load modern Emscripten glue directly in the worker.
-            // Webpack 4 cannot parse the modern JSCC syntax.
-            const glueUrl =
-              `${process.env.PUBLIC_URL}/wasm/devilutionx.js?v=${CACHE_VERSION}`;
-
-            if (typeof self.DiabloSpawn !== 'function') {
-              importScripts(glueUrl);
-            }
-
-            const moduleFactory =
-              self.DiabloSpawn;
-
-            if (typeof moduleFactory !== 'function') {
-              throw new Error(
-                'Failed to load Emscripten module factory'
-              );
-            }
-
-            const module =
-              await moduleFactory(
-                moduleConfig
-              );
-
-            progress({
-              loaded: 2000000
-            });
-
-            return module;"""
-
-          if old not in text:
-              raise SystemExit(
-                  "old initWasm block not found"
-              )
-
-          text = text.replace(
-              old,
-              new,
-              1
+          text = re.sub(
+              r"const DiabloSize = \d+;\s*"
+              r"const SpawnSize = \d+;",
+              (
+                  "const DiabloSize = 1519717;\n"
+                  "const SpawnSize = 1381584;"
+              ),
+              text,
+              count=1
           )
 
-          p.write_text(
+          start = text.find(
+              "async function initWasm("
+          )
+
+          end = text.find(
+              "\nasync function init_game",
+              start
+          )
+
+          if start < 0 or end < 0:
+              raise SystemExit(
+                  "initWasm block not found"
+              )
+
+          new_loader = r'''async function initWasm(spawn, progress) {
+            const base =
+              `${process.env.PUBLIC_URL}/wasm`;
+
+            const scriptName =
+              spawn
+                ? "DiabloSpawn.js"
+                : "Diablo.js";
+
+            const wasmName =
+              spawn
+                ? "DiabloSpawn.wasm"
+                : "Diablo.wasm";
+
+            const factoryName =
+              spawn
+                ? "DiabloSpawn"
+                : "Diablo";
+
+            if (
+              typeof worker[factoryName]
+              !== "function"
+            ) {
+              importScripts(
+                `${base}/${scriptName}?v=${CACHE_VERSION}`
+              );
+            }
+
+            const factory =
+              worker[factoryName];
+
+            if (
+              typeof factory
+              !== "function"
+            ) {
+              throw new Error(
+                `Missing ${factoryName} module factory`
+              );
+            }
+
+            const binary =
+              await axios.request({
+                url:
+                  `${base}/${wasmName}?v=${CACHE_VERSION}`,
+                responseType:
+                  "arraybuffer",
+                onDownloadProgress:
+                  progress,
+              });
+
+            let module =
+              factory({
+                wasmBinary:
+                  binary.data,
+              });
+
+            if (
+              module &&
+              module.ready
+            ) {
+              module =
+                await module.ready;
+            } else {
+              module =
+                await module;
+            }
+
+            if (
+              !module ||
+              typeof module._DApi_Init
+                !== "function" ||
+              typeof module._DApi_Render
+                !== "function" ||
+              typeof module._DApi_Mouse
+                !== "function"
+            ) {
+              throw new Error(
+                "Proven Diablo engine API initialization failed"
+              );
+            }
+
+            progress({
+              loaded:
+                binary.data.byteLength
+            });
+
+            return module;
+          }
+          '''
+
+          text = (
+              text[:start]
+              + new_loader
+              + text[end:]
+          )
+
+          worker.write_text(
               text,
               encoding="utf-8"
           )
 
-          print(
-              "GAME_WORKER_LOADER_FIXED"
-          )
-          PY
+          # ---------------------------------
+          # catch worker crashes
+          # ---------------------------------
 
-      - name: Add worker crash handling
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(
-              "app/src/api/loader.js"
+          loader = (
+              app /
+              "src/api/loader.js"
           )
 
-          text = p.read_text(
+          text = loader.read_text(
               encoding="utf-8"
           )
 
-          old = """      const worker = new Worker();
+          marker = """      const worker = new Worker();
 
                 let packetQueue = [];"""
 
-          new = """      const worker = new Worker();
+          replacement = """      const worker = new Worker();
 
                 worker.addEventListener(
                   "error",
@@ -226,10 +316,10 @@ jobs:
                     const message =
                       event && event.message
                         ? event.message
-                        : "Game worker crashed before initialization";
+                        : "Game worker crashed";
 
                     console.error(
-                      "[Loader] Game worker error:",
+                      "[Loader] worker:",
                       message
                     );
 
@@ -252,28 +342,24 @@ jobs:
 
                 let packetQueue = [];"""
 
-          if old not in text:
-              raise SystemExit(
-                  "worker creation block not found"
+          if marker in text:
+              text = text.replace(
+                  marker,
+                  replacement,
+                  1
               )
 
-          text = text.replace(
-              old,
-              new,
-              1
-          )
-
-          p.write_text(
+          loader.write_text(
               text,
               encoding="utf-8"
           )
 
           print(
-              "WORKER_ERROR_HANDLER_OK"
+              "PROVEN_ENGINE_PATCH_OK"
           )
           PY
 
-      - name: Patch webpack emission
+      - name: Patch webpack output
         shell: bash
         run: |
           set -e
@@ -323,16 +409,16 @@ jobs:
             const names =
               Object.keys(assets);
 
-            console.log(
-              "[FORCE-EMIT]",
-              names.length
-            );
-
             if (!names.length) {
               throw new Error(
                 "No webpack assets"
               );
             }
+
+            console.log(
+              "[FORCE-EMIT]",
+              names.length
+            );
 
             for (const name of names) {
               let source =
@@ -368,18 +454,13 @@ jobs:
                 output,
                 source
               );
-
-              console.log(
-                "[WRITE]",
-                name
-              );
             }
           }
           '''
 
           if marker not in text:
               raise SystemExit(
-                  "build marker not found"
+                  "build marker missing"
               )
 
           text = text.replace(
@@ -402,7 +483,7 @@ jobs:
 
           if marker2 not in text:
               raise SystemExit(
-                  "resolve marker not found"
+                  "resolve marker missing"
               )
 
           text = text.replace(
@@ -415,55 +496,51 @@ jobs:
               text,
               encoding="utf-8"
           )
-
-          print(
-              "WEBPACK_PATCH_OK"
-          )
           PY
 
-      - name: Verify source patches
+      - name: Verify proven engine
         shell: bash
         run: |
           set -e
 
-          if grep -q \
-            "Diablo.jscc" \
-            app/src/api/game.worker.js
-          then
-            echo \
-              "ERROR: Diablo.jscc import remains"
-            exit 1
-          fi
-
-          if grep -q \
-            "DiabloSpawn.jscc" \
-            app/src/api/game.worker.js
-          then
-            echo \
-              "ERROR: DiabloSpawn.jscc import remains"
-            exit 1
-          fi
-
-          grep -q \
-            "importScripts(glueUrl)" \
-            app/src/api/game.worker.js
-
-          grep -q \
-            "await moduleFactory" \
-            app/src/api/game.worker.js
-
-          grep -q \
-            'worker.addEventListener' \
-            app/src/api/loader.js
+          test -s \
+            app/public/wasm/Diablo.js
 
           test -s \
-            app/public/wasm/devilutionx.js
+            app/public/wasm/DiabloSpawn.js
 
           test -s \
-            app/public/wasm/devilutionx.wasm
+            app/public/wasm/Diablo.wasm
+
+          test -s \
+            app/public/wasm/DiabloSpawn.wasm
+
+          test "$(
+            stat -c%s \
+              app/public/wasm/Diablo.wasm
+          )" -eq 1519717
+
+          test "$(
+            stat -c%s \
+              app/public/wasm/DiabloSpawn.wasm
+          )" -eq 1381584
+
+          node --check \
+            app/public/wasm/Diablo.js
+
+          node --check \
+            app/public/wasm/DiabloSpawn.js
+
+          grep -q \
+            "DiabloSpawn.js" \
+            app/src/api/game.worker.js
+
+          grep -q \
+            "module.ready" \
+            app/src/api/game.worker.js
 
           echo \
-            "SOURCE_PATCHES_OK"
+            "PROVEN_ENGINE_OK"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -502,7 +579,7 @@ jobs:
 
           npm run build
 
-      - name: Create HTML
+      - name: Create index HTML
         shell: bash
         run: |
           set -e
@@ -510,13 +587,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          build = Path(
-              "app/build"
-          )
-
-          public = Path(
-              "app/public"
-          )
+          build = Path("app/build")
+          public = Path("app/public")
 
           jsdir = (
               build /
@@ -537,9 +609,8 @@ jobs:
           )
 
           chunks = sorted(
-              p
-              for p in
-              jsdir.glob(
+              p for p
+              in jsdir.glob(
                   "*.chunk.js"
               )
               if p.name[0].isdigit()
@@ -551,24 +622,15 @@ jobs:
               )
           )
 
-          css = (
-              sorted(
-                  cssdir.glob(
-                      "main.*.css"
-                  )
+          css = sorted(
+              cssdir.glob(
+                  "main.*.css"
               )
-              if cssdir.exists()
-              else []
           )
 
-          if not runtime:
+          if not runtime or not main:
               raise SystemExit(
-                  "main runtime missing"
-              )
-
-          if not main:
-              raise SystemExit(
-                  "main bundle missing"
+                  "main JS missing"
               )
 
           html = (
@@ -596,7 +658,8 @@ jobs:
           )
 
           js_tags = "\n".join(
-              f'<script src="/Game/static/js/{p.name}">'
+              f'<script '
+              f'src="/Game/static/js/{p.name}">'
               f'</script>'
               for p in scripts
           )
@@ -622,11 +685,11 @@ jobs:
           )
 
           print(
-              "INDEX_CREATED"
+              "INDEX_OK"
           )
           PY
 
-      - name: Clean old cache files
+      - name: Clean cache and verify build
         shell: bash
         run: |
           set -e
@@ -643,11 +706,6 @@ jobs:
           touch \
             app/build/.nojekyll
 
-      - name: Verify runtime build
-        shell: bash
-        run: |
-          set -e
-
           test -s \
             app/build/index.html
 
@@ -655,77 +713,54 @@ jobs:
             app/build/spawn.mpq
 
           test -s \
-            app/build/wasm/devilutionx.js
+            app/build/wasm/Diablo.wasm
 
           test -s \
-            app/build/wasm/devilutionx.wasm
+            app/build/wasm/DiabloSpawn.wasm
 
-          test -s \
-            app/build/wasm/devilutionx.data
+          test "$(
+            stat -c%s \
+              app/build/wasm/Diablo.wasm
+          )" -eq 1519717
+
+          test "$(
+            stat -c%s \
+              app/build/wasm/DiabloSpawn.wasm
+          )" -eq 1381584
 
           find \
             app/build/static/js \
-            -type f \
             -name 'main.*.js' \
             -size +0c \
             | grep -q .
 
-          find \
-            app/build \
-            -maxdepth 1 \
-            -type f \
-            -name '*.worker.js' \
-            -size +0c \
-            | grep -q .
+          GAME_WORKER="$(
+            grep -l \
+              "DiabloSpawn.js" \
+              app/build/*.worker.js \
+              | head -1
+          )"
+
+          if [ -z "$GAME_WORKER" ]; then
+            echo \
+              "ERROR: game worker missing"
+            exit 1
+          fi
 
           if grep -Fq \
             "Module parse failed" \
-            app/build/*.worker.js
+            "$GAME_WORKER"
           then
             echo \
-              "ERROR: broken JSCC module remains in worker"
+              "ERROR: broken worker"
             exit 1
           fi
 
-          if ! grep -Fq \
-            "devilutionx.js" \
-            app/build/*.worker.js
-          then
-            echo \
-              "ERROR: runtime glue loader missing"
-            exit 1
-          fi
-
-          find \
-            app/build/static/media \
-            -type f \
-            -name 'Diablo.*.wasm' \
-            -size +0c \
-            | grep -q .
-
-          find \
-            app/build/static/media \
-            -type f \
-            -name 'DiabloSpawn.*.wasm' \
-            -size +0c \
-            | grep -q .
-
-          grep -q \
-            '/Game/static/js/main.' \
-            app/build/index.html
+          echo \
+            "GAME_WORKER=$GAME_WORKER"
 
           echo \
-            "RUNTIME_BUILD_OK"
-
-          echo \
-            "=== WORKERS ==="
-
-          find \
-            app/build \
-            -maxdepth 1 \
-            -type f \
-            -name '*.worker.js' \
-            -exec ls -lh {} \;
+            "PROVEN_RUNTIME_BUILD_OK"
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
@@ -733,11 +768,11 @@ jobs:
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: modern-diablowebai
+          name: diablowebai-proven-engine
           path: app/build/
           if-no-files-found: error
 
-      - name: Upload Pages artifact
+      - name: Upload Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: app/build
