@@ -1,4 +1,4 @@
-name: Deploy proven DiabloWebAI prebuilt
+name: Deploy modern DiabloWebAI
 
 on:
   push:
@@ -20,217 +20,191 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout proven prebuilt DiabloWebAI
+      - name: Checkout modern DiabloWebAI
         uses: actions/checkout@v4
         with:
           repository: levidehaan/diablowebai
-          ref: gh-pages
-          path: site
+          ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
+          path: app
 
-      - name: Remove repository metadata
+      - name: Verify modern WASM loader
         shell: bash
         run: |
           set -e
 
-          rm -rf site/.git
-          rm -rf site/.github
+          echo "=== MODERN LOADER ==="
 
-          echo "=== PREBUILT SITE ==="
-          ls -lah site
+          grep -n \
+            "await module.ready" \
+            app/src/api/game.worker.js
 
-      - name: Rewrite site path to Game
+          grep -n \
+            "return module" \
+            app/src/api/game.worker.js
+
+          echo "MODERN_LOADER_OK"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        shell: bash
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
+        run: |
+          set -e
+
+          npm ci \
+            --legacy-peer-deps \
+            --no-audit \
+            --no-fund \
+            --ignore-scripts
+
+      - name: Build modern DiabloWebAI
+        working-directory: app
+        shell: bash
+        env:
+          PUBLIC_URL: .
+          NODE_ENV: production
+          CI: false
+          NODE_OPTIONS: --openssl-legacy-provider
+        run: |
+          set -e
+
+          npm run build
+
+      - name: Ensure shareware MPQ
         shell: bash
         run: |
           set -e
 
-          python3 - <<'PY'
-          from pathlib import Path
+          test -s app/public/spawn.mpq
 
-          root = Path("site")
+          cp -f \
+            app/public/spawn.mpq \
+            app/build/spawn.mpq
 
-          extensions = {
-              ".html",
-              ".js",
-              ".json",
-              ".css",
-              ".txt",
-              ".xml",
-              ".webmanifest",
-          }
+          test -s app/build/spawn.mpq
 
-          changed = []
+          echo "=== SPAWN.MPQ ==="
+          ls -lh app/build/spawn.mpq
 
-          for path in root.rglob("*"):
-              if not path.is_file():
-                  continue
-
-              if (
-                  path.suffix.lower() not in extensions
-                  and "precache-manifest" not in path.name
-                  and path.name != "service-worker.js"
-              ):
-                  continue
-
-              try:
-                  text = path.read_text(
-                      encoding="utf-8"
-                  )
-              except UnicodeDecodeError:
-                  continue
-
-              original = text
-
-              text = text.replace(
-                  '"/diabloweb/',
-                  '"/Game/'
-              )
-
-              text = text.replace(
-                  "'/diabloweb/",
-                  "'/Game/"
-              )
-
-              text = text.replace(
-                  '"/diabloweb"',
-                  '"/Game"'
-              )
-
-              text = text.replace(
-                  "'/diabloweb'",
-                  "'/Game'"
-              )
-
-              text = text.replace(
-                  "(/diabloweb/",
-                  "(/Game/"
-              )
-
-              text = text.replace(
-                  "=/diabloweb/",
-                  "=/Game/"
-              )
-
-              if text != original:
-                  path.write_text(
-                      text,
-                      encoding="utf-8"
-                  )
-
-                  changed.append(
-                      str(path)
-                  )
-
-          print("Changed files:")
-
-          for name in changed:
-              print(" -", name)
-
-          print(
-              "PATH_REWRITE_COUNT=",
-              len(changed)
-          )
-          PY
-
-      - name: Disable Jekyll
+      - name: Disable old service worker cache
         shell: bash
         run: |
-          touch site/.nojekyll
+          set -e
 
-      - name: Verify playable game
+          cat > app/build/service-worker.js <<'EOF'
+          self.addEventListener('install', function () {
+            self.skipWaiting();
+          });
+
+          self.addEventListener('activate', function (event) {
+            event.waitUntil(
+              (async function () {
+                const keys = await caches.keys();
+
+                await Promise.all(
+                  keys.map(function (key) {
+                    return caches.delete(key);
+                  })
+                );
+
+                await self.registration.unregister();
+
+                const clients = await self.clients.matchAll({
+                  type: 'window',
+                  includeUncontrolled: true
+                });
+
+                for (const client of clients) {
+                  try {
+                    client.navigate(client.url);
+                  } catch (e) {
+                  }
+                }
+              })()
+            );
+          });
+
+          self.addEventListener('fetch', function () {
+          });
+          EOF
+
+          touch app/build/.nojekyll
+
+      - name: Verify modern build
         shell: bash
         run: |
           set -e
 
           echo "=== INDEX ==="
 
-          test -s site/index.html
-          ls -lh site/index.html
+          test -s app/build/index.html
+          ls -lh app/build/index.html
 
-          echo "=== SPAWN.MPQ ==="
+          echo "=== SPAWN ==="
 
-          test -s site/spawn.mpq
-          ls -lh site/spawn.mpq
+          test -s app/build/spawn.mpq
+          ls -lh app/build/spawn.mpq
 
-          echo "=== DIABLO WASM ==="
+          echo "=== MODERN DEVILUTIONX WASM ==="
 
-          DIABLO_WASM="$(
-            find site \
-              -type f \
-              -name 'Diablo.*.wasm' \
-              | head -1
-          )"
+          test -s app/build/devilutionx.wasm
+          ls -lh app/build/devilutionx.wasm
 
-          if [ -z "$DIABLO_WASM" ]; then
-            echo "ERROR: Diablo WASM missing"
+          echo "=== MODERN DEVILUTIONX JS ==="
+
+          test -s app/build/devilutionx.js
+          ls -lh app/build/devilutionx.js
+
+          echo "=== WASM DATA DIRECTORY ==="
+
+          if [ -s app/build/wasm/devilutionx.data ]; then
+            ls -lh app/build/wasm/devilutionx.data
+          else
+            echo "ERROR: devilutionx.data missing"
             exit 1
           fi
 
-          test -s "$DIABLO_WASM"
-          ls -lh "$DIABLO_WASM"
-
-          echo "=== DIABLO SPAWN WASM ==="
-
-          SPAWN_WASM="$(
-            find site \
-              -type f \
-              -name 'DiabloSpawn.*.wasm' \
-              | head -1
-          )"
-
-          if [ -z "$SPAWN_WASM" ]; then
-            echo "ERROR: DiabloSpawn WASM missing"
+          if [ -s app/build/wasm/devilutionx.wasm ]; then
+            ls -lh app/build/wasm/devilutionx.wasm
+          else
+            echo "ERROR: wasm/devilutionx.wasm missing"
             exit 1
           fi
-
-          test -s "$SPAWN_WASM"
-          ls -lh "$SPAWN_WASM"
 
           echo "=== WORKERS ==="
 
-          WORKER_COUNT="$(
-            find site \
-              -maxdepth 1 \
+          find \
+            app/build \
+            -type f \
+            -name '*.worker.js' \
+            -exec ls -lh {} \;
+
+          WORKERS="$(
+            find \
+              app/build \
               -type f \
               -name '*.worker.js' \
               | wc -l
           )"
 
-          if [ "$WORKER_COUNT" -lt 1 ]; then
+          if [ "$WORKERS" -lt 1 ]; then
             echo "ERROR: worker missing"
             exit 1
           fi
 
-          find site \
-            -maxdepth 1 \
-            -type f \
-            -name '*.worker.js' \
-            -exec ls -lh {} \;
-
-          echo "=== SERVICE WORKER ==="
-
-          if [ -f site/service-worker.js ]; then
-            ls -lh site/service-worker.js
-          fi
-
-          echo "=== GAME PATH ==="
-
-          grep -o \
-            '/Game/[^"'"'"']*' \
-            site/index.html \
-            | head -20 \
-            || true
-
-          if ! grep -q \
-            '/Game/' \
-            site/index.html
-          then
-            echo "ERROR: /Game/ path missing"
-            exit 1
-          fi
-
-          echo "PREBUILT_GAME_OK"
+          echo "MODERN_DIABLOWEBAI_OK"
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
@@ -238,14 +212,14 @@ jobs:
       - name: Upload downloadable build
         uses: actions/upload-artifact@v4
         with:
-          name: diablowebai-prebuilt
-          path: site/
+          name: modern-diablowebai
+          path: app/build/
           if-no-files-found: error
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: app/build
 
   deploy:
     needs: build
