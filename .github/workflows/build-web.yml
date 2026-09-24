@@ -30,6 +30,85 @@ jobs:
           ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
           path: app
 
+      - name: Patch upstream build
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          package = Path("app/package.json")
+          data = json.loads(
+              package.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          removed = data.get(
+              "devDependencies",
+              {}
+          ).pop(
+              "canvas",
+              None
+          )
+
+          package.write_text(
+              json.dumps(
+                  data,
+                  indent=2
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              "Removed canvas:",
+              removed
+          )
+
+          webpack = Path(
+              "app/config/webpack.config.js"
+          )
+
+          text = webpack.read_text(
+              encoding="utf-8"
+          )
+
+          old = (
+              "futureEmitAssets: true,"
+          )
+
+          new = (
+              "futureEmitAssets: false,"
+          )
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: futureEmitAssets "
+                  "setting not found"
+              )
+
+          text = text.replace(
+              old,
+              new,
+              1
+          )
+
+          webpack.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+          print(
+              "futureEmitAssets disabled"
+          )
+          PY
+
+          grep -n \
+            "futureEmitAssets" \
+            app/config/webpack.config.js
+
       - name: Verify modern WASM loader
         shell: bash
         run: |
@@ -44,47 +123,6 @@ jobs:
             app/src/api/game.worker.js
 
           echo "MODERN_LOADER_OK"
-
-      - name: Fix upstream package mismatch
-        shell: bash
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          p = Path("app/package.json")
-
-          data = json.loads(
-              p.read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          dev = data.get(
-              "devDependencies",
-              {}
-          )
-
-          removed = dev.pop(
-              "canvas",
-              None
-          )
-
-          p.write_text(
-              json.dumps(
-                  data,
-                  indent=2
-              ) + "\n",
-              encoding="utf-8"
-          )
-
-          print(
-              "Removed canvas:",
-              removed
-          )
-          PY
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -108,17 +146,16 @@ jobs:
         run: |
           set -e
 
-          npm ci \
+          npm install \
             --legacy-peer-deps \
             --no-audit \
-            --no-fund \
-            --ignore-scripts
+            --no-fund
 
       - name: Build modern DiabloWebAI
         working-directory: app
         shell: bash
         env:
-          PUBLIC_URL: .
+          PUBLIC_URL: /Game
           NODE_ENV: production
           CI: false
           NODE_OPTIONS: --openssl-legacy-provider
@@ -129,368 +166,144 @@ jobs:
 
           npm run build
 
-          echo "=== BUILD DIRECTORY ==="
+      - name: Inspect real build output
+        shell: bash
+        run: |
+          set -e
 
-          find build \
-            -maxdepth 3 \
+          echo "=== BUILD ROOT ==="
+
+          ls -lah \
+            app/build
+
+          echo "=== STATIC FILES ==="
+
+          find \
+            app/build/static \
             -type f \
-            -printf '%p %s bytes\n' \
-            | sort \
-            | head -200
-
-      - name: Prepare deploy site
-        shell: bash
-        run: |
-          set -e
-
-          mkdir -p app/build
-
-          test -s app/public/spawn.mpq
-
-          cp -f \
-            app/public/spawn.mpq \
-            app/build/spawn.mpq
-
-          if [ -s app/public/devilutionx.js ]; then
-            cp -f \
-              app/public/devilutionx.js \
-              app/build/devilutionx.js
-          fi
-
-          if [ -s app/public/devilutionx.wasm ]; then
-            cp -f \
-              app/public/devilutionx.wasm \
-              app/build/devilutionx.wasm
-          fi
-
-          if [ -d app/public/wasm ]; then
-            mkdir -p app/build/wasm
-
-            cp -a \
-              app/public/wasm/. \
-              app/build/wasm/
-          fi
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          root = Path("app")
-          build = root / "build"
-          public = root / "public"
-
-          build.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          def asset_path(path):
-              return "./" + path.relative_to(
-                  build
-              ).as_posix()
-
-          css_files = sorted(
-              (build / "static" / "css").glob(
-                  "*.css"
-              )
-          ) if (
-              build / "static" / "css"
-          ).exists() else []
-
-          js_dir = (
-              build / "static" / "js"
-          )
-
-          all_js = sorted(
-              js_dir.glob("*.js")
-          ) if js_dir.exists() else []
-
-          def is_storage(path):
-              return (
-                  "storage" in
-                  path.name.lower()
-              )
-
-          main_runtime = [
-              p for p in all_js
-              if (
-                  "runtime~main" in
-                  p.name
-              )
-          ]
-
-          main_bundle = [
-              p for p in all_js
-              if (
-                  p.name.startswith(
-                      "main."
-                  )
-                  and not
-                  p.name.endswith(
-                      ".map"
-                  )
-              )
-          ]
-
-          chunks = [
-              p for p in all_js
-              if (
-                  p not in
-                  main_runtime
-                  and p not in
-                  main_bundle
-                  and not
-                  is_storage(p)
-              )
-          ]
-
-          main_js = (
-              main_runtime
-              + chunks
-              + main_bundle
-          )
-
-          index = (
-              build / "index.html"
-          )
-
-          if (
-              not index.exists()
-              or index.stat().st_size < 100
-          ):
-              print(
-                  "Repairing index.html"
-              )
-
-              template = (
-                  public / "index.html"
-              ).read_text(
-                  encoding="utf-8"
-              )
-
-              template = template.replace(
-                  "%PUBLIC_URL%",
-                  "."
-              )
-
-              css_tags = "\n".join(
-                  f'<link rel="stylesheet" href="{asset_path(p)}">'
-                  for p in css_files
-              )
-
-              js_tags = "\n".join(
-                  f'<script src="{asset_path(p)}"></script>'
-                  for p in main_js
-              )
-
-              template = template.replace(
-                  "</head>",
-                  css_tags
-                  + "\n</head>"
-              )
-
-              template = template.replace(
-                  "</body>",
-                  js_tags
-                  + "\n</body>"
-              )
-
-              index.write_text(
-                  template,
-                  encoding="utf-8"
-              )
-
-          else:
-              print(
-                  "Generated index.html exists"
-              )
-
-          storage = (
-              build / "storage.html"
-          )
-
-          if (
-              not storage.exists()
-              or storage.stat().st_size < 50
-          ):
-              print(
-                  "Repairing storage.html"
-              )
-
-              template = (
-                  public / "storage.html"
-              ).read_text(
-                  encoding="utf-8"
-              )
-
-              storage_runtime = [
-                  p for p in all_js
-                  if (
-                      "runtime~storage"
-                      in p.name
-                  )
-              ]
-
-              storage_bundle = [
-                  p for p in all_js
-                  if (
-                      p.name.startswith(
-                          "storage."
-                      )
-                  )
-              ]
-
-              storage_js = (
-                  storage_runtime
-                  + chunks
-                  + storage_bundle
-              )
-
-              tags = "\n".join(
-                  f'<script src="{asset_path(p)}"></script>'
-                  for p in storage_js
-              )
-
-              template = template.replace(
-                  "</body>",
-                  tags
-                  + "\n</body>"
-              )
-
-              storage.write_text(
-                  template,
-                  encoding="utf-8"
-              )
-
-          for html in [
-              index,
-              storage
-          ]:
-              if html.exists():
-                  text = html.read_text(
-                      encoding="utf-8"
-                  )
-
-                  text = text.replace(
-                      "%PUBLIC_URL%",
-                      "."
-                  )
-
-                  html.write_text(
-                      text,
-                      encoding="utf-8"
-                  )
-
-          print(
-              "index size:",
-              index.stat().st_size
-              if index.exists()
-              else 0
-          )
-
-          print(
-              "main js files:",
-              len(main_js)
-          )
-          PY
-
-      - name: Replace service worker
-        shell: bash
-        run: |
-          set -e
-
-          cat > app/build/service-worker.js <<'EOF'
-          self.addEventListener(
-            'install',
-            function () {
-              self.skipWaiting();
-            }
-          );
-
-          self.addEventListener(
-            'activate',
-            function (event) {
-              event.waitUntil(
-                (async function () {
-                  const keys =
-                    await caches.keys();
-
-                  await Promise.all(
-                    keys.map(
-                      function (key) {
-                        return caches.delete(
-                          key
-                        );
-                      }
-                    )
-                  );
-
-                  await self.clients.claim();
-
-                  const clients =
-                    await self.clients.matchAll({
-                      type: 'window',
-                      includeUncontrolled: true
-                    });
-
-                  for (
-                    const client
-                    of clients
-                  ) {
-                    try {
-                      client.navigate(
-                        client.url
-                      );
-                    } catch (e) {
-                    }
-                  }
-                })()
-              );
-            }
-          );
-
-          self.addEventListener(
-            'fetch',
-            function () {
-            }
-          );
-          EOF
-
-          touch app/build/.nojekyll
-
-      - name: Final site check
-        shell: bash
-        run: |
-          set -e
-
-          echo "=== FINAL ROOT ==="
-
-          ls -lah app/build
-
-          echo "=== INDEX ==="
-
-          test -s app/build/index.html
-          ls -lh app/build/index.html
-
-          echo "=== SPAWN ==="
-
-          test -s app/build/spawn.mpq
-          ls -lh app/build/spawn.mpq
-
-          echo "=== WASM ==="
-
-          find app/build \
-            -type f \
-            -name '*.wasm' \
+            -maxdepth 4 \
             -exec ls -lh {} \;
 
           echo "=== WORKERS ==="
 
-          find app/build \
+          find \
+            app/build \
             -type f \
             -name '*.worker.js' \
             -exec ls -lh {} \;
 
-          echo "SITE_READY"
+          echo "=== INDEX ==="
+
+          cat \
+            app/build/index.html
+
+      - name: Verify actual application bundle
+        shell: bash
+        run: |
+          set -e
+
+          test -s \
+            app/build/index.html
+
+          test -s \
+            app/build/spawn.mpq
+
+          echo "=== JS COUNT ==="
+
+          JS_COUNT="$(
+            find \
+              app/build/static/js \
+              -type f \
+              -name '*.js' \
+              | wc -l
+          )"
+
+          echo \
+            "JS_COUNT=$JS_COUNT"
+
+          if [ "$JS_COUNT" -lt 1 ]; then
+            echo \
+              "ERROR: webpack emitted no JS"
+            exit 1
+          fi
+
+          echo "=== MAIN JS ==="
+
+          MAIN_COUNT="$(
+            find \
+              app/build/static/js \
+              -type f \
+              -name 'main.*.js' \
+              | wc -l
+          )"
+
+          echo \
+            "MAIN_COUNT=$MAIN_COUNT"
+
+          if [ "$MAIN_COUNT" -lt 1 ]; then
+            echo \
+              "ERROR: main JS missing"
+            exit 1
+          fi
+
+          echo "=== WORKER COUNT ==="
+
+          WORKER_COUNT="$(
+            find \
+              app/build \
+              -type f \
+              -name '*.worker.js' \
+              | wc -l
+          )"
+
+          echo \
+            "WORKER_COUNT=$WORKER_COUNT"
+
+          if [ "$WORKER_COUNT" -lt 1 ]; then
+            echo \
+              "ERROR: game worker missing"
+            exit 1
+          fi
+
+          echo "=== INDEX SCRIPT CHECK ==="
+
+          if ! grep -q \
+            "static/js/" \
+            app/build/index.html
+          then
+            echo \
+              "ERROR: index has no JS bundle"
+            exit 1
+          fi
+
+          echo "=== WASM ==="
+
+          test -s \
+            app/build/wasm/devilutionx.wasm
+
+          test -s \
+            app/build/wasm/devilutionx.js
+
+          test -s \
+            app/build/wasm/devilutionx.data
+
+          ls -lh \
+            app/build/wasm/devilutionx.wasm \
+            app/build/wasm/devilutionx.js \
+            app/build/wasm/devilutionx.data
+
+          echo "=== SPAWN.MPQ ==="
+
+          ls -lh \
+            app/build/spawn.mpq
+
+          echo "REAL_GAME_BUILD_OK"
+
+      - name: Disable Jekyll
+        shell: bash
+        run: |
+          touch \
+            app/build/.nojekyll
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
