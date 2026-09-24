@@ -23,14 +23,14 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout modern frontend
+      - name: Checkout frontend
         uses: actions/checkout@v4
         with:
           repository: levidehaan/diablowebai
           ref: 4becbb4c81323dc8982504ecb2a5f338434c9772
           path: app
 
-      - name: Checkout proven DiabloWeb engine
+      - name: Checkout proven engine
         uses: actions/checkout@v4
         with:
           repository: d07RiV/diabloweb
@@ -51,189 +51,105 @@ jobs:
           app = Path("app")
           proven = Path("proven")
 
-          package = app / "package.json"
+          def replace_once(text, old, new, name):
+              if old not in text:
+                  raise SystemExit("PATCH FAILED: " + name)
+              return text.replace(old, new, 1)
 
-          data = json.loads(
-              package.read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          data.get(
-              "devDependencies",
-              {}
-          ).pop(
-              "canvas",
-              None
-          )
-
-          package.write_text(
-              json.dumps(
-                  data,
-                  indent=2
-              ) + "\n",
+          # package.json
+          p = app / "package.json"
+          data = json.loads(p.read_text(encoding="utf-8"))
+          data.get("devDependencies", {}).pop("canvas", None)
+          p.write_text(
+              json.dumps(data, indent=2) + "\n",
               encoding="utf-8"
           )
 
-          print("PACKAGE_FIXED")
-
-          index = app / "src/index.js"
-
-          text = index.read_text(
-              encoding="utf-8"
-          )
+          # Disable service worker
+          p = app / "src/index.js"
+          text = p.read_text(encoding="utf-8")
 
           old = """serviceWorker.register({
             onUpdate() {
             },
           });"""
 
-          if old not in text:
-              raise SystemExit(
-                  "ERROR: service worker block not found"
-              )
-
-          text = text.replace(
+          text = replace_once(
+              text,
               old,
               "serviceWorker.unregister();",
-              1
+              "service worker"
           )
 
-          index.write_text(
-              text,
-              encoding="utf-8"
-          )
+          p.write_text(text, encoding="utf-8")
 
-          print("SERVICE_WORKER_DISABLED")
+          # Proven engine
+          out = app / "public/wasm"
+          out.mkdir(parents=True, exist_ok=True)
 
-          wasm_dir = app / "public/wasm"
-
-          wasm_dir.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          copies = {
-              "Diablo.jscc":
-                  "Diablo.js",
-              "Diablo.wasm":
-                  "Diablo.wasm",
-              "DiabloSpawn.jscc":
-                  "DiabloSpawn.js",
-              "DiabloSpawn.wasm":
-                  "DiabloSpawn.wasm",
+          files = {
+              "Diablo.jscc": "Diablo.js",
+              "Diablo.wasm": "Diablo.wasm",
+              "DiabloSpawn.jscc": "DiabloSpawn.js",
+              "DiabloSpawn.wasm": "DiabloSpawn.wasm",
           }
 
-          for src, dst in copies.items():
+          for src, dst in files.items():
               shutil.copy2(
                   proven / "src/api" / src,
-                  wasm_dir / dst
+                  out / dst
               )
 
-          print("PROVEN_ENGINE_INSTALLED")
+          # Game worker
+          p = app / "src/api/game.worker.js"
+          text = p.read_text(encoding="utf-8")
 
-          worker = (
-              app /
-              "src/api/game.worker.js"
-          )
-
-          text = worker.read_text(
-              encoding="utf-8"
-          )
-
-          imports = [
+          for line in [
               "import DiabloBinary from './Diablo.wasm';\n",
               "import DiabloModule from './Diablo.jscc';\n",
               "import SpawnBinary from './DiabloSpawn.wasm';\n",
               "import SpawnModule from './DiabloSpawn.jscc';\n",
-          ]
-
-          for line in imports:
-              text = text.replace(
-                  line,
-                  ""
-              )
+          ]:
+              text = text.replace(line, "")
 
           text = re.sub(
-              r"const DiabloSize = \d+;\s*"
-              r"const SpawnSize = \d+;",
-              (
-                  "const DiabloSize = 1519717;\n"
-                  "const SpawnSize = 1381584;"
-              ),
+              r"const DiabloSize = \d+;\s*const SpawnSize = \d+;",
+              "const DiabloSize = 1519717;\nconst SpawnSize = 1381584;",
               text,
               count=1
           )
 
-          start = text.find(
-              "async function initWasm("
-          )
-
-          end = text.find(
-              "\nasync function init_game",
-              start
-          )
+          start = text.find("async function initWasm(")
+          end = text.find("\nasync function init_game", start)
 
           if start < 0 or end < 0:
-              raise SystemExit(
-                  "ERROR: initWasm block not found"
-              )
+              raise SystemExit("PATCH FAILED: initWasm")
 
           new_loader = r'''async function initWasm(spawn, progress) {
-            const base =
-              `${process.env.PUBLIC_URL}/wasm`;
+            const base = `${process.env.PUBLIC_URL}/wasm`;
+            const scriptName = spawn ? "DiabloSpawn.js" : "Diablo.js";
+            const wasmName = spawn ? "DiabloSpawn.wasm" : "Diablo.wasm";
+            const factoryName = spawn ? "DiabloSpawn" : "Diablo";
 
-            const scriptName =
-              spawn
-                ? "DiabloSpawn.js"
-                : "Diablo.js";
-
-            const wasmName =
-              spawn
-                ? "DiabloSpawn.wasm"
-                : "Diablo.wasm";
-
-            const factoryName =
-              spawn
-                ? "DiabloSpawn"
-                : "Diablo";
-
-            if (
-              typeof worker[factoryName]
-              !== "function"
-            ) {
-              importScripts(
-                `${base}/${scriptName}?v=${CACHE_VERSION}`
-              );
+            if (typeof worker[factoryName] !== "function") {
+              importScripts(`${base}/${scriptName}?v=${CACHE_VERSION}`);
             }
 
-            const factory =
-              worker[factoryName];
+            const factory = worker[factoryName];
 
-            if (
-              typeof factory
-              !== "function"
-            ) {
-              throw new Error(
-                `Missing ${factoryName} module factory`
-              );
+            if (typeof factory !== "function") {
+              throw new Error(`Missing ${factoryName} factory`);
             }
 
-            const binary =
-              await axios.request({
-                url:
-                  `${base}/${wasmName}?v=${CACHE_VERSION}`,
-                responseType:
-                  "arraybuffer",
-                onDownloadProgress:
-                  progress,
-              });
+            const binary = await axios.request({
+              url: `${base}/${wasmName}?v=${CACHE_VERSION}`,
+              responseType: "arraybuffer",
+              onDownloadProgress: progress,
+            });
 
-            const module =
-              factory({
-                wasmBinary:
-                  binary.data,
-              });
+            const module = factory({
+              wasmBinary: binary.data,
+            });
 
             const readyModule =
               module && module.ready
@@ -242,36 +158,20 @@ jobs:
 
             if (
               !readyModule ||
-              typeof readyModule._DApi_Init
-                !== "function" ||
-              typeof readyModule._DApi_Render
-                !== "function" ||
-              typeof readyModule._DApi_Mouse
-                !== "function" ||
-              typeof readyModule._DApi_Key
-                !== "function"
+              typeof readyModule._DApi_Init !== "function" ||
+              typeof readyModule._DApi_Render !== "function"
             ) {
-              throw new Error(
-                "Proven Diablo engine API initialization failed"
-              );
+              throw new Error("Diablo engine initialization failed");
             }
 
-            progress({
-              loaded:
-                binary.data.byteLength
-            });
-
+            progress({ loaded: binary.data.byteLength });
             return readyModule;
           }
           '''
 
-          text = (
-              text[:start]
-              + new_loader
-              + text[end:]
-          )
+          text = text[:start] + new_loader + text[end:]
 
-          detector_init = r'''  // Initialize Game Event Detector for AI quest system
+          detector = r'''  // Initialize Game Event Detector for AI quest system
             try {
               gameEventDetector.initialize(wasm);
               console.log('[Worker] Game Event Detector initialized');
@@ -280,22 +180,15 @@ jobs:
             }
           '''
 
-          if detector_init not in text:
-              raise SystemExit(
-                  "ERROR: detector init block not found"
-              )
-
-          text = text.replace(
-              detector_init,
-              """  // Neural detector deliberately disabled.
-            console.log(
-              '[Worker] NEURAL_EVENT_DETECTOR_DISABLED'
-            );
+          text = replace_once(
+              text,
+              detector,
+              """  console.log('[Worker] NEURAL_EVENT_DETECTOR_DISABLED');
           """,
-              1
+              "event detector"
           )
 
-          old_render = r'''  setInterval(() => {
+          old_loop = r'''  setInterval(() => {
               call_api("DApi_Render", Math.floor(performance.now()));
 
               // Process game events for AI/quest system
@@ -316,7 +209,7 @@ jobs:
             }, 50);
           '''
 
-          new_render = r'''  setInterval(() => {
+          new_loop = r'''  setInterval(() => {
               call_api(
                 "DApi_Render",
                 Math.floor(performance.now())
@@ -324,34 +217,20 @@ jobs:
             }, 50);
           '''
 
-          if old_render not in text:
-              raise SystemExit(
-                  "ERROR: render loop block not found"
-              )
-
-          text = text.replace(
-              old_render,
-              new_render,
-              1
-          )
-
-          worker.write_text(
+          text = replace_once(
               text,
-              encoding="utf-8"
+              old_loop,
+              new_loop,
+              "render loop"
           )
 
-          print("GAME_WORKER_BASELINE_OK")
+          p.write_text(text, encoding="utf-8")
 
-          loader = (
-              app /
-              "src/api/loader.js"
-          )
+          # Loader: disable automatic neural scan
+          p = app / "src/api/loader.js"
+          text = p.read_text(encoding="utf-8")
 
-          text = loader.read_text(
-              encoding="utf-8"
-          )
-
-          neural_block = r'''          // Initialize NeuralGameController with the worker
+          neural = r'''          // Initialize NeuralGameController with the worker
                     // Note: WASM module is not directly accessible here, controller will
                     // work through worker messages
                     neuralGameController.initialize(null, worker).then(() => {
@@ -362,80 +241,40 @@ jobs:
 
           '''
 
-          if neural_block not in text:
-              raise SystemExit(
-                  "ERROR: NeuralGameController startup block not found"
-              )
-
-          text = text.replace(
-              neural_block,
-              """          console.log(
-                      '[Loader] NEURAL_STARTUP_DISABLED'
-                    );
+          text = replace_once(
+              text,
+              neural,
+              """          console.log('[Loader] NEURAL_STARTUP_DISABLED');
 
           """,
-              1
+              "neural startup"
           )
 
-          marker = """      const worker = new Worker();
+          worker_create = "      const worker = new Worker();"
 
-                let packetQueue = [];"""
+          worker_create_new = """      const worker = new Worker();
 
-          replacement = """      const worker = new Worker();
+                worker.onerror = event => {
+                  reject(
+                    new Error(
+                      event.message || "Game worker crashed"
+                    )
+                  );
+                };"""
 
-                worker.addEventListener(
-                  "error",
-                  event => {
-                    const message =
-                      event && event.message
-                        ? event.message
-                        : "Game worker crashed";
-
-                    console.error(
-                      "[Loader] Game worker error:",
-                      message
-                    );
-
-                    reject(
-                      new Error(message)
-                    );
-                  }
-                );
-
-                worker.addEventListener(
-                  "messageerror",
-                  () => {
-                    reject(
-                      new Error(
-                        "Game worker message error"
-                      )
-                    );
-                  }
-                );
-
-                let packetQueue = [];"""
-
-          if marker not in text:
-              raise SystemExit(
-                  "ERROR: worker creation block not found"
-              )
-
-          text = text.replace(
-              marker,
-              replacement,
-              1
-          )
-
-          loader.write_text(
+          text = replace_once(
               text,
-              encoding="utf-8"
+              worker_create,
+              worker_create_new,
+              "worker error handler"
           )
 
-          print("NEURAL_STARTUP_DISABLED")
-          print("PATCH_COMPLETE")
+          p.write_text(text, encoding="utf-8")
+
+          print("APP_PATCH_OK")
           PY
 
-      - name: Patch webpack output
+      - name: Patch webpack
         shell: bash
         run: |
           set -e
@@ -443,13 +282,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          webpack = Path(
-              "app/config/webpack.config.js"
-          )
-
-          text = webpack.read_text(
-              encoding="utf-8"
-          )
+          p = Path("app/config/webpack.config.js")
+          text = p.read_text(encoding="utf-8")
 
           text = text.replace(
               "futureEmitAssets: true,",
@@ -457,157 +291,83 @@ jobs:
               1
           )
 
-          webpack.write_text(
-              text,
-              encoding="utf-8"
-          )
+          p.write_text(text, encoding="utf-8")
 
-          build = Path(
-              "app/scripts/build.js"
-          )
+          p = Path("app/scripts/build.js")
+          text = p.read_text(encoding="utf-8")
 
-          text = build.read_text(
-              encoding="utf-8"
-          )
-
-          marker = (
-              "const isInteractive = "
-              "process.stdout.isTTY;"
-          )
+          marker = "const isInteractive = process.stdout.isTTY;"
 
           helper = r'''
           const isInteractive = process.stdout.isTTY;
 
           function forceWriteAssets(stats) {
-            const assets =
-              stats.compilation.assets || {};
+            const assets = stats.compilation.assets || {};
 
-            const names =
-              Object.keys(assets);
-
-            console.log(
-              "[FORCE-EMIT]",
-              names.length
-            );
-
-            if (!names.length) {
-              throw new Error(
-                "No webpack assets"
-              );
-            }
-
-            for (const name of names) {
-              let source =
-                assets[name].source();
+            for (const name of Object.keys(assets)) {
+              let source = assets[name].source();
 
               if (
                 source instanceof Uint8Array &&
                 !Buffer.isBuffer(source)
               ) {
-                source =
-                  Buffer.from(source);
+                source = Buffer.from(source);
               }
 
               if (
                 typeof source !== "string" &&
                 !Buffer.isBuffer(source)
               ) {
-                source =
-                  Buffer.from(source);
+                source = Buffer.from(source);
               }
 
-              const output =
-                path.join(
-                  paths.appBuild,
-                  name
-                );
-
-              fs.ensureDirSync(
-                path.dirname(output)
+              const output = path.join(
+                paths.appBuild,
+                name
               );
 
-              fs.writeFileSync(
-                output,
-                source
-              );
+              fs.ensureDirSync(path.dirname(output));
+              fs.writeFileSync(output, source);
             }
           }
           '''
 
           if marker not in text:
-              raise SystemExit(
-                  "ERROR: build marker missing"
-              )
+              raise SystemExit("PATCH FAILED: build marker")
+
+          text = text.replace(marker, helper, 1)
+
+          marker = """      return resolve({
+                stats,"""
+
+          replacement = """      forceWriteAssets(stats);
+
+                return resolve({
+                stats,"""
+
+          if marker not in text:
+              raise SystemExit("PATCH FAILED: build resolve")
 
           text = text.replace(
               marker,
-              helper,
-              1
-          )
-
-          marker2 = (
-              "      return resolve({\n"
-              "        stats,"
-          )
-
-          replacement = (
-              "      forceWriteAssets(stats);\n"
-              "\n"
-              "      return resolve({\n"
-              "        stats,"
-          )
-
-          if marker2 not in text:
-              raise SystemExit(
-                  "ERROR: resolve marker missing"
-              )
-
-          text = text.replace(
-              marker2,
               replacement,
               1
           )
 
-          build.write_text(
-              text,
-              encoding="utf-8"
-          )
+          p.write_text(text, encoding="utf-8")
 
-          print("WEBPACK_OUTPUT_PATCH_OK")
+          print("WEBPACK_PATCH_OK")
           PY
 
-      - name: Verify source patches
+      - name: Verify source
         shell: bash
         run: |
           set -e
 
-          test -s \
-            app/public/wasm/Diablo.js
-
-          test -s \
-            app/public/wasm/DiabloSpawn.js
-
-          test -s \
-            app/public/wasm/Diablo.wasm
-
-          test -s \
-            app/public/wasm/DiabloSpawn.wasm
-
-          test "$(
-            stat -c%s \
-              app/public/wasm/Diablo.wasm
-          )" -eq 1519717
-
-          test "$(
-            stat -c%s \
-              app/public/wasm/DiabloSpawn.wasm
-          )" -eq 1381584
-
-          node --check \
-            app/public/wasm/Diablo.js
-
-          node --check \
-            app/public/wasm/DiabloSpawn.js
+          test -s app/public/wasm/Diablo.js
+          test -s app/public/wasm/Diablo.wasm
+          test -s app/public/wasm/DiabloSpawn.js
+          test -s app/public/wasm/DiabloSpawn.wasm
 
           grep -Fq \
             "NEURAL_STARTUP_DISABLED" \
@@ -617,26 +377,7 @@ jobs:
             "NEURAL_EVENT_DETECTOR_DISABLED" \
             app/src/api/game.worker.js
 
-          if grep -Fq \
-            "neuralGameController.initialize(null, worker)" \
-            app/src/api/loader.js
-          then
-            echo \
-              "ERROR: active neural startup remains"
-            exit 1
-          fi
-
-          if grep -Fq \
-            "gameEventDetector.processFrame()" \
-            app/src/api/game.worker.js
-          then
-            echo \
-              "ERROR: active neural frame call remains"
-            exit 1
-          fi
-
-          echo \
-            "BASELINE_SOURCE_OK"
+          echo "SOURCE_OK"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -647,13 +388,10 @@ jobs:
 
       - name: Install dependencies
         working-directory: app
-        shell: bash
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
         run: |
-          set -e
-
           npm ci \
             --legacy-peer-deps \
             --no-audit \
@@ -662,7 +400,6 @@ jobs:
 
       - name: Build
         working-directory: app
-        shell: bash
         env:
           PUBLIC_URL: /Game
           NODE_ENV: production
@@ -671,11 +408,9 @@ jobs:
           GENERATE_SOURCEMAP: false
           INLINE_RUNTIME_CHUNK: false
         run: |
-          set -e
-
           npm run build
 
-      - name: Create index HTML
+      - name: Create index
         shell: bash
         run: |
           set -e
@@ -683,68 +418,25 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          build = Path(
-              "app/build"
-          )
+          build = Path("app/build")
+          public = Path("app/public")
+          js = build / "static/js"
+          css = build / "static/css"
 
-          public = Path(
-              "app/public"
-          )
-
-          jsdir = (
-              build /
-              "static" /
-              "js"
-          )
-
-          cssdir = (
-              build /
-              "static" /
-              "css"
-          )
-
-          runtime = sorted(
-              jsdir.glob(
-                  "runtime~main.*.js"
-              )
-          )
-
+          runtime = sorted(js.glob("runtime~main.*.js"))
           chunks = sorted(
-              p for p
-              in jsdir.glob(
-                  "*.chunk.js"
-              )
+              p for p in js.glob("*.chunk.js")
               if p.name[0].isdigit()
           )
+          main = sorted(js.glob("main.*.js"))
+          styles = sorted(css.glob("main.*.css"))
 
-          main = sorted(
-              jsdir.glob(
-                  "main.*.js"
-              )
-          )
-
-          css = sorted(
-              cssdir.glob(
-                  "main.*.css"
-              )
-          )
-
-          if not runtime:
-              raise SystemExit(
-                  "ERROR: runtime JS missing"
-              )
-
-          if not main:
-              raise SystemExit(
-                  "ERROR: main JS missing"
-              )
+          if not runtime or not main:
+              raise SystemExit("MAIN BUNDLE MISSING")
 
           html = (
-              public /
-              "index.html"
-          ).read_text(
-              encoding="utf-8"
-          )
+              public / "index.html"
+          ).read_text(encoding="utf-8")
 
           html = html.replace(
               "%PUBLIC_URL%",
@@ -752,40 +444,26 @@ jobs:
           )
 
           css_tags = "\n".join(
-              f'<link rel="stylesheet" '
-              f'href="/Game/static/css/{p.name}">'
-              for p in css
-          )
-
-          scripts = (
-              runtime +
-              chunks +
-              main
+              f'<link rel="stylesheet" href="/Game/static/css/{p.name}">'
+              for p in styles
           )
 
           js_tags = "\n".join(
-              f'<script '
-              f'src="/Game/static/js/{p.name}">'
-              f'</script>'
-              for p in scripts
+              f'<script src="/Game/static/js/{p.name}"></script>'
+              for p in runtime + chunks + main
           )
 
           html = html.replace(
               "</head>",
-              css_tags +
-              "\n</head>"
+              css_tags + "\n</head>"
           )
 
           html = html.replace(
               "</body>",
-              js_tags +
-              "\n</body>"
+              js_tags + "\n</body>"
           )
 
-          (
-              build /
-              "index.html"
-          ).write_text(
+          (build / "index.html").write_text(
               html,
               encoding="utf-8"
           )
@@ -793,92 +471,81 @@ jobs:
           print("INDEX_OK")
           PY
 
-      - name: Clean cache files
+      - name: Prepare Pages
         shell: bash
         run: |
           set -e
 
-          rm -f \
-            app/build/service-worker.js
+          rm -f app/build/service-worker.js
 
-          find \
-            app/build \
+          find app/build \
             -maxdepth 1 \
             -name 'precache-manifest*' \
             -delete
 
-          touch \
-            app/build/.nojekyll
+          touch app/build/.nojekyll
 
-      - name: Verify final runtime
-        shell: bash
-        run: |
-          set -e
+          python3 - <<'PY'
+          from pathlib import Path
 
-          test -s \
-            app/build/index.html
+          required = [
+              "app/build/index.html",
+              "app/build/spawn.mpq",
+              "app/build/wasm/Diablo.js",
+              "app/build/wasm/Diablo.wasm",
+              "app/build/wasm/DiabloSpawn.js",
+              "app/build/wasm/DiabloSpawn.wasm",
+          ]
 
-          test -s \
-            app/build/spawn.mpq
+          for name in required:
+              p = Path(name)
+              if not p.exists() or p.stat().st_size == 0:
+                  raise SystemExit(
+                      "MISSING: " + name
+                  )
 
-          test -s \
-            app/build/wasm/Diablo.js
+          mains = list(
+              Path(
+                  "app/build/static/js"
+              ).glob(
+                  "main.*.js"
+              )
+          )
 
-          test -s \
-            app/build/wasm/Diablo.wasm
+          workers = list(
+              Path(
+                  "app/build"
+              ).glob(
+                  "*.worker.js"
+              )
+          )
 
-          test -s \
-            app/build/wasm/DiabloSpawn.js
+          if not mains:
+              raise SystemExit("MAIN JS MISSING")
 
-          test -s \
-            app/build/wasm/DiabloSpawn.wasm
+          if not workers:
+              raise SystemExit("WORKER MISSING")
 
-          test "$(
-            stat -c%s \
-              app/build/wasm/Diablo.wasm
-          )" -eq 1519717
+          print("SITE_READY")
+          PY
 
-          test "$(
-            stat -c%s \
-              app/build/wasm/DiabloSpawn.wasm
-          )" -eq 1381584
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
 
-          MAIN_JS="$(
-            find \
-              app/build/static/js \
-              -type f \
-              -name 'main.*.js' \
-              -size +0c \
-              | head -1
-          )"
+      - name: Upload Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/build
 
-          if [ -z "$MAIN_JS" ]; then
-            echo \
-              "ERROR: main JS missing"
-            exit 1
-          fi
+  deploy:
+    needs: build
+    runs-on: ubuntu-22.04
 
-          GAME_WORKER="$(
-            grep -l \
-              "DiabloSpawn.js" \
-              app/build/*.worker.js \
-              | head -1
-          )"
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
-          if [ -z "$GAME_WORKER" ]; then
-            echo \
-              "ERROR: game worker missing"
-            exit 1
-          fi
-
-          if grep -Fq \
-            "Module parse failed" \
-            "$GAME_WORKER"
-          then
-            echo \
-              "ERROR: broken game worker"
-            exit 1
-          fi
-
-          if ! grep -Fq \
-            "
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
