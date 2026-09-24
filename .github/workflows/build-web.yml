@@ -1,4 +1,4 @@
-name: Deploy DiabloWeb AutoAttack
+name: Deploy DiabloWeb AutoAttack V2
 
 on:
   push:
@@ -43,13 +43,17 @@ jobs:
           version: 1.39.20
           actions-cache-folder: emsdk-cache
 
-      - name: Add auto attack to engine
+      - name: Patch engine auto attack
         shell: bash
         run: |
           set -e
 
           python3 - <<'PY'
           from pathlib import Path
+
+          # ==================================================
+          # diablo.cpp
+          # ==================================================
 
           p = Path("engine/Source/diablo.cpp")
           text = p.read_text(encoding="utf-8")
@@ -64,49 +68,125 @@ jobs:
               )
 
           autoattack = r'''
-          static int FindMobileAutoAttackTarget()
+          /*
+           * Mobile auto attack V2.
+           *
+           * Do not synthesize a mouse click and do not enqueue another
+           * network attack command. For adjacent melee monsters, start
+           * the normal Diablo player attack state directly.
+           */
+          static int FindMobileAdjacentAttackDirection()
           {
-          	int best = -1;
-          	int bestDistance = 9999;
-
           	PlayerStruct &player = plr[myplr];
 
-          	const int px = player.WorldX;
-          	const int py = player.WorldY;
+          	for (int dir = 0; dir < 8; dir++) {
+          		const int x =
+          		    player.WorldX + offset_x[dir];
 
-          	const int maxDistance =
-          	    player._pwtype == WT_RANGED
-          	        ? 8
-          	        : 1;
+          		const int y =
+          		    player.WorldY + offset_y[dir];
 
-          	for (int n = 0; n < nummonsters; n++) {
-          		const int mi = monstactive[n];
+          		if (
+          		    x < 0 ||
+          		    y < 0 ||
+          		    x >= MAXDUNX ||
+          		    y >= MAXDUNY
+          		) {
+          			continue;
+          		}
 
-          		if (mi < 0 || mi >= MAXMONSTERS)
+          		const int cell =
+          		    dMonster[x][y];
+
+          		if (cell == 0)
           			continue;
 
-          		MonsterStruct &m = monster[mi];
+          		const int mi =
+          		    cell > 0
+          		        ? cell - 1
+          		        : -(cell + 1);
 
-          		if (m._mDelFlag)
+          		if (
+          		    mi < 0 ||
+          		    mi >= MAXMONSTERS
+          		) {
+          			continue;
+          		}
+
+          		MonsterStruct &monsterRef =
+          		    monster[mi];
+
+          		if (monsterRef._mDelFlag)
           			continue;
 
-          		if (m._mhitpoints <= 0)
+          		if (monsterRef._mhitpoints <= 0)
           			continue;
 
           		if (CanTalkToMonst(mi))
           			continue;
 
-          		const int dx = abs(m._mx - px);
-          		const int dy = abs(m._my - py);
+          		return dir;
+          	}
+
+          	return -1;
+          }
+
+          static int FindMobileRangedTarget()
+          {
+          	PlayerStruct &player = plr[myplr];
+
+          	int best = -1;
+          	int bestDistance = 9999;
+
+          	for (
+          	    int n = 0;
+          	    n < nummonsters;
+          	    n++
+          	) {
+          		const int mi =
+          		    monstactive[n];
+
+          		if (
+          		    mi < 0 ||
+          		    mi >= MAXMONSTERS
+          		) {
+          			continue;
+          		}
+
+          		MonsterStruct &monsterRef =
+          		    monster[mi];
+
+          		if (monsterRef._mDelFlag)
+          			continue;
+
+          		if (monsterRef._mhitpoints <= 0)
+          			continue;
+
+          		if (CanTalkToMonst(mi))
+          			continue;
+
+          		const int dx = abs(
+          		    monsterRef._mfutx -
+          		    player.WorldX
+          		);
+
+          		const int dy = abs(
+          		    monsterRef._mfuty -
+          		    player.WorldY
+          		);
 
           		const int distance =
           		    dx > dy ? dx : dy;
 
-          		if (distance > maxDistance)
+          		if (distance > 8)
           			continue;
 
-          		if (distance >= bestDistance)
+          		if (
+          		    distance >=
+          		    bestDistance
+          		) {
           			continue;
+          		}
 
           		best = mi;
           		bestDistance = distance;
@@ -129,46 +209,122 @@ jobs:
           	if (gmenu_exception())
           		return;
 
-          	if (stextflag || spselflag || qtextflag)
+          	if (
+          	    stextflag ||
+          	    spselflag ||
+          	    qtextflag ||
+          	    questlog ||
+          	    doomflag ||
+          	    dropGoldFlag ||
+          	    talkflag
+          	) {
           		return;
+          	}
 
-          	if (questlog || doomflag || dropGoldFlag)
+          	if (
+          	    chrflag ||
+          	    invflag ||
+          	    sbookflag ||
+          	    helpflag
+          	) {
           		return;
+          	}
 
           	if (track_isscrolling())
           		return;
 
+          	/*
+          	 * A finger or mouse button is currently being held.
+          	 * Do not steal manual input.
+          	 */
           	if (sgbMouseDown != 0)
           		return;
 
-          	PlayerStruct &player = plr[myplr];
+          	PlayerStruct &player =
+          	    plr[myplr];
+
+          	if (
+          	    player._pHitPoints <= 0
+          	) {
+          		return;
+          	}
 
           	/*
-          	 * Never interrupt movement, attacks,
-          	 * hit recovery or spell animations.
+          	 * Do not interrupt any animation.
           	 */
-          	if (player._pmode != PM_STAND)
+          	if (
+          	    player._pmode != PM_STAND
+          	) {
           		return;
-
-          	const int target =
-          	    FindMobileAutoAttackTarget();
-
-          	if (target < 0)
-          		return;
-
-          	if (player._pwtype == WT_RANGED) {
-          		NetSendCmdParam1(
-          		    TRUE,
-          		    CMD_RATTACKID,
-          		    target
-          		);
-          	} else {
-          		NetSendCmdParam1(
-          		    TRUE,
-          		    CMD_ATTACKID,
-          		    target
-          		);
           	}
+
+          	/*
+          	 * PM_STAND can still have a queued manual walk/action.
+          	 * Respect it.
+          	 */
+          	if (
+          	    player.walkpath[0] !=
+          	    WALK_NONE
+          	) {
+          		return;
+          	}
+
+          	if (
+          	    player.destAction !=
+          	    ACTION_NONE
+          	) {
+          		return;
+          	}
+
+          	if (
+          	    player._pwtype ==
+          	    WT_RANGED
+          	) {
+          		const int target =
+          		    FindMobileRangedTarget();
+
+          		if (target < 0)
+          			return;
+
+          		const int tx =
+          		    monster[target]._mfutx;
+
+          		const int ty =
+          		    monster[target]._mfuty;
+
+          		const int dir =
+          		    GetDirection(
+          		        player.WorldX,
+          		        player.WorldY,
+          		        tx,
+          		        ty
+          		    );
+
+          		StartRangeAttack(
+          		    myplr,
+          		    dir,
+          		    tx,
+          		    ty
+          		);
+
+          		return;
+          	}
+
+          	/*
+          	 * Shareware permits Warrior, so this is the important
+          	 * current path. Only an actually occupied adjacent
+          	 * dMonster square can trigger the attack.
+          	 */
+          	const int dir =
+          	    FindMobileAdjacentAttackDirection();
+
+          	if (dir < 0)
+          		return;
+
+          	StartAttack(
+          	    myplr,
+          	    dir
+          	);
           }
 
           '''
@@ -179,14 +335,14 @@ jobs:
               1
           )
 
-          old = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
+          old_logic = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
           		CheckCursMove();
           		track_process();
           	}
           	if (gbProcessPlayers) {
           """
 
-          new = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
+          new_logic = """\tif (!gmenu_exception() && sgnTimeoutCurs == 0) {
           		CheckCursMove();
           		track_process();
           		TryMobileAutoAttack();
@@ -194,14 +350,14 @@ jobs:
           	if (gbProcessPlayers) {
           """
 
-          if old not in text:
+          if old_logic not in text:
               raise SystemExit(
-                  "ERROR: game loop logic anchor missing"
+                  "ERROR: game_logic anchor missing"
               )
 
           text = text.replace(
-              old,
-              new,
+              old_logic,
+              new_logic,
               1
           )
 
@@ -210,7 +366,67 @@ jobs:
               encoding="utf-8"
           )
 
-          print("AUTOATTACK_PATCH_OK")
+          print("AUTOATTACK_V2_PATCH_OK")
+
+          # ==================================================
+          # main.cpp
+          #
+          # Add an exported marker so the web worker can prove
+          # that the deployed WASM is this exact autoattack build.
+          # ==================================================
+
+          p = Path("engine/Source/main.cpp")
+          text = p.read_text(encoding="utf-8")
+
+          marker = """EMSCRIPTEN_KEEPALIVE void DApi_Render(unsigned int time);
+          """
+
+          replacement = """EMSCRIPTEN_KEEPALIVE void DApi_Render(unsigned int time);
+          EMSCRIPTEN_KEEPALIVE int DApi_AutoAttackVersion();
+          """
+
+          if marker not in text:
+              raise SystemExit(
+                  "ERROR: DApi declaration anchor missing"
+              )
+
+          text = text.replace(
+              marker,
+              replacement,
+              1
+          )
+
+          marker = """EMSCRIPTEN_KEEPALIVE void* DApi_SyncTextPtr() {
+          """
+
+          replacement = """EMSCRIPTEN_KEEPALIVE int DApi_AutoAttackVersion() {
+            return 2;
+          }
+
+          EMSCRIPTEN_KEEPALIVE void* DApi_SyncTextPtr() {
+          """
+
+          if marker not in text:
+              raise SystemExit(
+                  "ERROR: DApi definition anchor missing"
+              )
+
+          text = text.replace(
+              marker,
+              replacement,
+              1
+          )
+
+          p.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+          print("AUTOATTACK_VERSION_API_OK")
+
+          # ==================================================
+          # build.js
+          # ==================================================
 
           p = Path("engine/build.js")
           text = p.read_text(encoding="utf-8")
@@ -245,7 +461,7 @@ jobs:
 
           if old not in text:
               raise SystemExit(
-                  "ERROR: build targets anchor missing"
+                  "ERROR: build target anchor missing"
               )
 
           text = text.replace(
@@ -262,30 +478,32 @@ jobs:
           print("ENGINE_BUILD_PATCH_OK")
           PY
 
-      - name: Verify auto attack source
+      - name: Verify engine source
         shell: bash
         run: |
           set -e
 
           grep -n \
-            "FindMobileAutoAttackTarget" \
+            "FindMobileAdjacentAttackDirection" \
             engine/Source/diablo.cpp
 
           grep -n \
-            "TryMobileAutoAttack" \
-            engine/Source/diablo.cpp
+            "StartAttack(" \
+            engine/Source/diablo.cpp \
+            | tail -5
 
           grep -n \
-            "CMD_ATTACKID" \
-            engine/Source/diablo.cpp
+            "StartRangeAttack(" \
+            engine/Source/diablo.cpp \
+            | tail -5
 
           grep -n \
-            "CMD_RATTACKID" \
-            engine/Source/diablo.cpp
+            "DApi_AutoAttackVersion" \
+            engine/Source/main.cpp
 
-          echo "AUTOATTACK_SOURCE_OK"
+          echo "AUTOATTACK_V2_SOURCE_OK"
 
-      - name: Build auto attack engine
+      - name: Build engine
         working-directory: engine
         shell: bash
         run: |
@@ -296,7 +514,7 @@ jobs:
 
           node build.js
 
-      - name: Verify engine build
+      - name: Verify engine output
         shell: bash
         run: |
           set -e
@@ -306,13 +524,21 @@ jobs:
           test -s engine/Diablo.jscc
           test -s engine/DiabloSpawn.jscc
 
+          grep -Fq \
+            "DApi_AutoAttackVersion" \
+            engine/Diablo.jscc
+
+          grep -Fq \
+            "DApi_AutoAttackVersion" \
+            engine/DiabloSpawn.jscc
+
           ls -lh \
             engine/Diablo.wasm \
             engine/DiabloSpawn.wasm \
             engine/Diablo.jscc \
             engine/DiabloSpawn.jscc
 
-          echo "AUTOATTACK_ENGINE_BUILT"
+          echo "AUTOATTACK_V2_ENGINE_OK"
 
       - name: Patch frontend
         shell: bash
@@ -328,20 +554,27 @@ jobs:
           app = Path("app")
           engine = Path("engine")
 
-          def replace_once(text, old, new, name):
+          def replace_once(
+              text,
+              old,
+              new,
+              name
+          ):
               if old not in text:
                   raise SystemExit(
-                      "PATCH FAILED: " + name
+                      "PATCH FAILED: " +
+                      name
                   )
+
               return text.replace(
                   old,
                   new,
                   1
               )
 
-          # --------------------------------
+          # ==================================================
           # package mismatch
-          # --------------------------------
+          # ==================================================
 
           p = app / "package.json"
 
@@ -367,9 +600,9 @@ jobs:
               encoding="utf-8"
           )
 
-          # --------------------------------
-          # service worker off
-          # --------------------------------
+          # ==================================================
+          # service worker disabled
+          # ==================================================
 
           p = app / "src/index.js"
 
@@ -394,9 +627,9 @@ jobs:
               encoding="utf-8"
           )
 
-          # --------------------------------
-          # install paired rebuilt engine
-          # --------------------------------
+          # ==================================================
+          # install rebuilt paired engine
+          # ==================================================
 
           out = app / "public/wasm"
 
@@ -436,18 +669,18 @@ jobs:
           ).stat().st_size
 
           print(
-              "Diablo WASM:",
+              "Diablo WASM size:",
               diablo_size
           )
 
           print(
-              "Spawn WASM:",
+              "Spawn WASM size:",
               spawn_size
           )
 
-          # --------------------------------
-          # game worker
-          # --------------------------------
+          # ==================================================
+          # game worker loader
+          # ==================================================
 
           p = (
               app /
@@ -559,14 +792,39 @@ jobs:
               typeof readyModule._DApi_Init
                 !== "function" ||
               typeof readyModule._DApi_Render
-                !== "function" ||
-              typeof readyModule._DApi_Mouse
                 !== "function"
             ) {
               throw new Error(
-                "AutoAttack Diablo engine initialization failed"
+                "Diablo engine initialization failed"
               );
             }
+
+            if (
+              typeof readyModule
+                ._DApi_AutoAttackVersion
+                !== "function"
+            ) {
+              throw new Error(
+                "AUTOATTACK V2 ENGINE NOT LOADED"
+              );
+            }
+
+            const autoAttackVersion =
+              readyModule
+                ._DApi_AutoAttackVersion();
+
+            if (
+              autoAttackVersion !== 2
+            ) {
+              throw new Error(
+                "WRONG AUTOATTACK ENGINE VERSION: " +
+                autoAttackVersion
+              );
+            }
+
+            console.log(
+              "[Worker] AUTOATTACK_ENGINE_V2"
+            );
 
             progress({
               loaded:
@@ -583,9 +841,9 @@ jobs:
               + text[end:]
           )
 
-          # --------------------------------
-          # disable expensive AI scanning
-          # --------------------------------
+          # ==================================================
+          # disable neural detector
+          # ==================================================
 
           detector = r'''  // Initialize Game Event Detector for AI quest system
             try {
@@ -645,14 +903,11 @@ jobs:
               encoding="utf-8"
           )
 
-          # --------------------------------
-          # loader: no memory scan
-          # --------------------------------
+          # ==================================================
+          # disable automatic neural memory scan
+          # ==================================================
 
-          p = (
-              app /
-              "src/api/loader.js"
-          )
+          p = app / "src/api/loader.js"
 
           text = p.read_text(
               encoding="utf-8"
@@ -702,7 +957,7 @@ jobs:
               text,
               marker,
               replacement,
-              "worker error handler"
+              "worker handler"
           )
 
           p.write_text(
@@ -796,7 +1051,7 @@ jobs:
                 );
 
               fs.ensureDirSync(
-                  path.dirname(output)
+                path.dirname(output)
               );
 
               fs.writeFileSync(
@@ -849,22 +1104,10 @@ jobs:
           print("WEBPACK_PATCH_OK")
           PY
 
-      - name: Verify patched runtime source
+      - name: Verify patched frontend
         shell: bash
         run: |
           set -e
-
-          grep -Fq \
-            "TryMobileAutoAttack" \
-            engine/Source/diablo.cpp
-
-          grep -Fq \
-            "CMD_ATTACKID" \
-            engine/Source/diablo.cpp
-
-          grep -Fq \
-            "CMD_RATTACKID" \
-            engine/Source/diablo.cpp
 
           test -s \
             app/public/wasm/Diablo.js
@@ -879,10 +1122,22 @@ jobs:
             app/public/wasm/DiabloSpawn.wasm
 
           grep -Fq \
+            "DApi_AutoAttackVersion" \
+            app/public/wasm/Diablo.js
+
+          grep -Fq \
+            "DApi_AutoAttackVersion" \
+            app/public/wasm/DiabloSpawn.js
+
+          grep -Fq \
+            "AUTOATTACK_ENGINE_V2" \
+            app/src/api/game.worker.js
+
+          grep -Fq \
             "NEURAL_STARTUP_DISABLED" \
             app/src/api/loader.js
 
-          echo "AUTOATTACK_RUNTIME_SOURCE_OK"
+          echo "AUTOATTACK_V2_FRONTEND_OK"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -995,19 +1250,17 @@ jobs:
               for p in styles
           )
 
-          scripts = (
-              runtime +
-              chunks +
-              main
-          )
-
           js_tags = "\n".join(
               (
                   '<script '
                   f'src="/Game/static/js/{p.name}">'
                   '</script>'
               )
-              for p in scripts
+              for p in (
+                  runtime +
+                  chunks +
+                  main
+              )
           )
 
           html = html.replace(
@@ -1068,6 +1321,22 @@ jobs:
           test -s \
             app/build/wasm/DiabloSpawn.wasm
 
+          grep -Fq \
+            "DApi_AutoAttackVersion" \
+            app/build/wasm/DiabloSpawn.js
+
+          GAME_WORKER="$(
+            grep -l \
+              "AUTOATTACK_ENGINE_V2" \
+              app/build/*.worker.js \
+              | head -1
+          )"
+
+          if [ -z "$GAME_WORKER" ]; then
+            echo "AUTOATTACK WORKER MISSING"
+            exit 1
+          fi
+
           find \
             app/build/static/js \
             -type f \
@@ -1075,15 +1344,11 @@ jobs:
             -size +0c \
             | grep -q .
 
-          find \
-            app/build \
-            -maxdepth 1 \
-            -type f \
-            -name '*.worker.js' \
-            -size +0c \
-            | grep -q .
+          echo \
+            "GAME_WORKER=$GAME_WORKER"
 
-          echo "AUTOATTACK_SITE_READY"
+          echo \
+            "AUTOATTACK_V2_SITE_READY"
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
