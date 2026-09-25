@@ -1,4 +1,4 @@
-name: Deploy SLKnight Fast Runtime Diagnostic
+name: Deploy SLKnight Asset Path Fix
 
 on:
   push:
@@ -22,19 +22,18 @@ env:
 
 jobs:
   build:
-    name: Patch current web build with runtime diagnostics
+    name: Fix Pages asset path and add boot diagnostics
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
-      - name: Install patch tools
+      - name: Install tools
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y curl unzip ruby python3 python3-pip
-          python3 -m pip install --break-system-packages rpzip
+          sudo apt-get install -y curl python3
 
-      - name: Download current deployed web build
+      - name: Download current successful deployment
         run: |
           set -e
           mkdir -p dist/assets
@@ -51,63 +50,69 @@ jobs:
           import re
 
           base = os.environ["SITE_URL"].rstrip("/") + "/"
-          html_path = Path("dist/index.html")
-          html = html_path.read_text(encoding="utf-8")
+          html = Path("dist/index.html").read_text(encoding="utf-8")
 
-          refs = re.findall(r'(?:src|href)=["\']([^"\']+)["\']', html)
+          refs = re.findall(
+              r'(?:src|href)=["\']([^"\']+)["\']',
+              html
+          )
 
-          downloaded = 0
+          asset_names = []
 
           for ref in refs:
-              if ref.startswith("./"):
-                  rel = ref[2:]
-              elif ref.startswith("/"):
-                  rel = ref[1:]
-              else:
-                  continue
+              match = re.search(
+                  r'(?:^|/)assets/([^?#]+)',
+                  ref
+              )
 
-              if not rel.startswith("assets/"):
-                  continue
+              if match:
+                  name = match.group(1)
 
-              out = Path("dist") / rel
-              out.parent.mkdir(parents=True, exist_ok=True)
+                  if name not in asset_names:
+                      asset_names.append(name)
+
+          if not asset_names:
+              raise SystemExit(
+                  "No assets found in deployed index.html"
+              )
+
+          for name in asset_names:
+              out = Path("dist/assets") / name
+              out.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
 
               req = Request(
-                  base + rel,
-                  headers={"Cache-Control": "no-cache"},
+                  base + "assets/" + name,
+                  headers={
+                      "Cache-Control": "no-cache"
+                  },
               )
 
               with urlopen(req) as response:
-                  out.write_bytes(response.read())
+                  out.write_bytes(
+                      response.read()
+                  )
 
-              print("downloaded", rel)
-              downloaded += 1
-
-          if downloaded == 0:
-              raise SystemExit("No frontend assets found in deployed index.html")
+              print(
+                  "downloaded asset",
+                  name
+              )
           PY
 
-          curl -L --fail --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/coi-serviceworker.min.js?run=${GITHUB_RUN_ID}" \
-            -o dist/coi-serviceworker.min.js
+          for file in \
+            coi-serviceworker.min.js \
+            mkxp-z_libretro.js \
+            mkxp-z_libretro.wasm \
+            slknight.mkxpz
+          do
+            curl -L --fail --retry 3 \
+              -H 'Cache-Control: no-cache' \
+              "${SITE_URL}/${file}?run=${GITHUB_RUN_ID}" \
+              -o "dist/${file}"
+          done
 
-          curl -L --fail --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/mkxp-z_libretro.js?run=${GITHUB_RUN_ID}" \
-            -o dist/mkxp-z_libretro.js
-
-          curl -L --fail --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/mkxp-z_libretro.wasm?run=${GITHUB_RUN_ID}" \
-            -o dist/mkxp-z_libretro.wasm
-
-          curl -L --fail --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/slknight.mkxpz?run=${GITHUB_RUN_ID}" \
-            -o current-slknight.mkxpz
-
-          cp current-slknight.mkxpz dist/slknight.mkxpz
           touch dist/.nojekyll
 
           test -s dist/index.html
@@ -115,248 +120,14 @@ jobs:
           test -s dist/mkxp-z_libretro.wasm
           test -s dist/slknight.mkxpz
 
-      - name: Inject visible RGSS crash screen
+      - name: Fix module path and add visible boot status
         run: |
           set -e
-
-          OLD_HASH="$(sha256sum current-slknight.mkxpz | awk '{print $1}')"
-          OLD_SIZE="$(stat -c%s current-slknight.mkxpz)"
-
-          export OLD_HASH OLD_SIZE
-
-          rm -rf game
-          mkdir game
-          unzip -q current-slknight.mkxpz -d game
-
-          ruby -rzlib - <<'RB'
-          ini = File.binread('game/Game.ini')
-          scripts_rel = ini[/^Scripts=(.+)$/i, 1]
-          abort 'Scripts entry missing from Game.ini' if scripts_rel == nil
-
-          scripts_rel = scripts_rel.strip.tr('\\', '/')
-          path = 'game/' + scripts_rel
-          abort "Scripts file missing: #{path}" unless File.file?(path)
-
-          scripts = Marshal.load(File.binread(path))
-          main = scripts.find { |entry| entry.is_a?(Array) && entry[1].to_s == 'Main' }
-          abort 'Main script not found' if main == nil
-
-          diagnostic_main = <<'RUBY'
-          begin
-            Graphics.frame_rate = 50
-            Graphics.freeze
-            $scene = Scene_Title.new
-
-            while $scene != nil
-              $scene.main
-            end
-
-            Graphics.transition(20)
-
-          rescue Exception => e
-
-            begin
-              warn("SLK_FATAL " + e.class.to_s + ": " + e.message.to_s)
-
-              if e.backtrace != nil
-                warn(e.backtrace.join("\n"))
-              end
-            rescue Exception
-            end
-
-            begin
-              Graphics.freeze
-
-              diagnostic_sprite = Sprite.new
-              diagnostic_sprite.z = 99999999
-
-              diagnostic_sprite.bitmap = Bitmap.new(800, 600)
-
-              diagnostic_sprite.bitmap.fill_rect(
-                0,
-                0,
-                800,
-                600,
-                Color.new(55, 0, 0, 255)
-              )
-
-              diagnostic_sprite.bitmap.font.name = [
-                "Arial",
-                "Tahoma"
-              ]
-
-              diagnostic_sprite.bitmap.font.size = 18
-              diagnostic_sprite.bitmap.font.bold = false
-
-              diagnostic_sprite.bitmap.font.color =
-                Color.new(255, 255, 255, 255)
-
-              lines = []
-
-              lines << "SLKnight RUNTIME ERROR"
-              lines << (
-                e.class.to_s +
-                ": " +
-                e.message.to_s
-              )
-
-              lines << ""
-
-              if e.backtrace != nil
-                for line in e.backtrace[0, 18]
-                  lines << line.to_s
-                end
-              end
-
-              y = 18
-
-              for line in lines
-                diagnostic_sprite.bitmap.draw_text(
-                  18,
-                  y,
-                  764,
-                  24,
-                  line.to_s
-                )
-
-                y += 26
-              end
-
-              Graphics.transition(0)
-
-              loop do
-                Graphics.update
-                Input.update
-              end
-
-            rescue Exception => draw_error
-
-              begin
-                warn(
-                  "SLK_DIAGNOSTIC_DRAW_FAILED " +
-                  draw_error.class.to_s +
-                  ": " +
-                  draw_error.message.to_s
-                )
-              rescue Exception
-              end
-
-              loop do
-                begin
-                  Graphics.update
-                rescue Exception
-                end
-              end
-            end
-          end
-          RUBY
-
-          main[2] = Zlib::Deflate.deflate(diagnostic_main)
-
-          File.binwrite(
-            path,
-            Marshal.dump(scripts)
-          )
-
-          puts 'RGSS_DIAGNOSTIC_MAIN_INJECTED'
-          RB
-
-          rm -f dist/slknight.mkxpz
-
-          cd game
-
-          rpzip -r \
-            "${GITHUB_WORKSPACE}/dist/slknight.mkxpz" \
-            *
-
-          cd "${GITHUB_WORKSPACE}"
-
-          NEW_HASH="$(sha256sum dist/slknight.mkxpz | awk '{print $1}')"
-          NEW_SIZE="$(stat -c%s dist/slknight.mkxpz)"
-
-          export NEW_HASH NEW_SIZE
-
-          echo "old game: ${OLD_SIZE} ${OLD_HASH}"
-          echo "new game: ${NEW_SIZE} ${NEW_HASH}"
 
           python3 - <<'PY'
           from pathlib import Path
           import os
-
-          old_hash = os.environ["OLD_HASH"]
-          new_hash = os.environ["NEW_HASH"]
-          old_size = os.environ["OLD_SIZE"]
-          new_size = os.environ["NEW_SIZE"]
-
-          candidates = list(
-              Path("dist/assets").glob("index-*.js")
-          )
-
-          if not candidates:
-              raise SystemExit(
-                  "Vite index JS not found"
-              )
-
-          selected = None
-
-          for path in candidates:
-              text = path.read_text(
-                  encoding="utf-8"
-              )
-
-              if old_hash in text:
-                  selected = path
-                  break
-
-          if selected is None:
-              raise SystemExit(
-                  "Old GAME_HASH not found in frontend JS"
-              )
-
-          text = selected.read_text(
-              encoding="utf-8"
-          )
-
-          if text.count(old_hash) != 1:
-              raise SystemExit(
-                  "Unexpected GAME_HASH occurrence count: " +
-                  str(text.count(old_hash))
-              )
-
-          if old_size not in text:
-              raise SystemExit(
-                  "Old GAME_SIZE not found in frontend JS"
-              )
-
-          text = text.replace(
-              old_hash,
-              new_hash,
-              1
-          )
-
-          text = text.replace(
-              old_size,
-              new_size,
-              1
-          )
-
-          new_name = (
-              selected.stem +
-              "-diag-" +
-              new_hash[:8] +
-              selected.suffix
-          )
-
-          new_path = selected.with_name(
-              new_name
-          )
-
-          new_path.write_text(
-              text,
-              encoding="utf-8"
-          )
-
-          selected.unlink()
+          import re
 
           index_path = Path(
               "dist/index.html"
@@ -366,39 +137,203 @@ jobs:
               encoding="utf-8"
           )
 
-          old_ref_a = (
-              "/assets/" +
-              selected.name
+          # GitHub project Pages에서는
+          # ../assets 가 /Game 밖으로 빠져버림.
+          # 전부 ./assets 로 강제 수정.
+          html = re.sub(
+              r'((?:src|href)=["\'])'
+              r'(?:\.\./|\./|/)?assets/',
+              r'\1./assets/',
+              html,
           )
 
-          old_ref_b = (
-              "./assets/" +
-              selected.name
+          module_match = re.search(
+              r'<script\s+'
+              r'type=["\']module["\']'
+              r'[^>]*'
+              r'\bsrc=["\']'
+              r'\.\/assets\/([^"\']+)'
+              r'["\']'
+              r'[^>]*>'
+              r'</script>',
+              html,
           )
 
-          new_ref = (
-              "./assets/" +
-              new_path.name
-          )
-
-          if old_ref_a in html:
-              html = html.replace(
-                  old_ref_a,
-                  new_ref,
-                  1
-              )
-
-          elif old_ref_b in html:
-              html = html.replace(
-                  old_ref_b,
-                  new_ref,
-                  1
-              )
-
-          else:
+          if module_match is None:
               raise SystemExit(
-                  "Frontend JS reference not found in index.html"
+                  "Fixed module script reference not found"
               )
+
+          old_name = module_match.group(1)
+
+          old_path = (
+              Path("dist/assets")
+              / old_name
+          )
+
+          if not old_path.is_file():
+              raise SystemExit(
+                  "Frontend module file missing: "
+                  + str(old_path)
+              )
+
+          run_id = os.environ.get(
+              "GITHUB_RUN_ID",
+              "manual"
+          )
+
+          stem = old_path.stem
+          suffix = old_path.suffix
+
+          new_name = (
+              f"{stem}"
+              f"-bootfix-"
+              f"{run_id}"
+              f"{suffix}"
+          )
+
+          new_path = old_path.with_name(
+              new_name
+          )
+
+          js = old_path.read_text(
+              encoding="utf-8"
+          )
+
+          js = (
+              'window.__slBoot&&'
+              'window.__slBoot('
+              '"FRONTEND JS OK"'
+              ');\n'
+              + js
+          )
+
+          new_path.write_text(
+              js,
+              encoding="utf-8"
+          )
+
+          old_path.unlink()
+
+          html = html.replace(
+              "./assets/" + old_name,
+              "./assets/" + new_name,
+              1,
+          )
+
+          boot_ui = r'''
+          <div
+            id="sl-boot-diagnostic"
+            style="
+              position:fixed;
+              z-index:2147483647;
+              left:8px;
+              top:8px;
+              max-width:calc(100vw - 16px);
+              padding:8px 10px;
+              border:1px solid rgba(255,255,255,.55);
+              border-radius:8px;
+              background:rgba(0,0,0,.86);
+              color:#fff;
+              font:12px/1.4 monospace;
+              white-space:pre-wrap;
+              word-break:break-word;
+              pointer-events:none;
+            "
+          >
+            BOOT: HTML OK
+          </div>
+
+          <script>
+            (function () {
+              var box =
+                document.getElementById(
+                  'sl-boot-diagnostic'
+                );
+
+              window.__slBoot =
+                function (message) {
+                  if (box) {
+                    box.textContent =
+                      'BOOT: ' +
+                      String(message);
+                  }
+                };
+
+              window.addEventListener(
+                'error',
+                function (event) {
+                  window.__slBoot(
+                    'JS ERROR\n' +
+                    (
+                      event.message ||
+                      'unknown error'
+                    ) +
+                    (
+                      event.filename
+                        ? '\n' +
+                          event.filename
+                        : ''
+                    ) +
+                    (
+                      event.lineno
+                        ? ':' +
+                          event.lineno
+                        : ''
+                    )
+                  );
+                }
+              );
+
+              window.addEventListener(
+                'unhandledrejection',
+                function (event) {
+                  window.__slBoot(
+                    'PROMISE ERROR\n' +
+                    String(
+                      event.reason
+                    )
+                  );
+                }
+              );
+
+              window.setTimeout(
+                function () {
+                  if (
+                    box &&
+                    box.textContent ===
+                      'BOOT: HTML OK'
+                  ) {
+                    box.textContent =
+                      'BOOT: FRONTEND MODULE DID NOT RUN\n' +
+                      'crossOriginIsolated=' +
+                      String(
+                        window.crossOriginIsolated
+                      ) +
+                      '\n' +
+                      'SharedArrayBuffer=' +
+                      String(
+                        typeof SharedArrayBuffer
+                          !== 'undefined'
+                      );
+                  }
+                },
+                5000
+              );
+            })();
+          </script>
+          '''
+
+          if "</body>" not in html:
+              raise SystemExit(
+                  "index.html has no closing body tag"
+              )
+
+          html = html.replace(
+              "</body>",
+              boot_ui + "\n</body>",
+              1,
+          )
 
           index_path.write_text(
               html,
@@ -406,37 +341,50 @@ jobs:
           )
 
           print(
-              "patched frontend GAME_HASH",
-              new_hash
-          )
-
-          print(
-              "patched frontend GAME_SIZE",
-              new_size
-          )
-
-          print(
-              "renamed frontend JS",
-              new_path.name
+              "module path fixed to",
+              "./assets/" + new_name
           )
           PY
 
-      - name: Verify diagnostic deployment files
+      - name: Verify fixed Pages package
         run: |
           set -e
 
           test -s dist/index.html
-          test -s dist/mkxp-z_libretro.js
-          test -s dist/mkxp-z_libretro.wasm
           test -s dist/slknight.mkxpz
 
-          grep -q 'diag-' dist/index.html
+          if grep -q \
+            'src="../assets/' \
+            dist/index.html
+          then
+            echo \
+              'ERROR: ../assets module path still exists'
+            exit 1
+          fi
 
-          unzip -tq \
-            dist/slknight.mkxpz \
-            >/dev/null
+          if grep -q \
+            "src='../assets/" \
+            dist/index.html
+          then
+            echo \
+              'ERROR: ../assets module path still exists'
+            exit 1
+          fi
 
-          echo 'SLKNIGHT_FAST_DIAGNOSTIC_BUILD_OK'
+          grep -q \
+            'src="./assets/' \
+            dist/index.html
+
+          grep -q \
+            'bootfix-' \
+            dist/index.html
+
+          grep -q \
+            'BOOT: HTML OK' \
+            dist/index.html
+
+          echo \
+            'SLKNIGHT_ASSET_PATH_FIX_OK'
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
