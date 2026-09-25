@@ -1,4 +1,4 @@
-name: Deploy SLKnight Asset Path Fix
+name: Deploy SLKnight Single Thread Boot Test
 
 on:
   push:
@@ -18,321 +18,422 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SITE_URL: https://gowellsik-hue.github.io/Game
+  ENGINE_REPO: white-axe/mkxp-z-libretro-emscripten
+  ENGINE_REF: f0a1ff80f05dd0d1f8ca711485a5b0a601bc7502
+  GAME_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLKnight_Android_JoiPlay.zip
+  GAME_SHA256: 9f007d46d2410742aca5e14c3901f63586084007e7f52c4d199116191824132a
 
 jobs:
   build:
-    name: Fix Pages asset path and add boot diagnostics
+    name: Build single-thread SLKnight browser version
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 80
 
     steps:
-      - name: Install tools
+      - name: Install build dependencies
         run: |
           set -e
+
           sudo apt-get update
-          sudo apt-get install -y curl python3
+          sudo apt-get install -y \
+            build-essential \
+            automake \
+            libtool \
+            zip \
+            unzip \
+            curl \
+            universal-ctags \
+            ruby \
+            meson \
+            cmake \
+            ninja-build \
+            python3 \
+            python3-pip
 
-      - name: Download current successful deployment
+          python3 -m pip install \
+            --break-system-packages \
+            rpzip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.8
+
+      - name: Checkout mkxp-z web engine
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          submodules: recursive
+          path: engine
+
+      - name: Set up WASI SDK
         run: |
           set -e
-          mkdir -p dist/assets
 
-          curl -L --fail --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/?run=${GITHUB_RUN_ID}" \
-            -o dist/index.html
+          curl -L \
+            --fail \
+            --retry 3 \
+            -o "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+
+          mkdir -p "${RUNNER_TEMP}/wasi-sdk"
+
+          tar -xzf \
+            "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
+            -C "${RUNNER_TEMP}/wasi-sdk" \
+            --strip-components=1
+
+      - name: Set up Binaryen
+        run: |
+          set -e
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -o "${RUNNER_TEMP}/binaryen.tar.gz" \
+            https://github.com/WebAssembly/binaryen/releases/download/version_126/binaryen-version_126-x86_64-linux.tar.gz
+
+          mkdir -p "${RUNNER_TEMP}/binaryen"
+
+          tar -xzf \
+            "${RUNNER_TEMP}/binaryen.tar.gz" \
+            -C "${RUNNER_TEMP}/binaryen" \
+            --strip-components=1
+
+      - name: Build mkxp-z stage 1
+        run: |
+          set -e
+
+          cd engine/mkxp-z/libretro
+
+          CLICOLOR_FORCE=1 \
+          make \
+            -j "$(nproc)" \
+            WASI_SDK="${RUNNER_TEMP}/wasi-sdk" \
+            WASM_OPT="${RUNNER_TEMP}/binaryen/bin/wasm-opt"
+
+      - name: Configure single-thread mkxp-z core
+        run: |
+          set -e
+
+          cat > "${RUNNER_TEMP}/cross.ini" <<EOF
+          [binaries]
+          c = 'emcc'
+          cpp = 'em++'
+          ar = 'emar'
+          cmake = 'cmake'
+
+          [host_machine]
+          system = 'emscripten'
+          cpu_family = 'wasm32'
+          cpu = 'wasm32'
+          endian = 'little'
+
+          [properties]
+          cmake_toolchain_file = '$(em-config EMSCRIPTEN_ROOT)/cmake/Modules/Platform/Emscripten.cmake'
+          EOF
+
+          cd engine/mkxp-z
+
+          CLICOLOR_FORCE=1 \
+          meson setup \
+            build \
+            --cross-file "${RUNNER_TEMP}/cross.ini" \
+            --buildtype release \
+            -Db_lto=true \
+            -Dlibretro=true \
+            -Dlibretro_save_states=true \
+            -Demscripten_threaded=false
+
+      - name: Build single-thread mkxp-z core
+        run: |
+          set -e
+          cd engine/mkxp-z/build
+          CLICOLOR_FORCE=1 ninja -v
+
+      - name: Build single-thread WebAssembly frontend
+        run: |
+          set -e
+
+          mv \
+            engine/mkxp-z/build/mkxp-z_libretro.a \
+            engine/retroarch/libretro_emscripten.a
+
+          cd engine/retroarch
+
+          CLICOLOR_FORCE=1 \
+          emmake make \
+            -f Makefile.emscripten \
+            LIBRETRO=mkxp-z \
+            HAVE_THREADS=0 \
+            PROXY_TO_PTHREAD=0 \
+            HAVE_AUDIOWORKLET=0 \
+            HAVE_RWEBAUDIO=1 \
+            HAVE_AL=0 \
+            HAVE_WASMFS=0 \
+            HAVE_EXTRA_WASMFS=0 \
+            ASYNC=1 \
+            INITIAL_HEAP=268435456
+
+      - name: Download clean SLKnight release
+        run: |
+          set -e
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -o slknight.zip \
+            "${GAME_URL}"
+
+          echo "${GAME_SHA256}  slknight.zip" | sha256sum -c -
+
+          mkdir -p game
+          unzip -q slknight.zip -d game
+
+          test -f game/SLKnight_Android_JoiPlay/Game.ini
+
+      - name: Patch only required browser compatibility
+        run: |
+          set -e
 
           python3 - <<'PY'
           from pathlib import Path
-          from urllib.request import Request, urlopen
-          import os
-          import re
 
-          base = os.environ["SITE_URL"].rstrip("/") + "/"
-          html = Path("dist/index.html").read_text(encoding="utf-8")
+          p = Path("game/SLKnight_Android_JoiPlay/Game.ini")
+          raw = p.read_bytes().splitlines()
+          out = []
 
-          refs = re.findall(
-              r'(?:src|href)=["\']([^"\']+)["\']',
-              html
-          )
+          for line in raw:
+              if line.startswith(b"Title="):
+                  out.append(b"Title=SLKnight")
+              else:
+                  out.append(line)
 
-          asset_names = []
-
-          for ref in refs:
-              match = re.search(
-                  r'(?:^|/)assets/([^?#]+)',
-                  ref
-              )
-
-              if match:
-                  name = match.group(1)
-
-                  if name not in asset_names:
-                      asset_names.append(name)
-
-          if not asset_names:
-              raise SystemExit(
-                  "No assets found in deployed index.html"
-              )
-
-          for name in asset_names:
-              out = Path("dist/assets") / name
-              out.parent.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              req = Request(
-                  base + "assets/" + name,
-                  headers={
-                      "Cache-Control": "no-cache"
-                  },
-              )
-
-              with urlopen(req) as response:
-                  out.write_bytes(
-                      response.read()
-                  )
-
-              print(
-                  "downloaded asset",
-                  name
-              )
+          p.write_bytes(b"\r\n".join(out) + b"\r\n")
           PY
 
-          for file in \
-            coi-serviceworker.min.js \
-            mkxp-z_libretro.js \
-            mkxp-z_libretro.wasm \
-            slknight.mkxpz
-          do
-            curl -L --fail --retry 3 \
-              -H 'Cache-Control: no-cache' \
-              "${SITE_URL}/${file}?run=${GITHUB_RUN_ID}" \
-              -o "dist/${file}"
-          done
+          ruby -rzlib - <<'RB'
+          path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
+          scripts = Marshal.load(File.binread(path))
 
-          touch dist/.nojekyll
+          changed_resize = false
+          changed_browser = false
+          changed_keyboard = false
 
-          test -s dist/index.html
-          test -s dist/mkxp-z_libretro.js
-          test -s dist/mkxp-z_libretro.wasm
-          test -s dist/slknight.mkxpz
+          scripts.each do |entry|
+            next unless entry.is_a?(Array) && entry.length >= 3
 
-      - name: Fix module path and add visible boot status
+            name = entry[1].to_s
+
+            begin
+              src = Zlib::Inflate.inflate(entry[2])
+            rescue
+              next
+            end
+
+            patched = src.dup
+
+            resize_old =
+              "if defined?($joiplay) && $joiplay\r\n" \
+              "  begin\r\n" \
+              "    Graphics.resize_screen($window_width, $window_height)\r\n" \
+              "  rescue\r\n" \
+              "  end\r\n" \
+              "else\r\n" \
+              "  Win32API.SetWindowPos($window_width, $window_height)\r\n" \
+              "end"
+
+            resize_new =
+              "begin\r\n" \
+              "  Graphics.resize_screen($window_width, $window_height)\r\n" \
+              "rescue\r\n" \
+              "end"
+
+            if patched.include?(resize_old)
+              patched.sub!(resize_old, resize_new)
+              changed_resize = true
+            end
+
+            browser_old =
+              "if defined?($joiplay) && $joiplay\r\n" \
+              "      return\r\n" \
+              "    end\r\n" \
+              "    se = Win32API.new(\"shell32\", \"ShellExecute\", ['L','P','P','P','P','L'], 'L' )\r\n" \
+              "    se.Call(0, \"open\", url, 0, 0, 0)"
+
+            if patched.include?(browser_old)
+              patched.sub!(browser_old, "return")
+              changed_browser = true
+            end
+
+            if name == 'Keyboard Input Module'
+              keyboard_old =
+                "  State = Win32API.new(\"user32\",\"GetKeyState\",['i'],'i')\r\n" \
+                "  Key = Win32API.new(\"user32\",\"GetAsyncKeyState\",['i'],'i')"
+
+              keyboard_new =
+                "  class WebKeyStateProxy\r\n" \
+                "    def call(key)\r\n" \
+                "      return 0\r\n" \
+                "    end\r\n" \
+                "  end\r\n" \
+                "  State = WebKeyStateProxy.new\r\n" \
+                "  Key = WebKeyStateProxy.new"
+
+              if patched.include?(keyboard_old)
+                patched.sub!(keyboard_old, keyboard_new)
+                changed_keyboard = true
+              end
+            end
+
+            next if patched == src
+            entry[2] = Zlib::Deflate.deflate(patched)
+          end
+
+          abort 'resize browser patch not found' unless changed_resize
+          abort 'keyboard web patch not found' unless changed_keyboard
+
+          puts 'ShellExecute patch was not present; continuing' unless changed_browser
+
+          main = scripts.find do |entry|
+            entry.is_a?(Array) && entry[1].to_s == 'Main'
+          end
+
+          abort 'Main script not found' if main == nil
+
+          original_main = Zlib::Inflate.inflate(main[2])
+
+          prefix = <<'RUBY'
+          begin
+          RUBY
+
+          suffix = <<'RUBY'
+          rescue Exception => e
+            begin
+              warn("SLK_FATAL " + e.class.to_s + ": " + e.message.to_s)
+              warn(e.backtrace.join("\n")) if e.backtrace != nil
+            rescue Exception
+            end
+
+            begin
+              Graphics.freeze
+
+              s = Sprite.new
+              s.z = 99999999
+              s.bitmap = Bitmap.new(800, 600)
+              s.bitmap.fill_rect(0, 0, 800, 600, Color.new(70, 0, 0, 255))
+              s.bitmap.font.size = 18
+              s.bitmap.font.color = Color.new(255, 255, 255, 255)
+
+              lines = []
+              lines << 'SLKnight RGSS ERROR'
+              lines << e.class.to_s + ': ' + e.message.to_s
+              lines << ''
+
+              if e.backtrace != nil
+                e.backtrace[0, 16].each { |line| lines << line.to_s }
+              end
+
+              y = 16
+
+              lines.each do |line|
+                s.bitmap.draw_text(16, y, 768, 24, line)
+                y += 26
+              end
+
+              Graphics.transition(0)
+
+              loop do
+                Graphics.update
+                Input.update
+              end
+            rescue Exception => draw_error
+              warn('SLK_ERROR_SCREEN_FAILED ' + draw_error.message.to_s) rescue nil
+
+              loop do
+                Graphics.update rescue nil
+              end
+            end
+          end
+          RUBY
+
+          indented_main = original_main.each_line.map { |line| '  ' + line }.join
+
+          main[2] =
+            Zlib::Deflate.deflate(
+              prefix +
+              indented_main +
+              suffix
+            )
+
+          File.binwrite(
+            path,
+            Marshal.dump(scripts)
+          )
+
+          puts 'SLKNIGHT_MINIMAL_BROWSER_PATCH_OK'
+          RB
+
+          rm -f game/SLKnight_Android_JoiPlay/README_Android.txt
+
+      - name: Pack clean boot-test game
+        run: |
+          set -e
+
+          cd game/SLKnight_Android_JoiPlay
+
+          rpzip \
+            -r \
+            "${GITHUB_WORKSPACE}/slknight.mkxpz" \
+            *
+
+          cd "${GITHUB_WORKSPACE}"
+
+          ls -lh slknight.mkxpz
+
+      - name: Patch frontend for single-thread boot diagnostics
         run: |
           set -e
 
           python3 - <<'PY'
           from pathlib import Path
-          import os
           import re
 
-          index_path = Path(
-              "dist/index.html"
+          index_path = Path("engine/nostalgist/index.html")
+          html = index_path.read_text(encoding="utf-8")
+
+          html = html.replace(
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
+              1,
           )
 
-          html = index_path.read_text(
-              encoding="utf-8"
+          html = html.replace(
+              '<script src="./coi-serviceworker.min.js"></script>',
+              '',
+              1,
           )
 
-          # GitHub project Pages에서는
-          # ../assets 가 /Game 밖으로 빠져버림.
-          # 전부 ./assets 로 강제 수정.
           html = re.sub(
-              r'((?:src|href)=["\'])'
-              r'(?:\.\./|\./|/)?assets/',
-              r'\1./assets/',
+              r'<script>\s*// Send a dummy message every 5 seconds.*?</script>',
+              '',
               html,
+              count=1,
+              flags=re.S,
           )
 
-          module_match = re.search(
-              r'<script\s+'
-              r'type=["\']module["\']'
-              r'[^>]*'
-              r'\bsrc=["\']'
-              r'\.\/assets\/([^"\']+)'
-              r'["\']'
-              r'[^>]*>'
-              r'</script>',
+          html = re.sub(
+              r'<p id="user-activation-prompt"[^>]*>\s*▶\s*</p>',
+              '<p id="user-activation-prompt" style="display:none;font-size:20px;padding:14px 20px;border:1px solid #888;border-radius:10px;background:#111;color:#fff">화면을 터치해 시작</p>',
               html,
-          )
-
-          if module_match is None:
-              raise SystemExit(
-                  "Fixed module script reference not found"
-              )
-
-          old_name = module_match.group(1)
-
-          old_path = (
-              Path("dist/assets")
-              / old_name
-          )
-
-          if not old_path.is_file():
-              raise SystemExit(
-                  "Frontend module file missing: "
-                  + str(old_path)
-              )
-
-          run_id = os.environ.get(
-              "GITHUB_RUN_ID",
-              "manual"
-          )
-
-          stem = old_path.stem
-          suffix = old_path.suffix
-
-          new_name = (
-              f"{stem}"
-              f"-bootfix-"
-              f"{run_id}"
-              f"{suffix}"
-          )
-
-          new_path = old_path.with_name(
-              new_name
-          )
-
-          js = old_path.read_text(
-              encoding="utf-8"
-          )
-
-          js = (
-              'window.__slBoot&&'
-              'window.__slBoot('
-              '"FRONTEND JS OK"'
-              ');\n'
-              + js
-          )
-
-          new_path.write_text(
-              js,
-              encoding="utf-8"
-          )
-
-          old_path.unlink()
-
-          html = html.replace(
-              "./assets/" + old_name,
-              "./assets/" + new_name,
-              1,
-          )
-
-          boot_ui = r'''
-          <div
-            id="sl-boot-diagnostic"
-            style="
-              position:fixed;
-              z-index:2147483647;
-              left:8px;
-              top:8px;
-              max-width:calc(100vw - 16px);
-              padding:8px 10px;
-              border:1px solid rgba(255,255,255,.55);
-              border-radius:8px;
-              background:rgba(0,0,0,.86);
-              color:#fff;
-              font:12px/1.4 monospace;
-              white-space:pre-wrap;
-              word-break:break-word;
-              pointer-events:none;
-            "
-          >
-            BOOT: HTML OK
-          </div>
-
-          <script>
-            (function () {
-              var box =
-                document.getElementById(
-                  'sl-boot-diagnostic'
-                );
-
-              window.__slBoot =
-                function (message) {
-                  if (box) {
-                    box.textContent =
-                      'BOOT: ' +
-                      String(message);
-                  }
-                };
-
-              window.addEventListener(
-                'error',
-                function (event) {
-                  window.__slBoot(
-                    'JS ERROR\n' +
-                    (
-                      event.message ||
-                      'unknown error'
-                    ) +
-                    (
-                      event.filename
-                        ? '\n' +
-                          event.filename
-                        : ''
-                    ) +
-                    (
-                      event.lineno
-                        ? ':' +
-                          event.lineno
-                        : ''
-                    )
-                  );
-                }
-              );
-
-              window.addEventListener(
-                'unhandledrejection',
-                function (event) {
-                  window.__slBoot(
-                    'PROMISE ERROR\n' +
-                    String(
-                      event.reason
-                    )
-                  );
-                }
-              );
-
-              window.setTimeout(
-                function () {
-                  if (
-                    box &&
-                    box.textContent ===
-                      'BOOT: HTML OK'
-                  ) {
-                    box.textContent =
-                      'BOOT: FRONTEND MODULE DID NOT RUN\n' +
-                      'crossOriginIsolated=' +
-                      String(
-                        window.crossOriginIsolated
-                      ) +
-                      '\n' +
-                      'SharedArrayBuffer=' +
-                      String(
-                        typeof SharedArrayBuffer
-                          !== 'undefined'
-                      );
-                  }
-                },
-                5000
-              );
-            })();
-          </script>
-          '''
-
-          if "</body>" not in html:
-              raise SystemExit(
-                  "index.html has no closing body tag"
-              )
-
-          html = html.replace(
-              "</body>",
-              boot_ui + "\n</body>",
-              1,
+              count=1,
+              flags=re.S,
           )
 
           index_path.write_text(
@@ -340,65 +441,392 @@ jobs:
               encoding="utf-8"
           )
 
+          main_path = Path(
+              "engine/nostalgist/src/main.ts"
+          )
+
+          text = main_path.read_text(
+              encoding="utf-8"
+          )
+
+          title_marker = '''if (GAME_NAME !== null) {
+            document.title = GAME_NAME;
+          }
+          '''
+
+          boot_code = r'''
+
+          const slBootBox = document.createElement("div");
+
+          slBootBox.id = "sl-boot-box";
+
+          slBootBox.style.cssText = `
+            position: fixed;
+            left: 8px;
+            top: 8px;
+            z-index: 2147483647;
+            max-width: calc(100vw - 16px);
+            padding: 8px 10px;
+            border: 1px solid rgba(255,255,255,.55);
+            border-radius: 8px;
+            background: rgba(0,0,0,.84);
+            color: #fff;
+            font: 12px/1.4 monospace;
+            white-space: pre-wrap;
+            word-break: break-word;
+            pointer-events: none;
+          `;
+
+          document.body.appendChild(
+            slBootBox
+          );
+
+          const slBoot = (
+            message: string
+          ) => {
+            slBootBox.textContent =
+              "BOOT: " + message;
+
+            console.log(
+              "[SLKnight]",
+              message
+            );
+          };
+
+          window.addEventListener(
+            "error",
+            (event) => {
+              slBoot(
+                "JS ERROR\\n" +
+                  (
+                    event.message ||
+                    "unknown error"
+                  ) +
+                  (
+                    event.filename
+                      ? "\\n" +
+                        event.filename
+                      : ""
+                  ) +
+                  (
+                    event.lineno
+                      ? ":" +
+                        String(
+                          event.lineno
+                        )
+                      : ""
+                  ),
+              );
+            }
+          );
+
+          window.addEventListener(
+            "unhandledrejection",
+            (event) => {
+              slBoot(
+                "PROMISE ERROR\\n" +
+                String(event.reason)
+              );
+            }
+          );
+
+          slBoot(
+            "FRONTEND JS OK / SINGLE THREAD"
+          );
+
+          '''
+
+          if title_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: title marker"
+              )
+
+          text = text.replace(
+              title_marker,
+              title_marker + boot_code,
+              1,
+          )
+
+          secure_start = text.find(
+              "// Multithreaded WebAssembly requires a secure context"
+          )
+
+          opfs_start = text.find(
+              "const opfs = !HAVE_OPFS",
+              secure_start,
+          )
+
+          if (
+              secure_start < 0
+              or opfs_start < 0
+          ):
+              raise SystemExit(
+                  "PATCH FAILED: COI block"
+              )
+
+          text = (
+              text[:secure_start]
+              + 'slBoot("COI/PTHREAD CHECKS DISABLED");\n\n'
+              + text[opfs_start:]
+          )
+
+          fetch_marker = (
+              "const [coreJsBlob, coreWasmBlob, gameBlob, rtpBlob] "
+              "= await Promise.all(["
+          )
+
+          if fetch_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: fetch marker"
+              )
+
+          text = text.replace(
+              fetch_marker,
+              'slBoot("DOWNLOADING ENGINE + GAME");\n\n'
+              + fetch_marker,
+              1,
+          )
+
+          promise_start = text.index(
+              fetch_marker
+          )
+
+          promise_end = text.find(
+              "]);",
+              promise_start,
+          )
+
+          if promise_end < 0:
+              raise SystemExit(
+                  "PATCH FAILED: Promise.all end"
+              )
+
+          promise_end += len("]);")
+
+          text = (
+              text[:promise_end]
+              + '\n\nslBoot("ENGINE + GAME FILES READY");'
+              + text[promise_end:]
+          )
+
+          prepare_marker = (
+              "const nostalgist = "
+              "await Nostalgist.prepare({"
+          )
+
+          if prepare_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: prepare marker"
+              )
+
+          text = text.replace(
+              prepare_marker,
+              'slBoot("PREPARING MKXP-Z CORE");\n\n'
+              + prepare_marker,
+              1,
+          )
+
+          after_prepare_marker = (
+              "\n\nif (opfs !== null) {"
+          )
+
+          prepare_pos = text.find(
+              prepare_marker
+          )
+
+          after_prepare = text.find(
+              after_prepare_marker,
+              prepare_pos,
+          )
+
+          if after_prepare < 0:
+              raise SystemExit(
+                  "PATCH FAILED: prepare end"
+              )
+
+          text = (
+              text[:after_prepare]
+              + '\n\nslBoot("MKXP-Z CORE PREPARED");'
+              + text[after_prepare:]
+          )
+
+          activation_marker = (
+              "// Force the user to interact "
+              "with the browser once before "
+              "starting the game;"
+          )
+
+          if activation_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: activation marker"
+              )
+
+          text = text.replace(
+              activation_marker,
+              'slBoot("WAITING FOR SCREEN TAP");\n\n'
+              + activation_marker,
+              1,
+          )
+
+          start_marker = (
+              "await nostalgist.start();"
+          )
+
+          if start_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: start marker"
+              )
+
+          start_code = r'''
+
+          slBoot(
+            "STARTING MKXP-Z CORE"
+          );
+
+          window.setTimeout(
+            () => {
+              if (
+                slBootBox.textContent ===
+                "BOOT: STARTING MKXP-Z CORE"
+              ) {
+                slBoot(
+                  "CORE CALL ACTIVE / WAITING FOR VIDEO"
+                );
+              }
+            },
+            5000
+          );
+
+          try {
+            await nostalgist.start();
+
+            slBoot(
+              "CORE EXITED"
+            );
+          } catch (error) {
+            slBoot(
+              "CORE START ERROR\\n" +
+              String(error)
+            );
+
+            throw error;
+          }
+
+          '''
+
+          text = text.replace(
+              start_marker,
+              start_code,
+              1,
+          )
+
+          main_path.write_text(
+              text,
+              encoding="utf-8"
+          )
+
           print(
-              "module path fixed to",
-              "./assets/" + new_name
+              "SINGLE_THREAD_FRONTEND_PATCH_OK"
           )
           PY
 
-      - name: Verify fixed Pages package
+      - name: Copy game and engine into web player
         run: |
           set -e
 
-          test -s dist/index.html
-          test -s dist/slknight.mkxpz
+          mv \
+            engine/retroarch/mkxp-z_libretro.js \
+            engine/nostalgist/public/
 
-          if grep -q \
-            'src="../assets/' \
-            dist/index.html
-          then
-            echo \
-              'ERROR: ../assets module path still exists'
-            exit 1
-          fi
+          mv \
+            engine/retroarch/mkxp-z_libretro.wasm \
+            engine/nostalgist/public/
 
-          if grep -q \
-            "src='../assets/" \
-            dist/index.html
-          then
-            echo \
-              'ERROR: ../assets module path still exists'
-            exit 1
-          fi
+          mv \
+            slknight.mkxpz \
+            engine/nostalgist/public/
+
+      - name: Configure single-thread web player
+        run: |
+          set -e
+
+          cat > engine/nostalgist/.env <<'EOF'
+          VITE_CORE_JS_PATH=./mkxp-z_libretro.js
+          VITE_CORE_WASM_PATH=./mkxp-z_libretro.wasm
+          VITE_GAME_NAME=SLKnight Single Thread Test
+          VITE_GAME_PATH=./slknight.mkxpz
+          VITE_XP_CONTROLS=true
+          VITE_HAVE_OPFS=false
+          VITE_REQUIRE_OPFS=false
+          EOF
+
+      - name: Build web player with relative asset paths
+        working-directory: engine/nostalgist
+        run: |
+          set -e
+
+          npm install
+
+          npx prettier \
+            --write \
+            src/main.ts \
+            index.html
+
+          npm run lint
+
+          node update-env.ts
+
+          npx vite build \
+            --base=./
+
+          touch dist/.nojekyll
+
+      - name: Verify single-thread deployment package
+        run: |
+          set -e
+
+          test -s \
+            engine/nostalgist/dist/index.html
+
+          test -s \
+            engine/nostalgist/dist/mkxp-z_libretro.js
+
+          test -s \
+            engine/nostalgist/dist/mkxp-z_libretro.wasm
+
+          test -s \
+            engine/nostalgist/dist/slknight.mkxpz
 
           grep -q \
             'src="./assets/' \
-            dist/index.html
+            engine/nostalgist/dist/index.html
 
-          grep -q \
-            'bootfix-' \
-            dist/index.html
+          if grep -q \
+            'src="../assets/' \
+            engine/nostalgist/dist/index.html
+          then
+            echo 'ERROR: broken ../assets path found'
+            exit 1
+          fi
 
-          grep -q \
-            'BOOT: HTML OK' \
-            dist/index.html
+          grep -R \
+            'FRONTEND JS OK / SINGLE THREAD' \
+            engine/nostalgist/dist/assets \
+            >/dev/null
 
           echo \
-            'SLKNIGHT_ASSET_PATH_FIX_OK'
+            'SLKNIGHT_SINGLE_THREAD_BUILD_OK'
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: dist
+          path: engine/nostalgist/dist
 
   deploy:
     name: Deploy GitHub Pages
-
     needs:
       - build
-
-    runs-on:
-      ubuntu-24.04
+    runs-on: ubuntu-24.04
 
     environment:
       name: github-pages
