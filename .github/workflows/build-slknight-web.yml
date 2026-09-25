@@ -1,4 +1,4 @@
-name: Deploy SLKnight Mobile Auto
+name: Deploy SLKnight Fast Runtime Diagnostic
 
 on:
   push:
@@ -18,915 +18,314 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ENGINE_REPO: white-axe/mkxp-z-libretro-emscripten
-  ENGINE_REF: f0a1ff80f05dd0d1f8ca711485a5b0a601bc7502
-  GAME_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLKnight_Android_JoiPlay.zip
-  GAME_SHA256: 9f007d46d2410742aca5e14c3901f63586084007e7f52c4d199116191824132a
+  SITE_URL: https://gowellsik-hue.github.io
 
 jobs:
   build:
-    name: Build SLKnight mobile auto version
+    name: Patch current web build with runtime diagnostics
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
+    timeout-minutes: 15
 
     steps:
-      - name: Install build dependencies
+      - name: Install patch tools
         run: |
           set -e
-
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential automake libtool zip unzip curl \
-            universal-ctags ruby meson cmake ninja-build \
-            python3 python3-pip
+          sudo apt-get install -y curl unzip ruby python3 python3-pip
+          python3 -m pip install --break-system-packages rpzip
 
-          python3 -m pip install \
-            --break-system-packages \
-            rpzip
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Set up Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: 4.0.8
-
-      - name: Checkout mkxp-z web engine
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.ENGINE_REPO }}
-          ref: ${{ env.ENGINE_REF }}
-          submodules: recursive
-          path: engine
-
-      - name: Set up WASI SDK
+      - name: Download current deployed web build
         run: |
           set -e
+          mkdir -p dist/assets
 
           curl -L --fail --retry 3 \
-            -o "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
-            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
-
-          mkdir -p "${RUNNER_TEMP}/wasi-sdk"
-
-          tar -xzf "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
-            -C "${RUNNER_TEMP}/wasi-sdk" \
-            --strip-components=1
-
-      - name: Set up Binaryen
-        run: |
-          set -e
-
-          curl -L --fail --retry 3 \
-            -o "${RUNNER_TEMP}/binaryen.tar.gz" \
-            https://github.com/WebAssembly/binaryen/releases/download/version_126/binaryen-version_126-x86_64-linux.tar.gz
-
-          mkdir -p "${RUNNER_TEMP}/binaryen"
-
-          tar -xzf "${RUNNER_TEMP}/binaryen.tar.gz" \
-            -C "${RUNNER_TEMP}/binaryen" \
-            --strip-components=1
-
-      - name: Build mkxp-z stage 1
-        run: |
-          set -e
-
-          cd engine/mkxp-z/libretro
-
-          CLICOLOR_FORCE=1 make -j "$(nproc)" \
-            WASI_SDK="${RUNNER_TEMP}/wasi-sdk" \
-            WASM_OPT="${RUNNER_TEMP}/binaryen/bin/wasm-opt"
-
-      - name: Configure mkxp-z core
-        run: |
-          set -e
-
-          cat > "${RUNNER_TEMP}/cross.ini" <<EOF
-          [binaries]
-          c = 'emcc'
-          cpp = 'em++'
-          ar = 'emar'
-          cmake = 'cmake'
-
-          [host_machine]
-          system = 'emscripten'
-          cpu_family = 'wasm32'
-          cpu = 'wasm32'
-          endian = 'little'
-
-          [properties]
-          cmake_toolchain_file = '$(em-config EMSCRIPTEN_ROOT)/cmake/Modules/Platform/Emscripten.cmake'
-          EOF
-
-          cd engine/mkxp-z
-
-          CLICOLOR_FORCE=1 meson setup build \
-            --cross-file "${RUNNER_TEMP}/cross.ini" \
-            --buildtype release \
-            -Db_lto=true \
-            -Dlibretro=true \
-            -Dlibretro_save_states=true \
-            -Demscripten_threaded=true
-
-      - name: Build mkxp-z core
-        run: |
-          set -e
-          cd engine/mkxp-z/build
-          CLICOLOR_FORCE=1 ninja -v
-
-      - name: Build WebAssembly frontend
-        run: |
-          set -e
-
-          mv \
-            engine/mkxp-z/build/mkxp-z_libretro.a \
-            engine/retroarch/libretro_emscripten.a
-
-          cd engine/retroarch
-
-          CLICOLOR_FORCE=1 emmake make \
-            -f Makefile.emscripten \
-            LIBRETRO=mkxp-z \
-            HAVE_THREADS=1 \
-            PROXY_TO_PTHREAD=1 \
-            HAVE_AUDIOWORKLET=1 \
-            HAVE_RWEBAUDIO=0 \
-            HAVE_AL=0 \
-            HAVE_WASMFS=1 \
-            HAVE_EXTRA_WASMFS=1
-
-      - name: Download SLKnight release
-        run: |
-          set -e
-
-          curl -L --fail --retry 3 \
-            -o slknight.zip \
-            "${GAME_URL}"
-
-          echo "${GAME_SHA256}  slknight.zip" | sha256sum -c -
-
-          mkdir -p game
-          unzip -q slknight.zip -d game
-
-          test -f game/SLKnight_Android_JoiPlay/Game.ini
-
-      - name: Patch SLKnight runtime and add mobile assist
-        run: |
-          set -e
-
-          GAME_DIR="game/SLKnight_Android_JoiPlay"
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/?run=${GITHUB_RUN_ID}" \
+            -o dist/index.html
 
           python3 - <<'PY'
           from pathlib import Path
+          from urllib.request import Request, urlopen
+          import re
 
-          p = Path("game/SLKnight_Android_JoiPlay/Game.ini")
-          raw = p.read_bytes().splitlines()
-          out = []
+          base = "https://gowellsik-hue.github.io/"
+          html_path = Path("dist/index.html")
+          html = html_path.read_text(encoding="utf-8")
 
-          for line in raw:
-              if line.startswith(b"Title="):
-                  out.append(b"Title=SLKnight")
+          refs = re.findall(r'(?:src|href)=["\']([^"\']+)["\']', html)
+
+          for ref in refs:
+              if ref.startswith("./"):
+                  rel = ref[2:]
+              elif ref.startswith("/"):
+                  rel = ref[1:]
               else:
-                  out.append(line)
+                  continue
 
-          p.write_bytes(b"\r\n".join(out) + b"\r\n")
+              if not rel.startswith("assets/"):
+                  continue
+
+              out = Path("dist") / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+
+              req = Request(
+                  base + rel,
+                  headers={"Cache-Control": "no-cache"},
+              )
+
+              with urlopen(req) as response:
+                  out.write_bytes(response.read())
+
+              print("downloaded", rel)
           PY
 
+          curl -L --fail --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/coi-serviceworker.min.js?run=${GITHUB_RUN_ID}" \
+            -o dist/coi-serviceworker.min.js
+
+          curl -L --fail --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/mkxp-z_libretro.js?run=${GITHUB_RUN_ID}" \
+            -o dist/mkxp-z_libretro.js
+
+          curl -L --fail --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/mkxp-z_libretro.wasm?run=${GITHUB_RUN_ID}" \
+            -o dist/mkxp-z_libretro.wasm
+
+          curl -L --fail --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/slknight.mkxpz?run=${GITHUB_RUN_ID}" \
+            -o current-slknight.mkxpz
+
+          cp current-slknight.mkxpz dist/slknight.mkxpz
+          touch dist/.nojekyll
+
+          test -s dist/index.html
+          test -s dist/mkxp-z_libretro.js
+          test -s dist/mkxp-z_libretro.wasm
+          test -s dist/slknight.mkxpz
+
+      - name: Inject visible RGSS crash screen
+        run: |
+          set -e
+
+          OLD_HASH="$(sha256sum current-slknight.mkxpz | awk '{print $1}')"
+          OLD_SIZE="$(stat -c%s current-slknight.mkxpz)"
+
+          export OLD_HASH OLD_SIZE
+
+          rm -rf game
+          mkdir game
+          unzip -q current-slknight.mkxpz -d game
+
           ruby -rzlib - <<'RB'
-          path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
+          ini = File.binread('game/Game.ini')
+          scripts_rel = ini[/^Scripts=(.+)$/i, 1]
+          abort 'Scripts entry missing from Game.ini' if scripts_rel == nil
+
+          scripts_rel = scripts_rel.strip.tr('\\', '/')
+          path = 'game/' + scripts_rel
+          abort "Scripts file missing: #{path}" unless File.file?(path)
+
           scripts = Marshal.load(File.binread(path))
+          main = scripts.find { |entry| entry.is_a?(Array) && entry[1].to_s == 'Main' }
+          abort 'Main script not found' if main == nil
 
-          changed_resize = false
-          changed_browser = false
-          changed_keyboard = false
+          diagnostic_main = <<'RUBY'
+          # SLKnight browser runtime diagnostic Main.
+          begin
+            Graphics.frame_rate = 50
+            Graphics.freeze
+            $scene = Scene_Title.new
 
-          scripts.each do |entry|
-            next unless entry.is_a?(Array) && entry.length >= 3
+            while $scene != nil
+              $scene.main
+            end
 
-            name = entry[1].to_s
+            Graphics.transition(20)
+          rescue Exception => e
+            begin
+              warn("SLK_FATAL " + e.class.to_s + ": " + e.message.to_s)
+              if e.backtrace != nil
+                warn(e.backtrace.join("\n"))
+              end
+            rescue Exception
+            end
 
             begin
-              src = Zlib::Inflate.inflate(entry[2])
-            rescue
-              next
-            end
+              Graphics.freeze
 
-            patched = src.dup
+              diagnostic_sprite = Sprite.new
+              diagnostic_sprite.z = 99999999
+              diagnostic_sprite.bitmap = Bitmap.new(800, 600)
+              diagnostic_sprite.bitmap.fill_rect(
+                0,
+                0,
+                800,
+                600,
+                Color.new(55, 0, 0, 255)
+              )
 
-            resize_old =
-              "if defined?($joiplay) && $joiplay\r\n" \
-              "  begin\r\n" \
-              "    Graphics.resize_screen($window_width, $window_height)\r\n" \
-              "  rescue\r\n" \
-              "  end\r\n" \
-              "else\r\n" \
-              "  Win32API.SetWindowPos($window_width, $window_height)\r\n" \
-              "end"
+              diagnostic_sprite.bitmap.font.name = ["Arial", "Tahoma"]
+              diagnostic_sprite.bitmap.font.size = 18
+              diagnostic_sprite.bitmap.font.bold = false
+              diagnostic_sprite.bitmap.font.color = Color.new(255, 255, 255, 255)
 
-            resize_new =
-              "begin\r\n" \
-              "  Graphics.resize_screen($window_width, $window_height)\r\n" \
-              "rescue\r\n" \
-              "end"
+              lines = []
+              lines << "SLKnight RUNTIME ERROR"
+              lines << (e.class.to_s + ": " + e.message.to_s)
+              lines << ""
 
-            if patched.include?(resize_old)
-              patched.sub!(resize_old, resize_new)
-              changed_resize = true
-            end
-
-            browser_old =
-              "if defined?($joiplay) && $joiplay\r\n" \
-              "      return\r\n" \
-              "    end\r\n" \
-              "    se = Win32API.new(\"shell32\", \"ShellExecute\", ['L','P','P','P','P','L'], 'L' )\r\n" \
-              "    se.Call(0, \"open\", url, 0, 0, 0)"
-
-            if patched.include?(browser_old)
-              patched.sub!(browser_old, "return")
-              changed_browser = true
-            end
-
-            if name == "Keyboard Input Module"
-              keyboard_old =
-                "  State = Win32API.new(\"user32\",\"GetKeyState\",['i'],'i')\r\n" \
-                "  Key = Win32API.new(\"user32\",\"GetAsyncKeyState\",['i'],'i')"
-
-              keyboard_new =
-                "  class WebKeyStateProxy\r\n" \
-                "    def call(key)\r\n" \
-                "      return 0\r\n" \
-                "    end\r\n" \
-                "  end\r\n" \
-                "  State = WebKeyStateProxy.new\r\n" \
-                "  Key = WebKeyStateProxy.new"
-
-              if patched.include?(keyboard_old)
-                patched.sub!(keyboard_old, keyboard_new)
-                changed_keyboard = true
-              end
-            end
-
-            next if patched == src
-            entry[2] = Zlib::Deflate.deflate(patched)
-          end
-
-          abort 'resize patch not found' unless changed_resize
-          abort 'browser patch not found' unless changed_browser
-          abort 'keyboard web patch not found' unless changed_keyboard
-
-          mobile_assist = <<'RUBY'
-          # SLKnight mobile Diablo-style assist.
-          # Physical Win32 keyboard shortcuts are intentionally disabled on web.
-
-          $mobile_auto_attack_active = false
-          $mobile_auto_attack_event_id = 0
-          $mobile_auto_attack_cooldown = 0
-
-          class Game_Event
-            def mobile_enemy_event?
-              event_data = instance_variable_get(:@event)
-              page_data = instance_variable_get(:@page)
-              erased = instance_variable_get(:@erased)
-
-              return false if event_data == nil
-              return false if page_data == nil
-              return false if erased
-
-              name = event_data.instance_variable_get(:@name).to_s
-
-              return false unless name[0, 3] == "[ID"
-              return false if self.through
-              return false unless self.trigger == 2
-
-              return true
-            end
-          end
-
-          class Interpreter
-            alias mobile_diablo_original_command_111 command_111
-
-            def command_111
-              if $mobile_auto_attack_active &&
-                 @event_id == $mobile_auto_attack_event_id &&
-                 @parameters[0] == 11 &&
-                 @parameters[1] == 13
-
-                $mobile_auto_attack_active = false
-                @branch[@list[@index].indent] = true
-                @branch.delete(@list[@index].indent)
-                return true
-              end
-
-              return mobile_diablo_original_command_111
-            end
-          end
-
-          class Game_Player
-            alias mobile_diablo_original_update update
-
-            def update
-              mobile_diablo_original_update
-
-              if $mobile_auto_attack_cooldown > 0
-                $mobile_auto_attack_cooldown -= 1
-              end
-
-              if $mobile_auto_attack_active && $mobile_auto_attack_cooldown <= 8
-                $mobile_auto_attack_active = false
-              end
-
-              return if moving?
-              return if @move_route_forcing
-              return if $game_temp.message_window_showing
-              return if $game_system.map_interpreter.running?
-              return if $game_switches[743]
-              return if $mobile_auto_attack_cooldown > 0
-
-              target = nil
-              best_distance = 9999
-
-              for event in $game_map.events.values
-                next unless event.mobile_enemy_event?
-
-                dx = event.x - self.x
-                dy = event.y - self.y
-                distance = dx.abs + dy.abs
-
-                next unless distance == 1
-
-                if distance < best_distance
-                  best_distance = distance
-                  target = event
+              if e.backtrace != nil
+                for line in e.backtrace[0, 18]
+                  lines << line.to_s
                 end
               end
 
-              return if target == nil
-
-              dx = target.x - self.x
-              dy = target.y - self.y
-
-              if dx > 0
-                turn_right
-              elsif dx < 0
-                turn_left
-              elsif dy > 0
-                turn_down
-              elsif dy < 0
-                turn_up
+              y = 18
+              for line in lines
+                diagnostic_sprite.bitmap.draw_text(18, y, 764, 24, line.to_s)
+                y += 26
               end
 
-              target.turn_toward_player
+              Graphics.transition(0)
 
-              $mobile_auto_attack_event_id = target.id
-              $mobile_auto_attack_active = true
-              $mobile_auto_attack_cooldown = 20
+              loop do
+                Graphics.update
+                Input.update
+              end
+            rescue Exception => draw_error
+              begin
+                warn(
+                  "SLK_DIAGNOSTIC_DRAW_FAILED " +
+                  draw_error.class.to_s +
+                  ": " +
+                  draw_error.message.to_s
+                )
+              rescue Exception
+              end
 
-              target.start
+              loop do
+                begin
+                  Graphics.update
+                rescue Exception
+                end
+              end
             end
           end
           RUBY
 
-          main_index = scripts.index { |entry| entry[1].to_s == 'Main' }
-          abort 'Main script not found' if main_index == nil
-
-          scripts.insert(
-            main_index,
-            [99999991, 'Mobile Diablo Assist', Zlib::Deflate.deflate(mobile_assist)]
-          )
-
+          main[2] = Zlib::Deflate.deflate(diagnostic_main)
           File.binwrite(path, Marshal.dump(scripts))
 
-          puts 'SLKNIGHT_WEB_KEYBOARD_PATCH_OK'
-          puts 'SLKNIGHT_AUTO_ATTACK_PATCH_OK'
-          puts 'SLKNIGHT_AUTO_LOOT_USES_EXISTING_MONSTER_REWARD_EVENTS'
+          puts 'RGSS_DIAGNOSTIC_MAIN_INJECTED'
           RB
 
-          rm -f "${GAME_DIR}/README_Android.txt"
+          rm -f dist/slknight.mkxpz
 
-      - name: Verify patched RGSS scripts
-        run: |
-          set -e
-
-          ruby -rzlib - <<'RB'
-          path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
-          scripts = Marshal.load(File.binread(path))
-
-          keyboard = scripts.find { |entry| entry[1].to_s == 'Keyboard Input Module' }
-          assist = scripts.find { |entry| entry[1].to_s == 'Mobile Diablo Assist' }
-
-          abort 'Keyboard Input Module missing' if keyboard == nil
-          abort 'Mobile Diablo Assist missing' if assist == nil
-
-          keyboard_src = Zlib::Inflate.inflate(keyboard[2])
-          assist_src = Zlib::Inflate.inflate(assist[2])
-
-          abort 'Win32 keyboard calls still present' if keyboard_src.include?('GetAsyncKeyState')
-          abort 'web keyboard proxy missing' unless keyboard_src.include?('WebKeyStateProxy')
-          abort 'auto attack code missing' unless assist_src.include?('mobile_enemy_event?')
-
-          File.binwrite('/tmp/mobile_diablo_assist.rb', assist_src)
-
-          puts 'PATCHED_RGSS_VERIFY_OK'
-          RB
-
-          ruby -c /tmp/mobile_diablo_assist.rb
-
-      - name: Pack game as mkxpz
-        run: |
-          set -e
-
-          cd game/SLKnight_Android_JoiPlay
-          rpzip -r "${GITHUB_WORKSPACE}/slknight.mkxpz" *
-
+          cd game
+          rpzip -r "${GITHUB_WORKSPACE}/dist/slknight.mkxpz" *
           cd "${GITHUB_WORKSPACE}"
-          ls -lh slknight.mkxpz
 
-      - name: Patch mobile touch frontend
-        run: |
-          set -e
+          NEW_HASH="$(sha256sum dist/slknight.mkxpz | awk '{print $1}')"
+          NEW_SIZE="$(stat -c%s dist/slknight.mkxpz)"
+
+          export NEW_HASH NEW_SIZE
+
+          echo "old game: ${OLD_SIZE} ${OLD_HASH}"
+          echo "new game: ${NEW_SIZE} ${NEW_HASH}"
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
+          import os
 
-          index_path = Path("engine/nostalgist/index.html")
+          old_hash = os.environ["OLD_HASH"]
+          new_hash = os.environ["NEW_HASH"]
+          old_size = os.environ["OLD_SIZE"]
+          new_size = os.environ["NEW_SIZE"]
+
+          candidates = list(Path("dist/assets").glob("index-*.js"))
+          if not candidates:
+              raise SystemExit("Vite index JS not found")
+
+          selected = None
+
+          for path in candidates:
+              text = path.read_text(encoding="utf-8")
+              if old_hash in text:
+                  selected = path
+                  break
+
+          if selected is None:
+              raise SystemExit("Old GAME_HASH not found in frontend JS")
+
+          text = selected.read_text(encoding="utf-8")
+
+          if text.count(old_hash) != 1:
+              raise SystemExit(
+                  "Unexpected GAME_HASH occurrence count: " +
+                  str(text.count(old_hash))
+              )
+
+          if old_size not in text:
+              raise SystemExit("Old GAME_SIZE not found in frontend JS")
+
+          text = text.replace(old_hash, new_hash, 1)
+          text = text.replace(old_size, new_size, 1)
+
+          new_name = (
+              selected.stem +
+              "-diag-" +
+              new_hash[:8] +
+              selected.suffix
+          )
+          new_path = selected.with_name(new_name)
+          new_path.write_text(text, encoding="utf-8")
+          selected.unlink()
+
+          index_path = Path("dist/index.html")
           html = index_path.read_text(encoding="utf-8")
 
-          html = html.replace(
-              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
-              '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
-              1,
-          )
+          old_ref_a = "/assets/" + selected.name
+          old_ref_b = "./assets/" + selected.name
+          new_ref = "/assets/" + new_path.name
 
-          prompt = '''<p
-              id="user-activation-prompt"
-              style="
-                display: none;
-                padding: 14px 22px;
-                border: 1px solid rgba(255,255,255,.55);
-                border-radius: 12px;
-                background: rgba(0,0,0,.75);
-                color: white;
-                font-size: 18px;
-                text-align: center;
-              "
-            >화면을 터치해 시작</p>'''
-
-          html, count = re.subn(
-              r'<p\s+id="user-activation-prompt"[^>]*>.*?</p>',
-              prompt,
-              html,
-              count=1,
-              flags=re.S,
-          )
-
-          if count != 1:
-              raise SystemExit("PATCH FAILED: activation prompt")
+          if old_ref_a in html:
+              html = html.replace(old_ref_a, new_ref, 1)
+          elif old_ref_b in html:
+              html = html.replace(old_ref_b, new_ref, 1)
+          else:
+              raise SystemExit("Frontend JS reference not found in index.html")
 
           index_path.write_text(html, encoding="utf-8")
 
-          main_path = Path("engine/nostalgist/src/main.ts")
-          text = main_path.read_text(encoding="utf-8")
-
-          text = text.replace(
-              'import { Button, Gamepad } from "@rbuljan/gamepad";\n',
-              '',
-              1,
-          )
-
-          text = text.replace(
-              'import { primaryInput } from "detect-it";\n',
-              '',
-              1,
-          )
-
-          block_start = text.find(
-              '// Show an on-screen gamepad overlay if the user is using a touchscreen device'
-          )
-
-          start_call = text.find(
-              'await nostalgist.start();',
-              block_start,
-          )
-
-          if block_start < 0 or start_call < 0:
-              raise SystemExit("PATCH FAILED: stock gamepad block")
-
-          block_end = start_call + len('await nostalgist.start();')
-
-          mobile_code = r'''
-          // SLKnight mobile controls.
-          // Combat is handled automatically by the injected RGSS assist.
-          // Monster reward events already grant drops directly, so loot is automatic.
-
-          const mobileStyle = document.createElement("style");
-
-          mobileStyle.textContent = `
-            html,
-            body {
-              margin: 0 !important;
-              width: 100% !important;
-              height: 100% !important;
-              overflow: hidden !important;
-              overscroll-behavior: none !important;
-              touch-action: none !important;
-              user-select: none !important;
-              -webkit-user-select: none !important;
-              -webkit-touch-callout: none !important;
-              background: #000 !important;
-            }
-
-            #nostalgist-canvas {
-              touch-action: none !important;
-              user-select: none !important;
-              -webkit-user-select: none !important;
-            }
-
-            #gamepad-target {
-              display: none !important;
-              pointer-events: none !important;
-            }
-
-            #sl-mobile-ui {
-              position: fixed;
-              inset: 0;
-              z-index: 5000;
-              pointer-events: none;
-              touch-action: none;
-            }
-
-            #sl-status {
-              position: absolute;
-              left: 50%;
-              top: max(8px, env(safe-area-inset-top));
-              transform: translateX(-50%);
-              padding: 5px 10px;
-              border-radius: 8px;
-              background: rgba(0, 0, 0, 0.55);
-              color: rgba(255, 255, 255, 0.75);
-              font: 12px system-ui, sans-serif;
-              white-space: nowrap;
-              transition: opacity 0.5s;
-            }
-
-            #sl-joystick {
-              position: absolute;
-              left: max(14px, env(safe-area-inset-left));
-              bottom: max(18px, env(safe-area-inset-bottom));
-              width: 178px;
-              height: 178px;
-              border-radius: 50%;
-              pointer-events: auto;
-              touch-action: none;
-            }
-
-            #sl-joy-base {
-              position: absolute;
-              left: 19px;
-              top: 19px;
-              width: 140px;
-              height: 140px;
-              border-radius: 50%;
-              border: 2px solid rgba(230, 230, 230, 0.36);
-              background: rgba(0, 0, 0, 0.18);
-            }
-
-            #sl-joy-knob {
-              position: absolute;
-              left: 54px;
-              top: 54px;
-              width: 70px;
-              height: 70px;
-              border-radius: 50%;
-              border: 2px solid rgba(255, 255, 255, 0.62);
-              background: rgba(40, 40, 40, 0.62);
-              box-shadow: 0 3px 14px rgba(0, 0, 0, 0.45);
-              transform: translate(0px, 0px);
-            }
-
-            #sl-actions {
-              position: absolute;
-              right: max(18px, env(safe-area-inset-right));
-              bottom: max(22px, env(safe-area-inset-bottom));
-              width: 160px;
-              height: 150px;
-              pointer-events: none;
-            }
-
-            .sl-action {
-              position: absolute;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              box-sizing: border-box;
-              border-radius: 50%;
-              border: 2px solid rgba(255, 255, 255, 0.48);
-              background: rgba(0, 0, 0, 0.38);
-              color: rgba(255, 255, 255, 0.88);
-              font: 600 14px system-ui, sans-serif;
-              pointer-events: auto;
-              touch-action: none;
-            }
-
-            .sl-action.active {
-              transform: scale(0.93);
-              background: rgba(255, 255, 255, 0.22);
-              border-color: rgba(255, 255, 255, 0.9);
-            }
-
-            #sl-confirm {
-              width: 88px;
-              height: 88px;
-              right: 0;
-              bottom: 0;
-            }
-
-            #sl-cancel {
-              width: 60px;
-              height: 60px;
-              right: 94px;
-              bottom: 82px;
-              font-size: 12px;
-            }
-
-            @media (orientation: portrait) {
-              #sl-joystick {
-                width: 155px;
-                height: 155px;
-              }
-
-              #sl-joy-base {
-                left: 17px;
-                top: 17px;
-                width: 121px;
-                height: 121px;
-              }
-
-              #sl-joy-knob {
-                left: 49px;
-                top: 49px;
-                width: 57px;
-                height: 57px;
-              }
-            }
-          `;
-
-          document.head.appendChild(mobileStyle);
-
-          const mobileUi = document.createElement("div");
-          mobileUi.id = "sl-mobile-ui";
-          mobileUi.innerHTML = `
-            <div id="sl-status">엔진 시작 중...</div>
-
-            <div id="sl-joystick">
-              <div id="sl-joy-base"></div>
-              <div id="sl-joy-knob"></div>
-            </div>
-
-            <div id="sl-actions">
-              <button id="sl-cancel" class="sl-action" type="button">취소</button>
-              <button id="sl-confirm" class="sl-action" type="button">확인</button>
-            </div>
-          `;
-
-          document.body.appendChild(mobileUi);
-
-          type SlDirection = "up" | "down" | "left" | "right";
-
-          const heldDirections = new Set<SlDirection>();
-          const joystick = document.getElementById("sl-joystick");
-          const knob = document.getElementById("sl-joy-knob");
-          const status = document.getElementById("sl-status");
-          let joystickPointer: number | null = null;
-
-          const setDirections = (next: Set<SlDirection>) => {
-            for (const direction of heldDirections) {
-              if (!next.has(direction)) {
-                nostalgist.pressUp({ button: direction });
-              }
-            }
-
-            for (const direction of next) {
-              if (!heldDirections.has(direction)) {
-                nostalgist.pressDown({ button: direction });
-              }
-            }
-
-            heldDirections.clear();
-            for (const direction of next) {
-              heldDirections.add(direction);
-            }
-          };
-
-          const updateJoystick = (clientX: number, clientY: number) => {
-            if (joystick === null || knob === null) {
-              return;
-            }
-
-            const rect = joystick.getBoundingClientRect();
-            const centerX = rect.left + rect.width / 2;
-            const centerY = rect.top + rect.height / 2;
-
-            let dx = clientX - centerX;
-            let dy = clientY - centerY;
-
-            const maxDistance = Math.min(rect.width, rect.height) * 0.3;
-            const distance = Math.hypot(dx, dy);
-
-            if (distance > maxDistance) {
-              const scale = maxDistance / distance;
-              dx *= scale;
-              dy *= scale;
-            }
-
-            knob.style.transform = `translate(${dx}px, ${dy}px)`;
-
-            const dead = maxDistance * 0.28;
-            const next = new Set<SlDirection>();
-
-            if (dx < -dead) next.add("left");
-            if (dx > dead) next.add("right");
-            if (dy < -dead) next.add("up");
-            if (dy > dead) next.add("down");
-
-            setDirections(next);
-          };
-
-          const resetJoystick = () => {
-            if (knob !== null) {
-              knob.style.transform = "translate(0px, 0px)";
-            }
-
-            setDirections(new Set<SlDirection>());
-            joystickPointer = null;
-          };
-
-          if (joystick !== null) {
-            joystick.addEventListener("pointerdown", (event) => {
-              event.preventDefault();
-
-              if (joystickPointer !== null) {
-                return;
-              }
-
-              joystickPointer = event.pointerId;
-
-              try {
-                joystick.setPointerCapture(event.pointerId);
-              } catch {
-                // Pointer capture is optional.
-              }
-
-              updateJoystick(event.clientX, event.clientY);
-            });
-
-            joystick.addEventListener("pointermove", (event) => {
-              if (event.pointerId !== joystickPointer) {
-                return;
-              }
-
-              event.preventDefault();
-              updateJoystick(event.clientX, event.clientY);
-            });
-
-            joystick.addEventListener("pointerup", (event) => {
-              if (event.pointerId !== joystickPointer) {
-                return;
-              }
-
-              event.preventDefault();
-              resetJoystick();
-            });
-
-            joystick.addEventListener("pointercancel", () => {
-              resetJoystick();
-            });
-          }
-
-          const bindButton = (
-            id: string,
-            button: "a" | "b",
-          ) => {
-            const element = document.getElementById(id);
-
-            if (element === null) {
-              return;
-            }
-
-            element.addEventListener("pointerdown", (event) => {
-              event.preventDefault();
-              element.classList.add("active");
-
-              try {
-                element.setPointerCapture(event.pointerId);
-              } catch {
-                // Pointer capture is optional.
-              }
-
-              nostalgist.pressDown({ button });
-            });
-
-            const release = (event: PointerEvent) => {
-              event.preventDefault();
-              element.classList.remove("active");
-              nostalgist.pressUp({ button });
-            };
-
-            element.addEventListener("pointerup", release);
-            element.addEventListener("pointercancel", release);
-          };
-
-          bindButton("sl-confirm", "a");
-          bindButton("sl-cancel", "b");
-
-          window.addEventListener("blur", () => {
-            resetJoystick();
-            nostalgist.pressUp({ button: "a" });
-            nostalgist.pressUp({ button: "b" });
-          });
-
-          document.addEventListener("contextmenu", (event) => {
-            event.preventDefault();
-          });
-
-          try {
-            await nostalgist.start();
-
-            if (status !== null) {
-              status.textContent = "자동공격 · 자동줍기";
-              window.setTimeout(() => {
-                status.style.opacity = "0";
-              }, 2500);
-            }
-          } catch (error) {
-            if (status !== null) {
-              status.textContent = `실행 오류: ${String(error)}`;
-              status.style.opacity = "1";
-            }
-
-            throw error;
-          }
-          '''
-
-          text = text[:block_start] + mobile_code + text[block_end:]
-          main_path.write_text(text, encoding="utf-8")
-
-          print("MOBILE_TOUCH_FRONTEND_PATCH_OK")
+          print("patched frontend GAME_HASH", new_hash)
+          print("patched frontend GAME_SIZE", new_size)
+          print("renamed frontend JS", new_path.name)
           PY
 
-      - name: Copy game and engine into web player
+      - name: Verify diagnostic deployment files
         run: |
           set -e
 
-          mv engine/retroarch/mkxp-z_libretro.js engine/nostalgist/public/
-          mv engine/retroarch/mkxp-z_libretro.wasm engine/nostalgist/public/
-          mv slknight.mkxpz engine/nostalgist/public/
+          test -s dist/index.html
+          test -s dist/mkxp-z_libretro.js
+          test -s dist/mkxp-z_libretro.wasm
+          test -s dist/slknight.mkxpz
 
-      - name: Configure web player
-        run: |
-          set -e
+          grep -q 'diag-' dist/index.html
 
-          cat > engine/nostalgist/.env <<'EOF'
-          VITE_CORE_JS_PATH=./mkxp-z_libretro.js
-          VITE_CORE_WASM_PATH=./mkxp-z_libretro.wasm
-          VITE_GAME_NAME=SLKnight Mobile
-          VITE_GAME_PATH=./slknight.mkxpz
-          VITE_XP_CONTROLS=true
-          VITE_HAVE_OPFS=true
-          VITE_REQUIRE_OPFS=false
-          EOF
+          unzip -tq dist/slknight.mkxpz >/dev/null
 
-      - name: Build mobile web player
-        working-directory: engine/nostalgist
-        run: |
-          set -e
-
-          npm install
-          npx prettier --write src/main.ts index.html
-          npm run build
-          touch dist/.nojekyll
-
-      - name: Verify mobile build
-        run: |
-          set -e
-
-          test -s engine/nostalgist/dist/index.html
-          test -s engine/nostalgist/dist/mkxp-z_libretro.js
-          test -s engine/nostalgist/dist/mkxp-z_libretro.wasm
-          test -s engine/nostalgist/dist/slknight.mkxpz
-
-          grep -R "자동공격" engine/nostalgist/dist/assets >/dev/null
-          grep -R "화면을 터치해 시작" engine/nostalgist/dist/index.html >/dev/null
-
-          echo "SLKNIGHT_MOBILE_AUTO_BUILD_OK"
+          echo 'SLKNIGHT_FAST_DIAGNOSTIC_BUILD_OK'
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: engine/nostalgist/dist
+          path: dist
 
   deploy:
     name: Deploy GitHub Pages
