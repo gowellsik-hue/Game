@@ -1,4 +1,4 @@
-name: Deploy SLKnight Mobile Touch
+name: Deploy SLKnight Mobile Auto
 
 on:
   push:
@@ -25,7 +25,7 @@ env:
 
 jobs:
   build:
-    name: Build SLKnight mobile browser version
+    name: Build SLKnight mobile auto version
     runs-on: ubuntu-24.04
     timeout-minutes: 70
 
@@ -35,21 +35,10 @@ jobs:
           set -e
 
           sudo apt-get update
-
           sudo apt-get install -y \
-            build-essential \
-            automake \
-            libtool \
-            zip \
-            unzip \
-            curl \
-            universal-ctags \
-            ruby \
-            meson \
-            cmake \
-            ninja-build \
-            python3 \
-            python3-pip
+            build-essential automake libtool zip unzip curl \
+            universal-ctags ruby meson cmake ninja-build \
+            python3 python3-pip
 
           python3 -m pip install \
             --break-system-packages \
@@ -77,16 +66,13 @@ jobs:
         run: |
           set -e
 
-          curl -L \
-            --fail \
-            --retry 3 \
+          curl -L --fail --retry 3 \
             -o "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
             https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
 
           mkdir -p "${RUNNER_TEMP}/wasi-sdk"
 
-          tar -xzf \
-            "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
+          tar -xzf "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
             -C "${RUNNER_TEMP}/wasi-sdk" \
             --strip-components=1
 
@@ -94,16 +80,13 @@ jobs:
         run: |
           set -e
 
-          curl -L \
-            --fail \
-            --retry 3 \
+          curl -L --fail --retry 3 \
             -o "${RUNNER_TEMP}/binaryen.tar.gz" \
             https://github.com/WebAssembly/binaryen/releases/download/version_126/binaryen-version_126-x86_64-linux.tar.gz
 
           mkdir -p "${RUNNER_TEMP}/binaryen"
 
-          tar -xzf \
-            "${RUNNER_TEMP}/binaryen.tar.gz" \
+          tar -xzf "${RUNNER_TEMP}/binaryen.tar.gz" \
             -C "${RUNNER_TEMP}/binaryen" \
             --strip-components=1
 
@@ -113,9 +96,7 @@ jobs:
 
           cd engine/mkxp-z/libretro
 
-          CLICOLOR_FORCE=1 \
-          make \
-            -j "$(nproc)" \
+          CLICOLOR_FORCE=1 make -j "$(nproc)" \
             WASI_SDK="${RUNNER_TEMP}/wasi-sdk" \
             WASM_OPT="${RUNNER_TEMP}/binaryen/bin/wasm-opt"
 
@@ -142,9 +123,7 @@ jobs:
 
           cd engine/mkxp-z
 
-          CLICOLOR_FORCE=1 \
-          meson setup \
-            build \
+          CLICOLOR_FORCE=1 meson setup build \
             --cross-file "${RUNNER_TEMP}/cross.ini" \
             --buildtype release \
             -Db_lto=true \
@@ -155,7 +134,6 @@ jobs:
       - name: Build mkxp-z core
         run: |
           set -e
-
           cd engine/mkxp-z/build
           CLICOLOR_FORCE=1 ninja -v
 
@@ -169,8 +147,7 @@ jobs:
 
           cd engine/retroarch
 
-          CLICOLOR_FORCE=1 \
-          emmake make \
+          CLICOLOR_FORCE=1 emmake make \
             -f Makefile.emscripten \
             LIBRETRO=mkxp-z \
             HAVE_THREADS=1 \
@@ -185,25 +162,18 @@ jobs:
         run: |
           set -e
 
-          curl -L \
-            --fail \
-            --retry 3 \
+          curl -L --fail --retry 3 \
             -o slknight.zip \
             "${GAME_URL}"
 
           echo "${GAME_SHA256}  slknight.zip" | sha256sum -c -
 
           mkdir -p game
+          unzip -q slknight.zip -d game
 
-          unzip \
-            -q \
-            slknight.zip \
-            -d game
+          test -f game/SLKnight_Android_JoiPlay/Game.ini
 
-          test -f \
-            game/SLKnight_Android_JoiPlay/Game.ini
-
-      - name: Patch SLKnight for browser engine
+      - name: Patch SLKnight runtime and add mobile assist
         run: |
           set -e
 
@@ -213,7 +183,6 @@ jobs:
           from pathlib import Path
 
           p = Path("game/SLKnight_Android_JoiPlay/Game.ini")
-
           raw = p.read_bytes().splitlines()
           out = []
 
@@ -228,14 +197,16 @@ jobs:
 
           ruby -rzlib - <<'RB'
           path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
-
           scripts = Marshal.load(File.binread(path))
 
           changed_resize = false
           changed_browser = false
+          changed_keyboard = false
 
           scripts.each do |entry|
             next unless entry.is_a?(Array) && entry.length >= 3
+
+            name = entry[1].to_s
 
             begin
               src = Zlib::Inflate.inflate(entry[2])
@@ -278,34 +249,199 @@ jobs:
               changed_browser = true
             end
 
-            next if patched == src
+            if name == "Keyboard Input Module"
+              keyboard_old =
+                "  State = Win32API.new(\"user32\",\"GetKeyState\",['i'],'i')\r\n" \
+                "  Key = Win32API.new(\"user32\",\"GetAsyncKeyState\",['i'],'i')"
 
+              keyboard_new =
+                "  class WebKeyStateProxy\r\n" \
+                "    def call(key)\r\n" \
+                "      return 0\r\n" \
+                "    end\r\n" \
+                "  end\r\n" \
+                "  State = WebKeyStateProxy.new\r\n" \
+                "  Key = WebKeyStateProxy.new"
+
+              if patched.include?(keyboard_old)
+                patched.sub!(keyboard_old, keyboard_new)
+                changed_keyboard = true
+              end
+            end
+
+            next if patched == src
             entry[2] = Zlib::Deflate.deflate(patched)
           end
 
           abort 'resize patch not found' unless changed_resize
           abort 'browser patch not found' unless changed_browser
+          abort 'keyboard web patch not found' unless changed_keyboard
+
+          mobile_assist = <<'RUBY'
+          # SLKnight mobile Diablo-style assist.
+          # Physical Win32 keyboard shortcuts are intentionally disabled on web.
+
+          $mobile_auto_attack_active = false
+          $mobile_auto_attack_event_id = 0
+          $mobile_auto_attack_cooldown = 0
+
+          class Game_Event
+            def mobile_enemy_event?
+              event_data = instance_variable_get(:@event)
+              page_data = instance_variable_get(:@page)
+              erased = instance_variable_get(:@erased)
+
+              return false if event_data == nil
+              return false if page_data == nil
+              return false if erased
+
+              name = event_data.instance_variable_get(:@name).to_s
+
+              return false unless name[0, 3] == "[ID"
+              return false if self.through
+              return false unless self.trigger == 2
+
+              return true
+            end
+          end
+
+          class Interpreter
+            alias mobile_diablo_original_command_111 command_111
+
+            def command_111
+              if $mobile_auto_attack_active &&
+                 @event_id == $mobile_auto_attack_event_id &&
+                 @parameters[0] == 11 &&
+                 @parameters[1] == 13
+
+                $mobile_auto_attack_active = false
+                @branch[@list[@index].indent] = true
+                @branch.delete(@list[@index].indent)
+                return true
+              end
+
+              return mobile_diablo_original_command_111
+            end
+          end
+
+          class Game_Player
+            alias mobile_diablo_original_update update
+
+            def update
+              mobile_diablo_original_update
+
+              if $mobile_auto_attack_cooldown > 0
+                $mobile_auto_attack_cooldown -= 1
+              end
+
+              if $mobile_auto_attack_active && $mobile_auto_attack_cooldown <= 8
+                $mobile_auto_attack_active = false
+              end
+
+              return if moving?
+              return if @move_route_forcing
+              return if $game_temp.message_window_showing
+              return if $game_system.map_interpreter.running?
+              return if $game_switches[743]
+              return if $mobile_auto_attack_cooldown > 0
+
+              target = nil
+              best_distance = 9999
+
+              for event in $game_map.events.values
+                next unless event.mobile_enemy_event?
+
+                dx = event.x - self.x
+                dy = event.y - self.y
+                distance = dx.abs + dy.abs
+
+                next unless distance == 1
+
+                if distance < best_distance
+                  best_distance = distance
+                  target = event
+                end
+              end
+
+              return if target == nil
+
+              dx = target.x - self.x
+              dy = target.y - self.y
+
+              if dx > 0
+                turn_right
+              elsif dx < 0
+                turn_left
+              elsif dy > 0
+                turn_down
+              elsif dy < 0
+                turn_up
+              end
+
+              target.turn_toward_player
+
+              $mobile_auto_attack_event_id = target.id
+              $mobile_auto_attack_active = true
+              $mobile_auto_attack_cooldown = 20
+
+              target.start
+            end
+          end
+          RUBY
+
+          main_index = scripts.index { |entry| entry[1].to_s == 'Main' }
+          abort 'Main script not found' if main_index == nil
+
+          scripts.insert(
+            main_index,
+            [99999991, 'Mobile Diablo Assist', Zlib::Deflate.deflate(mobile_assist)]
+          )
 
           File.binwrite(path, Marshal.dump(scripts))
 
-          puts 'SLKnight browser patches applied'
+          puts 'SLKNIGHT_WEB_KEYBOARD_PATCH_OK'
+          puts 'SLKNIGHT_AUTO_ATTACK_PATCH_OK'
+          puts 'SLKNIGHT_AUTO_LOOT_USES_EXISTING_MONSTER_REWARD_EVENTS'
           RB
 
           rm -f "${GAME_DIR}/README_Android.txt"
+
+      - name: Verify patched RGSS scripts
+        run: |
+          set -e
+
+          ruby -rzlib - <<'RB'
+          path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
+          scripts = Marshal.load(File.binread(path))
+
+          keyboard = scripts.find { |entry| entry[1].to_s == 'Keyboard Input Module' }
+          assist = scripts.find { |entry| entry[1].to_s == 'Mobile Diablo Assist' }
+
+          abort 'Keyboard Input Module missing' if keyboard == nil
+          abort 'Mobile Diablo Assist missing' if assist == nil
+
+          keyboard_src = Zlib::Inflate.inflate(keyboard[2])
+          assist_src = Zlib::Inflate.inflate(assist[2])
+
+          abort 'Win32 keyboard calls still present' if keyboard_src.include?('GetAsyncKeyState')
+          abort 'web keyboard proxy missing' unless keyboard_src.include?('WebKeyStateProxy')
+          abort 'auto attack code missing' unless assist_src.include?('mobile_enemy_event?')
+
+          File.binwrite('/tmp/mobile_diablo_assist.rb', assist_src)
+
+          puts 'PATCHED_RGSS_VERIFY_OK'
+          RB
+
+          ruby -c /tmp/mobile_diablo_assist.rb
 
       - name: Pack game as mkxpz
         run: |
           set -e
 
           cd game/SLKnight_Android_JoiPlay
-
-          rpzip \
-            -r \
-            "${GITHUB_WORKSPACE}/slknight.mkxpz" \
-            *
+          rpzip -r "${GITHUB_WORKSPACE}/slknight.mkxpz" *
 
           cd "${GITHUB_WORKSPACE}"
-
           ls -lh slknight.mkxpz
 
       - name: Patch mobile touch frontend
@@ -314,150 +450,81 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           index_path = Path("engine/nostalgist/index.html")
           html = index_path.read_text(encoding="utf-8")
 
-          old_viewport = (
-              '<meta name="viewport" '
-              'content="width=device-width, initial-scale=1.0" />'
+          html = html.replace(
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
+              1,
           )
 
-          new_viewport = (
-              '<meta name="viewport" '
-              'content="width=device-width, initial-scale=1.0, '
-              'maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />'
-          )
+          prompt = '''<p
+              id="user-activation-prompt"
+              style="
+                display: none;
+                padding: 14px 22px;
+                border: 1px solid rgba(255,255,255,.55);
+                border-radius: 12px;
+                background: rgba(0,0,0,.75);
+                color: white;
+                font-size: 18px;
+                text-align: center;
+              "
+            >화면을 터치해 시작</p>'''
 
-          if old_viewport in html:
-              html = html.replace(
-                  old_viewport,
-                  new_viewport,
-                  1
-              )
-
-          old_prompt = (
-              '<p id="user-activation-prompt" '
-              'style="display: none; font-size: 100px">'
-          )
-
-          new_prompt = (
-              '<p id="user-activation-prompt" '
-              'style="display:none;font-size:32px;'
-              'text-align:center;line-height:1.5">'
-          )
-
-          if old_prompt in html:
-              html = html.replace(
-                  old_prompt,
-                  new_prompt,
-                  1
-              )
-
-          index_path.write_text(
+          html, count = re.subn(
+              r'<p\s+id="user-activation-prompt"[^>]*>.*?</p>',
+              prompt,
               html,
-              encoding="utf-8"
+              count=1,
+              flags=re.S,
           )
 
-          main_path = Path(
-              "engine/nostalgist/src/main.ts"
-          )
+          if count != 1:
+              raise SystemExit("PATCH FAILED: activation prompt")
 
-          text = main_path.read_text(
-              encoding="utf-8"
-          )
+          index_path.write_text(html, encoding="utf-8")
 
-          game_name_marker = '''if (GAME_NAME !== null) {
-            document.title = GAME_NAME;
-          }
-          '''
-
-          error_support = r'''
-
-          const slErrorBox = document.createElement("div");
-
-          slErrorBox.id = "sl-runtime-error";
-
-          slErrorBox.style.cssText = `
-            display:none;
-            position:fixed;
-            left:12px;
-            right:12px;
-            top:12px;
-            z-index:99999;
-            padding:12px 14px;
-            border-radius:10px;
-            background:rgba(80,0,0,.94);
-            border:1px solid rgba(255,120,120,.8);
-            color:white;
-            font:13px/1.45 system-ui,sans-serif;
-            white-space:pre-wrap;
-            word-break:break-word;
-            pointer-events:auto;
-          `;
-
-          document.body.appendChild(slErrorBox);
-
-          const showSlError = (message: string) => {
-            slErrorBox.textContent =
-              "SLKnight 실행 오류\n\n" + message;
-
-            slErrorBox.style.display = "block";
-          };
-
-          window.addEventListener("error", (event) => {
-            showSlError(
-              event.message || "Unknown browser error"
-            );
-          });
-
-          window.addEventListener(
-            "unhandledrejection",
-            (event) => {
-              showSlError(
-                String(
-                  event.reason ??
-                    "Unhandled promise rejection"
-                )
-              );
-            }
-          );
-
-          '''
-
-          if game_name_marker not in text:
-              raise SystemExit(
-                  "PATCH FAILED: GAME_NAME marker"
-              )
+          main_path = Path("engine/nostalgist/src/main.ts")
+          text = main_path.read_text(encoding="utf-8")
 
           text = text.replace(
-              game_name_marker,
-              game_name_marker + error_support,
-              1
+              'import { Button, Gamepad } from "@rbuljan/gamepad";\n',
+              '',
+              1,
           )
 
-          start_marker = "await nostalgist.start();"
+          text = text.replace(
+              'import { primaryInput } from "detect-it";\n',
+              '',
+              1,
+          )
 
-          mobile_touch_code = r'''
+          block_start = text.find(
+              '// Show an on-screen gamepad overlay if the user is using a touchscreen device'
+          )
 
-          const stockGamepad =
-            document.getElementById(
-              "gamepad-target"
-            );
+          start_call = text.find(
+              'await nostalgist.start();',
+              block_start,
+          )
 
-          if (stockGamepad !== null) {
-            stockGamepad.style.setProperty(
-              "display",
-              "none",
-              "important"
-            );
-          }
+          if block_start < 0 or start_call < 0:
+              raise SystemExit("PATCH FAILED: stock gamepad block")
 
-          const mobileStyle =
-            document.createElement("style");
+          block_end = start_call + len('await nostalgist.start();')
+
+          mobile_code = r'''
+          // SLKnight mobile controls.
+          // Combat is handled automatically by the injected RGSS assist.
+          // Monster reward events already grant drops directly, so loot is automatic.
+
+          const mobileStyle = document.createElement("style");
 
           mobileStyle.textContent = `
-
             html,
             body {
               margin: 0 !important;
@@ -491,16 +558,24 @@ jobs:
               touch-action: none;
             }
 
+            #sl-status {
+              position: absolute;
+              left: 50%;
+              top: max(8px, env(safe-area-inset-top));
+              transform: translateX(-50%);
+              padding: 5px 10px;
+              border-radius: 8px;
+              background: rgba(0, 0, 0, 0.55);
+              color: rgba(255, 255, 255, 0.75);
+              font: 12px system-ui, sans-serif;
+              white-space: nowrap;
+              transition: opacity 0.5s;
+            }
+
             #sl-joystick {
               position: absolute;
-              left: max(
-                14px,
-                env(safe-area-inset-left)
-              );
-              bottom: max(
-                16px,
-                env(safe-area-inset-bottom)
-              );
+              left: max(14px, env(safe-area-inset-left));
+              bottom: max(18px, env(safe-area-inset-bottom));
               width: 178px;
               height: 178px;
               border-radius: 50%;
@@ -515,10 +590,8 @@ jobs:
               width: 140px;
               height: 140px;
               border-radius: 50%;
-              border: 2px solid
-                rgba(230, 230, 230, 0.38);
-              background:
-                rgba(0, 0, 0, 0.18);
+              border: 2px solid rgba(230, 230, 230, 0.36);
+              background: rgba(0, 0, 0, 0.18);
             }
 
             #sl-joy-knob {
@@ -528,154 +601,55 @@ jobs:
               width: 70px;
               height: 70px;
               border-radius: 50%;
-              border: 2px solid
-                rgba(255, 255, 255, 0.62);
-              background:
-                rgba(40, 40, 40, 0.62);
-              box-shadow:
-                0 3px 14px
-                rgba(0, 0, 0, 0.45);
-              transform:
-                translate(0px, 0px);
+              border: 2px solid rgba(255, 255, 255, 0.62);
+              background: rgba(40, 40, 40, 0.62);
+              box-shadow: 0 3px 14px rgba(0, 0, 0, 0.45);
+              transform: translate(0px, 0px);
             }
 
             #sl-actions {
               position: absolute;
-              right: max(
-                14px,
-                env(safe-area-inset-right)
-              );
-              bottom: max(
-                14px,
-                env(safe-area-inset-bottom)
-              );
-              width: 215px;
-              height: 205px;
+              right: max(18px, env(safe-area-inset-right));
+              bottom: max(22px, env(safe-area-inset-bottom));
+              width: 160px;
+              height: 150px;
               pointer-events: none;
             }
 
-            .sl-touch-btn {
+            .sl-action {
               position: absolute;
               display: flex;
-              justify-content: center;
               align-items: center;
+              justify-content: center;
               box-sizing: border-box;
               border-radius: 50%;
-              border: 2px solid
-                rgba(255, 255, 255, 0.48);
-              background:
-                rgba(0, 0, 0, 0.38);
-              color:
-                rgba(255, 255, 255, 0.86);
-              font:
-                600 14px/1
-                system-ui,
-                sans-serif;
-              text-align: center;
+              border: 2px solid rgba(255, 255, 255, 0.48);
+              background: rgba(0, 0, 0, 0.38);
+              color: rgba(255, 255, 255, 0.88);
+              font: 600 14px system-ui, sans-serif;
               pointer-events: auto;
               touch-action: none;
             }
 
-            .sl-touch-btn.active {
+            .sl-action.active {
               transform: scale(0.93);
-              background:
-                rgba(255, 255, 255, 0.22);
-              border-color:
-                rgba(255, 255, 255, 0.9);
+              background: rgba(255, 255, 255, 0.22);
+              border-color: rgba(255, 255, 255, 0.9);
             }
 
-            #sl-btn-f {
+            #sl-confirm {
               width: 88px;
               height: 88px;
               right: 0;
-              bottom: 32px;
-              font-size: 16px;
-            }
-
-            #sl-btn-h {
-              width: 58px;
-              height: 58px;
-              right: 94px;
               bottom: 0;
             }
 
-            #sl-btn-e {
-              width: 58px;
-              height: 58px;
-              right: 105px;
-              bottom: 70px;
-            }
-
-            #sl-btn-tab {
-              width: 58px;
-              height: 58px;
-              right: 55px;
-              bottom: 132px;
-              font-size: 11px;
-            }
-
-            #sl-hotbar {
-              position: absolute;
-              left: 50%;
-              bottom: max(
-                12px,
-                env(safe-area-inset-bottom)
-              );
-              transform:
-                translateX(-50%);
-              display: flex;
-              gap: 5px;
-              pointer-events: auto;
-            }
-
-            .sl-hotkey {
-              width: 37px;
-              height: 37px;
-              border-radius: 9px;
-              border: 1px solid
-                rgba(255, 255, 255, 0.38);
-              background:
-                rgba(0, 0, 0, 0.42);
-              color:
-                rgba(255, 255, 255, 0.82);
-              font:
-                600 14px
-                system-ui,
-                sans-serif;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              pointer-events: auto;
-              touch-action: none;
-            }
-
-            .sl-hotkey.active {
-              background:
-                rgba(255, 255, 255, 0.25);
-              transform: scale(0.93);
-            }
-
-            #sl-control-hint {
-              position: absolute;
-              left: 50%;
-              top: max(
-                7px,
-                env(safe-area-inset-top)
-              );
-              transform:
-                translateX(-50%);
-              padding: 4px 9px;
-              border-radius: 7px;
-              background:
-                rgba(0, 0, 0, 0.38);
-              color:
-                rgba(255, 255, 255, 0.62);
-              font:
-                11px
-                system-ui,
-                sans-serif;
-              white-space: nowrap;
-              pointer-events: none;
+            #sl-cancel {
+              width: 60px;
+              height: 60px;
+              right: 94px;
+              bottom: 82px;
+              font-size: 12px;
             }
 
             @media (orientation: portrait) {
@@ -697,40 +671,15 @@ jobs:
                 width: 57px;
                 height: 57px;
               }
-
-              #sl-actions {
-                transform: scale(0.88);
-                transform-origin:
-                  right bottom;
-              }
-
-              #sl-hotbar {
-                bottom: 185px;
-              }
-
-              .sl-hotkey {
-                width: 34px;
-                height: 34px;
-                font-size: 13px;
-              }
             }
-
           `;
 
-          document.head.appendChild(
-            mobileStyle
-          );
+          document.head.appendChild(mobileStyle);
 
-          const mobileUi =
-            document.createElement("div");
-
+          const mobileUi = document.createElement("div");
           mobileUi.id = "sl-mobile-ui";
-
           mobileUi.innerHTML = `
-
-            <div id="sl-control-hint">
-              왼쪽 이동 · 오른쪽 액션
-            </div>
+            <div id="sl-status">엔진 시작 중...</div>
 
             <div id="sl-joystick">
               <div id="sl-joy-base"></div>
@@ -738,729 +687,203 @@ jobs:
             </div>
 
             <div id="sl-actions">
-
-              <button
-                id="sl-btn-f"
-                class="sl-touch-btn"
-                type="button"
-              >
-                공격<br />F
-              </button>
-
-              <button
-                id="sl-btn-h"
-                class="sl-touch-btn"
-                type="button"
-              >
-                H
-              </button>
-
-              <button
-                id="sl-btn-e"
-                class="sl-touch-btn"
-                type="button"
-              >
-                E
-              </button>
-
-              <button
-                id="sl-btn-tab"
-                class="sl-touch-btn"
-                type="button"
-              >
-                TAB
-              </button>
-
+              <button id="sl-cancel" class="sl-action" type="button">취소</button>
+              <button id="sl-confirm" class="sl-action" type="button">확인</button>
             </div>
-
-            <div id="sl-hotbar">
-              <button
-                class="sl-hotkey"
-                data-sl-key="1"
-                type="button"
-              >1</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="2"
-                type="button"
-              >2</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="3"
-                type="button"
-              >3</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="4"
-                type="button"
-              >4</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="5"
-                type="button"
-              >5</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="6"
-                type="button"
-              >6</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="7"
-                type="button"
-              >7</button>
-
-              <button
-                class="sl-hotkey"
-                data-sl-key="8"
-                type="button"
-              >8</button>
-            </div>
-
           `;
 
-          document.body.appendChild(
-            mobileUi
-          );
+          document.body.appendChild(mobileUi);
 
-          type SlKeySpec = {
-            code: string;
-            key: string;
-            keyCode: number;
+          type SlDirection = "up" | "down" | "left" | "right";
+
+          const heldDirections = new Set<SlDirection>();
+          const joystick = document.getElementById("sl-joystick");
+          const knob = document.getElementById("sl-joy-knob");
+          const status = document.getElementById("sl-status");
+          let joystickPointer: number | null = null;
+
+          const setDirections = (next: Set<SlDirection>) => {
+            for (const direction of heldDirections) {
+              if (!next.has(direction)) {
+                nostalgist.pressUp({ button: direction });
+              }
+            }
+
+            for (const direction of next) {
+              if (!heldDirections.has(direction)) {
+                nostalgist.pressDown({ button: direction });
+              }
+            }
+
+            heldDirections.clear();
+            for (const direction of next) {
+              heldDirections.add(direction);
+            }
           };
 
-          const slKeys:
-            Record<string, SlKeySpec> = {
-
-            UP: {
-              code: "ArrowUp",
-              key: "ArrowUp",
-              keyCode: 38,
-            },
-
-            DOWN: {
-              code: "ArrowDown",
-              key: "ArrowDown",
-              keyCode: 40,
-            },
-
-            LEFT: {
-              code: "ArrowLeft",
-              key: "ArrowLeft",
-              keyCode: 37,
-            },
-
-            RIGHT: {
-              code: "ArrowRight",
-              key: "ArrowRight",
-              keyCode: 39,
-            },
-
-            F: {
-              code: "KeyF",
-              key: "f",
-              keyCode: 70,
-            },
-
-            H: {
-              code: "KeyH",
-              key: "h",
-              keyCode: 72,
-            },
-
-            E: {
-              code: "KeyE",
-              key: "e",
-              keyCode: 69,
-            },
-
-            TAB: {
-              code: "Tab",
-              key: "Tab",
-              keyCode: 9,
-            },
-
-            "1": {
-              code: "Digit1",
-              key: "1",
-              keyCode: 49,
-            },
-
-            "2": {
-              code: "Digit2",
-              key: "2",
-              keyCode: 50,
-            },
-
-            "3": {
-              code: "Digit3",
-              key: "3",
-              keyCode: 51,
-            },
-
-            "4": {
-              code: "Digit4",
-              key: "4",
-              keyCode: 52,
-            },
-
-            "5": {
-              code: "Digit5",
-              key: "5",
-              keyCode: 53,
-            },
-
-            "6": {
-              code: "Digit6",
-              key: "6",
-              keyCode: 54,
-            },
-
-            "7": {
-              code: "Digit7",
-              key: "7",
-              keyCode: 55,
-            },
-
-            "8": {
-              code: "Digit8",
-              key: "8",
-              keyCode: 56,
-            },
-
-          };
-
-          const heldKeys =
-            new Set<string>();
-
-          const emitSlKey = (
-            name: string,
-            down: boolean
-          ) => {
-            const spec = slKeys[name];
-
-            if (spec === undefined) {
+          const updateJoystick = (clientX: number, clientY: number) => {
+            if (joystick === null || knob === null) {
               return;
             }
 
-            if (down) {
-              if (heldKeys.has(name)) {
-                return;
-              }
+            const rect = joystick.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
 
-              heldKeys.add(name);
-            } else {
-              if (!heldKeys.has(name)) {
-                return;
-              }
+            let dx = clientX - centerX;
+            let dy = clientY - centerY;
 
-              heldKeys.delete(name);
-            }
+            const maxDistance = Math.min(rect.width, rect.height) * 0.3;
+            const distance = Math.hypot(dx, dy);
 
-            const event =
-              new KeyboardEvent(
-                down
-                  ? "keydown"
-                  : "keyup",
-                {
-                  key: spec.key,
-                  code: spec.code,
-                  bubbles: true,
-                  cancelable: true,
-                  repeat: false,
-                }
-              );
-
-            try {
-              Object.defineProperty(
-                event,
-                "keyCode",
-                {
-                  get: () =>
-                    spec.keyCode,
-                }
-              );
-
-              Object.defineProperty(
-                event,
-                "which",
-                {
-                  get: () =>
-                    spec.keyCode,
-                }
-              );
-            } catch {
-              /*
-               * Some browsers expose these
-               * properties as non-configurable.
-               */
-            }
-
-            nostalgist
-              .getCanvas()
-              .dispatchEvent(event);
-          };
-
-          const bindSlButton = (
-            id: string,
-            keyName: string
-          ) => {
-            const button =
-              document.getElementById(id);
-
-            if (button === null) {
-              return;
-            }
-
-            button.addEventListener(
-              "pointerdown",
-              (event) => {
-                event.preventDefault();
-
-                button.classList.add(
-                  "active"
-                );
-
-                try {
-                  button.setPointerCapture(
-                    event.pointerId
-                  );
-                } catch {
-                  /*
-                   * Pointer capture is
-                   * optional here.
-                   */
-                }
-
-                emitSlKey(
-                  keyName,
-                  true
-                );
-
-                if (
-                  "vibrate" in navigator
-                ) {
-                  navigator.vibrate(8);
-                }
-              }
-            );
-
-            const release = (
-              event: PointerEvent
-            ) => {
-              event.preventDefault();
-
-              button.classList.remove(
-                "active"
-              );
-
-              emitSlKey(
-                keyName,
-                false
-              );
-            };
-
-            button.addEventListener(
-              "pointerup",
-              release
-            );
-
-            button.addEventListener(
-              "pointercancel",
-              release
-            );
-          };
-
-          bindSlButton(
-            "sl-btn-f",
-            "F"
-          );
-
-          bindSlButton(
-            "sl-btn-h",
-            "H"
-          );
-
-          bindSlButton(
-            "sl-btn-e",
-            "E"
-          );
-
-          bindSlButton(
-            "sl-btn-tab",
-            "TAB"
-          );
-
-          for (
-            const button
-            of document.querySelectorAll<HTMLElement>(
-              ".sl-hotkey"
-            )
-          ) {
-            const key =
-              button.dataset.slKey;
-
-            if (key === undefined) {
-              continue;
-            }
-
-            button.addEventListener(
-              "pointerdown",
-              (event) => {
-                event.preventDefault();
-
-                button.classList.add(
-                  "active"
-                );
-
-                emitSlKey(
-                  key,
-                  true
-                );
-              }
-            );
-
-            const release = (
-              event: PointerEvent
-            ) => {
-              event.preventDefault();
-
-              button.classList.remove(
-                "active"
-              );
-
-              emitSlKey(
-                key,
-                false
-              );
-            };
-
-            button.addEventListener(
-              "pointerup",
-              release
-            );
-
-            button.addEventListener(
-              "pointercancel",
-              release
-            );
-          }
-
-          const joystick =
-            document.getElementById(
-              "sl-joystick"
-            );
-
-          const knob =
-            document.getElementById(
-              "sl-joy-knob"
-            );
-
-          let joystickPointer:
-            number | null = null;
-
-          const joystickDirections =
-            new Set<string>();
-
-          const setJoystickDirections = (
-            next: Set<string>
-          ) => {
-            for (
-              const current
-              of joystickDirections
-            ) {
-              if (!next.has(current)) {
-                emitSlKey(
-                  current,
-                  false
-                );
-              }
-            }
-
-            for (
-              const current
-              of next
-            ) {
-              if (
-                !joystickDirections.has(
-                  current
-                )
-              ) {
-                emitSlKey(
-                  current,
-                  true
-                );
-              }
-            }
-
-            joystickDirections.clear();
-
-            for (
-              const current
-              of next
-            ) {
-              joystickDirections.add(
-                current
-              );
-            }
-          };
-
-          const updateJoystick = (
-            clientX: number,
-            clientY: number
-          ) => {
-            if (
-              joystick === null ||
-              knob === null
-            ) {
-              return;
-            }
-
-            const rect =
-              joystick.getBoundingClientRect();
-
-            const centerX =
-              rect.left +
-              rect.width / 2;
-
-            const centerY =
-              rect.top +
-              rect.height / 2;
-
-            let dx =
-              clientX - centerX;
-
-            let dy =
-              clientY - centerY;
-
-            const maxDistance =
-              Math.min(
-                rect.width,
-                rect.height
-              ) * 0.3;
-
-            const distance =
-              Math.hypot(dx, dy);
-
-            if (
-              distance >
-              maxDistance
-            ) {
-              const scale =
-                maxDistance /
-                distance;
-
+            if (distance > maxDistance) {
+              const scale = maxDistance / distance;
               dx *= scale;
               dy *= scale;
             }
 
-            knob.style.transform =
-              `translate(${dx}px, ${dy}px)`;
+            knob.style.transform = `translate(${dx}px, ${dy}px)`;
 
-            const dead =
-              maxDistance * 0.27;
+            const dead = maxDistance * 0.28;
+            const next = new Set<SlDirection>();
 
-            const next =
-              new Set<string>();
+            if (dx < -dead) next.add("left");
+            if (dx > dead) next.add("right");
+            if (dy < -dead) next.add("up");
+            if (dy > dead) next.add("down");
 
-            if (dx < -dead) {
-              next.add("LEFT");
-            }
-
-            if (dx > dead) {
-              next.add("RIGHT");
-            }
-
-            if (dy < -dead) {
-              next.add("UP");
-            }
-
-            if (dy > dead) {
-              next.add("DOWN");
-            }
-
-            setJoystickDirections(
-              next
-            );
+            setDirections(next);
           };
 
           const resetJoystick = () => {
             if (knob !== null) {
-              knob.style.transform =
-                "translate(0px, 0px)";
+              knob.style.transform = "translate(0px, 0px)";
             }
 
-            setJoystickDirections(
-              new Set<string>()
-            );
-
+            setDirections(new Set<SlDirection>());
             joystickPointer = null;
           };
 
           if (joystick !== null) {
-            joystick.addEventListener(
-              "pointerdown",
-              (event) => {
-                event.preventDefault();
+            joystick.addEventListener("pointerdown", (event) => {
+              event.preventDefault();
 
-                if (
-                  joystickPointer !== null
-                ) {
-                  return;
-                }
-
-                joystickPointer =
-                  event.pointerId;
-
-                try {
-                  joystick.setPointerCapture(
-                    event.pointerId
-                  );
-                } catch {
-                  /*
-                   * Pointer capture is
-                   * optional here.
-                   */
-                }
-
-                updateJoystick(
-                  event.clientX,
-                  event.clientY
-                );
+              if (joystickPointer !== null) {
+                return;
               }
-            );
 
-            joystick.addEventListener(
-              "pointermove",
-              (event) => {
-                if (
-                  event.pointerId !==
-                  joystickPointer
-                ) {
-                  return;
-                }
+              joystickPointer = event.pointerId;
 
-                event.preventDefault();
-
-                updateJoystick(
-                  event.clientX,
-                  event.clientY
-                );
+              try {
+                joystick.setPointerCapture(event.pointerId);
+              } catch {
+                // Pointer capture is optional.
               }
-            );
 
-            joystick.addEventListener(
-              "pointerup",
-              (event) => {
-                if (
-                  event.pointerId !==
-                  joystickPointer
-                ) {
-                  return;
-                }
+              updateJoystick(event.clientX, event.clientY);
+            });
 
-                event.preventDefault();
-
-                resetJoystick();
+            joystick.addEventListener("pointermove", (event) => {
+              if (event.pointerId !== joystickPointer) {
+                return;
               }
-            );
 
-            joystick.addEventListener(
-              "pointercancel",
-              () => {
-                resetJoystick();
+              event.preventDefault();
+              updateJoystick(event.clientX, event.clientY);
+            });
+
+            joystick.addEventListener("pointerup", (event) => {
+              if (event.pointerId !== joystickPointer) {
+                return;
               }
-            );
+
+              event.preventDefault();
+              resetJoystick();
+            });
+
+            joystick.addEventListener("pointercancel", () => {
+              resetJoystick();
+            });
           }
 
-          window.addEventListener(
-            "blur",
-            () => {
-              for (
-                const key
-                of Array.from(
-                  heldKeys
-                )
-              ) {
-                emitSlKey(
-                  key,
-                  false
-                );
+          const bindButton = (
+            id: string,
+            button: "a" | "b",
+          ) => {
+            const element = document.getElementById(id);
+
+            if (element === null) {
+              return;
+            }
+
+            element.addEventListener("pointerdown", (event) => {
+              event.preventDefault();
+              element.classList.add("active");
+
+              try {
+                element.setPointerCapture(event.pointerId);
+              } catch {
+                // Pointer capture is optional.
               }
 
-              resetJoystick();
-            }
-          );
+              nostalgist.pressDown({ button });
+            });
 
-          document.addEventListener(
-            "contextmenu",
-            (event) => {
+            const release = (event: PointerEvent) => {
               event.preventDefault();
-            }
-          );
+              element.classList.remove("active");
+              nostalgist.pressUp({ button });
+            };
 
-          console.log(
-            "[SLKnight] MOBILE_TOUCH_UI_READY"
-          );
+            element.addEventListener("pointerup", release);
+            element.addEventListener("pointercancel", release);
+          };
+
+          bindButton("sl-confirm", "a");
+          bindButton("sl-cancel", "b");
+
+          window.addEventListener("blur", () => {
+            resetJoystick();
+            nostalgist.pressUp({ button: "a" });
+            nostalgist.pressUp({ button: "b" });
+          });
+
+          document.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+          });
 
           try {
             await nostalgist.start();
 
-            console.log(
-              "[SLKnight] GAME_STARTED"
-            );
+            if (status !== null) {
+              status.textContent = "자동공격 · 자동줍기";
+              window.setTimeout(() => {
+                status.style.opacity = "0";
+              }, 2500);
+            }
           } catch (error) {
-            showSlError(
-              String(error)
-            );
+            if (status !== null) {
+              status.textContent = `실행 오류: ${String(error)}`;
+              status.style.opacity = "1";
+            }
 
             throw error;
           }
-
           '''
 
-          if start_marker not in text:
-              raise SystemExit(
-                  "PATCH FAILED: nostalgist.start marker"
-              )
+          text = text[:block_start] + mobile_code + text[block_end:]
+          main_path.write_text(text, encoding="utf-8")
 
-          text = text.replace(
-              start_marker,
-              mobile_touch_code,
-              1
-          )
-
-          main_path.write_text(
-              text,
-              encoding="utf-8"
-          )
-
-          print(
-              "SLKNIGHT_MOBILE_TOUCH_PATCH_OK"
-          )
+          print("MOBILE_TOUCH_FRONTEND_PATCH_OK")
           PY
 
       - name: Copy game and engine into web player
         run: |
           set -e
 
-          mv \
-            engine/retroarch/mkxp-z_libretro.js \
-            engine/nostalgist/public/
-
-          mv \
-            engine/retroarch/mkxp-z_libretro.wasm \
-            engine/nostalgist/public/
-
-          mv \
-            slknight.mkxpz \
-            engine/nostalgist/public/
+          mv engine/retroarch/mkxp-z_libretro.js engine/nostalgist/public/
+          mv engine/retroarch/mkxp-z_libretro.wasm engine/nostalgist/public/
+          mv slknight.mkxpz engine/nostalgist/public/
 
       - name: Configure web player
         run: |
@@ -1482,38 +905,23 @@ jobs:
           set -e
 
           npm install
-
-          npx prettier \
-            --write \
-            src/main.ts \
-            index.html
-
+          npx prettier --write src/main.ts index.html
           npm run build
-
           touch dist/.nojekyll
 
       - name: Verify mobile build
         run: |
           set -e
 
-          test -s \
-            engine/nostalgist/dist/index.html
+          test -s engine/nostalgist/dist/index.html
+          test -s engine/nostalgist/dist/mkxp-z_libretro.js
+          test -s engine/nostalgist/dist/mkxp-z_libretro.wasm
+          test -s engine/nostalgist/dist/slknight.mkxpz
 
-          test -s \
-            engine/nostalgist/dist/mkxp-z_libretro.js
+          grep -R "자동공격" engine/nostalgist/dist/assets >/dev/null
+          grep -R "화면을 터치해 시작" engine/nostalgist/dist/index.html >/dev/null
 
-          test -s \
-            engine/nostalgist/dist/mkxp-z_libretro.wasm
-
-          test -s \
-            engine/nostalgist/dist/slknight.mkxpz
-
-          grep -R \
-            "MOBILE_TOUCH_UI_READY" \
-            engine/nostalgist/dist/assets \
-            >/dev/null
-
-          echo "SLKNIGHT_MOBILE_BUILD_OK"
+          echo "SLKNIGHT_MOBILE_AUTO_BUILD_OK"
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
@@ -1524,7 +932,6 @@ jobs:
     name: Deploy GitHub Pages
     needs:
       - build
-
     runs-on: ubuntu-24.04
 
     environment:
