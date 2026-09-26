@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web BOOT TRAP V7
+name: Deploy SLKnight mkxp-web DIRECT TRACE V8
 
 on:
   push:
@@ -23,12 +23,14 @@ env:
   LIVE_MKXP_REF: 07e1519f9a2b9100512c567e97455fa3c77a3221
 
 jobs:
+
   build:
-    name: Build SLKnight BOOT TRAP V7
+    name: Build SLKnight DIRECT TRACE V8
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
+
       - name: Install tools
         run: |
           set -e
@@ -72,11 +74,15 @@ jobs:
             extra/make_mapping.sh
           sparse-checkout-cone-mode: false
 
-      - name: Verify working engine
+      - name: Verify exact working engine
         run: |
           set -e
 
-          test "$(git -C player rev-parse HEAD)" = "$LIVE_MKXP_REF"
+          ACTUAL_REF="$(git -C player rev-parse HEAD)"
+
+          echo "ENGINE_REF=${ACTUAL_REF}"
+
+          test "${ACTUAL_REF}" = "${LIVE_MKXP_REF}"
 
           JS_SIZE="$(stat -c '%s' player/mkxp.js)"
           WASM_SIZE="$(stat -c '%s' player/mkxp.wasm)"
@@ -93,7 +99,7 @@ jobs:
 
           echo "LIVE_ENGINE_OK"
 
-      - name: Download SLKnight
+      - name: Download clean SLKnight
         run: |
           set -e
 
@@ -147,41 +153,67 @@ jobs:
 
           echo "SLKNIGHT_DATA_OK"
 
-      - name: Convert and trap SLKnight RGSS errors
+      - name: Convert and directly trace RGSS scripts
         run: |
           set -e
 
           ruby -rzlib - <<'RB'
-          game_dir = 'player/gameasync'
-          ini_path = File.join(game_dir, 'Game.ini')
 
-          ini = File.binread(ini_path)
+          game_dir =
+            'player/gameasync'
 
-          scripts_rel = ini[/^Scripts=(.+)$/i, 1]
+          ini_path =
+            File.join(
+              game_dir,
+              'Game.ini'
+            )
 
-          abort 'Scripts entry missing from Game.ini' \
+          ini =
+            File.binread(
+              ini_path
+            )
+
+          scripts_rel =
+            ini[/^Scripts=(.+)$/i, 1]
+
+          abort 'Scripts entry missing' \
             if scripts_rel == nil
 
-          scripts_rel = scripts_rel.strip.tr('\\', '/')
-
-          scripts_path = File.join(
-            game_dir,
+          scripts_rel =
             scripts_rel
-          )
+              .strip
+              .tr('\\', '/')
+
+          scripts_path =
+            File.join(
+              game_dir,
+              scripts_rel
+            )
 
           abort "Scripts file missing: #{scripts_path}" \
-            unless File.file?(scripts_path)
+            unless File.file?(
+              scripts_path
+            )
 
-          scripts = Marshal.load(
-            File.binread(scripts_path)
-          )
+          scripts =
+            Marshal.load(
+              File.binread(
+                scripts_path
+              )
+            )
 
-          # ========================================================
-          # Win32 API compatibility
-          # ========================================================
+          # ----------------------------------------------------------
+          # Browser compatibility script.
+          #
+          # This executes BEFORE the game's keyboard/Win32 scripts.
+          # ----------------------------------------------------------
 
           web_compat = <<'RUBY'
+
+          puts("SLLOAD|000|WEB_COMPAT")
+
           class Win32API
+
             def initialize(*args)
             end
 
@@ -192,49 +224,73 @@ jobs:
             def Call(*args)
               call(*args)
             end
+
           end
+
           RUBY
 
           scripts.insert(
             0,
             [
               0,
-              'Web Compatibility',
-              Zlib::Deflate.deflate(web_compat)
+              '000|Web Compatibility',
+              Zlib::Deflate.deflate(
+                web_compat
+              )
             ]
           )
 
-          # ========================================================
-          # Convert:
+          # ----------------------------------------------------------
+          # Convert unsupported:
           #
           # begin
           #   ...
           # end until condition
           #
-          # to mruby-compatible loop
-          # ========================================================
+          # into:
+          #
+          # loop do
+          #   ...
+          #   break if condition
+          # end
+          # ----------------------------------------------------------
 
           def patch_begin_until(source)
-            lines = source.lines
-            changed = 0
-            i = 0
+
+            lines =
+              source.lines
+
+            changed =
+              0
+
+            i =
+              0
 
             while i < lines.length
-              match = lines[i].match(
-                /^(\s*)end\s+until\s+(.+?)\s*$/
-              )
+
+              match =
+                lines[i].match(
+                  /^(\s*)end\s+until\s+(.+?)\s*$/
+                )
 
               if match
-                indent = match[1]
-                condition = match[2]
 
-                j = i - 1
+                indent =
+                  match[1]
+
+                condition =
+                  match[2]
+
+                j =
+                  i - 1
 
                 while j >= 0
+
                   if (
                     lines[j][/^\s*/] == indent &&
                     lines[j].strip == 'begin'
                   )
+
                     lines[j] =
                       indent +
                       "loop do\n"
@@ -247,65 +303,96 @@ jobs:
                       indent +
                       "end\n"
 
-                    changed += 1
+                    changed +=
+                      1
+
                     break
+
                   end
 
-                  j -= 1
+                  j -=
+                    1
+
                 end
+
               end
 
-              i += 1
+              i +=
+                1
+
             end
 
             [
               lines.join,
               changed
             ]
+
           end
 
-          # ========================================================
-          # Remove classic RPG Maker scene frame loops.
-          # mkxp-web drives one frame at a time.
-          # ========================================================
+          # ----------------------------------------------------------
+          # Browser owns the frame loop.
+          # Remove standard RPG Maker XP scene loops.
+          # ----------------------------------------------------------
 
           def patch_scene_loops(source)
-            lines = source.lines
-            changed = 0
-            i = 0
+
+            lines =
+              source.lines
+
+            changed =
+              0
+
+            i =
+              0
 
             while i < lines.length
+
               unless lines[i].strip == 'loop do'
-                i += 1
+
+                i +=
+                  1
+
                 next
+
               end
 
-              indent = lines[i][/^\s*/]
+              indent =
+                lines[i][/^\s*/]
 
-              significant = []
-              k = i + 1
+              significant =
+                []
+
+              k =
+                i + 1
 
               while (
                 k < lines.length &&
                 significant.length < 8
               )
-                stripped = lines[k].strip
+
+                stripped =
+                  lines[k].strip
 
                 unless (
                   stripped.empty? ||
                   stripped.start_with?('#')
                 )
+
                   significant << [
                     k,
                     stripped,
                     lines[k][/^\s*/]
                   ]
+
                 end
 
-                k += 1
+                k +=
+                  1
+
               end
 
-              end_index = nil
+              end_index =
+                nil
 
               if (
                 significant.length >= 7 &&
@@ -318,7 +405,9 @@ jobs:
                 significant[6][1] == 'end' &&
                 significant[6][2] == indent
               )
-                end_index = significant[6][0]
+
+                end_index =
+                  significant[6][0]
 
               elsif (
                 significant.length >= 5 &&
@@ -329,10 +418,14 @@ jobs:
                 significant[4][1] == 'end' &&
                 significant[4][2] == indent
               )
-                end_index = significant[4][0]
+
+                end_index =
+                  significant[4][0]
+
               end
 
               if end_index != nil
+
                 lines[i..end_index] = [
                   indent +
                   "end\n\n" +
@@ -340,79 +433,124 @@ jobs:
                   "def dispose\n"
                 ]
 
-                changed += 1
-                i += 1
+                changed +=
+                  1
+
+                i +=
+                  1
+
                 next
+
               end
 
-              i += 1
+              i +=
+                1
+
             end
 
             [
               lines.join,
               changed
             ]
+
           end
 
-          scene_loop_count = 0
-          begin_until_count = 0
+          scene_loop_count =
+            0
 
-          # ========================================================
-          # First make the actual game scripts web-compatible.
-          # ========================================================
+          begin_until_count =
+            0
 
-          scripts.each do |entry|
+          # ----------------------------------------------------------
+          # DIRECT loading.
+          #
+          # IMPORTANT:
+          # No eval().
+          # No Ruby wrapper around each game script.
+          #
+          # We add one puts() at the beginning of every script.
+          # ----------------------------------------------------------
+
+          scripts.each_with_index do |entry, index|
+
             next unless (
               entry.is_a?(Array) &&
               entry.length >= 3
             )
 
-            name = entry[1].to_s
+            name =
+              entry[1].to_s
 
             begin
-              source = Zlib::Inflate.inflate(
-                entry[2]
-              )
+
+              source =
+                Zlib::Inflate.inflate(
+                  entry[2]
+                )
+
             rescue
+
               next
+
             end
 
-            patched = source.dup
+            patched =
+              source.dup
 
-            patched, count = patch_begin_until(
-              patched
-            )
-
-            begin_until_count += count
-
-            unless name == 'Main'
-              patched, count = patch_scene_loops(
+            patched, count =
+              patch_begin_until(
                 patched
               )
 
-              scene_loop_count += count
+            begin_until_count +=
+              count
+
+            unless name.include?('Main')
+
+              patched, count =
+                patch_scene_loops(
+                  patched
+                )
+
+              scene_loop_count +=
+                count
+
             end
+
+            # --------------------------------------------------------
+            # Main browser frame dispatcher
+            # --------------------------------------------------------
 
             if name == 'Main'
+
               browser_loop = <<'RUBY'
+
           $prev_scene = nil
+          $sl_last_scene_name = nil
 
           def main_update_loop
-
-            if $sl_boot_error
-              sl_boot_error_screen
-              Graphics.update
-              Input.update
-              return
-            end
 
             begin
 
               if $scene != nil
 
-                $sl_boot_stage =
-                  "runtime:" +
+                current_scene_name =
                   $scene.class.to_s
+
+                if (
+                  $sl_last_scene_name !=
+                  current_scene_name
+                )
+
+                  puts(
+                    "SLFRAME|" +
+                    current_scene_name
+                  )
+
+                  $sl_last_scene_name =
+                    current_scene_name
+
+                end
 
                 if $scene != $prev_scene
 
@@ -420,11 +558,16 @@ jobs:
                     $prev_scene != nil &&
                     $prev_scene.respond_to?(:dispose)
                   )
+
                     $prev_scene.dispose
+
                   end
 
                   $scene.main
-                  $prev_scene = $scene
+
+                  $prev_scene =
+                    $scene
+
                 end
 
                 Graphics.update
@@ -432,51 +575,100 @@ jobs:
                 $scene.update
 
               else
+
+                puts(
+                  "SLRUNTIMEERR|SCENE_NIL"
+                )
+
                 raise "END"
+
               end
 
             rescue Exception => e
 
-              $sl_boot_error =
-                $sl_boot_stage.to_s +
-                " | " +
-                e.class.to_s +
-                " | " +
-                e.message.to_s
-
               puts(
-                "SLBOOTERR|" +
-                $sl_boot_error
+                "SLRUNTIMEERR|" +
+                e.class.to_s +
+                "|" +
+                e.message.to_s
               )
 
-              sl_boot_error_screen
             end
+
           end
+
           RUBY
 
               unless patched.include?(
                 'def main_update_loop'
               )
+
                 patched =
                   browser_loop +
                   patched
+
               end
 
               patched.sub!(
                 /\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,
                 "\n"
               )
+
+              patched.gsub!(
+                '$scene = Scene_Title.new',
+                "$scene = Scene_Title.new\nputs(\"SLMAIN|SCENE_TITLE_CREATED\")"
+              )
+
             end
+
+            trace_index =
+              format(
+                '%03d',
+                index
+              )
+
+            # Put a marker at the top of the DIRECT script.
+            #
+            # If this script has a parse error, its marker will not
+            # execute, so the previous marker tells us exactly where
+            # loading stopped.
+
+            patched =
+              "puts(\"SLLOAD|#{trace_index}\")\n" +
+              patched
+
+            # Prefix metadata name.
+            #
+            # mkxp-web itself prints:
+            #
+            # <script name> - err
+            #
+            # if mruby reports an exception.
+
+            entry[1] =
+              trace_index +
+              "|" +
+              name
 
             entry[2] =
               Zlib::Deflate.deflate(
                 patched
               )
+
           end
 
-          main = scripts.find do |entry|
-            entry[1].to_s == 'Main'
-          end
+          # ----------------------------------------------------------
+          # Locate Main after prefixing names.
+          # ----------------------------------------------------------
+
+          main =
+            scripts.find do |entry|
+
+              entry[1].to_s.end_with?(
+                '|Main'
+              )
+
+            end
 
           abort 'Main script missing' \
             if main == nil
@@ -491,199 +683,9 @@ jobs:
               'def main_update_loop'
             )
 
-          # ========================================================
-          # This script ALWAYS loads first.
-          #
-          # Even if an SLKnight script crashes while loading,
-          # main_update_loop still exists and can draw the error.
-          # ========================================================
-
-          boot_guard = <<'RUBY'
-          $sl_boot_error = nil
-          $sl_boot_stage = "starting"
-          $sl_boot_error_sprite = nil
-          $sl_boot_error_bitmap = nil
-
-          def sl_boot_error_screen
-
-            return if $sl_boot_error_sprite != nil
-
-            begin
-
-              bitmap = Bitmap.new(
-                640,
-                480
-              )
-
-              bitmap.fill_rect(
-                0,
-                0,
-                640,
-                480,
-                Color.new(
-                  0,
-                  0,
-                  0,
-                  255
-                )
-              )
-
-              bitmap.font.size = 20
-
-              bitmap.font.color =
-                Color.new(
-                  255,
-                  255,
-                  255,
-                  255
-                )
-
-              bitmap.draw_text(
-                16,
-                16,
-                608,
-                32,
-                "SLKnight WEB BOOT ERROR"
-              )
-
-              text =
-                $sl_boot_error.to_s
-
-              y = 64
-              start = 0
-
-              while (
-                start < text.length &&
-                y < 450
-              )
-                bitmap.draw_text(
-                  16,
-                  y,
-                  608,
-                  28,
-                  text[
-                    start,
-                    58
-                  ].to_s
-                )
-
-                start += 58
-                y += 30
-              end
-
-              sprite = Sprite.new
-              sprite.bitmap = bitmap
-              sprite.z = 999999
-
-              $sl_boot_error_bitmap =
-                bitmap
-
-              $sl_boot_error_sprite =
-                sprite
-
-              begin
-                Graphics.transition(0)
-              rescue Exception
-              end
-
-            rescue Exception => e
-
-              puts(
-                "SLBOOTSCREENERR|" +
-                e.class.to_s +
-                "|" +
-                e.message.to_s
-              )
-            end
-          end
-
-          def main_update_loop
-
-            if $sl_boot_error
-              sl_boot_error_screen
-            end
-
-            Graphics.update
-            Input.update
-          end
-          RUBY
-
-          wrapped_scripts = [
-            [
-              0,
-              'Web Boot Guard',
-              Zlib::Deflate.deflate(
-                boot_guard
-              )
-            ]
-          ]
-
-          # ========================================================
-          # Each original script is run inside a rescue.
-          #
-          # If one fails:
-          #
-          # load:SCRIPT_NAME | ErrorClass | message
-          #
-          # is stored instead of allowing mkxp-web to die silently.
-          # ========================================================
-
-          scripts.each do |entry|
-            next unless (
-              entry.is_a?(Array) &&
-              entry.length >= 3
-            )
-
-            name = entry[1].to_s
-
-            begin
-              source =
-                Zlib::Inflate.inflate(
-                  entry[2]
-                )
-            rescue
-              next
-            end
-
-            wrapper = <<RUBY
-          unless $sl_boot_error
-
-            $sl_boot_stage =
-              "load:" +
-              #{name.dump}
-
-            begin
-
-              eval(
-                #{source.dump}
-              )
-
-            rescue Exception => e
-
-              $sl_boot_error =
-                $sl_boot_stage.to_s +
-                " | " +
-                e.class.to_s +
-                " | " +
-                e.message.to_s
-
-              puts(
-                "SLBOOTERR|" +
-                $sl_boot_error
-              )
-            end
-
-          end
-          RUBY
-
-            wrapped_scripts << [
-              entry[0],
-              name,
-              Zlib::Deflate.deflate(
-                wrapper
-              )
-            ]
-          end
+          # ----------------------------------------------------------
+          # Standard mkxp-web name.
+          # ----------------------------------------------------------
 
           target_scripts =
             File.join(
@@ -695,39 +697,63 @@ jobs:
           File.binwrite(
             target_scripts,
             Marshal.dump(
-              wrapped_scripts
+              scripts
             )
           )
 
           unless (
-            File.expand_path(scripts_path) ==
-            File.expand_path(target_scripts)
+            File.expand_path(
+              scripts_path
+            ) ==
+            File.expand_path(
+              target_scripts
+            )
           )
+
             File.delete(
               scripts_path
             )
+
           end
 
+          # ----------------------------------------------------------
+          # Game.ini
+          # ----------------------------------------------------------
+
           ini_lines =
-            ini.split(/\r?\n/)
+            ini.split(
+              /\r?\n/
+            )
 
           ini_lines.map! do |line|
 
             if line =~ /^Scripts=/i
+
               'Scripts=Data\Scripts.rxdata'
 
             elsif line =~ /^Title=/i
+
               'Title=SLKnight'
 
             else
+
               line
+
             end
+
           end
 
           File.binwrite(
             ini_path,
-            ini_lines.join("\r\n") +
+            ini_lines.join(
+              "\r\n"
+            ) +
             "\r\n"
+          )
+
+          puts(
+            "SCRIPT_COUNT=" +
+            scripts.length.to_s
           )
 
           puts(
@@ -741,16 +767,12 @@ jobs:
           )
 
           puts(
-            "WRAPPED_SCRIPTS=" +
-            wrapped_scripts.length.to_s
+            "SLKNIGHT_DIRECT_TRACE_V8_OK"
           )
 
-          puts(
-            "SLKNIGHT_BOOT_TRAP_V7_OK"
-          )
           RB
 
-      - name: Verify trapped script archive
+      - name: Verify direct script archive
         run: |
           set -e
 
@@ -762,6 +784,7 @@ jobs:
             player/gameasync/Game.ini
 
           ruby -rzlib - <<'RB'
+
           scripts =
             Marshal.load(
               File.binread(
@@ -769,44 +792,55 @@ jobs:
               )
             )
 
-          abort 'Boot Guard missing' \
-            unless (
-              scripts[0] &&
-              scripts[0][1] ==
-              'Web Boot Guard'
-            )
+          puts(
+            "SCRIPT_ARCHIVE_COUNT=" +
+            scripts.length.to_s
+          )
 
-          guard =
+          abort 'Too few scripts' \
+            if scripts.length < 100
+
+          first =
             Zlib::Inflate.inflate(
               scripts[0][2]
             )
 
-          abort 'Fallback loop missing' \
-            unless guard.include?(
-              'def main_update_loop'
+          abort 'First trace missing' \
+            unless first.include?(
+              'SLLOAD|000'
             )
 
           main =
             scripts.find do |entry|
-              entry[1].to_s == 'Main'
+
+              entry[1].to_s.end_with?(
+                '|Main'
+              )
+
             end
 
-          abort 'Wrapped Main missing' \
+          abort 'Main missing' \
             if main == nil
 
-          main_source =
+          source =
             Zlib::Inflate.inflate(
               main[2]
             )
 
-          abort 'Boot trap missing from Main' \
-            unless main_source.include?(
-              'SLBOOTERR'
+          abort 'Main direct trace missing' \
+            unless source.include?(
+              'SLFRAME|'
+            )
+
+          abort 'Main runtime trace missing' \
+            unless source.include?(
+              'SLRUNTIMEERR|'
             )
 
           puts(
-            "BOOT_TRAP_ARCHIVE_VERIFY_OK"
+            "DIRECT_TRACE_ARCHIVE_VERIFY_OK"
           )
+
           RB
 
       - name: Convert audio to OGG
@@ -814,14 +848,19 @@ jobs:
           set -e
 
           python3 - <<'PY'
+
           from pathlib import Path
           import subprocess
           import sys
 
-          root = Path("player/gameasync/Audio")
+          root = Path(
+              "player/gameasync/Audio"
+          )
 
           if not root.exists():
-              print("AUDIO_DIRECTORY_NOT_PRESENT")
+              print(
+                  "AUDIO_DIRECTORY_NOT_PRESENT"
+              )
               raise SystemExit(0)
 
           convertible = {
@@ -843,8 +882,12 @@ jobs:
           files = [
               path
               for path in root.rglob("*")
-              if path.is_file()
-              and path.suffix.lower() in convertible
+              if (
+                  path.is_file()
+                  and
+                  path.suffix.lower()
+                  in convertible
+              )
           ]
 
           print(
@@ -856,17 +899,29 @@ jobs:
           failures = []
 
           for src in files:
-              ext = src.suffix.lower()
-              out = src.with_suffix(".ogg")
+
+              ext =
+                  src.suffix.lower()
+
+              out =
+                  src.with_suffix(
+                      ".ogg"
+                  )
+
               temp_wav = None
 
               try:
-                  source_for_ffmpeg = src
+
+                  source_for_ffmpeg =
+                      src
 
                   if ext in midi_exts:
-                      temp_wav = src.with_name(
-                          src.name + ".mkxpweb.wav"
-                      )
+
+                      temp_wav =
+                          src.with_name(
+                              src.name +
+                              ".mkxpweb.wav"
+                          )
 
                       subprocess.run(
                           [
@@ -879,7 +934,8 @@ jobs:
                           check=True,
                       )
 
-                      source_for_ffmpeg = temp_wav
+                      source_for_ffmpeg =
+                          temp_wav
 
                   subprocess.run(
                       [
@@ -889,7 +945,9 @@ jobs:
                           "error",
                           "-y",
                           "-i",
-                          str(source_for_ffmpeg),
+                          str(
+                              source_for_ffmpeg
+                          ),
                           "-c:a",
                           "libvorbis",
                           "-q:a",
@@ -901,8 +959,10 @@ jobs:
 
                   if (
                       not out.exists()
-                      or out.stat().st_size == 0
+                      or
+                      out.stat().st_size == 0
                   ):
+
                       raise RuntimeError(
                           "OGG output missing: "
                           + str(out)
@@ -910,16 +970,25 @@ jobs:
 
                   if (
                       temp_wav is not None
-                      and temp_wav.exists()
+                      and
+                      temp_wav.exists()
                   ):
+
                       temp_wav.unlink()
 
-                  if src.exists() and src != out:
+                  if (
+                      src.exists()
+                      and
+                      src != out
+                  ):
+
                       src.unlink()
 
-                  converted += 1
+                  converted +=
+                      1
 
               except Exception as exc:
+
                   failures.append(
                       (
                           str(src),
@@ -929,21 +998,25 @@ jobs:
 
                   if (
                       temp_wav is not None
-                      and temp_wav.exists()
+                      and
+                      temp_wav.exists()
                   ):
+
                       temp_wav.unlink()
 
           if failures:
+
               print(
                   "AUDIO CONVERSION FAILURES:",
                   file=sys.stderr,
               )
 
               for name, error in failures:
+
                   print(
-                      name
-                      + " -> "
-                      + error,
+                      name +
+                      " -> " +
+                      error,
                       file=sys.stderr,
                   )
 
@@ -957,6 +1030,7 @@ jobs:
           print(
               "AUDIO_CONVERSION_OK"
           )
+
           PY
 
       - name: Convert unsupported images to PNG
@@ -964,6 +1038,7 @@ jobs:
           set -e
 
           python3 - <<'PY'
+
           from pathlib import Path
           import subprocess
           import sys
@@ -973,9 +1048,11 @@ jobs:
           )
 
           if not root.exists():
+
               print(
                   "GRAPHICS_DIRECTORY_NOT_PRESENT"
               )
+
               raise SystemExit(0)
 
           convertible = {
@@ -989,8 +1066,12 @@ jobs:
           files = [
               path
               for path in root.rglob("*")
-              if path.is_file()
-              and path.suffix.lower() in convertible
+              if (
+                  path.is_file()
+                  and
+                  path.suffix.lower()
+                  in convertible
+              )
           ]
 
           print(
@@ -1002,11 +1083,14 @@ jobs:
           failures = []
 
           for src in files:
-              out = src.with_suffix(
-                  ".png"
-              )
+
+              out =
+                  src.with_suffix(
+                      ".png"
+                  )
 
               try:
+
                   subprocess.run(
                       [
                           "convert",
@@ -1018,17 +1102,22 @@ jobs:
 
                   if (
                       not out.exists()
-                      or out.stat().st_size == 0
+                      or
+                      out.stat().st_size == 0
                   ):
+
                       raise RuntimeError(
                           "PNG output missing: "
                           + str(out)
                       )
 
                   src.unlink()
-                  converted += 1
+
+                  converted +=
+                      1
 
               except Exception as exc:
+
                   failures.append(
                       (
                           str(src),
@@ -1037,16 +1126,18 @@ jobs:
                   )
 
           if failures:
+
               print(
                   "IMAGE CONVERSION FAILURES:",
                   file=sys.stderr,
               )
 
               for name, error in failures:
+
                   print(
-                      name
-                      + " -> "
-                      + error,
+                      name +
+                      " -> " +
+                      error,
                       file=sys.stderr,
                   )
 
@@ -1060,27 +1151,34 @@ jobs:
           print(
               "IMAGE_CONVERSION_OK"
           )
+
           PY
 
       - name: Generate async filesystem mapping
         run: |
           set -e
 
-          cd player/gameasync
+          cd \
+            player/gameasync
 
           bash \
             ../../mkxp-tools/extra/make_mapping.sh
 
-          test -s mapping.js
-          test -s bitmap-map.js
+          test -s \
+            mapping.js
 
-          echo "MAPPING_OK"
+          test -s \
+            bitmap-map.js
+
+          echo \
+            "MAPPING_OK"
 
       - name: Create map preload files
         run: |
           set -e
 
           python3 - <<'PY'
+
           from pathlib import Path
 
           data_root = Path(
@@ -1103,6 +1201,7 @@ jobs:
                   "Map*.rxdata"
               )
           ):
+
               target = (
                   preload_root
                   /
@@ -1123,13 +1222,15 @@ jobs:
               "MAP_PRELOAD_FILES="
               + str(count)
           )
+
           PY
 
-      - name: Add browser error display and V7 badge
+      - name: Add V8 native and Ruby trace panel
         run: |
           set -e
 
           python3 - <<'PY'
+
           from pathlib import Path
           import re
 
@@ -1141,67 +1242,15 @@ jobs:
               encoding="utf-8"
           )
 
-          debug_script = r'''
+          trace_script = r'''
           <script>
           (function () {
 
-              function makeBadge() {
-                  var badge =
-                      document.getElementById(
-                          'sl-v7-badge'
-                      );
+              function getPanel() {
 
-                  if (badge) {
-                      return;
-                  }
-
-                  badge =
-                      document.createElement(
-                          'div'
-                      );
-
-                  badge.id =
-                      'sl-v7-badge';
-
-                  badge.textContent =
-                      'V7';
-
-                  badge.style.position =
-                      'fixed';
-
-                  badge.style.top =
-                      '6px';
-
-                  badge.style.right =
-                      '6px';
-
-                  badge.style.zIndex =
-                      '99999998';
-
-                  badge.style.background =
-                      'rgba(0,0,0,0.65)';
-
-                  badge.style.color =
-                      'white';
-
-                  badge.style.padding =
-                      '4px 7px';
-
-                  badge.style.font =
-                      '12px monospace';
-
-                  badge.style.borderRadius =
-                      '4px';
-
-                  document.body.appendChild(
-                      badge
-                  );
-              }
-
-              function makePanel() {
                   var panel =
                       document.getElementById(
-                          'sl-debug'
+                          'sl-trace'
                       );
 
                   if (panel) {
@@ -1214,7 +1263,7 @@ jobs:
                       );
 
                   panel.id =
-                      'sl-debug';
+                      'sl-trace';
 
                   panel.style.position =
                       'fixed';
@@ -1223,13 +1272,13 @@ jobs:
                       '8px';
 
                   panel.style.top =
-                      '32px';
+                      '34px';
 
                   panel.style.right =
                       '8px';
 
                   panel.style.maxHeight =
-                      '65vh';
+                      '55vh';
 
                   panel.style.overflow =
                       'auto';
@@ -1238,19 +1287,19 @@ jobs:
                       '99999999';
 
                   panel.style.padding =
-                      '12px';
+                      '10px';
 
                   panel.style.margin =
                       '0';
 
                   panel.style.background =
-                      'rgba(0,0,0,0.94)';
+                      'rgba(0,0,0,0.90)';
 
                   panel.style.color =
                       'white';
 
                   panel.style.fontSize =
-                      '14px';
+                      '13px';
 
                   panel.style.fontFamily =
                       'monospace';
@@ -1268,69 +1317,266 @@ jobs:
                   return panel;
               }
 
-              function showLine(
-                  value,
+              function addLine(
+                  text,
                   force
               ) {
-                  var text =
-                      String(value);
+
+                  text =
+                      String(text);
+
+                  var useful =
+                      (
+                          text.indexOf(
+                              'SLLOAD|'
+                          ) >= 0
+                          ||
+                          text.indexOf(
+                              'SLMAIN|'
+                          ) >= 0
+                          ||
+                          text.indexOf(
+                              'SLFRAME|'
+                          ) >= 0
+                          ||
+                          text.indexOf(
+                              'SLRUNTIMEERR|'
+                          ) >= 0
+                          ||
+                          text.indexOf(
+                              ' - err'
+                          ) >= 0
+                          ||
+                          /NO SUCH FILE/i.test(
+                              text
+                          )
+                          ||
+                          /PHYSFS/i.test(
+                              text
+                          )
+                          ||
+                          /exception/i.test(
+                              text
+                          )
+                          ||
+                          /error/i.test(
+                              text
+                          )
+                      );
 
                   if (
                       !force &&
-                      !(
-                          /SLBOOT/i.test(text) ||
-                          / - err/i.test(text) ||
-                          /NO SUCH FILE/i.test(text) ||
-                          /PHYSFS/i.test(text) ||
-                          /failed/i.test(text) ||
-                          /exception/i.test(text) ||
-                          /error/i.test(text)
-                      )
+                      !useful
                   ) {
                       return;
                   }
 
                   var panel =
-                      makePanel();
+                      getPanel();
 
                   panel.style.display =
                       'block';
 
-                  var current =
+                  var existing =
                       panel.textContent || '';
 
-                  if (current) {
-                      current += '\n';
+                  if (existing) {
+                      existing += '\n';
                   }
 
-                  current += text;
+                  existing +=
+                      text;
 
                   if (
-                      current.length >
-                      8000
+                      existing.length >
+                      12000
                   ) {
-                      current =
-                          current.slice(
-                              -8000
+
+                      existing =
+                          existing.slice(
+                              -12000
                           );
                   }
 
                   panel.textContent =
-                      current;
+                      existing;
+
+                  panel.scrollTop =
+                      panel.scrollHeight;
+              }
+
+              function decodeCppException(
+                  ptr
+              ) {
+
+                  var result =
+                      'CPP EXCEPTION | ptr=' +
+                      String(ptr);
+
+                  try {
+
+                      if (
+                          typeof ExceptionInfo ===
+                          'function'
+                          &&
+                          typeof HEAPU32 !==
+                          'undefined'
+                      ) {
+
+                          var info =
+                              new ExceptionInfo(
+                                  ptr
+                              );
+
+                          var typePtr =
+                              info.get_type();
+
+                          var objectPtr =
+                              info.get_exception_ptr();
+
+                          result +=
+                              ' | typePtr=' +
+                              String(typePtr);
+
+                          result +=
+                              ' | objectPtr=' +
+                              String(objectPtr);
+
+                          var namePtr =
+                              HEAPU32[
+                                  (
+                                      typePtr +
+                                      4
+                                  )
+                                  >> 2
+                              ];
+
+                          if (
+                              namePtr
+                              &&
+                              typeof UTF8ToString ===
+                              'function'
+                          ) {
+
+                              var typeName =
+                                  UTF8ToString(
+                                      namePtr
+                                  );
+
+                              result +=
+                                  ' | type=' +
+                                  typeName;
+
+                              if (
+                                  /Exception/.test(
+                                      typeName
+                                  )
+                                  &&
+                                  typeof HEAP32 !==
+                                  'undefined'
+                              ) {
+
+                                  var mkxpType =
+                                      HEAP32[
+                                          objectPtr
+                                          >> 2
+                                      ];
+
+                                  var names = [
+                                      'RGSSError',
+                                      'NoFileError',
+                                      'IOError',
+                                      'TypeError',
+                                      'ArgumentError',
+                                      'PHYSFSError',
+                                      'SDLError',
+                                      'MKXPError'
+                                  ];
+
+                                  result +=
+                                      ' | mkxpType=' +
+                                      String(
+                                          mkxpType
+                                      );
+
+                                  if (
+                                      mkxpType >= 0
+                                      &&
+                                      mkxpType <
+                                      names.length
+                                  ) {
+
+                                      result +=
+                                          '(' +
+                                          names[
+                                              mkxpType
+                                          ] +
+                                          ')';
+                                  }
+                              }
+                          }
+                      }
+
+                  } catch (
+                      decodeError
+                  ) {
+
+                      result +=
+                          ' | decode=' +
+                          String(
+                              decodeError
+                          );
+                  }
+
+                  return result;
+              }
+
+              function badge() {
+
+                  var node =
+                      document.createElement(
+                          'div'
+                      );
+
+                  node.textContent =
+                      'V8';
+
+                  node.style.position =
+                      'fixed';
+
+                  node.style.top =
+                      '6px';
+
+                  node.style.right =
+                      '6px';
+
+                  node.style.zIndex =
+                      '99999998';
+
+                  node.style.background =
+                      'rgba(0,0,0,.7)';
+
+                  node.style.color =
+                      'white';
+
+                  node.style.font =
+                      '12px monospace';
+
+                  node.style.padding =
+                      '4px 7px';
+
+                  node.style.borderRadius =
+                      '4px';
+
+                  document.body.appendChild(
+                      node
+                  );
               }
 
               document.addEventListener(
                   'DOMContentLoaded',
-                  makeBadge
+                  badge
               );
-
-              window.slDebugLine =
-                  function (text) {
-                      showLine(
-                          text,
-                          false
-                      );
-                  };
 
               var originalLog =
                   console.log.bind(
@@ -1339,6 +1585,7 @@ jobs:
 
               console.log =
                   function () {
+
                       var args =
                           Array.prototype.slice.call(
                               arguments
@@ -1349,7 +1596,7 @@ jobs:
                           args
                       );
 
-                      showLine(
+                      addLine(
                           args.join(' '),
                           false
                       );
@@ -1362,6 +1609,7 @@ jobs:
 
               console.error =
                   function () {
+
                       var args =
                           Array.prototype.slice.call(
                               arguments
@@ -1372,7 +1620,7 @@ jobs:
                           args
                       );
 
-                      showLine(
+                      addLine(
                           args.join(' '),
                           true
                       );
@@ -1381,20 +1629,69 @@ jobs:
               window.addEventListener(
                   'error',
                   function (event) {
-                      showLine(
+
+                      addLine(
                           'JS ERROR | '
-                          + event.message,
+                          +
+                          String(
+                              event.message
+                          )
+                          +
+                          ' | '
+                          +
+                          String(
+                              event.filename || ''
+                          )
+                          +
+                          ':'
+                          +
+                          String(
+                              event.lineno || ''
+                          )
+                          +
+                          ':'
+                          +
+                          String(
+                              event.colno || ''
+                          ),
                           true
                       );
+
+                      if (
+                          typeof event.error ===
+                          'number'
+                      ) {
+
+                          addLine(
+                              decodeCppException(
+                                  event.error
+                              ),
+                              true
+                          );
+
+                      } else if (
+                          event.error &&
+                          event.error.stack
+                      ) {
+
+                          addLine(
+                              String(
+                                  event.error.stack
+                              ),
+                              true
+                          );
+                      }
                   }
               );
 
               window.addEventListener(
                   'unhandledrejection',
                   function (event) {
-                      showLine(
+
+                      addLine(
                           'PROMISE ERROR | '
-                          + String(
+                          +
+                          String(
                               event.reason
                           ),
                           true
@@ -1402,33 +1699,25 @@ jobs:
                   }
               );
 
-              window.alert =
-                  function (message) {
-                      showLine(
-                          'ENGINE ERROR | '
-                          + String(message),
-                          true
-                      );
-                  };
-
           })();
           </script>
           '''
 
           html = html.replace(
               "<head>",
-              "<head>\n" + debug_script,
+              "<head>\n"
+              + trace_script,
               1,
           )
 
-          html, namespace_count = re.subn(
+          html, count1 = re.subn(
               r"var namespace = '[^']*';",
-              "var namespace = 'slknight_boottrap_v7';",
+              "var namespace = 'slknight_direct_trace_v8';",
               html,
               count=1,
           )
 
-          html, title_count = re.subn(
+          html, count2 = re.subn(
               r"var wTitle = '[^']*'\s*;?",
               "var wTitle = 'SLKnight';",
               html,
@@ -1437,16 +1726,16 @@ jobs:
 
           html = html.replace(
               "<title>MKXP</title>",
-              "<title>SLKnight V7</title>",
+              "<title>SLKnight V8</title>",
               1,
           )
 
-          if namespace_count != 1:
+          if count1 != 1:
               raise SystemExit(
                   "namespace patch failed"
               )
 
-          if title_count != 1:
+          if count2 != 1:
               raise SystemExit(
                   "title patch failed"
               )
@@ -1457,57 +1746,84 @@ jobs:
           )
 
           print(
-              "BROWSER_ERROR_DISPLAY_OK"
+              "V8_TRACE_PANEL_OK"
           )
+
           PY
 
-          touch player/.nojekyll
+          touch \
+            player/.nojekyll
 
-      - name: Verify final V7 package
+      - name: Verify final V8 package
         run: |
           set -e
 
-          test -s player/index.html
-          test -s player/mkxp.js
-          test -s player/mkxp.wasm
+          test -s \
+            player/index.html
 
-          test -s player/js/drive.js
-          test -s player/js/dpad.js
-          test -s player/js/localforage.min.js
+          test -s \
+            player/mkxp.js
 
-          test -s player/gameasync/Game.ini
-          test -s player/gameasync/rgss.rb
+          test -s \
+            player/mkxp.wasm
 
-          test -s player/gameasync/mapping.js
-          test -s player/gameasync/bitmap-map.js
+          test -s \
+            player/js/drive.js
+
+          test -s \
+            player/js/dpad.js
+
+          test -s \
+            player/js/localforage.min.js
+
+          test -s \
+            player/gameasync/Game.ini
+
+          test -s \
+            player/gameasync/rgss.rb
+
+          test -s \
+            player/gameasync/mapping.js
+
+          test -s \
+            player/gameasync/bitmap-map.js
 
           test -s \
             player/gameasync/Data/Scripts.rxdata
 
           grep -Fq \
-            "slknight_boottrap_v7" \
+            "slknight_direct_trace_v8" \
             player/index.html
 
           grep -Fq \
-            "sl-v7-badge" \
+            "CPP EXCEPTION" \
             player/index.html
 
           grep -Fq \
-            "slDebugLine" \
+            "V8" \
             player/index.html
 
-          test "$(stat -c '%s' player/mkxp.js)" = "290574"
-          test "$(stat -c '%s' player/mkxp.wasm)" = "5217852"
+          test "$(
+            stat -c '%s' \
+              player/mkxp.js
+          )" = "290574"
 
-          rm -rf player/.git
+          test "$(
+            stat -c '%s' \
+              player/mkxp.wasm
+          )" = "5217852"
+
+          rm -rf \
+            player/.git
 
           echo
           echo "========================================"
-          echo " SLKNIGHT BOOT TRAP V7 READY"
+          echo " SLKNIGHT DIRECT TRACE V8 READY"
           echo "========================================"
           echo
 
-          du -sh player
+          du -sh \
+            player
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
@@ -1527,6 +1843,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
 
