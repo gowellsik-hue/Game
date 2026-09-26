@@ -1,4 +1,4 @@
-name: XP Engine Isolation Test V2
+name: Deploy SLKnight mkxp-web Stage 1
 
 on:
   push:
@@ -18,18 +18,17 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ENGINE_REPO: white-axe/mkxp-z-libretro-emscripten
-  ENGINE_REF: f0a1ff80f05dd0d1f8ca711485a5b0a601bc7502
-  SITE_URL: https://gowellsik-hue.github.io/Game
+  GAME_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLKnight_Android_JoiPlay.zip
+  GAME_SHA256: 9f007d46d2410742aca5e14c3901f63586084007e7f52c4d199116191824132a
 
 jobs:
   build:
-    name: Test official XP sample
+    name: Build SLKnight with working mkxp-web engine
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - name: Install tools
+      - name: Install conversion tools
         run: |
           set -e
 
@@ -38,248 +37,774 @@ jobs:
           sudo apt-get install -y \
             curl \
             unzip \
-            innoextract \
-            python3 \
-            python3-pip
+            ruby \
+            ffmpeg \
+            imagemagick \
+            file \
+            timidity \
+            freepats
 
-          python3 -m pip install \
-            --break-system-packages \
-            rpzip
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Checkout clean Nostalgist frontend
+      - name: Checkout known-working mkxp-web player
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.ENGINE_REPO }}
-          ref: ${{ env.ENGINE_REF }}
-          submodules: false
-          path: engine
+          repository: pulsejet/knight-blade-web-async
+          ref: gh-pages
+          path: player
+          sparse-checkout: |
+            index.html
+            js
+            mkxp.js
+            mkxp.wasm
+          sparse-checkout-cone-mode: false
 
-      - name: Reuse exact V7 threaded engine
+      - name: Checkout mkxp-web support files
+        uses: actions/checkout@v4
+        with:
+          repository: pulsejet/mkxp-web
+          ref: master
+          path: mkxp-web
+          sparse-checkout: |
+            COPYING
+            extra/rgss.rb
+            extra/make_mapping.sh
+            extra/manifest.webmanifest
+          sparse-checkout-cone-mode: false
+
+      - name: Download clean SLKnight release
+        run: |
+          set -e
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -o slknight.zip \
+            "${GAME_URL}"
+
+          echo "${GAME_SHA256}  slknight.zip" \
+            | sha256sum -c -
+
+          rm -rf game
+          mkdir -p game
+
+          unzip -q \
+            slknight.zip \
+            -d game
+
+          test -f \
+            game/SLKnight_Android_JoiPlay/Game.ini
+
+      - name: Replace sample game with SLKnight
+        run: |
+          set -e
+
+          rm -rf player/gameasync
+          mkdir -p player/gameasync
+
+          cp -a \
+            game/SLKnight_Android_JoiPlay/. \
+            player/gameasync/
+
+          cp \
+            mkxp-web/extra/rgss.rb \
+            player/gameasync/rgss.rb
+
+          cp \
+            mkxp-web/extra/manifest.webmanifest \
+            player/manifest.webmanifest
+
+          cp \
+            mkxp-web/COPYING \
+            player/COPYING-mkxp-web.txt
+
+          rm -f \
+            player/gameasync/README_Android.txt
+
+      - name: Convert SLKnight RGSS scripts for mruby web runtime
+        run: |
+          set -e
+
+          ruby -rzlib - <<'RB'
+          game_dir = 'player/gameasync'
+          ini_path = File.join(game_dir, 'Game.ini')
+
+          ini = File.binread(ini_path)
+
+          scripts_rel = ini[/^Scripts=(.+)$/i, 1]
+
+          abort 'Scripts entry missing from Game.ini' \
+            if scripts_rel == nil
+
+          scripts_rel =
+            scripts_rel
+              .strip
+              .tr('\\', '/')
+
+          scripts_path =
+            File.join(
+              game_dir,
+              scripts_rel
+            )
+
+          abort "Scripts file missing: #{scripts_path}" \
+            unless File.file?(scripts_path)
+
+          scripts =
+            Marshal.load(
+              File.binread(scripts_path)
+            )
+
+          # ----------------------------------------------------------
+          # Win32 API compatibility
+          # ----------------------------------------------------------
+
+          web_compat = <<'RUBY'
+          # Browser compatibility shim.
+          # Windows DLL calls have no browser equivalent.
+
+          class Win32API
+            def initialize(*args)
+            end
+
+            def call(*args)
+              return 0
+            end
+
+            def Call(*args)
+              return call(*args)
+            end
+          end
+          RUBY
+
+          scripts.insert(
+            0,
+            [
+              0,
+              'Web Compatibility',
+              Zlib::Deflate.deflate(
+                web_compat
+              )
+            ]
+          )
+
+          # ----------------------------------------------------------
+          # mruby does not support:
+          #
+          # begin
+          #   ...
+          # end until condition
+          #
+          # Convert to:
+          #
+          # loop do
+          #   ...
+          #   break if condition
+          # end
+          # ----------------------------------------------------------
+
+          def patch_begin_until(source)
+            lines = source.lines
+            changed = 0
+
+            i = 0
+
+            while i < lines.length
+              match =
+                lines[i].match(
+                  /^(\s*)end\s+until\s+(.+?)\s*$/
+                )
+
+              if match
+                indent = match[1]
+                condition = match[2]
+
+                j = i - 1
+
+                while j >= 0
+                  if (
+                    lines[j][/^\s*/] == indent &&
+                    lines[j].strip == 'begin'
+                  )
+                    lines[j] =
+                      indent +
+                      "loop do\n"
+
+                    lines[i] =
+                      indent +
+                      "  break if " +
+                      condition +
+                      "\n" +
+                      indent +
+                      "end\n"
+
+                    changed += 1
+                    break
+                  end
+
+                  j -= 1
+                end
+              end
+
+              i += 1
+            end
+
+            [
+              lines.join,
+              changed
+            ]
+          end
+
+          # ----------------------------------------------------------
+          # RPG Maker normally owns its own endless scene loop.
+          #
+          # mkxp-web instead calls main_update_loop from the browser
+          # every frame.
+          #
+          # Convert the usual:
+          #
+          # loop do
+          #   Graphics.update
+          #   Input.update
+          #   update
+          #   if $scene != self
+          #     break
+          #   end
+          # end
+          #
+          # into setup main + dispose.
+          # ----------------------------------------------------------
+
+          def patch_scene_loops(source)
+            lines = source.lines
+            changed = 0
+            i = 0
+
+            while i < lines.length
+              unless lines[i].strip == 'loop do'
+                i += 1
+                next
+              end
+
+              indent =
+                lines[i][/^\s*/]
+
+              significant = []
+              k = i + 1
+
+              while (
+                k < lines.length &&
+                significant.length < 8
+              )
+                stripped =
+                  lines[k].strip
+
+                unless (
+                  stripped.empty? ||
+                  stripped.start_with?('#')
+                )
+                  significant << [
+                    k,
+                    stripped,
+                    lines[k][/^\s*/]
+                  ]
+                end
+
+                k += 1
+              end
+
+              end_index = nil
+
+              if (
+                significant.length >= 7 &&
+                significant[0][1] == 'Graphics.update' &&
+                significant[1][1] == 'Input.update' &&
+                significant[2][1] == 'update' &&
+                significant[3][1] == 'if $scene != self' &&
+                significant[4][1] == 'break' &&
+                significant[5][1] == 'end' &&
+                significant[6][1] == 'end' &&
+                significant[6][2] == indent
+              )
+                end_index =
+                  significant[6][0]
+
+              elsif (
+                significant.length >= 5 &&
+                significant[0][1] == 'Graphics.update' &&
+                significant[1][1] == 'Input.update' &&
+                significant[2][1] == 'update' &&
+                significant[3][1] == 'break if $scene != self' &&
+                significant[4][1] == 'end' &&
+                significant[4][2] == indent
+              )
+                end_index =
+                  significant[4][0]
+              end
+
+              if end_index != nil
+                lines[i..end_index] = [
+                  indent +
+                  "end\n\n" +
+                  indent +
+                  "def dispose\n"
+                ]
+
+                changed += 1
+                i += 1
+                next
+              end
+
+              i += 1
+            end
+
+            [
+              lines.join,
+              changed
+            ]
+          end
+
+          scene_loop_count = 0
+          begin_until_count = 0
+
+          # ----------------------------------------------------------
+          # Patch scripts
+          # ----------------------------------------------------------
+
+          scripts.each do |entry|
+            next unless (
+              entry.is_a?(Array) &&
+              entry.length >= 3
+            )
+
+            name =
+              entry[1].to_s
+
+            begin
+              source =
+                Zlib::Inflate.inflate(
+                  entry[2]
+                )
+            rescue
+              next
+            end
+
+            patched =
+              source.dup
+
+            patched, count =
+              patch_begin_until(
+                patched
+              )
+
+            begin_until_count +=
+              count
+
+            unless name == 'Main'
+              patched, count =
+                patch_scene_loops(
+                  patched
+                )
+
+              scene_loop_count +=
+                count
+            end
+
+            # --------------------------------------------------------
+            # Browser main loop
+            # --------------------------------------------------------
+
+            if name == 'Main'
+              unless patched.include?(
+                'def main_update_loop'
+              )
+                browser_loop = <<'RUBY'
+          $prev_scene = nil
+
+          def main_update_loop
+            if $scene != nil
+
+              if $scene != $prev_scene
+
+                if (
+                  $prev_scene != nil &&
+                  $prev_scene.respond_to?(:dispose)
+                )
+                  $prev_scene.dispose
+                end
+
+                $scene.main
+                $prev_scene = $scene
+              end
+
+              Graphics.update
+              Input.update
+              $scene.update
+
+            else
+              raise "END"
+            end
+          end
+
+          RUBY
+
+                patched =
+                  browser_loop +
+                  patched
+              end
+
+              # Original RPG Maker endless scene dispatcher.
+              # The browser now owns this loop.
+              patched.sub!(
+                /\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,
+                "\n"
+              )
+            end
+
+            next if patched == source
+
+            entry[2] =
+              Zlib::Deflate.deflate(
+                patched
+              )
+          end
+
+          # ----------------------------------------------------------
+          # Validate Main
+          # ----------------------------------------------------------
+
+          main =
+            scripts.find do |entry|
+              entry[1].to_s == 'Main'
+            end
+
+          abort 'Main script missing' \
+            if main == nil
+
+          main_source =
+            Zlib::Inflate.inflate(
+              main[2]
+            )
+
+          abort 'main_update_loop injection failed' \
+            unless main_source.include?(
+              'def main_update_loop'
+            )
+
+          # ----------------------------------------------------------
+          # Rename custom script archive to the standard name.
+          #
+          # The known-working player preloads Data/Scripts.
+          # ----------------------------------------------------------
+
+          target_scripts =
+            File.join(
+              game_dir,
+              'Data',
+              'Scripts.rxdata'
+            )
+
+          File.binwrite(
+            target_scripts,
+            Marshal.dump(scripts)
+          )
+
+          unless (
+            File.expand_path(scripts_path) ==
+            File.expand_path(target_scripts)
+          )
+            File.delete(
+              scripts_path
+            )
+          end
+
+          # ----------------------------------------------------------
+          # Rewrite Game.ini
+          # ----------------------------------------------------------
+
+          ini_lines =
+            ini.split(/\r?\n/)
+
+          ini_lines.map! do |line|
+            if line =~ /^Scripts=/i
+              'Scripts=Data\Scripts.rxdata'
+
+            elsif line =~ /^Title=/i
+              'Title=SLKnight'
+
+            else
+              line
+            end
+          end
+
+          File.binwrite(
+            ini_path,
+            ini_lines.join("\r\n") +
+            "\r\n"
+          )
+
+          puts(
+            "SCENE_LOOPS_PATCHED=" +
+            scene_loop_count.to_s
+          )
+
+          puts(
+            "BEGIN_UNTIL_PATCHED=" +
+            begin_until_count.to_s
+          )
+
+          puts(
+            'SLKNIGHT_MRUBY_STAGE1_PATCH_OK'
+          )
+          RB
+
+          test -s \
+            player/gameasync/Data/Scripts.rxdata
+
+          grep -a -q \
+            'Scripts=Data\Scripts.rxdata' \
+            player/gameasync/Game.ini
+
+      - name: Convert unsupported audio to OGG
+        run: |
+          set -e
+
+          if [ -d player/gameasync/Audio ]
+          then
+            find \
+              player/gameasync/Audio \
+              -type f \
+              -print0 \
+              | while IFS= read -r -d '' file
+            do
+              ext="${file##*.}"
+
+              ext="$(
+                printf '%s' "${ext}" \
+                  | tr '[:upper:]' '[:lower:]'
+              )"
+
+              case "${ext}" in
+
+                ogg)
+                  ;;
+
+                mid|midi)
+                  out="${file%.*}.ogg"
+                  tmp="${file%.*}.mkxpweb.wav"
+
+                  timidity \
+                    "${file}" \
+                    -Ow \
+                    -o "${tmp}"
+
+                  ffmpeg \
+                    -v error \
+                    -y \
+                    -i "${tmp}" \
+                    -c:a libvorbis \
+                    -q:a 4 \
+                    "${out}"
+
+                  rm -f \
+                    "${file}" \
+                    "${tmp}"
+                  ;;
+
+                mp3|wav|wma|aac|m4a|flac)
+                  out="${file%.*}.ogg"
+
+                  ffmpeg \
+                    -v error \
+                    -y \
+                    -i "${file}" \
+                    -c:a libvorbis \
+                    -q:a 4 \
+                    "${out}"
+
+                  rm -f \
+                    "${file}"
+                  ;;
+
+              esac
+            done
+          fi
+
+          echo \
+            'AUDIO_CONVERSION_OK'
+
+      - name: Convert unsupported images to PNG
+        run: |
+          set -e
+
+          if [ -d player/gameasync/Graphics ]
+          then
+            find \
+              player/gameasync/Graphics \
+              -type f \
+              -print0 \
+              | while IFS= read -r -d '' file
+            do
+              ext="${file##*.}"
+
+              ext="$(
+                printf '%s' "${ext}" \
+                  | tr '[:upper:]' '[:lower:]'
+              )"
+
+              case "${ext}" in
+
+                bmp|gif|webp|tif|tiff)
+                  out="${file%.*}.png"
+
+                  convert \
+                    "${file}[0]" \
+                    "${out}"
+
+                  rm -f \
+                    "${file}"
+                  ;;
+
+              esac
+            done
+          fi
+
+          echo \
+            'IMAGE_CONVERSION_OK'
+
+      - name: Generate async file mapping
+        run: |
+          set -e
+
+          cd player/gameasync
+
+          bash \
+            ../../mkxp-web/extra/make_mapping.sh
+
+          test -s \
+            mapping.js
+
+          test -s \
+            bitmap-map.js
+
+          echo \
+            'MAPPING_GENERATION_OK'
+
+      - name: Create empty optional map preload files
         run: |
           set -e
 
           mkdir -p \
-            engine/nostalgist/public
+            player/preload/Data
 
-          curl -L \
-            --fail \
-            --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/mkxp-z_libretro.js?run=${GITHUB_RUN_ID}" \
-            -o engine/nostalgist/public/mkxp-z_libretro.js
+          find \
+            player/gameasync/Data \
+            -maxdepth 1 \
+            -type f \
+            -iname 'Map*.rxdata' \
+            -print0 \
+            | while IFS= read -r -d '' file
+          do
+            name="$(
+              basename "${file}"
+            )"
 
-          curl -L \
-            --fail \
-            --retry 3 \
-            -H 'Cache-Control: no-cache' \
-            "${SITE_URL}/mkxp-z_libretro.wasm?run=${GITHUB_RUN_ID}" \
-            -o engine/nostalgist/public/mkxp-z_libretro.wasm
+            printf '[]\n' \
+              > "player/preload/Data/${name}.json"
+          done
 
-          test -s \
-            engine/nostalgist/public/mkxp-z_libretro.js
-
-          test -s \
-            engine/nostalgist/public/mkxp-z_libretro.wasm
-
-          echo "=== V7 THREADED ENGINE ==="
-
-          ls -lh \
-            engine/nostalgist/public/mkxp-z_libretro.js \
-            engine/nostalgist/public/mkxp-z_libretro.wasm
-
-          sha256sum \
-            engine/nostalgist/public/mkxp-z_libretro.js \
-            engine/nostalgist/public/mkxp-z_libretro.wasm
-
-      - name: Download official RPG Maker XP sample
+      - name: Configure SLKnight player shell
         run: |
           set -e
 
-          curl -Lk \
-            --fail \
-            --retry 3 \
-            -o knight-blade.zip \
-            https://dl.komodo.jp/rpgmakerweb/sample-games/knight-blade-howling-of-kerberos.zip
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          echo \
-            "a47c9cf1eaa466fc0fcd5e4fff0143881d318a71424fe1fab823aa95acaac58c  knight-blade.zip" \
-            | sha256sum -c -
+          path = Path(
+              'player/index.html'
+          )
 
-          unzip -q \
-            knight-blade.zip
+          html = path.read_text(
+              encoding='utf-8'
+          )
 
-          test -f \
-            KN_E/Game.ini
+          html = re.sub(
+              r"var namespace = '[^']*';",
+              "var namespace = 'slknight_web_v1';",
+              html,
+              count=1,
+          )
 
-          echo "=== KNIGHT BLADE FOUND ==="
+          html = re.sub(
+              r"var wTitle = '[^']*'\s*;?",
+              "var wTitle = 'SLKnight';",
+              html,
+              count=1,
+          )
 
-          ls -lh \
-            KN_E/Game.ini
+          html = html.replace(
+              '<title>MKXP</title>',
+              '<title>SLKnight</title>',
+              1,
+          )
 
-      - name: Pack official XP sample
-        run: |
-          set -e
-
-          rm -f \
-            knight-blade.mkxpz
-
-          cd KN_E
-
-          rpzip -r \
-            "${GITHUB_WORKSPACE}/knight-blade.mkxpz" \
-            *
-
-          cd "${GITHUB_WORKSPACE}"
-
-          test -s \
-            knight-blade.mkxpz
-
-          unzip -tq \
-            knight-blade.mkxpz \
-            >/dev/null
-
-          cp \
-            knight-blade.mkxpz \
-            engine/nostalgist/public/
-
-          echo "=== KNIGHT BLADE MKXPZ ==="
-
-          ls -lh \
-            engine/nostalgist/public/knight-blade.mkxpz
-
-      - name: Download official RPG Maker XP RTP
-        run: |
-          set -e
-
-          curl -Lk \
-            --fail \
-            --retry 3 \
-            -o xp_rtp104e.exe \
-            https://dl.komodo.jp/rpgmakerweb/run-time-packages/xp_rtp104e.exe
-
-          echo \
-            "b3bd20ad7f413b40ac233aafd2e061de1dc429c2eadb59d0b3157ba3c47f16b2  xp_rtp104e.exe" \
-            | sha256sum -c -
-
-          rm -rf \
-            app
-
-          innoextract \
-            xp_rtp104e.exe
-
-          test -d \
-            app
-
-          echo "=== XP RTP EXTRACTED ==="
-
-      - name: Pack official XP RTP
-        run: |
-          set -e
-
-          rm -f \
-            Standard.mkxpz
-
-          cd app
-
-          rpzip -r \
-            "${GITHUB_WORKSPACE}/Standard.mkxpz" \
-            *
-
-          cd "${GITHUB_WORKSPACE}"
-
-          test -s \
-            Standard.mkxpz
-
-          unzip -tq \
-            Standard.mkxpz \
-            >/dev/null
-
-          cp \
-            Standard.mkxpz \
-            engine/nostalgist/public/
-
-          echo "=== XP RTP MKXPZ ==="
-
-          ls -lh \
-            engine/nostalgist/public/Standard.mkxpz
-
-      - name: Configure exact upstream XP test
-        run: |
-          set -e
-
-          cat > engine/nostalgist/.env <<'ENVEOF'
-          VITE_CORE_JS_PATH=./mkxp-z_libretro.js
-          VITE_CORE_WASM_PATH=./mkxp-z_libretro.wasm
-          VITE_GAME_NAME=KNight-Blade XP Engine Test
-          VITE_GAME_PATH=./knight-blade.mkxpz
-          VITE_RTP_PATH=./Standard.mkxpz
-          VITE_XP_CONTROLS=true
-          VITE_HAVE_OPFS=true
-          VITE_REQUIRE_OPFS=false
-          ENVEOF
-
-          echo "=== TEST ENV ==="
-
-          cat \
-            engine/nostalgist/.env
-
-      - name: Install frontend packages
-        working-directory: engine/nostalgist
-        run: |
-          set -e
-
-          npm install
-
-      - name: Build clean upstream frontend
-        working-directory: engine/nostalgist
-        run: |
-          set -e
-
-          npm run build
+          path.write_text(
+              html,
+              encoding='utf-8',
+          )
+          PY
 
           touch \
-            dist/.nojekyll
+            player/.nojekyll
 
-      - name: Verify XP isolation package
+      - name: Verify deploy package
         run: |
           set -e
 
           test -s \
-            engine/nostalgist/dist/index.html
+            player/index.html
 
           test -s \
-            engine/nostalgist/dist/coi-serviceworker.min.js
+            player/mkxp.js
 
           test -s \
-            engine/nostalgist/dist/mkxp-z_libretro.js
+            player/mkxp.wasm
 
           test -s \
-            engine/nostalgist/dist/mkxp-z_libretro.wasm
+            player/js/drive.js
 
           test -s \
-            engine/nostalgist/dist/knight-blade.mkxpz
+            player/gameasync/Game.ini
 
           test -s \
-            engine/nostalgist/dist/Standard.mkxpz
+            player/gameasync/rgss.rb
+
+          test -s \
+            player/gameasync/mapping.js
+
+          test -s \
+            player/gameasync/bitmap-map.js
+
+          test -s \
+            player/gameasync/Data/Scripts.rxdata
+
+          grep -Fq \
+            "var namespace = 'slknight_web_v1';" \
+            player/index.html
+
+          grep -Fq \
+            "var wTitle = 'SLKnight';" \
+            player/index.html
 
           echo \
-            "XP_ENGINE_ISOLATION_V2_READY"
+            'SLKNIGHT_MKXP_WEB_STAGE1_READY'
 
-          ls -lh \
-            engine/nostalgist/dist/mkxp-z_libretro.js \
-            engine/nostalgist/dist/mkxp-z_libretro.wasm \
-            engine/nostalgist/dist/knight-blade.mkxpz \
-            engine/nostalgist/dist/Standard.mkxpz
+          du -sh \
+            player
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: engine/nostalgist/dist
+          path: player
 
   deploy:
     name: Deploy GitHub Pages
