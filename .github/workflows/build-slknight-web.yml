@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web Stage 1 V2
+name: Deploy SLKnight mkxp-web Stage 1 V3
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
   build:
     name: Build SLKnight with working mkxp-web engine
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Install conversion tools
@@ -38,6 +38,7 @@ jobs:
             curl \
             unzip \
             ruby \
+            python3 \
             ffmpeg \
             imagemagick \
             file \
@@ -503,108 +504,321 @@ jobs:
         run: |
           set -e
 
-          if [ -d player/gameasync/Audio ]
-          then
-            find \
-              player/gameasync/Audio \
-              -type f \
-              -print0 \
-              | while IFS= read -r -d '' file
-            do
-              ext="${file##*.}"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
 
-              ext="$(
-                printf '%s' "${ext}" \
-                  | tr '[:upper:]' '[:lower:]'
-              )"
+          root = Path(
+              "player/gameasync/Audio"
+          )
 
-              case "${ext}" in
+          if not root.exists():
+              print(
+                  "AUDIO_DIRECTORY_NOT_PRESENT"
+              )
+              raise SystemExit(0)
 
-                ogg)
-                  ;;
+          convertible = {
+              ".mp3",
+              ".wav",
+              ".wma",
+              ".aac",
+              ".m4a",
+              ".flac",
+              ".mid",
+              ".midi",
+          }
 
-                mid|midi)
-                  out="${file%.*}.ogg"
-                  tmp="${file%.*}.mkxpweb.wav"
+          midi_exts = {
+              ".mid",
+              ".midi",
+          }
 
-                  timidity \
-                    "${file}" \
-                    -Ow \
-                    -o "${tmp}"
+          files = [
+              path
+              for path in root.rglob("*")
+              if (
+                  path.is_file()
+                  and
+                  path.suffix.lower()
+                  in convertible
+              )
+          ]
 
-                  ffmpeg \
-                    -v error \
-                    -y \
-                    -i "${tmp}" \
-                    -c:a libvorbis \
-                    -q:a 4 \
-                    "${out}"
+          print(
+              "AUDIO_FILES_TO_CONVERT="
+              + str(len(files))
+          )
 
-                  rm -f \
-                    "${file}" \
-                    "${tmp}"
-                  ;;
+          converted = 0
+          failures = []
 
-                mp3|wav|wma|aac|m4a|flac)
-                  out="${file%.*}.ogg"
+          for src in files:
+              ext = src.suffix.lower()
 
-                  ffmpeg \
-                    -v error \
-                    -y \
-                    -i "${file}" \
-                    -c:a libvorbis \
-                    -q:a 4 \
-                    "${out}"
+              out = src.with_suffix(
+                  ".ogg"
+              )
 
-                  rm -f \
-                    "${file}"
-                  ;;
+              temp_wav = None
 
-              esac
-            done
-          fi
+              try:
+                  source_for_ffmpeg = src
 
-          echo \
-            'AUDIO_CONVERSION_OK'
+                  if ext in midi_exts:
+                      temp_wav = src.with_name(
+                          src.name
+                          + ".mkxpweb.wav"
+                      )
+
+                      print(
+                          "MIDI: "
+                          + str(src)
+                      )
+
+                      subprocess.run(
+                          [
+                              "timidity",
+                              str(src),
+                              "-Ow",
+                              "-o",
+                              str(temp_wav),
+                          ],
+                          check=True,
+                      )
+
+                      source_for_ffmpeg = (
+                          temp_wav
+                      )
+
+                  else:
+                      print(
+                          "AUDIO: "
+                          + str(src)
+                      )
+
+                  subprocess.run(
+                      [
+                          "ffmpeg",
+                          "-nostdin",
+                          "-v",
+                          "error",
+                          "-y",
+                          "-i",
+                          str(
+                              source_for_ffmpeg
+                          ),
+                          "-c:a",
+                          "libvorbis",
+                          "-q:a",
+                          "4",
+                          str(out),
+                      ],
+                      check=True,
+                  )
+
+                  if (
+                      not out.exists()
+                      or out.stat().st_size == 0
+                  ):
+                      raise RuntimeError(
+                          "OGG output missing: "
+                          + str(out)
+                      )
+
+                  if (
+                      temp_wav is not None
+                      and temp_wav.exists()
+                  ):
+                      temp_wav.unlink()
+
+                  if (
+                      src.exists()
+                      and src != out
+                  ):
+                      src.unlink()
+
+                  converted += 1
+
+              except Exception as exc:
+                  failures.append(
+                      (
+                          str(src),
+                          str(exc),
+                      )
+                  )
+
+                  if (
+                      temp_wav is not None
+                      and temp_wav.exists()
+                  ):
+                      temp_wav.unlink()
+
+          if failures:
+              print(
+                  "AUDIO CONVERSION FAILURES:",
+                  file=sys.stderr,
+              )
+
+              for name, error in failures:
+                  print(
+                      name
+                      + " -> "
+                      + error,
+                      file=sys.stderr,
+                  )
+
+              raise SystemExit(1)
+
+          remaining = [
+              str(path)
+              for path in root.rglob("*")
+              if (
+                  path.is_file()
+                  and
+                  path.suffix.lower()
+                  in convertible
+              )
+          ]
+
+          if remaining:
+              print(
+                  "UNCONVERTED AUDIO:",
+                  file=sys.stderr,
+              )
+
+              for path in remaining:
+                  print(
+                      path,
+                      file=sys.stderr,
+                  )
+
+              raise SystemExit(1)
+
+          print(
+              "AUDIO_CONVERTED="
+              + str(converted)
+          )
+
+          print(
+              "AUDIO_CONVERSION_OK"
+          )
+          PY
 
       - name: Convert unsupported images to PNG
         run: |
           set -e
 
-          if [ -d player/gameasync/Graphics ]
-          then
-            find \
-              player/gameasync/Graphics \
-              -type f \
-              -print0 \
-              | while IFS= read -r -d '' file
-            do
-              ext="${file##*.}"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
 
-              ext="$(
-                printf '%s' "${ext}" \
-                  | tr '[:upper:]' '[:lower:]'
-              )"
+          root = Path(
+              "player/gameasync/Graphics"
+          )
 
-              case "${ext}" in
+          if not root.exists():
+              print(
+                  "GRAPHICS_DIRECTORY_NOT_PRESENT"
+              )
+              raise SystemExit(0)
 
-                bmp|gif|webp|tif|tiff)
-                  out="${file%.*}.png"
+          convertible = {
+              ".bmp",
+              ".gif",
+              ".webp",
+              ".tif",
+              ".tiff",
+          }
 
-                  convert \
-                    "${file}[0]" \
-                    "${out}"
+          files = [
+              path
+              for path in root.rglob("*")
+              if (
+                  path.is_file()
+                  and
+                  path.suffix.lower()
+                  in convertible
+              )
+          ]
 
-                  rm -f \
-                    "${file}"
-                  ;;
+          print(
+              "IMAGE_FILES_TO_CONVERT="
+              + str(len(files))
+          )
 
-              esac
-            done
-          fi
+          failures = []
+          converted = 0
 
-          echo \
-            'IMAGE_CONVERSION_OK'
+          for src in files:
+              out = src.with_suffix(
+                  ".png"
+              )
+
+              try:
+                  print(
+                      "IMAGE: "
+                      + str(src)
+                  )
+
+                  subprocess.run(
+                      [
+                          "convert",
+                          str(src) + "[0]",
+                          str(out),
+                      ],
+                      check=True,
+                  )
+
+                  if (
+                      not out.exists()
+                      or out.stat().st_size == 0
+                  ):
+                      raise RuntimeError(
+                          "PNG output missing: "
+                          + str(out)
+                      )
+
+                  if src.exists():
+                      src.unlink()
+
+                  converted += 1
+
+              except Exception as exc:
+                  failures.append(
+                      (
+                          str(src),
+                          str(exc),
+                      )
+                  )
+
+          if failures:
+              print(
+                  "IMAGE CONVERSION FAILURES:",
+                  file=sys.stderr,
+              )
+
+              for name, error in failures:
+                  print(
+                      name
+                      + " -> "
+                      + error,
+                      file=sys.stderr,
+                  )
+
+              raise SystemExit(1)
+
+          print(
+              "IMAGES_CONVERTED="
+              + str(converted)
+          )
+
+          print(
+              "IMAGE_CONVERSION_OK"
+          )
+          PY
 
       - name: Generate async file mapping
         run: |
@@ -624,28 +838,53 @@ jobs:
           echo \
             'MAPPING_GENERATION_OK'
 
-      - name: Create empty optional map preload files
+      - name: Create optional map preload files
         run: |
           set -e
 
-          mkdir -p \
-            player/preload/Data
+          python3 - <<'PY'
+          from pathlib import Path
 
-          find \
-            player/gameasync/Data \
-            -maxdepth 1 \
-            -type f \
-            -iname 'Map*.rxdata' \
-            -print0 \
-            | while IFS= read -r -d '' file
-          do
-            name="$(
-              basename "${file}"
-            )"
+          data_root = Path(
+              "player/gameasync/Data"
+          )
 
-            printf '[]\n' \
-              > "player/preload/Data/${name}.json"
-          done
+          preload_root = Path(
+              "player/preload/Data"
+          )
+
+          preload_root.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          count = 0
+
+          for source in sorted(
+              data_root.glob(
+                  "Map*.rxdata"
+              )
+          ):
+              target = (
+                  preload_root
+                  / (
+                      source.name
+                      + ".json"
+                  )
+              )
+
+              target.write_text(
+                  "[]\n",
+                  encoding="utf-8",
+              )
+
+              count += 1
+
+          print(
+              "MAP_PRELOAD_FILES="
+              + str(count)
+          )
+          PY
 
       - name: Configure SLKnight player shell
         run: |
@@ -656,21 +895,21 @@ jobs:
           import re
 
           path = Path(
-              'player/index.html'
+              "player/index.html"
           )
 
           html = path.read_text(
-              encoding='utf-8'
+              encoding="utf-8"
           )
 
-          html = re.sub(
+          html, count1 = re.subn(
               r"var namespace = '[^']*';",
               "var namespace = 'slknight_web_v1';",
               html,
               count=1,
           )
 
-          html = re.sub(
+          html, count2 = re.subn(
               r"var wTitle = '[^']*'\s*;?",
               "var wTitle = 'SLKnight';",
               html,
@@ -678,14 +917,28 @@ jobs:
           )
 
           html = html.replace(
-              '<title>MKXP</title>',
-              '<title>SLKnight</title>',
+              "<title>MKXP</title>",
+              "<title>SLKnight</title>",
               1,
           )
 
+          if count1 != 1:
+              raise SystemExit(
+                  "namespace patch failed"
+              )
+
+          if count2 != 1:
+              raise SystemExit(
+                  "title variable patch failed"
+              )
+
           path.write_text(
               html,
-              encoding='utf-8',
+              encoding="utf-8",
+          )
+
+          print(
+              "PLAYER_SHELL_CONFIG_OK"
           )
           PY
 
@@ -731,8 +984,11 @@ jobs:
             "var wTitle = 'SLKnight';" \
             player/index.html
 
+          rm -rf \
+            player/.git
+
           echo \
-            'SLKNIGHT_MKXP_WEB_STAGE1_READY'
+            'SLKNIGHT_MKXP_WEB_STAGE1_V3_READY'
 
           du -sh \
             player
@@ -748,7 +1004,8 @@ jobs:
     needs:
       - build
 
-    runs-on: ubuntu-24.04
+    runs-on:
+      ubuntu-24.04
 
     environment:
       name: github-pages
