@@ -1,1 +1,805 @@
+name: Deploy SLKnight Runtime Log Capture
 
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-slknight-web.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: slknight-github-pages
+  cancel-in-progress: true
+
+env:
+  ENGINE_REPO: white-axe/mkxp-z-libretro-emscripten
+  ENGINE_REF: f0a1ff80f05dd0d1f8ca711485a5b0a601bc7502
+  SITE_URL: https://gowellsik-hue.github.io/Game
+
+jobs:
+  build:
+    name: Build runtime log capture frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Checkout frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          submodules: false
+          path: engine
+
+      - name: Download current single-thread engine and game
+        run: |
+          set -e
+
+          mkdir -p engine/nostalgist/public
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/mkxp-z_libretro.js?run=${GITHUB_RUN_ID}" \
+            -o engine/nostalgist/public/mkxp-z_libretro.js
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/mkxp-z_libretro.wasm?run=${GITHUB_RUN_ID}" \
+            -o engine/nostalgist/public/mkxp-z_libretro.wasm
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -H 'Cache-Control: no-cache' \
+            "${SITE_URL}/slknight.mkxpz?run=${GITHUB_RUN_ID}" \
+            -o engine/nostalgist/public/slknight.mkxpz
+
+          test -s engine/nostalgist/public/mkxp-z_libretro.js
+          test -s engine/nostalgist/public/mkxp-z_libretro.wasm
+          test -s engine/nostalgist/public/slknight.mkxpz
+
+          ls -lh \
+            engine/nostalgist/public/mkxp-z_libretro.js \
+            engine/nostalgist/public/mkxp-z_libretro.wasm \
+            engine/nostalgist/public/slknight.mkxpz
+
+      - name: Configure single-thread frontend
+        run: |
+          set -e
+
+          cat > engine/nostalgist/.env <<'EOF'
+          VITE_CORE_JS_PATH=./mkxp-z_libretro.js
+          VITE_CORE_WASM_PATH=./mkxp-z_libretro.wasm
+          VITE_GAME_NAME=SLKnight Runtime Log
+          VITE_GAME_PATH=./slknight.mkxpz
+          VITE_XP_CONTROLS=true
+          VITE_HAVE_OPFS=false
+          VITE_REQUIRE_OPFS=false
+          EOF
+
+      - name: Inject runtime log viewer
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          index_path = Path("engine/nostalgist/index.html")
+          html = index_path.read_text(encoding="utf-8")
+
+          html = html.replace(
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
+              1,
+          )
+
+          html = html.replace(
+              '<script src="./coi-serviceworker.min.js"></script>',
+              '',
+              1,
+          )
+
+          html = re.sub(
+              r'<script>\s*// Send a dummy message every 5 seconds.*?</script>',
+              '',
+              html,
+              count=1,
+              flags=re.S,
+          )
+
+          html = re.sub(
+              r'<p id="user-activation-prompt"[^>]*>\s*▶\s*</p>',
+              '''
+              <p
+                id="user-activation-prompt"
+                style="
+                  display:none;
+                  font-size:18px;
+                  padding:14px 20px;
+                  border:1px solid #888;
+                  border-radius:10px;
+                  background:#111;
+                  color:#fff
+                "
+              >
+                화면을 터치해 실행
+              </p>
+              ''',
+              html,
+              count=1,
+              flags=re.S,
+          )
+
+          index_path.write_text(
+              html,
+              encoding="utf-8",
+          )
+
+          main_path = Path(
+              "engine/nostalgist/src/main.ts"
+          )
+
+          text = main_path.read_text(
+              encoding="utf-8"
+          )
+
+          # ----------------------------------------------------------
+          # 1. 화면 로그창 설치
+          # ----------------------------------------------------------
+
+          title_marker = '''if (GAME_NAME !== null) {
+            document.title = GAME_NAME;
+          }
+          '''
+
+          if title_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: title marker"
+              )
+
+          logger_code = r'''
+
+          const slLogLines: string[] = [];
+
+          const slLogBox =
+            document.createElement("div");
+
+          slLogBox.id = "sl-runtime-log";
+
+          slLogBox.style.cssText = `
+            position: fixed;
+            z-index: 2147483647;
+            left: 6px;
+            top: 6px;
+            width: calc(100vw - 12px);
+            max-height: 46vh;
+            box-sizing: border-box;
+            overflow: hidden;
+            padding: 8px;
+            border: 1px solid rgba(255,255,255,.65);
+            border-radius: 7px;
+            background: rgba(0,0,0,.88);
+            color: #f4f4f4;
+            font: 11px/1.28 monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+            pointer-events: none;
+          `;
+
+          document.body.appendChild(
+            slLogBox
+          );
+
+          const slString = (
+            value: unknown
+          ): string => {
+            if (value instanceof Error) {
+              return (
+                value.stack ??
+                value.message
+              );
+            }
+
+            if (typeof value === "string") {
+              return value;
+            }
+
+            try {
+              const json =
+                JSON.stringify(value);
+
+              if (
+                typeof json ===
+                "string"
+              ) {
+                return json;
+              }
+            } catch {
+              // ignore
+            }
+
+            return String(value);
+          };
+
+          const slLog = (
+            ...values: unknown[]
+          ) => {
+            const time =
+              new Date()
+                .toLocaleTimeString();
+
+            const line =
+              "[" +
+              time +
+              "] " +
+              values
+                .map(slString)
+                .join(" ");
+
+            slLogLines.push(line);
+
+            if (
+              slLogLines.length > 120
+            ) {
+              slLogLines.splice(
+                0,
+                slLogLines.length - 120,
+              );
+            }
+
+            slLogBox.textContent =
+              [
+                "SLKnight RUNTIME LOG",
+                "------------------------------",
+                ...slLogLines.slice(-34),
+              ].join("\\n");
+
+            try {
+              localStorage.setItem(
+                "slknight-runtime-log",
+                slLogLines.join("\\n"),
+              );
+            } catch {
+              // ignore
+            }
+          };
+
+          const originalConsoleInfo =
+            console.info.bind(console);
+
+          const originalConsoleWarn =
+            console.warn.bind(console);
+
+          const originalConsoleError =
+            console.error.bind(console);
+
+          console.info = (
+            ...values: unknown[]
+          ) => {
+            originalConsoleInfo(
+              ...values
+            );
+
+            slLog(
+              "[CONSOLE INFO]",
+              ...values,
+            );
+          };
+
+          console.warn = (
+            ...values: unknown[]
+          ) => {
+            originalConsoleWarn(
+              ...values
+            );
+
+            slLog(
+              "[CONSOLE WARN]",
+              ...values,
+            );
+          };
+
+          console.error = (
+            ...values: unknown[]
+          ) => {
+            originalConsoleError(
+              ...values
+            );
+
+            slLog(
+              "[CONSOLE ERROR]",
+              ...values,
+            );
+          };
+
+          window.addEventListener(
+            "error",
+            (event) => {
+              slLog(
+                "[WINDOW ERROR]",
+                event.message,
+                event.filename,
+                event.lineno,
+                event.colno,
+              );
+            },
+          );
+
+          window.addEventListener(
+            "unhandledrejection",
+            (event) => {
+              slLog(
+                "[PROMISE REJECTION]",
+                event.reason,
+              );
+            },
+          );
+
+          slLog(
+            "[BOOT] FRONTEND LOGGER READY"
+          );
+
+          '''
+
+          text = text.replace(
+              title_marker,
+              title_marker + logger_code,
+              1,
+          )
+
+          # ----------------------------------------------------------
+          # 2. 싱글스레드이므로 COI / service worker 검사 제거
+          # ----------------------------------------------------------
+
+          secure_start = text.find(
+              "// Multithreaded WebAssembly requires a secure context"
+          )
+
+          opfs_start = text.find(
+              "const opfs = !HAVE_OPFS",
+              secure_start,
+          )
+
+          if (
+              secure_start < 0
+              or opfs_start < 0
+          ):
+              raise SystemExit(
+                  "PATCH FAILED: COI block"
+              )
+
+          text = (
+              text[:secure_start]
+              + '''
+          slLog(
+            "[BOOT] SINGLE THREAD / COI CHECK SKIPPED"
+          );
+
+          '''
+              + text[opfs_start:]
+          )
+
+          # ----------------------------------------------------------
+          # 3. 다운로드 단계 표시
+          # ----------------------------------------------------------
+
+          fetch_marker = (
+              "const [coreJsBlob, coreWasmBlob, gameBlob, rtpBlob] "
+              "= await Promise.all(["
+          )
+
+          if fetch_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: fetch marker"
+              )
+
+          text = text.replace(
+              fetch_marker,
+              '''
+          slLog(
+            "[BOOT] DOWNLOADING CORE + GAME"
+          );
+
+          '''
+              + fetch_marker,
+              1,
+          )
+
+          fetch_pos = text.find(
+              fetch_marker
+          )
+
+          fetch_end = text.find(
+              "]);",
+              fetch_pos,
+          )
+
+          if fetch_end < 0:
+              raise SystemExit(
+                  "PATCH FAILED: fetch end"
+              )
+
+          fetch_end += len("]);")
+
+          text = (
+              text[:fetch_end]
+              + '''
+
+          slLog(
+            "[BOOT] CORE + GAME DOWNLOAD COMPLETE",
+            "game=" +
+              String(
+                gameBlob?.size ??
+                0
+              ) +
+              " bytes",
+            "wasm=" +
+              String(
+                coreWasmBlob.size
+              ) +
+              " bytes",
+          );
+          '''
+              + text[fetch_end:]
+          )
+
+          # ----------------------------------------------------------
+          # 4. 실제 Emscripten / RetroArch stdout stderr 가로채기
+          # ----------------------------------------------------------
+
+          old_emscripten = '''  emscriptenModule: {
+            preRun: [
+              (module) => {
+                if (opfs !== null) {
+                  // Indicate to RetroArch that we want to enable OPFS support if it's supported
+                  module.ENV.OPFS_MOUNT = PERSISTENT_DIRECTORY;
+                }
+              },
+            ],
+          },
+          '''
+
+          new_emscripten = '''  emscriptenModule: {
+            preRun: [
+              (module) => {
+                slLog(
+                  "[EMSCRIPTEN] preRun"
+                );
+
+                if (opfs !== null) {
+                  module.ENV.OPFS_MOUNT =
+                    PERSISTENT_DIRECTORY;
+                }
+              },
+            ],
+
+            print: (
+              ...values: unknown[]
+            ) => {
+              slLog(
+                "[STDOUT]",
+                ...values,
+              );
+            },
+
+            printErr: (
+              ...values: unknown[]
+            ) => {
+              slLog(
+                "[STDERR]",
+                ...values,
+              );
+            },
+
+            quit: (
+              status: unknown,
+              toThrow: unknown,
+            ) => {
+              slLog(
+                "[QUIT]",
+                "status=" +
+                  String(status),
+                toThrow,
+              );
+            },
+          },
+          '''
+
+          if old_emscripten not in text:
+              raise SystemExit(
+                  "PATCH FAILED: emscriptenModule block"
+              )
+
+          text = text.replace(
+              old_emscripten,
+              new_emscripten,
+              1,
+          )
+
+          # ----------------------------------------------------------
+          # 5. RetroArch 로그 레벨 최대
+          # ----------------------------------------------------------
+
+          text = text.replace(
+              "libretro_log_level: import.meta.env.DEV ? 0 : 1,",
+              "libretro_log_level: 0,",
+              1,
+          )
+
+          text = text.replace(
+              "frontend_log_level: import.meta.env.DEV ? 0 : 1,",
+              "frontend_log_level: 0,",
+              1,
+          )
+
+          # ----------------------------------------------------------
+          # 6. prepare 전후 확인
+          # ----------------------------------------------------------
+
+          prepare_marker = (
+              "const nostalgist = "
+              "await Nostalgist.prepare({"
+          )
+
+          if prepare_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: prepare marker"
+              )
+
+          text = text.replace(
+              prepare_marker,
+              '''
+          slLog(
+            "[BOOT] Nostalgist.prepare BEGIN"
+          );
+
+          '''
+              + prepare_marker,
+              1,
+          )
+
+          after_prepare_marker = (
+              "\n\nif (opfs !== null) {"
+          )
+
+          prepare_pos = text.find(
+              prepare_marker
+          )
+
+          prepare_end = text.find(
+              after_prepare_marker,
+              prepare_pos,
+          )
+
+          if prepare_end < 0:
+              raise SystemExit(
+                  "PATCH FAILED: prepare end"
+              )
+
+          text = (
+              text[:prepare_end]
+              + '''
+
+          slLog(
+            "[BOOT] Nostalgist.prepare COMPLETE"
+          );
+          '''
+              + text[prepare_end:]
+          )
+
+          # ----------------------------------------------------------
+          # 7. 시작 호출 전후 + 실제 상태 heartbeat
+          # ----------------------------------------------------------
+
+          start_marker = (
+              "await nostalgist.start();"
+          )
+
+          if start_marker not in text:
+              raise SystemExit(
+                  "PATCH FAILED: start marker"
+              )
+
+          start_code = r'''
+
+          slLog(
+            "[START] calling nostalgist.start()"
+          );
+
+          try {
+            await nostalgist.start();
+
+            slLog(
+              "[START] start() RETURNED",
+              "status=" +
+                nostalgist.getStatus(),
+              "(RETURNED does NOT mean core exited)",
+            );
+
+          } catch (error) {
+
+            slLog(
+              "[START ERROR]",
+              error,
+            );
+
+            throw error;
+          }
+
+          let slHeartbeatCount = 0;
+
+          const slHeartbeatTimer =
+            window.setInterval(
+              () => {
+                slHeartbeatCount += 1;
+
+                const canvas =
+                  document.getElementById(
+                    "nostalgist-canvas"
+                  ) as HTMLCanvasElement | null;
+
+                slLog(
+                  "[HEARTBEAT " +
+                    String(
+                      slHeartbeatCount
+                    ) +
+                    "]",
+                  "status=" +
+                    nostalgist.getStatus(),
+                  "canvas=" +
+                    String(
+                      canvas?.width ?? 0
+                    ) +
+                    "x" +
+                    String(
+                      canvas?.height ?? 0
+                    ),
+                  "client=" +
+                    String(
+                      canvas?.clientWidth ?? 0
+                    ) +
+                    "x" +
+                    String(
+                      canvas?.clientHeight ?? 0
+                    ),
+                );
+
+                if (
+                  slHeartbeatCount >= 12
+                ) {
+                  window.clearInterval(
+                    slHeartbeatTimer
+                  );
+                }
+              },
+              3000,
+            );
+
+          '''
+
+          text = text.replace(
+              start_marker,
+              start_code,
+              1,
+          )
+
+          main_path.write_text(
+              text,
+              encoding="utf-8",
+          )
+
+          print(
+              "SLKNIGHT_RUNTIME_LOG_PATCH_OK"
+          )
+          PY
+
+      - name: Install frontend packages
+        working-directory: engine/nostalgist
+        run: |
+          set -e
+          npm install
+
+      - name: Format and type-check patched frontend
+        working-directory: engine/nostalgist
+        run: |
+          set -e
+
+          npx prettier \
+            --write \
+            src/main.ts \
+            index.html
+
+          npm run lint
+
+      - name: Generate game hashes and sizes
+        working-directory: engine/nostalgist
+        run: |
+          set -e
+          node update-env.ts
+
+      - name: Build relative-path GitHub Pages frontend
+        working-directory: engine/nostalgist
+        run: |
+          set -e
+
+          npx vite build \
+            --base=./
+
+          touch dist/.nojekyll
+
+      - name: Verify diagnostic package
+        run: |
+          set -e
+
+          test -s \
+            engine/nostalgist/dist/index.html
+
+          test -s \
+            engine/nostalgist/dist/mkxp-z_libretro.js
+
+          test -s \
+            engine/nostalgist/dist/mkxp-z_libretro.wasm
+
+          test -s \
+            engine/nostalgist/dist/slknight.mkxpz
+
+          grep -q \
+            'src="./assets/' \
+            engine/nostalgist/dist/index.html
+
+          grep -R \
+            'SLKnight RUNTIME LOG' \
+            engine/nostalgist/dist/assets \
+            >/dev/null
+
+          grep -R \
+            '\[STDERR\]' \
+            engine/nostalgist/dist/assets \
+            >/dev/null
+
+          grep -R \
+            '\[QUIT\]' \
+            engine/nostalgist/dist/assets \
+            >/dev/null
+
+          echo \
+            'SLKNIGHT_RUNTIME_LOG_BUILD_OK'
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: engine/nostalgist/dist
+
+  deploy:
+    name: Deploy GitHub Pages
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
