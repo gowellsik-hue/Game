@@ -1,4 +1,4 @@
-name: Deploy SLKnight Runtime Log Capture V5
+name: Deploy SLKnight Play V6
 
 on:
   push:
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build:
-    name: Build runtime logger V5
+    name: Build SLKnight Play V6
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -34,7 +34,7 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Checkout frontend source
+      - name: Checkout clean frontend
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ENGINE_REPO }}
@@ -42,13 +42,19 @@ jobs:
           submodules: false
           path: engine
 
-      - name: Download existing single-thread engine and game
+      - name: Reuse existing single-thread engine and game
         run: |
           set -e
+
           mkdir -p engine/nostalgist/public
 
-          for file in mkxp-z_libretro.js mkxp-z_libretro.wasm slknight.mkxpz
+          for file in \
+            mkxp-z_libretro.js \
+            mkxp-z_libretro.wasm \
+            slknight.mkxpz
           do
+            echo "Downloading ${file}"
+
             curl -L \
               --fail \
               --retry 3 \
@@ -66,21 +72,21 @@ jobs:
             engine/nostalgist/public/mkxp-z_libretro.wasm \
             engine/nostalgist/public/slknight.mkxpz
 
-      - name: Configure single-thread frontend
+      - name: Configure SLKnight play frontend
         run: |
           set -e
 
           cat > engine/nostalgist/.env <<'ENVEOF'
           VITE_CORE_JS_PATH=./mkxp-z_libretro.js
           VITE_CORE_WASM_PATH=./mkxp-z_libretro.wasm
-          VITE_GAME_NAME=SLKnight Runtime Logger V5
+          VITE_GAME_NAME=SLKnight
           VITE_GAME_PATH=./slknight.mkxpz
           VITE_XP_CONTROLS=true
           VITE_HAVE_OPFS=false
           VITE_REQUIRE_OPFS=false
           ENVEOF
 
-      - name: Inject filtered runtime logger V5
+      - name: Patch frontend for direct play
         run: |
           set -e
 
@@ -88,249 +94,155 @@ jobs:
           from pathlib import Path
           import re
 
-          index_path = Path("engine/nostalgist/index.html")
-          html = index_path.read_text(encoding="utf-8")
+          # ==========================================================
+          # index.html
+          # ==========================================================
+
+          index_path = Path(
+              "engine/nostalgist/index.html"
+          )
+
+          html = index_path.read_text(
+              encoding="utf-8"
+          )
+
+          # Mobile viewport
+          old_viewport = (
+              '<meta name="viewport" '
+              'content="width=device-width, initial-scale=1.0" />'
+          )
+
+          new_viewport = (
+              '<meta name="viewport" '
+              'content="width=device-width, initial-scale=1.0, '
+              'maximum-scale=1.0, user-scalable=no, '
+              'viewport-fit=cover" />'
+          )
+
+          if old_viewport not in html:
+              raise SystemExit(
+                  "PATCH FAILED: viewport"
+              )
 
           html = html.replace(
-              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
-              '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
+              old_viewport,
+              new_viewport,
               1,
           )
 
+          # Single-thread build does not need COI service worker
           html = html.replace(
               '<script src="./coi-serviceworker.min.js"></script>',
               '',
               1,
           )
 
+          # Remove service-worker heartbeat block
           html = re.sub(
-              r'<script>\s*// Send a dummy message every 5 seconds.*?</script>',
+              r'<script>\s*'
+              r'// Send a dummy message every 5 seconds'
+              r'.*?</script>',
               '',
               html,
               count=1,
               flags=re.S,
           )
 
+          # Give the real game canvas an explicit backing size.
+          canvas_id = (
+              '      id="nostalgist-canvas"\n'
+          )
+
+          if html.count(canvas_id) != 1:
+              raise SystemExit(
+                  "PATCH FAILED: canvas id"
+              )
+
+          html = html.replace(
+              canvas_id,
+              (
+                  '      id="nostalgist-canvas"\n'
+                  '      width="640"\n'
+                  '      height="480"\n'
+              ),
+              1,
+          )
+
+          old_canvas_style = (
+              'style="position: fixed; left: 0; top: 0; '
+              'width: 100%; height: 100%"'
+          )
+
+          new_canvas_style = (
+              'style="position: fixed; left: 0; top: 0; '
+              'width: 100vw; height: 100vh; '
+              'display: block; background: #000"'
+          )
+
+          if old_canvas_style not in html:
+              raise SystemExit(
+                  "PATCH FAILED: canvas style"
+              )
+
+          html = html.replace(
+              old_canvas_style,
+              new_canvas_style,
+              1,
+          )
+
+          # Replace giant play symbol with a normal mobile prompt.
           html = re.sub(
-              r'<p id="user-activation-prompt"[^>]*>\s*▶\s*</p>',
-              '<p id="user-activation-prompt" style="display:none;font-size:18px;padding:14px 20px;border:1px solid #888;border-radius:10px;background:#111;color:#fff">화면을 터치해 실행</p>',
+              r'<p id="user-activation-prompt"'
+              r'[^>]*>\s*▶\s*</p>',
+              '''
+              <p
+                id="user-activation-prompt"
+                style="
+                  display:none;
+                  position:fixed;
+                  left:50%;
+                  top:50%;
+                  transform:translate(-50%,-50%);
+                  z-index:100;
+                  margin:0;
+                  padding:14px 20px;
+                  border:1px solid #777;
+                  border-radius:10px;
+                  background:#111;
+                  color:#fff;
+                  font-size:18px;
+                  font-family:system-ui,sans-serif
+                "
+              >
+                화면을 터치해 시작
+              </p>
+              ''',
               html,
               count=1,
               flags=re.S,
           )
 
-          index_path.write_text(html, encoding="utf-8")
-
-          main_path = Path("engine/nostalgist/src/main.ts")
-          text = main_path.read_text(encoding="utf-8")
-
-          title_marker = "if (GAME_NAME !== null) {\n  document.title = GAME_NAME;\n}\n"
-
-          if text.count(title_marker) != 1:
-              raise SystemExit("PATCH FAILED: title marker")
-
-          logger = r'''
-
-          const slLines: string[] = [];
-          const slPinned: string[] = [];
-          const slBox = document.createElement("div");
-
-          slBox.id = "sl-runtime-log";
-          slBox.style.cssText = `
-            position: fixed;
-            z-index: 2147483647;
-            left: 5px;
-            top: 5px;
-            width: calc(100vw - 10px);
-            max-height: 64vh;
-            overflow: hidden;
-            box-sizing: border-box;
-            padding: 7px;
-            border: 1px solid #aaa;
-            border-radius: 6px;
-            background: rgba(0,0,0,.92);
-            color: #fff;
-            font: 10px/1.28 monospace;
-            white-space: pre-wrap;
-            word-break: break-all;
-            pointer-events: none;
-          `;
-
-          document.body.appendChild(slBox);
-
-          const slString = (value: unknown): string => {
-            if (value instanceof Error) {
-              return value.stack ?? value.message;
-            }
-
-            if (typeof value === "string") {
-              return value;
-            }
-
-            try {
-              const json = JSON.stringify(value);
-
-              if (typeof json === "string") {
-                return json;
-              }
-            } catch {
-              // ignore
-            }
-
-            return String(value);
-          };
-
-          const slJoined = (...values: unknown[]) =>
-            values.map(slString).join(" ");
-
-          const slImportant = (line: string) => {
-            const lower = line.toLowerCase();
-
-            return [
-              "error",
-              "warn",
-              "fatal",
-              "exception",
-              "loaderror",
-              "runtimeerror",
-              "syntaxerror",
-              "nomethoderror",
-              "errno",
-              "failed",
-              "failure",
-              "not found",
-              "no such file",
-              "unsupported",
-              "abort",
-              "cannot",
-              "could not",
-              "invalid",
-            ].some((token) => lower.includes(token));
-          };
-
-          const slNoise = (line: string) => {
-            if (slImportant(line)) {
-              return false;
-            }
-
-            return (
-              line.includes("[libretro DEBUG]") ||
-              line.includes("wasi:filesystem/") ||
-              line.includes("descriptor.open-at(") ||
-              line.includes("WASI resource created:") ||
-              line.includes("descriptor.read-via-stream(") ||
-              line.includes("input-stream.read(") ||
-              line.includes("pollable.block(")
-            );
-          };
-
-          const slRender = () => {
-            slBox.textContent = [
-              "SLKnight RUNTIME LOG V5",
-              "================================",
-              ...slPinned.slice(-10),
-              "--------------------------------",
-              ...slLines.slice(-32),
-            ].join("\n");
-          };
-
-          const slLog = (...values: unknown[]) => {
-            const line = slJoined(...values);
-
-            if (slNoise(line)) {
-              return;
-            }
-
-            slLines.push(line);
-
-            if (slLines.length > 200) {
-              slLines.splice(
-                0,
-                slLines.length - 200
-              );
-            }
-
-            slRender();
-          };
-
-          const slPin = (...values: unknown[]) => {
-            const line = slJoined(...values);
-
-            slPinned.push(line);
-
-            if (slPinned.length > 30) {
-              slPinned.splice(
-                0,
-                slPinned.length - 30
-              );
-            }
-
-            slRender();
-          };
-
-          const slConsoleLog =
-            console.log.bind(console);
-
-          const slConsoleInfo =
-            console.info.bind(console);
-
-          const slConsoleWarn =
-            console.warn.bind(console);
-
-          const slConsoleError =
-            console.error.bind(console);
-
-          console.log = (...values: unknown[]) => {
-            slConsoleLog(...values);
-            slLog("[LOG]", ...values);
-          };
-
-          console.info = (...values: unknown[]) => {
-            slConsoleInfo(...values);
-            slLog("[STDOUT]", ...values);
-          };
-
-          console.warn = (...values: unknown[]) => {
-            slConsoleWarn(...values);
-            slLog("[WARN]", ...values);
-          };
-
-          console.error = (...values: unknown[]) => {
-            slConsoleError(...values);
-            slLog("[STDERR]", ...values);
-          };
-
-          window.addEventListener(
-            "error",
-            (event) => {
-              slPin(
-                "[WINDOW ERROR]",
-                event.message,
-                event.filename,
-                event.lineno,
-                event.colno,
-              );
-            }
-          );
-
-          window.addEventListener(
-            "unhandledrejection",
-            (event) => {
-              slPin(
-                "[PROMISE ERROR]",
-                event.reason,
-              );
-            }
-          );
-
-          slPin("[BOOT] LOGGER READY");
-          '''
-
-          text = text.replace(
-              title_marker,
-              title_marker + logger,
-              1,
+          index_path.write_text(
+              html,
+              encoding="utf-8",
           )
+
+          # ==========================================================
+          # main.ts
+          # ==========================================================
+
+          main_path = Path(
+              "engine/nostalgist/src/main.ts"
+          )
+
+          text = main_path.read_text(
+              encoding="utf-8"
+          )
+
+          # ----------------------------------------------------------
+          # Remove threaded / COI browser checks.
+          # The reused core is the already-successful single-thread core.
+          # ----------------------------------------------------------
 
           secure_marker = (
               "// Multithreaded WebAssembly requires a secure context"
@@ -349,229 +261,123 @@ jobs:
               secure_pos,
           )
 
-          if secure_pos < 0 or opfs_pos < 0:
+          if (
+              secure_pos < 0
+              or opfs_pos < 0
+          ):
               raise SystemExit(
-                  "PATCH FAILED: COI region"
+                  "PATCH FAILED: COI block"
               )
 
           text = (
               text[:secure_pos]
-              + 'slPin("[BOOT] SINGLE THREAD MODE");\n\n'
               + text[opfs_pos:]
           )
 
-          old_libretro = (
-              "libretro_log_level: import.meta.env.DEV ? 0 : 1,"
+          # ----------------------------------------------------------
+          # Important:
+          # Nostalgist renames the supplied canvas ID to "canvas".
+          #
+          # Give Nostalgist an explicit internal framebuffer size
+          # instead of depending on offsetWidth/offsetHeight.
+          # ----------------------------------------------------------
+
+          element_marker = (
+              '  element: "#nostalgist-canvas",\n'
           )
 
-          old_frontend = (
-              "frontend_log_level: import.meta.env.DEV ? 0 : 1,"
-          )
-
-          if text.count(old_libretro) != 1:
+          if text.count(element_marker) != 1:
               raise SystemExit(
-                  "PATCH FAILED: libretro log level"
+                  "PATCH FAILED: element marker"
               )
 
-          if text.count(old_frontend) != 1:
-              raise SystemExit(
-                  "PATCH FAILED: frontend log level"
-              )
+          element_replacement = '''  element: "#nostalgist-canvas",
+            size: {
+              width: 640,
+              height: 480,
+            },
+            style: {
+              position: "fixed",
+              left: "0",
+              top: "0",
+              width: "100vw",
+              height: "100vh",
+              display: "block",
+              backgroundColor: "black",
+              imageRendering: "auto",
+            },
+          '''
 
           text = text.replace(
-              old_libretro,
-              "libretro_log_level: 0,",
+              element_marker,
+              element_replacement,
               1,
           )
 
-          text = text.replace(
-              old_frontend,
-              "frontend_log_level: 0,",
-              1,
-          )
+          # ----------------------------------------------------------
+          # After prepare(), make sure the actual Nostalgist canvas
+          # itself is visible. Use getCanvas(), NOT the old DOM ID.
+          # ----------------------------------------------------------
 
-          prepare_marker = (
-              "const nostalgist = await Nostalgist.prepare({"
-          )
-
-          if text.count(prepare_marker) != 1:
-              raise SystemExit(
-                  "PATCH FAILED: prepare marker"
-              )
-
-          text = text.replace(
-              prepare_marker,
-              'slPin("[BOOT] PREPARE BEGIN");\n\n'
-              + prepare_marker,
-              1,
-          )
-
-          after_prepare_marker = (
+          prepare_end_marker = (
               "\n\nif (opfs !== null) {"
           )
 
-          prepare_pos = text.find(
-              prepare_marker
+          prepare_start = text.find(
+              "const nostalgist = await Nostalgist.prepare({"
           )
 
           prepare_end = text.find(
-              after_prepare_marker,
-              prepare_pos,
+              prepare_end_marker,
+              prepare_start,
           )
 
-          if prepare_end < 0:
+          if (
+              prepare_start < 0
+              or prepare_end < 0
+          ):
               raise SystemExit(
-                  "PATCH FAILED: prepare end"
+                  "PATCH FAILED: prepare block"
               )
 
-          after_prepare = r'''
+          canvas_fix = r'''
 
-          slPin("[BOOT] PREPARE COMPLETE");
+          const slGameCanvas =
+            nostalgist.getCanvas();
 
-          try {
-            const slFs =
-              nostalgist.getEmscriptenFS();
+          slGameCanvas.style.position =
+            "fixed";
 
-            const slContentDir =
-              "/home/web_user/retroarch/userdata/content";
+          slGameCanvas.style.left =
+            "0";
 
-            slPin(
-              "[FS CONTENT]",
-              slFs
-                .readdir(slContentDir)
-                .join(" | "),
-            );
-          } catch (error) {
-            slPin(
-              "[FS CONTENT ERROR]",
-              error
-            );
-          }
+          slGameCanvas.style.top =
+            "0";
 
-          try {
-            const slModule =
-              nostalgist
-                .getEmscripten()
-                .Module;
+          slGameCanvas.style.width =
+            "100vw";
 
-            const slOriginalCallMain =
-              slModule
-                .callMain
-                .bind(slModule);
+          slGameCanvas.style.height =
+            "100vh";
 
-            slModule.callMain =
-              (args: string[]) => {
-                slPin(
-                  "[CALLMAIN]",
-                  args.join(" "),
-                );
+          slGameCanvas.style.display =
+            "block";
 
-                try {
-                  return slOriginalCallMain(
-                    args
-                  );
-                } catch (error) {
-                  slPin(
-                    "[CALLMAIN THROW]",
-                    error,
-                  );
+          slGameCanvas.style.visibility =
+            "visible";
 
-                  throw error;
-                }
-              };
-          } catch (error) {
-            slPin(
-              "[CALLMAIN WRAP ERROR]",
-              error,
-            );
-          }
+          slGameCanvas.style.opacity =
+            "1";
+
+          slGameCanvas.style.backgroundColor =
+            "#000";
+
           '''
 
           text = (
               text[:prepare_end]
-              + after_prepare
+              + canvas_fix
               + text[prepare_end:]
-          )
-
-          start_marker = (
-              "await nostalgist.start();"
-          )
-
-          if text.count(start_marker) != 1:
-              raise SystemExit(
-                  "PATCH FAILED: start marker"
-              )
-
-          start_replacement = r'''
-          slPin("[START] CALLING CORE");
-
-          try {
-            await nostalgist.start();
-
-            slPin(
-              "[START] RETURNED",
-              "status=" +
-                nostalgist.getStatus(),
-            );
-          } catch (error) {
-            slPin(
-              "[START ERROR]",
-              error,
-            );
-
-            throw error;
-          }
-
-          let slBeat = 0;
-
-          const slTimer =
-            window.setInterval(
-              () => {
-                slBeat += 1;
-
-                const canvas =
-                  document.getElementById(
-                    "nostalgist-canvas",
-                  ) as HTMLCanvasElement | null;
-
-                slPin(
-                  "[HEARTBEAT " +
-                    String(slBeat) +
-                    "]",
-                  "status=" +
-                    nostalgist.getStatus(),
-                  "canvas=" +
-                    String(
-                      canvas?.width ?? 0
-                    ) +
-                    "x" +
-                    String(
-                      canvas?.height ?? 0
-                    ),
-                  "css=" +
-                    String(
-                      canvas?.clientWidth ?? 0
-                    ) +
-                    "x" +
-                    String(
-                      canvas?.clientHeight ?? 0
-                    ),
-                );
-
-                if (slBeat >= 12) {
-                  window.clearInterval(
-                    slTimer
-                  );
-                }
-              },
-              2000,
-            );
-          '''
-
-          text = text.replace(
-              start_marker,
-              start_replacement,
-              1,
           )
 
           main_path.write_text(
@@ -579,66 +385,75 @@ jobs:
               encoding="utf-8",
           )
 
+          # ==========================================================
+          # Source validation
+          # ==========================================================
+
           final_text = main_path.read_text(
-              encoding="utf-8",
+              encoding="utf-8"
           )
 
           required = [
-              "SLKnight RUNTIME LOG V5",
-              "slNoise",
-              "[STDERR]",
-              "[FS CONTENT]",
-              "[CALLMAIN]",
-              "[CALLMAIN THROW]",
-              "[START] CALLING CORE",
-              "[HEARTBEAT ",
-              '.join("\\n")',
+              'size: {',
+              'width: 640',
+              'height: 480',
+              'nostalgist.getCanvas()',
+              'slGameCanvas.style.visibility',
+              'const opfs = !HAVE_OPFS',
           ]
 
           for item in required:
               if item not in final_text:
                   raise SystemExit(
-                      "FINAL VALIDATION FAILED: "
+                      "VALIDATION FAILED: "
                       + item
                   )
 
+          if (
+              "Multithreaded WebAssembly requires a secure context"
+              in final_text
+          ):
+              raise SystemExit(
+                  "VALIDATION FAILED: threaded browser check still present"
+              )
+
           print(
-              "SLKNIGHT_RUNTIME_LOG_V5_PATCH_OK"
+              "SLKNIGHT_PLAY_V6_PATCH_OK"
           )
           PY
 
-      - name: Install packages
+      - name: Install frontend packages
         working-directory: engine/nostalgist
         run: |
           set -e
           npm install
 
-      - name: Format patched source
+      - name: Format patched frontend
         working-directory: engine/nostalgist
         run: |
           set -e
           npx prettier --write src/main.ts index.html
 
-      - name: Type check patched source
+      - name: Type check frontend
         working-directory: engine/nostalgist
         run: |
           set -e
           npm run lint
 
-      - name: Generate hashes and sizes
+      - name: Generate asset hashes and sizes
         working-directory: engine/nostalgist
         run: |
           set -e
           node update-env.ts
 
-      - name: Build GitHub Pages version
+      - name: Build play version
         working-directory: engine/nostalgist
         run: |
           set -e
           npx vite build --base=./
           touch dist/.nojekyll
 
-      - name: Verify output
+      - name: Verify deploy files
         run: |
           set -e
 
@@ -647,19 +462,7 @@ jobs:
           test -s engine/nostalgist/dist/mkxp-z_libretro.wasm
           test -s engine/nostalgist/dist/slknight.mkxpz
 
-          grep -Fq \
-            'src="./assets/' \
-            engine/nostalgist/dist/index.html
-
-          grep -FRq \
-            'SLKnight RUNTIME LOG V5' \
-            engine/nostalgist/dist/assets
-
-          grep -FRq \
-            '[CALLMAIN]' \
-            engine/nostalgist/dist/assets
-
-          echo 'SLKNIGHT_RUNTIME_LOG_V5_BUILD_OK'
+          echo "SLKNIGHT_PLAY_V6_BUILD_OK"
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
@@ -668,10 +471,8 @@ jobs:
 
   deploy:
     name: Deploy GitHub Pages
-
     needs:
       - build
-
     runs-on: ubuntu-24.04
 
     environment:
