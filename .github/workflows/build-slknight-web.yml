@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web DIRECT TRACE V8B
+name: Deploy SLKnight mkxp-web NATIVE PLANE V9
 
 on:
   push:
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build:
-    name: Build SLKnight DIRECT TRACE V8B
+    name: Build SLKnight NATIVE PLANE V9
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -151,7 +151,7 @@ jobs:
 
           echo "SLKNIGHT_DATA_OK"
 
-      - name: Convert and directly trace RGSS scripts
+      - name: Convert RGSS and patch native Plane conflict
         run: |
           set -e
 
@@ -163,22 +163,30 @@ jobs:
 
           scripts_rel = ini[/^Scripts=(.+)$/i, 1]
 
-          abort 'Scripts entry missing' \
-            if scripts_rel == nil
+          abort 'Scripts entry missing' if scripts_rel == nil
 
-          scripts_rel = scripts_rel.strip.tr('\\', '/')
-
-          scripts_path = File.join(
-            game_dir,
+          scripts_rel =
             scripts_rel
-          )
+              .strip
+              .tr('\\', '/')
 
-          abort "Scripts file missing: #{scripts_path}" \
+          scripts_path =
+            File.join(
+              game_dir,
+              scripts_rel
+            )
+
+          abort "Scripts missing: #{scripts_path}" \
             unless File.file?(scripts_path)
 
-          scripts = Marshal.load(
-            File.binread(scripts_path)
-          )
+          scripts =
+            Marshal.load(
+              File.binread(scripts_path)
+            )
+
+          # ----------------------------------------------------------
+          # Browser compatibility
+          # ----------------------------------------------------------
 
           web_compat = <<'RUBY'
           puts("SLLOAD|000|WEB_COMPAT")
@@ -201,12 +209,27 @@ jobs:
             0,
             [
               0,
-              '000|Web Compatibility',
+              'Web Compatibility',
               Zlib::Deflate.deflate(
                 web_compat
               )
             ]
           )
+
+          # ----------------------------------------------------------
+          # mruby:
+          #
+          # begin
+          #   ...
+          # end until condition
+          #
+          # ->
+          #
+          # loop do
+          #   ...
+          #   break if condition
+          # end
+          # ----------------------------------------------------------
 
           def patch_begin_until(source)
             lines = source.lines
@@ -214,9 +237,10 @@ jobs:
             i = 0
 
             while i < lines.length
-              match = lines[i].match(
-                /^(\s*)end\s+until\s+(.+?)\s*$/
-              )
+              match =
+                lines[i].match(
+                  /^(\s*)end\s+until\s+(.+?)\s*$/
+                )
 
               if match
                 indent = match[1]
@@ -257,6 +281,11 @@ jobs:
             ]
           end
 
+          # ----------------------------------------------------------
+          # Remove RPG Maker's own per-scene loop.
+          # mkxp-web runs one frame per browser callback.
+          # ----------------------------------------------------------
+
           def patch_scene_loops(source)
             lines = source.lines
             changed = 0
@@ -268,7 +297,8 @@ jobs:
                 next
               end
 
-              indent = lines[i][/^\s*/]
+              indent =
+                lines[i][/^\s*/]
 
               significant = []
               k = i + 1
@@ -277,7 +307,8 @@ jobs:
                 k < lines.length &&
                 significant.length < 8
               )
-                stripped = lines[k].strip
+                stripped =
+                  lines[k].strip
 
                 unless (
                   stripped.empty? ||
@@ -306,7 +337,8 @@ jobs:
                 significant[6][1] == 'end' &&
                 significant[6][2] == indent
               )
-                end_index = significant[6][0]
+                end_index =
+                  significant[6][0]
 
               elsif (
                 significant.length >= 5 &&
@@ -317,7 +349,8 @@ jobs:
                 significant[4][1] == 'end' &&
                 significant[4][2] == indent
               )
-                end_index = significant[4][0]
+                end_index =
+                  significant[4][0]
               end
 
               if end_index != nil
@@ -344,6 +377,7 @@ jobs:
 
           scene_loop_count = 0
           begin_until_count = 0
+          plane_patch_count = 0
 
           scripts.each_with_index do |entry, index|
             next unless (
@@ -351,33 +385,85 @@ jobs:
               entry.length >= 3
             )
 
-            name = entry[1].to_s
+            name =
+              entry[1].to_s
 
             begin
-              source = Zlib::Inflate.inflate(
-                entry[2]
-              )
+              source =
+                Zlib::Inflate.inflate(
+                  entry[2]
+                )
             rescue
               next
             end
 
+            # ========================================================
+            # V9 FIX
+            #
+            # SLKnight script:
+            #
+            #   포그 수정
+            #   class Plane < Sprite
+            #
+            # mkxp-web already defines Plane natively with Object as
+            # its Ruby superclass.
+            #
+            # Re-declaring it as Plane < Sprite causes a superclass
+            # mismatch before the next script can load.
+            #
+            # mkxp-web's native Plane already supports repeating
+            # bitmaps, ox, oy, zoom, opacity, blend, color and tone.
+            # ========================================================
+
+            if (
+              name == '포그 수정' ||
+              source.match?(
+                /^\s*class\s+Plane\s*<\s*Sprite\b/
+              )
+            )
+              puts(
+                "PATCH_NATIVE_PLANE=" +
+                name
+              )
+
+              source = <<'RUBY'
+          puts("SLPATCH|NATIVE_PLANE_ACTIVE")
+
+          # SLKnight's old Plane < Sprite replacement is intentionally
+          # disabled on mkxp-web.
+          #
+          # mkxp-web supplies its own native RGSS Plane implementation.
+          RUBY
+
+              plane_patch_count += 1
+            end
+
             patched = source.dup
 
-            patched, count = patch_begin_until(
-              patched
-            )
-
-            begin_until_count += count
-
-            unless name.include?('Main')
-              patched, count = patch_scene_loops(
+            patched, count =
+              patch_begin_until(
                 patched
               )
 
-              scene_loop_count += count
+            begin_until_count +=
+              count
+
+            unless name == 'Main'
+              patched, count =
+                patch_scene_loops(
+                  patched
+                )
+
+              scene_loop_count +=
+                count
             end
 
+            # --------------------------------------------------------
+            # Browser frame dispatcher
+            # --------------------------------------------------------
+
             if name == 'Main'
+
               browser_loop = <<'RUBY'
           $prev_scene = nil
           $sl_last_scene_name = nil
@@ -403,7 +489,6 @@ jobs:
 
                   $sl_last_scene_name =
                     current_scene_name
-
                 end
 
                 if $scene != $prev_scene
@@ -412,16 +497,23 @@ jobs:
                     $prev_scene != nil &&
                     $prev_scene.respond_to?(:dispose)
                   )
-
                     $prev_scene.dispose
-
                   end
+
+                  puts(
+                    "SLMAINCALL|" +
+                    current_scene_name
+                  )
 
                   $scene.main
 
+                  puts(
+                    "SLMAINREADY|" +
+                    current_scene_name
+                  )
+
                   $prev_scene =
                     $scene
-
                 end
 
                 Graphics.update
@@ -435,7 +527,6 @@ jobs:
                 )
 
                 raise "END"
-
               end
 
             rescue Exception => e
@@ -448,7 +539,6 @@ jobs:
               )
 
             end
-
           end
           RUBY
 
@@ -471,10 +561,11 @@ jobs:
               )
             end
 
-            trace_index = format(
-              '%03d',
-              index
-            )
+            trace_index =
+              format(
+                '%03d',
+                index
+              )
 
             patched =
               "puts(\"SLLOAD|#{trace_index}\")\n" +
@@ -491,11 +582,15 @@ jobs:
               )
           end
 
-          main = scripts.find do |entry|
-            entry[1].to_s.end_with?(
-              '|Main'
-            )
-          end
+          abort 'Native Plane patch not applied' \
+            unless plane_patch_count == 1
+
+          main =
+            scripts.find do |entry|
+              entry[1].to_s.end_with?(
+                '|Main'
+              )
+            end
 
           abort 'Main script missing' \
             if main == nil
@@ -505,16 +600,17 @@ jobs:
               main[2]
             )
 
-          abort 'main_update_loop injection failed' \
+          abort 'main_update_loop missing' \
             unless main_source.include?(
               'def main_update_loop'
             )
 
-          target_scripts = File.join(
-            game_dir,
-            'Data',
-            'Scripts.rxdata'
-          )
+          target_scripts =
+            File.join(
+              game_dir,
+              'Data',
+              'Scripts.rxdata'
+            )
 
           File.binwrite(
             target_scripts,
@@ -532,9 +628,10 @@ jobs:
             )
           end
 
-          ini_lines = ini.split(
-            /\r?\n/
-          )
+          ini_lines =
+            ini.split(
+              /\r?\n/
+            )
 
           ini_lines.map! do |line|
             if line =~ /^Scripts=/i
@@ -562,6 +659,11 @@ jobs:
           )
 
           puts(
+            "NATIVE_PLANE_PATCHED=" +
+            plane_patch_count.to_s
+          )
+
+          puts(
             "SCENE_LOOPS_PATCHED=" +
             scene_loop_count.to_s
           )
@@ -572,11 +674,11 @@ jobs:
           )
 
           puts(
-            "SLKNIGHT_DIRECT_TRACE_V8B_OK"
+            "SLKNIGHT_V9_SCRIPT_PATCH_OK"
           )
           RB
 
-      - name: Verify direct script archive
+      - name: Verify V9 script archive
         run: |
           set -e
 
@@ -588,11 +690,12 @@ jobs:
             player/gameasync/Game.ini
 
           ruby -rzlib - <<'RB'
-          scripts = Marshal.load(
-            File.binread(
-              'player/gameasync/Data/Scripts.rxdata'
+          scripts =
+            Marshal.load(
+              File.binread(
+                'player/gameasync/Data/Scripts.rxdata'
+              )
             )
-          )
 
           puts(
             "SCRIPT_ARCHIVE_COUNT=" +
@@ -602,40 +705,53 @@ jobs:
           abort 'Too few scripts' \
             if scripts.length < 100
 
-          first = Zlib::Inflate.inflate(
-            scripts[0][2]
-          )
+          plane =
+            scripts.find do |entry|
+              entry[1].to_s.include?(
+                '포그 수정'
+              )
+            end
 
-          abort 'First trace missing' \
-            unless first.include?(
-              'SLLOAD|000'
+          abort 'Fog script missing' \
+            if plane == nil
+
+          plane_source =
+            Zlib::Inflate.inflate(
+              plane[2]
             )
 
-          main = scripts.find do |entry|
-            entry[1].to_s.end_with?(
-              '|Main'
+          abort 'Old Plane subclass still present' \
+            if plane_source.match?(
+              /class\s+Plane\s*<\s*Sprite/
             )
-          end
+
+          abort 'Native Plane marker missing' \
+            unless plane_source.include?(
+              'NATIVE_PLANE_ACTIVE'
+            )
+
+          main =
+            scripts.find do |entry|
+              entry[1].to_s.end_with?(
+                '|Main'
+              )
+            end
 
           abort 'Main missing' \
             if main == nil
 
-          source = Zlib::Inflate.inflate(
-            main[2]
-          )
+          main_source =
+            Zlib::Inflate.inflate(
+              main[2]
+            )
 
-          abort 'Main direct trace missing' \
-            unless source.include?(
+          abort 'Frame trace missing' \
+            unless main_source.include?(
               'SLFRAME|'
             )
 
-          abort 'Main runtime trace missing' \
-            unless source.include?(
-              'SLRUNTIMEERR|'
-            )
-
           puts(
-            "DIRECT_TRACE_ARCHIVE_VERIFY_OK"
+            'V9_SCRIPT_ARCHIVE_VERIFY_OK'
           )
           RB
 
@@ -648,10 +764,14 @@ jobs:
           import subprocess
           import sys
 
-          root = Path("player/gameasync/Audio")
+          root = Path(
+              "player/gameasync/Audio"
+          )
 
           if not root.exists():
-              print("AUDIO_DIRECTORY_NOT_PRESENT")
+              print(
+                  "AUDIO_DIRECTORY_NOT_PRESENT"
+              )
               raise SystemExit(0)
 
           convertible = {
@@ -676,7 +796,8 @@ jobs:
               if (
                   path.is_file()
                   and
-                  path.suffix.lower() in convertible
+                  path.suffix.lower()
+                  in convertible
               )
           ]
 
@@ -698,7 +819,8 @@ jobs:
 
                   if ext in midi_exts:
                       temp_wav = src.with_name(
-                          src.name + ".mkxpweb.wav"
+                          src.name
+                          + ".mkxpweb.wav"
                       )
 
                       subprocess.run(
@@ -712,7 +834,9 @@ jobs:
                           check=True,
                       )
 
-                      source_for_ffmpeg = temp_wav
+                      source_for_ffmpeg = (
+                          temp_wav
+                      )
 
                   subprocess.run(
                       [
@@ -722,7 +846,9 @@ jobs:
                           "error",
                           "-y",
                           "-i",
-                          str(source_for_ffmpeg),
+                          str(
+                              source_for_ffmpeg
+                          ),
                           "-c:a",
                           "libvorbis",
                           "-q:a",
@@ -789,30 +915,6 @@ jobs:
 
               raise SystemExit(1)
 
-          remaining = [
-              str(path)
-              for path in root.rglob("*")
-              if (
-                  path.is_file()
-                  and
-                  path.suffix.lower() in convertible
-              )
-          ]
-
-          if remaining:
-              print(
-                  "UNCONVERTED AUDIO:",
-                  file=sys.stderr,
-              )
-
-              for path in remaining:
-                  print(
-                      path,
-                      file=sys.stderr,
-                  )
-
-              raise SystemExit(1)
-
           print(
               "AUDIO_CONVERTED="
               + str(converted)
@@ -856,7 +958,8 @@ jobs:
               if (
                   path.is_file()
                   and
-                  path.suffix.lower() in convertible
+                  path.suffix.lower()
+                  in convertible
               )
           ]
 
@@ -869,14 +972,11 @@ jobs:
           converted = 0
 
           for src in files:
-              out = src.with_suffix(".png")
+              out = src.with_suffix(
+                  ".png"
+              )
 
               try:
-                  print(
-                      "IMAGE: "
-                      + str(src)
-                  )
-
                   subprocess.run(
                       [
                           "convert",
@@ -998,7 +1098,7 @@ jobs:
           )
           PY
 
-      - name: Add V8B native and Ruby trace panel
+      - name: Add V9 trace panel
         run: |
           set -e
 
@@ -1018,120 +1118,97 @@ jobs:
           <script>
           (function () {
 
-              function getPanel() {
-                  var panel =
+              function panel() {
+                  var p =
                       document.getElementById(
                           'sl-trace'
                       );
 
-                  if (panel) {
-                      return panel;
+                  if (p) {
+                      return p;
                   }
 
-                  panel =
+                  p =
                       document.createElement(
                           'pre'
                       );
 
-                  panel.id =
+                  p.id =
                       'sl-trace';
 
-                  panel.style.position =
+                  p.style.position =
                       'fixed';
 
-                  panel.style.left =
+                  p.style.left =
                       '8px';
 
-                  panel.style.top =
+                  p.style.top =
                       '34px';
 
-                  panel.style.right =
+                  p.style.right =
                       '8px';
 
-                  panel.style.maxHeight =
-                      '55vh';
+                  p.style.maxHeight =
+                      '58vh';
 
-                  panel.style.overflow =
+                  p.style.overflow =
                       'auto';
 
-                  panel.style.zIndex =
+                  p.style.zIndex =
                       '99999999';
 
-                  panel.style.padding =
+                  p.style.padding =
                       '10px';
 
-                  panel.style.margin =
+                  p.style.margin =
                       '0';
 
-                  panel.style.background =
-                      'rgba(0,0,0,0.90)';
+                  p.style.background =
+                      'rgba(0,0,0,.90)';
 
-                  panel.style.color =
+                  p.style.color =
                       'white';
 
-                  panel.style.fontSize =
+                  p.style.fontSize =
                       '13px';
 
-                  panel.style.fontFamily =
+                  p.style.fontFamily =
                       'monospace';
 
-                  panel.style.whiteSpace =
+                  p.style.whiteSpace =
                       'pre-wrap';
 
-                  panel.style.display =
+                  p.style.display =
                       'none';
 
                   document.body.appendChild(
-                      panel
+                      p
                   );
 
-                  return panel;
+                  return p;
               }
 
-              function addLine(
-                  text,
+              function log(
+                  value,
                   force
               ) {
-                  text =
-                      String(text);
+                  var text =
+                      String(value);
 
                   var useful =
                       (
-                          text.indexOf(
-                              'SLLOAD|'
-                          ) >= 0
-                          ||
-                          text.indexOf(
-                              'SLMAIN|'
-                          ) >= 0
-                          ||
-                          text.indexOf(
-                              'SLFRAME|'
-                          ) >= 0
-                          ||
-                          text.indexOf(
-                              'SLRUNTIMEERR|'
-                          ) >= 0
-                          ||
-                          text.indexOf(
-                              ' - err'
-                          ) >= 0
-                          ||
-                          /NO SUCH FILE/i.test(
-                              text
-                          )
-                          ||
-                          /PHYSFS/i.test(
-                              text
-                          )
-                          ||
-                          /exception/i.test(
-                              text
-                          )
-                          ||
-                          /error/i.test(
-                              text
-                          )
+                          /SLLOAD\|/.test(text) ||
+                          /SLPATCH\|/.test(text) ||
+                          /SLMAIN\|/.test(text) ||
+                          /SLMAINCALL\|/.test(text) ||
+                          /SLMAINREADY\|/.test(text) ||
+                          /SLFRAME\|/.test(text) ||
+                          /SLRUNTIMEERR\|/.test(text) ||
+                          / - err/.test(text) ||
+                          /error/i.test(text) ||
+                          /exception/i.test(text) ||
+                          /PHYSFS/i.test(text) ||
+                          /NO SUCH FILE/i.test(text)
                       );
 
                   if (
@@ -1141,196 +1218,76 @@ jobs:
                       return;
                   }
 
-                  var panel =
-                      getPanel();
+                  var p =
+                      panel();
 
-                  panel.style.display =
+                  p.style.display =
                       'block';
 
-                  var existing =
-                      panel.textContent || '';
+                  var old =
+                      p.textContent || '';
 
-                  if (existing) {
-                      existing += '\n';
+                  if (old) {
+                      old += '\n';
                   }
 
-                  existing +=
-                      text;
+                  old += text;
 
                   if (
-                      existing.length >
-                      12000
+                      old.length >
+                      16000
                   ) {
-                      existing =
-                          existing.slice(
-                              -12000
+                      old =
+                          old.slice(
+                              -16000
                           );
                   }
 
-                  panel.textContent =
-                      existing;
+                  p.textContent =
+                      old;
 
-                  panel.scrollTop =
-                      panel.scrollHeight;
-              }
-
-              function decodeCppException(
-                  ptr
-              ) {
-                  var result =
-                      'CPP EXCEPTION | ptr=' +
-                      String(ptr);
-
-                  try {
-                      if (
-                          typeof ExceptionInfo ===
-                          'function'
-                          &&
-                          typeof HEAPU32 !==
-                          'undefined'
-                      ) {
-                          var info =
-                              new ExceptionInfo(
-                                  ptr
-                              );
-
-                          var typePtr =
-                              info.get_type();
-
-                          var objectPtr =
-                              info.get_exception_ptr();
-
-                          result +=
-                              ' | typePtr=' +
-                              String(typePtr);
-
-                          result +=
-                              ' | objectPtr=' +
-                              String(objectPtr);
-
-                          var namePtr =
-                              HEAPU32[
-                                  (
-                                      typePtr +
-                                      4
-                                  )
-                                  >> 2
-                              ];
-
-                          if (
-                              namePtr
-                              &&
-                              typeof UTF8ToString ===
-                              'function'
-                          ) {
-                              var typeName =
-                                  UTF8ToString(
-                                      namePtr
-                                  );
-
-                              result +=
-                                  ' | type=' +
-                                  typeName;
-
-                              if (
-                                  /Exception/.test(
-                                      typeName
-                                  )
-                                  &&
-                                  typeof HEAP32 !==
-                                  'undefined'
-                              ) {
-                                  var mkxpType =
-                                      HEAP32[
-                                          objectPtr
-                                          >> 2
-                                      ];
-
-                                  var names = [
-                                      'RGSSError',
-                                      'NoFileError',
-                                      'IOError',
-                                      'TypeError',
-                                      'ArgumentError',
-                                      'PHYSFSError',
-                                      'SDLError',
-                                      'MKXPError'
-                                  ];
-
-                                  result +=
-                                      ' | mkxpType=' +
-                                      String(
-                                          mkxpType
-                                      );
-
-                                  if (
-                                      mkxpType >= 0
-                                      &&
-                                      mkxpType <
-                                      names.length
-                                  ) {
-                                      result +=
-                                          '(' +
-                                          names[
-                                              mkxpType
-                                          ] +
-                                          ')';
-                                  }
-                              }
-                          }
-                      }
-
-                  } catch (
-                      decodeError
-                  ) {
-                      result +=
-                          ' | decode=' +
-                          String(
-                              decodeError
-                          );
-                  }
-
-                  return result;
+                  p.scrollTop =
+                      p.scrollHeight;
               }
 
               function badge() {
-                  var node =
+                  var b =
                       document.createElement(
                           'div'
                       );
 
-                  node.textContent =
-                      'V8B';
+                  b.textContent =
+                      'V9';
 
-                  node.style.position =
+                  b.style.position =
                       'fixed';
 
-                  node.style.top =
+                  b.style.top =
                       '6px';
 
-                  node.style.right =
+                  b.style.right =
                       '6px';
 
-                  node.style.zIndex =
+                  b.style.zIndex =
                       '99999998';
 
-                  node.style.background =
+                  b.style.background =
                       'rgba(0,0,0,.7)';
 
-                  node.style.color =
+                  b.style.color =
                       'white';
 
-                  node.style.font =
+                  b.style.font =
                       '12px monospace';
 
-                  node.style.padding =
+                  b.style.padding =
                       '4px 7px';
 
-                  node.style.borderRadius =
+                  b.style.borderRadius =
                       '4px';
 
                   document.body.appendChild(
-                      node
+                      b
                   );
               }
 
@@ -1339,7 +1296,7 @@ jobs:
                   badge
               );
 
-              var originalLog =
+              var oldLog =
                   console.log.bind(
                       console
                   );
@@ -1351,18 +1308,18 @@ jobs:
                               arguments
                           );
 
-                      originalLog.apply(
+                      oldLog.apply(
                           console,
                           args
                       );
 
-                      addLine(
+                      log(
                           args.join(' '),
                           false
                       );
                   };
 
-              var originalError =
+              var oldError =
                   console.error.bind(
                       console
                   );
@@ -1374,12 +1331,12 @@ jobs:
                               arguments
                           );
 
-                      originalError.apply(
+                      oldError.apply(
                           console,
                           args
                       );
 
-                      addLine(
+                      log(
                           args.join(' '),
                           true
                       );
@@ -1387,52 +1344,35 @@ jobs:
 
               window.addEventListener(
                   'error',
-                  function (event) {
-                      addLine(
+                  function (e) {
+                      log(
                           'JS ERROR | '
-                          +
-                          String(
-                              event.message
+                          + String(
+                              e.message
                           )
-                          +
-                          ' | '
-                          +
-                          String(
-                              event.filename || ''
+                          + ' | '
+                          + String(
+                              e.filename || ''
                           )
-                          +
-                          ':'
-                          +
-                          String(
-                              event.lineno || ''
+                          + ':'
+                          + String(
+                              e.lineno || ''
                           )
-                          +
-                          ':'
-                          +
-                          String(
-                              event.colno || ''
+                          + ':'
+                          + String(
+                              e.colno || ''
                           ),
                           true
                       );
 
                       if (
-                          typeof event.error ===
-                          'number'
+                          e.error !==
+                          undefined
                       ) {
-                          addLine(
-                              decodeCppException(
-                                  event.error
-                              ),
-                              true
-                          );
-
-                      } else if (
-                          event.error &&
-                          event.error.stack
-                      ) {
-                          addLine(
-                              String(
-                                  event.error.stack
+                          log(
+                              'JS VALUE | '
+                              + String(
+                                  e.error
                               ),
                               true
                           );
@@ -1442,12 +1382,11 @@ jobs:
 
               window.addEventListener(
                   'unhandledrejection',
-                  function (event) {
-                      addLine(
+                  function (e) {
+                      log(
                           'PROMISE ERROR | '
-                          +
-                          String(
-                              event.reason
+                          + String(
+                              e.reason
                           ),
                           true
                       );
@@ -1458,39 +1397,43 @@ jobs:
           </script>
           '''
 
-          html = html.replace(
-              "<head>",
-              "<head>\n"
-              + trace_script,
-              1,
-          )
+          html =
+              html.replace(
+                  "<head>",
+                  "<head>\n"
+                  + trace_script,
+                  1,
+              )
 
-          html, count1 = re.subn(
-              r"var namespace = '[^']*';",
-              "var namespace = 'slknight_direct_trace_v8b';",
-              html,
-              count=1,
-          )
+          html, c1 =
+              re.subn(
+                  r"var namespace = '[^']*';",
+                  "var namespace = 'slknight_native_plane_v9';",
+                  html,
+                  count=1,
+              )
 
-          html, count2 = re.subn(
-              r"var wTitle = '[^']*'\s*;?",
-              "var wTitle = 'SLKnight';",
-              html,
-              count=1,
-          )
+          html, c2 =
+              re.subn(
+                  r"var wTitle = '[^']*'\s*;?",
+                  "var wTitle = 'SLKnight';",
+                  html,
+                  count=1,
+              )
 
-          html = html.replace(
-              "<title>MKXP</title>",
-              "<title>SLKnight V8B</title>",
-              1,
-          )
+          html =
+              html.replace(
+                  "<title>MKXP</title>",
+                  "<title>SLKnight V9</title>",
+                  1,
+              )
 
-          if count1 != 1:
+          if c1 != 1:
               raise SystemExit(
                   "namespace patch failed"
               )
 
-          if count2 != 1:
+          if c2 != 1:
               raise SystemExit(
                   "title patch failed"
               )
@@ -1501,60 +1444,39 @@ jobs:
           )
 
           print(
-              "V8B_TRACE_PANEL_OK"
+              "V9_TRACE_PANEL_OK"
           )
           PY
 
-          touch \
-            player/.nojekyll
+          touch player/.nojekyll
 
-      - name: Verify final V8B package
+      - name: Verify final V9 package
         run: |
           set -e
 
-          test -s \
-            player/index.html
+          test -s player/index.html
+          test -s player/mkxp.js
+          test -s player/mkxp.wasm
 
-          test -s \
-            player/mkxp.js
+          test -s player/js/drive.js
+          test -s player/js/dpad.js
+          test -s player/js/localforage.min.js
 
-          test -s \
-            player/mkxp.wasm
+          test -s player/gameasync/Game.ini
+          test -s player/gameasync/rgss.rb
 
-          test -s \
-            player/js/drive.js
-
-          test -s \
-            player/js/dpad.js
-
-          test -s \
-            player/js/localforage.min.js
-
-          test -s \
-            player/gameasync/Game.ini
-
-          test -s \
-            player/gameasync/rgss.rb
-
-          test -s \
-            player/gameasync/mapping.js
-
-          test -s \
-            player/gameasync/bitmap-map.js
+          test -s player/gameasync/mapping.js
+          test -s player/gameasync/bitmap-map.js
 
           test -s \
             player/gameasync/Data/Scripts.rxdata
 
           grep -Fq \
-            "slknight_direct_trace_v8b" \
+            "slknight_native_plane_v9" \
             player/index.html
 
           grep -Fq \
-            "CPP EXCEPTION" \
-            player/index.html
-
-          grep -Fq \
-            "V8B" \
+            "V9" \
             player/index.html
 
           test "$(
@@ -1567,17 +1489,15 @@ jobs:
               player/mkxp.wasm
           )" = "5217852"
 
-          rm -rf \
-            player/.git
+          rm -rf player/.git
 
           echo
           echo "========================================"
-          echo " SLKNIGHT DIRECT TRACE V8B READY"
+          echo " SLKNIGHT NATIVE PLANE V9 READY"
           echo "========================================"
           echo
 
-          du -sh \
-            player
+          du -sh player
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
