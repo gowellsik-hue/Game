@@ -1,4 +1,4 @@
-name: Deploy SLKnight Play V6
+name: Deploy SLKnight Official Threaded V7
 
 on:
   push:
@@ -20,59 +20,388 @@ concurrency:
 env:
   ENGINE_REPO: white-axe/mkxp-z-libretro-emscripten
   ENGINE_REF: f0a1ff80f05dd0d1f8ca711485a5b0a601bc7502
-  SITE_URL: https://gowellsik-hue.github.io/Game
+  GAME_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLKnight_Android_JoiPlay.zip
+  GAME_SHA256: 9f007d46d2410742aca5e14c3901f63586084007e7f52c4d199116191824132a
 
 jobs:
   build:
-    name: Build SLKnight Play V6
+    name: Build official threaded SLKnight
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 90
 
     steps:
+      - name: Install build dependencies
+        run: |
+          set -e
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            automake \
+            libtool \
+            zip \
+            unzip \
+            curl \
+            universal-ctags \
+            ruby \
+            meson \
+            cmake \
+            ninja-build \
+            python3 \
+            python3-pip
+
+          python3 -m pip install \
+            --break-system-packages \
+            rpzip
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
-      - name: Checkout clean frontend
+      - name: Set up Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.8
+
+      - name: Checkout mkxp-z web engine
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ENGINE_REPO }}
           ref: ${{ env.ENGINE_REF }}
-          submodules: false
+          submodules: recursive
           path: engine
 
-      - name: Reuse existing single-thread engine and game
+      - name: Set up WASI SDK 30
         run: |
           set -e
 
-          mkdir -p engine/nostalgist/public
+          curl -L --fail --retry 3 \
+            -o "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
 
-          for file in \
-            mkxp-z_libretro.js \
-            mkxp-z_libretro.wasm \
-            slknight.mkxpz
-          do
-            echo "Downloading ${file}"
+          mkdir -p "${RUNNER_TEMP}/wasi-sdk"
 
-            curl -L \
-              --fail \
-              --retry 3 \
-              -H 'Cache-Control: no-cache' \
-              "${SITE_URL}/${file}?run=${GITHUB_RUN_ID}" \
-              -o "engine/nostalgist/public/${file}"
-          done
+          tar -xzf "${RUNNER_TEMP}/wasi-sdk.tar.gz" \
+            -C "${RUNNER_TEMP}/wasi-sdk" \
+            --strip-components=1
 
-          test -s engine/nostalgist/public/mkxp-z_libretro.js
-          test -s engine/nostalgist/public/mkxp-z_libretro.wasm
-          test -s engine/nostalgist/public/slknight.mkxpz
+      - name: Set up Binaryen 126
+        run: |
+          set -e
 
-          ls -lh \
-            engine/nostalgist/public/mkxp-z_libretro.js \
-            engine/nostalgist/public/mkxp-z_libretro.wasm \
-            engine/nostalgist/public/slknight.mkxpz
+          curl -L --fail --retry 3 \
+            -o "${RUNNER_TEMP}/binaryen.tar.gz" \
+            https://github.com/WebAssembly/binaryen/releases/download/version_126/binaryen-version_126-x86_64-linux.tar.gz
 
-      - name: Configure SLKnight play frontend
+          mkdir -p "${RUNNER_TEMP}/binaryen"
+
+          tar -xzf "${RUNNER_TEMP}/binaryen.tar.gz" \
+            -C "${RUNNER_TEMP}/binaryen" \
+            --strip-components=1
+
+      - name: Build mkxp-z stage 1
+        run: |
+          set -e
+
+          cd engine/mkxp-z/libretro
+
+          CLICOLOR_FORCE=1 make -j "$(nproc)" \
+            WASI_SDK="${RUNNER_TEMP}/wasi-sdk" \
+            WASM_OPT="${RUNNER_TEMP}/binaryen/bin/wasm-opt"
+
+      - name: Configure official threaded mkxp-z core
+        run: |
+          set -e
+
+          cat > "${RUNNER_TEMP}/cross.ini" <<EOF
+          [binaries]
+          c = 'emcc'
+          cpp = 'em++'
+          ar = 'emar'
+          cmake = 'cmake'
+
+          [host_machine]
+          system = 'emscripten'
+          cpu_family = 'wasm32'
+          cpu = 'wasm32'
+          endian = 'little'
+
+          [properties]
+          cmake_toolchain_file = '$(em-config EMSCRIPTEN_ROOT)/cmake/Modules/Platform/Emscripten.cmake'
+          EOF
+
+          cd engine/mkxp-z
+
+          CLICOLOR_FORCE=1 meson setup build \
+            --cross-file "${RUNNER_TEMP}/cross.ini" \
+            --buildtype release \
+            -Db_lto=true \
+            -Dlibretro=true \
+            -Dlibretro_save_states=true \
+            -Demscripten_threaded=true
+
+      - name: Build mkxp-z core
+        run: |
+          set -e
+
+          cd engine/mkxp-z/build
+          CLICOLOR_FORCE=1 ninja -v
+
+      - name: Build official threaded RetroArch frontend
+        run: |
+          set -e
+
+          mv \
+            engine/mkxp-z/build/mkxp-z_libretro.a \
+            engine/retroarch/libretro_emscripten.a
+
+          cd engine/retroarch
+
+          CLICOLOR_FORCE=1 emmake make \
+            -f Makefile.emscripten \
+            LIBRETRO=mkxp-z \
+            HAVE_THREADS=1 \
+            PROXY_TO_PTHREAD=1 \
+            HAVE_AUDIOWORKLET=1 \
+            HAVE_RWEBAUDIO=0 \
+            HAVE_AL=0 \
+            HAVE_WASMFS=1 \
+            HAVE_EXTRA_WASMFS=1
+
+          test -s mkxp-z_libretro.js
+          test -s mkxp-z_libretro.wasm
+
+      - name: Download clean SLKnight release
+        run: |
+          set -e
+
+          curl -L --fail --retry 3 \
+            -o slknight-release.zip \
+            "${GAME_URL}"
+
+          echo "${GAME_SHA256}  slknight-release.zip" \
+            | sha256sum -c -
+
+          rm -rf game
+          mkdir -p game
+
+          unzip -q \
+            slknight-release.zip \
+            -d game
+
+          test -f \
+            game/SLKnight_Android_JoiPlay/Game.ini
+
+          test -f \
+            game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata
+
+      - name: Apply only required browser compatibility patches
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "game/SLKnight_Android_JoiPlay/Game.ini"
+          )
+
+          raw = path.read_bytes().splitlines()
+          output = []
+
+          for line in raw:
+              if line.startswith(b"Title="):
+                  output.append(b"Title=SLKnight")
+              else:
+                  output.append(line)
+
+          path.write_bytes(
+              b"\r\n".join(output) + b"\r\n"
+          )
+          PY
+
+          ruby -rzlib - <<'RB'
+          path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
+
+          scripts = Marshal.load(
+            File.binread(path)
+          )
+
+          changed_resize = false
+          changed_browser = false
+          changed_keyboard = false
+
+          scripts.each do |entry|
+            next unless entry.is_a?(Array)
+            next unless entry.length >= 3
+
+            name = entry[1].to_s
+
+            begin
+              src = Zlib::Inflate.inflate(entry[2])
+            rescue
+              next
+            end
+
+            patched = src.dup
+
+            resize_old =
+              "if defined?($joiplay) && $joiplay\r\n" \
+              "  begin\r\n" \
+              "    Graphics.resize_screen($window_width, $window_height)\r\n" \
+              "  rescue\r\n" \
+              "  end\r\n" \
+              "else\r\n" \
+              "  Win32API.SetWindowPos($window_width, $window_height)\r\n" \
+              "end"
+
+            resize_new =
+              "begin\r\n" \
+              "  Graphics.resize_screen($window_width, $window_height)\r\n" \
+              "rescue\r\n" \
+              "end"
+
+            if patched.include?(resize_old)
+              patched.sub!(resize_old, resize_new)
+              changed_resize = true
+            end
+
+            browser_old =
+              "if defined?($joiplay) && $joiplay\r\n" \
+              "      return\r\n" \
+              "    end\r\n" \
+              "    se = Win32API.new(\"shell32\", \"ShellExecute\", ['L','P','P','P','P','L'], 'L' )\r\n" \
+              "    se.Call(0, \"open\", url, 0, 0, 0)"
+
+            if patched.include?(browser_old)
+              patched.sub!(browser_old, "return")
+              changed_browser = true
+            end
+
+            if name == "Keyboard Input Module"
+              keyboard_old =
+                "  State = Win32API.new(\"user32\",\"GetKeyState\",['i'],'i')\r\n" \
+                "  Key = Win32API.new(\"user32\",\"GetAsyncKeyState\",['i'],'i')"
+
+              keyboard_new =
+                "  class WebKeyStateProxy\r\n" \
+                "    def call(key)\r\n" \
+                "      return 0\r\n" \
+                "    end\r\n" \
+                "  end\r\n" \
+                "  State = WebKeyStateProxy.new\r\n" \
+                "  Key = WebKeyStateProxy.new"
+
+              if patched.include?(keyboard_old)
+                patched.sub!(
+                  keyboard_old,
+                  keyboard_new
+                )
+                changed_keyboard = true
+              end
+            end
+
+            next if patched == src
+
+            entry[2] = Zlib::Deflate.deflate(
+              patched
+            )
+          end
+
+          abort 'resize patch not found' unless changed_resize
+          abort 'browser patch not found' unless changed_browser
+          abort 'keyboard patch not found' unless changed_keyboard
+
+          File.binwrite(
+            path,
+            Marshal.dump(scripts)
+          )
+
+          puts 'SLKNIGHT_BROWSER_PATCH_OK'
+          RB
+
+      - name: Verify clean browser game scripts
+        run: |
+          set -e
+
+          ruby -rzlib - <<'RB'
+          path = 'game/SLKnight_Android_JoiPlay/Data/DCDIJDXDTWTQXQXJPWCOSXPLCLOLNGRIJOQARTLOScripts.rxdata'
+
+          scripts = Marshal.load(
+            File.binread(path)
+          )
+
+          keyboard = scripts.find do |entry|
+            entry[1].to_s == 'Keyboard Input Module'
+          end
+
+          main = scripts.find do |entry|
+            entry[1].to_s == 'Main'
+          end
+
+          abort 'Keyboard Input Module missing' if keyboard == nil
+          abort 'Main missing' if main == nil
+
+          keyboard_src = Zlib::Inflate.inflate(
+            keyboard[2]
+          )
+
+          main_src = Zlib::Inflate.inflate(
+            main[2]
+          )
+
+          abort 'GetAsyncKeyState still active' \
+            if keyboard_src.include?('GetAsyncKeyState')
+
+          abort 'web key proxy missing' \
+            unless keyboard_src.include?('WebKeyStateProxy')
+
+          abort 'Main was unexpectedly replaced' \
+            unless main_src.include?('$scene = Scene_Title.new')
+
+          abort 'diagnostic Main still present' \
+            if main_src.include?('SLK_FATAL') || \
+               main_src.include?('SLKnight RGSS ERROR')
+
+          puts 'SLKNIGHT_CLEAN_SCRIPT_VERIFY_OK'
+          RB
+
+      - name: Pack SLKnight as mkxpz
+        run: |
+          set -e
+
+          rm -f slknight.mkxpz
+
+          cd game/SLKnight_Android_JoiPlay
+
+          rpzip -r \
+            "${GITHUB_WORKSPACE}/slknight.mkxpz" \
+            *
+
+          cd "${GITHUB_WORKSPACE}"
+
+          test -s slknight.mkxpz
+          unzip -tq slknight.mkxpz >/dev/null
+          ls -lh slknight.mkxpz
+
+      - name: Copy official engine and game into Nostalgist
+        run: |
+          set -e
+
+          cp \
+            engine/retroarch/mkxp-z_libretro.js \
+            engine/nostalgist/public/
+
+          cp \
+            engine/retroarch/mkxp-z_libretro.wasm \
+            engine/nostalgist/public/
+
+          cp \
+            slknight.mkxpz \
+            engine/nostalgist/public/
+
+      - name: Configure official threaded Nostalgist
         run: |
           set -e
 
@@ -82,11 +411,11 @@ jobs:
           VITE_GAME_NAME=SLKnight
           VITE_GAME_PATH=./slknight.mkxpz
           VITE_XP_CONTROLS=true
-          VITE_HAVE_OPFS=false
+          VITE_HAVE_OPFS=true
           VITE_REQUIRE_OPFS=false
           ENVEOF
 
-      - name: Patch frontend for direct play
+      - name: Replace play triangle with start text
         run: |
           set -e
 
@@ -94,375 +423,95 @@ jobs:
           from pathlib import Path
           import re
 
-          # ==========================================================
-          # index.html
-          # ==========================================================
-
-          index_path = Path(
+          path = Path(
               "engine/nostalgist/index.html"
           )
 
-          html = index_path.read_text(
+          html = path.read_text(
               encoding="utf-8"
           )
 
-          # Mobile viewport
-          old_viewport = (
-              '<meta name="viewport" '
-              'content="width=device-width, initial-scale=1.0" />'
-          )
-
-          new_viewport = (
-              '<meta name="viewport" '
-              'content="width=device-width, initial-scale=1.0, '
-              'maximum-scale=1.0, user-scalable=no, '
-              'viewport-fit=cover" />'
-          )
-
-          if old_viewport not in html:
-              raise SystemExit(
-                  "PATCH FAILED: viewport"
-              )
-
           html = html.replace(
-              old_viewport,
-              new_viewport,
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+              '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
               1,
           )
 
-          # Single-thread build does not need COI service worker
-          html = html.replace(
-              '<script src="./coi-serviceworker.min.js"></script>',
-              '',
-              1,
-          )
-
-          # Remove service-worker heartbeat block
-          html = re.sub(
-              r'<script>\s*'
-              r'// Send a dummy message every 5 seconds'
-              r'.*?</script>',
-              '',
+          html, count = re.subn(
+              r'<p id="user-activation-prompt"[^>]*>\s*▶\s*</p>',
+              '<p id="user-activation-prompt" style="display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:100;padding:14px 20px;border:1px solid #777;border-radius:10px;background:#111;color:#fff;font:18px system-ui,sans-serif">화면을 터치해 시작</p>',
               html,
               count=1,
               flags=re.S,
           )
 
-          # Give the real game canvas an explicit backing size.
-          canvas_id = (
-              '      id="nostalgist-canvas"\n'
-          )
-
-          if html.count(canvas_id) != 1:
+          if count != 1:
               raise SystemExit(
-                  "PATCH FAILED: canvas id"
+                  "PATCH FAILED: activation prompt"
               )
 
-          html = html.replace(
-              canvas_id,
-              (
-                  '      id="nostalgist-canvas"\n'
-                  '      width="640"\n'
-                  '      height="480"\n'
-              ),
-              1,
-          )
-
-          old_canvas_style = (
-              'style="position: fixed; left: 0; top: 0; '
-              'width: 100%; height: 100%"'
-          )
-
-          new_canvas_style = (
-              'style="position: fixed; left: 0; top: 0; '
-              'width: 100vw; height: 100vh; '
-              'display: block; background: #000"'
-          )
-
-          if old_canvas_style not in html:
-              raise SystemExit(
-                  "PATCH FAILED: canvas style"
-              )
-
-          html = html.replace(
-              old_canvas_style,
-              new_canvas_style,
-              1,
-          )
-
-          # Replace giant play symbol with a normal mobile prompt.
-          html = re.sub(
-              r'<p id="user-activation-prompt"'
-              r'[^>]*>\s*▶\s*</p>',
-              '''
-              <p
-                id="user-activation-prompt"
-                style="
-                  display:none;
-                  position:fixed;
-                  left:50%;
-                  top:50%;
-                  transform:translate(-50%,-50%);
-                  z-index:100;
-                  margin:0;
-                  padding:14px 20px;
-                  border:1px solid #777;
-                  border-radius:10px;
-                  background:#111;
-                  color:#fff;
-                  font-size:18px;
-                  font-family:system-ui,sans-serif
-                "
-              >
-                화면을 터치해 시작
-              </p>
-              ''',
+          path.write_text(
               html,
-              count=1,
-              flags=re.S,
-          )
-
-          index_path.write_text(
-              html,
-              encoding="utf-8",
-          )
-
-          # ==========================================================
-          # main.ts
-          # ==========================================================
-
-          main_path = Path(
-              "engine/nostalgist/src/main.ts"
-          )
-
-          text = main_path.read_text(
               encoding="utf-8"
-          )
-
-          # ----------------------------------------------------------
-          # Remove threaded / COI browser checks.
-          # The reused core is the already-successful single-thread core.
-          # ----------------------------------------------------------
-
-          secure_marker = (
-              "// Multithreaded WebAssembly requires a secure context"
-          )
-
-          opfs_marker = (
-              "const opfs = !HAVE_OPFS"
-          )
-
-          secure_pos = text.find(
-              secure_marker
-          )
-
-          opfs_pos = text.find(
-              opfs_marker,
-              secure_pos,
-          )
-
-          if (
-              secure_pos < 0
-              or opfs_pos < 0
-          ):
-              raise SystemExit(
-                  "PATCH FAILED: COI block"
-              )
-
-          text = (
-              text[:secure_pos]
-              + text[opfs_pos:]
-          )
-
-          # ----------------------------------------------------------
-          # Important:
-          # Nostalgist renames the supplied canvas ID to "canvas".
-          #
-          # Give Nostalgist an explicit internal framebuffer size
-          # instead of depending on offsetWidth/offsetHeight.
-          # ----------------------------------------------------------
-
-          element_marker = (
-              '  element: "#nostalgist-canvas",\n'
-          )
-
-          if text.count(element_marker) != 1:
-              raise SystemExit(
-                  "PATCH FAILED: element marker"
-              )
-
-          element_replacement = '''  element: "#nostalgist-canvas",
-            size: {
-              width: 640,
-              height: 480,
-            },
-            style: {
-              position: "fixed",
-              left: "0",
-              top: "0",
-              width: "100vw",
-              height: "100vh",
-              display: "block",
-              backgroundColor: "black",
-              imageRendering: "auto",
-            },
-          '''
-
-          text = text.replace(
-              element_marker,
-              element_replacement,
-              1,
-          )
-
-          # ----------------------------------------------------------
-          # After prepare(), make sure the actual Nostalgist canvas
-          # itself is visible. Use getCanvas(), NOT the old DOM ID.
-          # ----------------------------------------------------------
-
-          prepare_end_marker = (
-              "\n\nif (opfs !== null) {"
-          )
-
-          prepare_start = text.find(
-              "const nostalgist = await Nostalgist.prepare({"
-          )
-
-          prepare_end = text.find(
-              prepare_end_marker,
-              prepare_start,
-          )
-
-          if (
-              prepare_start < 0
-              or prepare_end < 0
-          ):
-              raise SystemExit(
-                  "PATCH FAILED: prepare block"
-              )
-
-          canvas_fix = r'''
-
-          const slGameCanvas =
-            nostalgist.getCanvas();
-
-          slGameCanvas.style.position =
-            "fixed";
-
-          slGameCanvas.style.left =
-            "0";
-
-          slGameCanvas.style.top =
-            "0";
-
-          slGameCanvas.style.width =
-            "100vw";
-
-          slGameCanvas.style.height =
-            "100vh";
-
-          slGameCanvas.style.display =
-            "block";
-
-          slGameCanvas.style.visibility =
-            "visible";
-
-          slGameCanvas.style.opacity =
-            "1";
-
-          slGameCanvas.style.backgroundColor =
-            "#000";
-
-          '''
-
-          text = (
-              text[:prepare_end]
-              + canvas_fix
-              + text[prepare_end:]
-          )
-
-          main_path.write_text(
-              text,
-              encoding="utf-8",
-          )
-
-          # ==========================================================
-          # Source validation
-          # ==========================================================
-
-          final_text = main_path.read_text(
-              encoding="utf-8"
-          )
-
-          required = [
-              'size: {',
-              'width: 640',
-              'height: 480',
-              'nostalgist.getCanvas()',
-              'slGameCanvas.style.visibility',
-              'const opfs = !HAVE_OPFS',
-          ]
-
-          for item in required:
-              if item not in final_text:
-                  raise SystemExit(
-                      "VALIDATION FAILED: "
-                      + item
-                  )
-
-          if (
-              "Multithreaded WebAssembly requires a secure context"
-              in final_text
-          ):
-              raise SystemExit(
-                  "VALIDATION FAILED: threaded browser check still present"
-              )
-
-          print(
-              "SLKNIGHT_PLAY_V6_PATCH_OK"
           )
           PY
 
-      - name: Install frontend packages
+      - name: Install Nostalgist packages
         working-directory: engine/nostalgist
         run: |
           set -e
           npm install
 
-      - name: Format patched frontend
+      - name: Check frontend
         working-directory: engine/nostalgist
         run: |
           set -e
-          npx prettier --write src/main.ts index.html
 
-      - name: Type check frontend
-        working-directory: engine/nostalgist
-        run: |
-          set -e
+          npx prettier \
+            --write \
+            index.html
+
           npm run lint
 
-      - name: Generate asset hashes and sizes
+      - name: Generate hashes and sizes
         working-directory: engine/nostalgist
         run: |
           set -e
           node update-env.ts
 
-      - name: Build play version
+      - name: Build project Pages package
         working-directory: engine/nostalgist
         run: |
           set -e
-          npx vite build --base=./
+
+          npx vite build \
+            --base=./
+
+          cp \
+            node_modules/coi-serviceworker/coi-serviceworker.min.js \
+            dist/
+
           touch dist/.nojekyll
 
-      - name: Verify deploy files
+      - name: Verify final threaded deployment
         run: |
           set -e
 
           test -s engine/nostalgist/dist/index.html
+          test -s engine/nostalgist/dist/coi-serviceworker.min.js
           test -s engine/nostalgist/dist/mkxp-z_libretro.js
           test -s engine/nostalgist/dist/mkxp-z_libretro.wasm
           test -s engine/nostalgist/dist/slknight.mkxpz
 
-          echo "SLKNIGHT_PLAY_V6_BUILD_OK"
+          grep -Fq \
+            'src="./assets/' \
+            engine/nostalgist/dist/index.html
+
+          grep -Fq \
+            '화면을 터치해 시작' \
+            engine/nostalgist/dist/index.html
+
+          echo 'SLKNIGHT_OFFICIAL_THREADED_V7_OK'
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
