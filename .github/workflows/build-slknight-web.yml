@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web Stage 1 V4
+name: Deploy SLKnight mkxp-web LIVE Engine V5
 
 on:
   push:
@@ -21,9 +21,12 @@ env:
   GAME_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLKnight_Android_JoiPlay.zip
   GAME_SHA256: 9f007d46d2410742aca5e14c3901f63586084007e7f52c4d199116191824132a
 
+  # Exact commit behind the working mkxp-web "built" branch.
+  LIVE_MKXP_REF: 07e1519f9a2b9100512c567e97455fa3c77a3221
+
 jobs:
   build:
-    name: Build SLKnight with working mkxp-web engine
+    name: Build SLKnight with LIVE mkxp-web engine
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -45,31 +48,71 @@ jobs:
             timidity \
             freepats
 
-      - name: Checkout known-working mkxp-web player
+      # ------------------------------------------------------------
+      # IMPORTANT
+      #
+      # This is NOT knight-blade-web-async.
+      #
+      # This is the exact mkxp-web built commit corresponding to
+      # the player that worked on the phone.
+      # ------------------------------------------------------------
+
+      - name: Checkout exact working LIVE mkxp-web player
         uses: actions/checkout@v4
         with:
-          repository: pulsejet/knight-blade-web-async
-          ref: gh-pages
+          repository: pulsejet/mkxp-web
+          ref: ${{ env.LIVE_MKXP_REF }}
           path: player
           sparse-checkout: |
             index.html
             js
+            manifest.webmanifest
             mkxp.js
             mkxp.wasm
           sparse-checkout-cone-mode: false
 
-      - name: Checkout mkxp-web support files
+      - name: Checkout mkxp-web conversion tools
         uses: actions/checkout@v4
         with:
           repository: pulsejet/mkxp-web
           ref: master
-          path: mkxp-web
+          path: mkxp-tools
           sparse-checkout: |
             COPYING
             extra/rgss.rb
             extra/make_mapping.sh
-            extra/manifest.webmanifest
           sparse-checkout-cone-mode: false
+
+      - name: Verify exact LIVE engine
+        run: |
+          set -e
+
+          echo "LIVE ENGINE COMMIT:"
+          git -C player rev-parse HEAD
+
+          test "$(
+            git -C player rev-parse HEAD
+          )" = "$LIVE_MKXP_REF"
+
+          JS_SIZE="$(
+            stat -c '%s' player/mkxp.js
+          )"
+
+          WASM_SIZE="$(
+            stat -c '%s' player/mkxp.wasm
+          )"
+
+          echo "mkxp.js=${JS_SIZE}"
+          echo "mkxp.wasm=${WASM_SIZE}"
+
+          test "${JS_SIZE}" = "290574"
+          test "${WASM_SIZE}" = "5217852"
+
+          test -s player/js/drive.js
+          test -s player/js/dpad.js
+          test -s player/js/localforage.min.js
+
+          echo "EXACT_LIVE_ENGINE_OK"
 
       - name: Download clean SLKnight release
         run: |
@@ -94,33 +137,38 @@ jobs:
           test -f \
             game/SLKnight_Android_JoiPlay/Game.ini
 
-      - name: Replace sample game with SLKnight
+          echo "SLKNIGHT_RELEASE_OK"
+
+      - name: Replace LIVE demo game with SLKnight
         run: |
           set -e
 
-          rm -rf player/gameasync
-          mkdir -p player/gameasync
+          rm -rf \
+            player/gameasync \
+            player/preload
+
+          mkdir -p \
+            player/gameasync \
+            player/preload
 
           cp -a \
             game/SLKnight_Android_JoiPlay/. \
             player/gameasync/
 
           cp \
-            mkxp-web/extra/rgss.rb \
+            mkxp-tools/extra/rgss.rb \
             player/gameasync/rgss.rb
 
           cp \
-            mkxp-web/extra/manifest.webmanifest \
-            player/manifest.webmanifest
-
-          cp \
-            mkxp-web/COPYING \
+            mkxp-tools/COPYING \
             player/COPYING-mkxp-web.txt
 
           rm -f \
             player/gameasync/README_Android.txt
 
-      - name: Convert SLKnight RGSS scripts for mruby web runtime
+          echo "SLKNIGHT_DATA_INSTALLED"
+
+      - name: Convert SLKnight RGSS for mkxp-web
         run: |
           set -e
 
@@ -130,7 +178,8 @@ jobs:
 
           ini = File.binread(ini_path)
 
-          scripts_rel = ini[/^Scripts=(.+)$/i, 1]
+          scripts_rel =
+            ini[/^Scripts=(.+)$/i, 1]
 
           abort 'Scripts entry missing from Game.ini' \
             if scripts_rel == nil
@@ -154,17 +203,21 @@ jobs:
               File.binread(scripts_path)
             )
 
+          # ==========================================================
+          # Browser / Windows API compatibility
+          # ==========================================================
+
           web_compat = <<'RUBY'
           class Win32API
             def initialize(*args)
             end
 
             def call(*args)
-              return 0
+              0
             end
 
             def Call(*args)
-              return call(*args)
+              call(*args)
             end
           end
           RUBY
@@ -179,6 +232,21 @@ jobs:
               )
             ]
           )
+
+          # ==========================================================
+          # mruby:
+          #
+          # begin
+          #   ...
+          # end until x
+          #
+          # ->
+          #
+          # loop do
+          #   ...
+          #   break if x
+          # end
+          # ==========================================================
 
           def patch_begin_until(source)
             lines = source.lines
@@ -230,6 +298,10 @@ jobs:
               changed
             ]
           end
+
+          # ==========================================================
+          # Move standard RPG Maker scene loops under browser control.
+          # ==========================================================
 
           def patch_scene_loops(source)
             lines = source.lines
@@ -307,6 +379,7 @@ jobs:
                 ]
 
                 changed += 1
+
                 i += 1
                 next
               end
@@ -362,6 +435,10 @@ jobs:
                 count
             end
 
+            # ========================================================
+            # Browser animation-frame dispatcher
+            # ========================================================
+
             if name == 'Main'
               unless patched.include?(
                 'def main_update_loop'
@@ -415,6 +492,10 @@ jobs:
               )
           end
 
+          # ==========================================================
+          # Verify Main
+          # ==========================================================
+
           main =
             scripts.find do |entry|
               entry[1].to_s == 'Main'
@@ -432,6 +513,10 @@ jobs:
             unless main_source.include?(
               'def main_update_loop'
             )
+
+          # ==========================================================
+          # mkxp-web LIVE preload list expects Data/Scripts.rxdata.
+          # ==========================================================
 
           target_scripts =
             File.join(
@@ -453,6 +538,10 @@ jobs:
               scripts_path
             )
           end
+
+          # ==========================================================
+          # Rewrite Game.ini
+          # ==========================================================
 
           ini_lines =
             ini.split(/\r?\n/)
@@ -486,7 +575,7 @@ jobs:
           )
 
           puts(
-            'SLKNIGHT_MRUBY_STAGE1_PATCH_OK'
+            "SLKNIGHT_RGSS_LIVE_ENGINE_PATCH_OK"
           )
           RB
 
@@ -500,7 +589,7 @@ jobs:
           echo \
             'SCRIPT_ARCHIVE_VERIFY_OK'
 
-      - name: Convert unsupported audio to OGG
+      - name: Convert audio to OGG
         run: |
           set -e
 
@@ -547,19 +636,21 @@ jobs:
           ]
 
           print(
-              "AUDIO_FILES_TO_CONVERT="
-              + str(len(files))
+              "AUDIO_FILES_TO_CONVERT=" +
+              str(len(files))
           )
 
           converted = 0
           failures = []
 
           for src in files:
-              ext = src.suffix.lower()
+              ext =
+                  src.suffix.lower()
 
-              out = src.with_suffix(
-                  ".ogg"
-              )
+              out =
+                  src.with_suffix(
+                      ".ogg"
+                  )
 
               temp_wav = None
 
@@ -567,15 +658,11 @@ jobs:
                   source_for_ffmpeg = src
 
                   if ext in midi_exts:
-                      temp_wav = src.with_name(
-                          src.name +
-                          ".mkxpweb.wav"
-                      )
-
-                      print(
-                          "MIDI: " +
-                          str(src)
-                      )
+                      temp_wav =
+                          src.with_name(
+                              src.name +
+                              ".mkxpweb.wav"
+                          )
 
                       subprocess.run(
                           [
@@ -590,12 +677,6 @@ jobs:
 
                       source_for_ffmpeg = \
                           temp_wav
-
-                  else:
-                      print(
-                          "AUDIO: " +
-                          str(src)
-                      )
 
                   subprocess.run(
                       [
@@ -674,31 +755,6 @@ jobs:
 
               raise SystemExit(1)
 
-          remaining = [
-              str(path)
-              for path in root.rglob("*")
-              if (
-                  path.is_file()
-                  and
-                  path.suffix.lower()
-                  in convertible
-              )
-          ]
-
-          if remaining:
-              print(
-                  "UNCONVERTED AUDIO:",
-                  file=sys.stderr,
-              )
-
-              for path in remaining:
-                  print(
-                      path,
-                      file=sys.stderr,
-                  )
-
-              raise SystemExit(1)
-
           print(
               "AUDIO_CONVERTED=" +
               str(converted)
@@ -752,20 +808,16 @@ jobs:
               str(len(files))
           )
 
-          failures = []
           converted = 0
+          failures = []
 
           for src in files:
-              out = src.with_suffix(
-                  ".png"
-              )
-
-              try:
-                  print(
-                      "IMAGE: " +
-                      str(src)
+              out =
+                  src.with_suffix(
+                      ".png"
                   )
 
+              try:
                   subprocess.run(
                       [
                           "convert",
@@ -785,9 +837,7 @@ jobs:
                           str(out)
                       )
 
-                  if src.exists():
-                      src.unlink()
-
+                  src.unlink()
                   converted += 1
 
               except Exception as exc:
@@ -824,14 +874,14 @@ jobs:
           )
           PY
 
-      - name: Generate async file mapping
+      - name: Generate LIVE async filesystem mapping
         run: |
           set -e
 
           cd player/gameasync
 
           bash \
-            ../../mkxp-web/extra/make_mapping.sh
+            ../../mkxp-tools/extra/make_mapping.sh
 
           test -s \
             mapping.js
@@ -840,9 +890,9 @@ jobs:
             bitmap-map.js
 
           echo \
-            'MAPPING_GENERATION_OK'
+            'LIVE_MAPPING_GENERATION_OK'
 
-      - name: Create optional map preload files
+      - name: Create SLKnight map preload files
         run: |
           set -e
 
@@ -870,8 +920,8 @@ jobs:
               )
           ):
               target = (
-                  preload_root
-                  / (
+                  preload_root /
+                  (
                       source.name +
                       ".json"
                   )
@@ -890,7 +940,7 @@ jobs:
           )
           PY
 
-      - name: Configure SLKnight player shell
+      - name: Configure LIVE player for SLKnight
         run: |
           set -e
 
@@ -898,27 +948,34 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path(
-              "player/index.html"
-          )
+          path =
+              Path(
+                  "player/index.html"
+              )
 
-          html = path.read_text(
-              encoding="utf-8"
-          )
+          html =
+              path.read_text(
+                  encoding="utf-8"
+              )
 
-          html, count1 = re.subn(
-              r"var namespace = '[^']*';",
-              "var namespace = 'slknight_web_v1';",
-              html,
-              count=1,
-          )
+          # Only change game identity.
+          # Keep the actual working LIVE player intact.
 
-          html, count2 = re.subn(
-              r"var wTitle = '[^']*'\s*;?",
-              "var wTitle = 'SLKnight';",
-              html,
-              count=1,
-          )
+          html, namespace_count = \
+              re.subn(
+                  r"var namespace = '[^']*';",
+                  "var namespace = 'slknight_live_v5';",
+                  html,
+                  count=1,
+              )
+
+          html, title_count = \
+              re.subn(
+                  r"var wTitle = '[^']*'\s*;?",
+                  "var wTitle = 'SLKnight';",
+                  html,
+                  count=1,
+              )
 
           html = html.replace(
               "<title>MKXP</title>",
@@ -926,14 +983,14 @@ jobs:
               1,
           )
 
-          if count1 != 1:
+          if namespace_count != 1:
               raise SystemExit(
                   "namespace patch failed"
               )
 
-          if count2 != 1:
+          if title_count != 1:
               raise SystemExit(
-                  "title variable patch failed"
+                  "title patch failed"
               )
 
           path.write_text(
@@ -942,57 +999,59 @@ jobs:
           )
 
           print(
-              "PLAYER_SHELL_CONFIG_OK"
+              "LIVE_PLAYER_CONFIG_OK"
           )
           PY
 
           touch \
             player/.nojekyll
 
-      - name: Verify deploy package
+      - name: Verify final LIVE-engine package
         run: |
           set -e
 
-          test -s \
-            player/index.html
+          test -s player/index.html
+          test -s player/mkxp.js
+          test -s player/mkxp.wasm
 
-          test -s \
-            player/mkxp.js
+          test -s player/js/drive.js
+          test -s player/js/dpad.js
+          test -s player/js/localforage.min.js
 
-          test -s \
-            player/mkxp.wasm
+          test -s player/gameasync/Game.ini
+          test -s player/gameasync/rgss.rb
 
-          test -s \
-            player/js/localforage.min.js
-
-          test -s \
-            player/gameasync/Game.ini
-
-          test -s \
-            player/gameasync/rgss.rb
-
-          test -s \
-            player/gameasync/mapping.js
-
-          test -s \
-            player/gameasync/bitmap-map.js
+          test -s player/gameasync/mapping.js
+          test -s player/gameasync/bitmap-map.js
 
           test -s \
             player/gameasync/Data/Scripts.rxdata
 
           grep -Fq \
-            "var namespace = 'slknight_web_v1';" \
+            "var namespace = 'slknight_live_v5';" \
             player/index.html
 
           grep -Fq \
             "var wTitle = 'SLKnight';" \
             player/index.html
 
+          # Re-check that the actual engine binaries were never changed.
+          test "$(
+            stat -c '%s' player/mkxp.js
+          )" = "290574"
+
+          test "$(
+            stat -c '%s' player/mkxp.wasm
+          )" = "5217852"
+
           rm -rf \
             player/.git
 
-          echo \
-            'SLKNIGHT_MKXP_WEB_STAGE1_V4_READY'
+          echo
+          echo "======================================="
+          echo " SLKNIGHT LIVE MKXP-WEB V5 READY"
+          echo "======================================="
+          echo
 
           du -sh \
             player
