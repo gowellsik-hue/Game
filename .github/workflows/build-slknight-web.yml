@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web NATIVE PLANE V9H
+name: Deploy SLKnight mkxp-web NATIVE PLANE V9I
 
 on:
   push:
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build:
-    name: Build SLKnight NATIVE PLANE V9H
+    name: Build SLKnight NATIVE PLANE V9I
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -86,34 +86,95 @@ jobs:
       - name: Install SLKnight data
         run: |
           set -e
+
           rm -rf player/gameasync player/preload
           mkdir -p player/gameasync player/preload
+
           cp -a game/SLKnight_Android_JoiPlay/. player/gameasync/
           cp mkxp-tools/extra/rgss.rb player/gameasync/rgss.rb
           cp mkxp-tools/COPYING player/COPYING-mkxp-web.txt
+
           rm -f player/gameasync/README_Android.txt
+
+          # Original package contains Save1.rxdata.
+          # Do not ship desktop/JoiPlay save data into a fresh web install.
+          rm -f player/gameasync/Save*.rxdata
+
+          if find player/gameasync -maxdepth 1 -type f -name 'Save*.rxdata' | grep -q .; then
+            echo BUNDLED_SAVE_REMOVE_FAILED
+            exit 1
+          fi
+
+          echo BUNDLED_SAVE_REMOVED
           echo SLKNIGHT_DATA_OK
 
       - name: Convert RGSS and patch web conflicts
         run: |
           set -e
+
           ruby -rzlib - <<'RB'
           game_dir = 'player/gameasync'
-          ini_path = File.join(game_dir, 'Game.ini')
-          ini = File.binread(ini_path)
-          scripts_rel = ini[/^Scripts=(.+)$/i, 1]
-          abort 'Scripts entry missing' if scripts_rel.nil?
-          scripts_rel = scripts_rel.strip.tr('\\', '/')
-          scripts_path = File.join(game_dir, scripts_rel)
-          abort "Scripts missing: #{scripts_path}" unless File.file?(scripts_path)
-          scripts = Marshal.load(File.binread(scripts_path))
+
+          ini_path =
+            File.join(
+              game_dir,
+              'Game.ini'
+            )
+
+          ini =
+            File.binread(
+              ini_path
+            )
+
+          scripts_rel =
+            ini[
+              /^Scripts=(.+)$/i,
+              1
+            ]
+
+          abort 'Scripts entry missing' \
+            if scripts_rel.nil?
+
+          scripts_rel =
+            scripts_rel
+              .strip
+              .tr(
+                '\\',
+                '/'
+              )
+
+          scripts_path =
+            File.join(
+              game_dir,
+              scripts_rel
+            )
+
+          abort "Scripts missing: #{scripts_path}" \
+            unless File.file?(
+              scripts_path
+            )
+
+          scripts =
+            Marshal.load(
+              File.binread(
+                scripts_path
+              )
+            )
 
           web_compat = <<'RUBY'
           puts("SLLOAD|000|WEB_COMPAT")
+
           class Win32API
-            def initialize(*args); end
-            def call(*args); 0; end
-            def Call(*args); call(*args); end
+            def initialize(*args)
+            end
+
+            def call(*args)
+              0
+            end
+
+            def Call(*args)
+              call(*args)
+            end
           end
           RUBY
 
@@ -122,24 +183,34 @@ jobs:
             [
               0,
               'Web Compatibility',
-              Zlib::Deflate.deflate(web_compat)
+              Zlib::Deflate.deflate(
+                web_compat
+              )
             ]
           )
 
           def patch_begin_until(source)
-            lines = source.lines
+            lines =
+              source.lines
+
             changed = 0
             i = 0
 
             while i < lines.length
-              match = lines[i].match(
-                /^(\s*)end\s+until\s+(.+?)\s*$/
-              )
+              match =
+                lines[i].match(
+                  /^(\s*)end\s+until\s+(.+?)\s*$/
+                )
 
               if match
-                indent = match[1]
-                condition = match[2]
-                j = i - 1
+                indent =
+                  match[1]
+
+                condition =
+                  match[2]
+
+                j =
+                  i - 1
 
                 while j >= 0
                   if (
@@ -176,7 +247,9 @@ jobs:
           end
 
           def patch_scene_loops(source)
-            lines = source.lines
+            lines =
+              source.lines
+
             changed = 0
             i = 0
 
@@ -196,7 +269,8 @@ jobs:
                 k < lines.length &&
                 significant.length < 8
               )
-                stripped = lines[k].strip
+                stripped =
+                  lines[k].strip
 
                 unless (
                   stripped.empty? ||
@@ -269,6 +343,7 @@ jobs:
           resolution_patch_count = 0
           id_patch_count = 0
           font_name_patch_count = 0
+          new_game_trace_count = 0
 
           scripts.each_with_index do |entry, index|
             next unless (
@@ -310,6 +385,85 @@ jobs:
                 font_name_matches
             end
 
+            # Scene_Title:
+            # add markers around New Game initialization.
+            if index == 76
+              if source.include?(
+                'def command_new_game'
+              )
+                source.sub!(
+                  'def command_new_game',
+                  "def command_new_game\n" +
+                  "    puts(\"SLNEW|BEGIN\")"
+                )
+
+                new_game_trace_count += 1
+              end
+
+              markers = [
+                [
+                  'Graphics.frame_count = 0',
+                  "puts(\"SLNEW|FRAME_COUNT\")\n" +
+                  "    Graphics.frame_count = 0"
+                ],
+                [
+                  '$game_temp          = Game_Temp.new',
+                  "puts(\"SLNEW|GAME_OBJECTS_BEGIN\")\n" +
+                  "    $game_temp          = Game_Temp.new"
+                ],
+                [
+                  '$game_party.setup_starting_members',
+                  "puts(\"SLNEW|STARTING_PARTY\")\n" +
+                  "    $game_party.setup_starting_members"
+                ],
+                [
+                  '$game_map.setup($data_system.start_map_id)',
+                  "puts(\"SLNEW|MAP_SETUP\")\n" +
+                  "    $game_map.setup($data_system.start_map_id)"
+                ],
+                [
+                  '$game_player.moveto($data_system.start_x, $data_system.start_y)',
+                  "puts(\"SLNEW|PLAYER_MOVETO\")\n" +
+                  "    $game_player.moveto($data_system.start_x, $data_system.start_y)"
+                ],
+                [
+                  '$game_player.refresh',
+                  "puts(\"SLNEW|PLAYER_REFRESH\")\n" +
+                  "    $game_player.refresh"
+                ],
+                [
+                  '$game_map.autoplay',
+                  "puts(\"SLNEW|AUTOPLAY\")\n" +
+                  "    $game_map.autoplay"
+                ],
+                [
+                  '$game_map.update',
+                  "puts(\"SLNEW|MAP_UPDATE\")\n" +
+                  "    $game_map.update"
+                ],
+                [
+                  '$scene = Scene_Map.new',
+                  "puts(\"SLNEW|SCENE_MAP\")\n" +
+                  "    $scene = Scene_Map.new\n" +
+                  "    puts(\"SLNEW|DONE\")"
+                ]
+              ]
+
+              markers.each do |old_text, new_text|
+                if source.include?(
+                  old_text
+                )
+                  source.sub!(
+                    old_text,
+                    new_text
+                  )
+
+                  new_game_trace_count += 1
+                end
+              end
+            end
+
+            # Original Windows resolution hook is incompatible with web.
             if index == 97
               puts(
                 "PATCH_WEB_RESOLUTION_INDEX=#{index}"
@@ -317,11 +471,14 @@ jobs:
 
               source = <<'RUBY'
           puts("SLPATCH|WEB_RESOLUTION_SCRIPT_DISABLED")
+
+          # Browser/mkxp-web owns canvas and screen dimensions.
           RUBY
 
               resolution_patch_count += 1
             end
 
+            # Fix self-inheriting Sprite_Character patch.
             if index == 111
               puts(
                 "PATCH_WEB_ID_SPRITE_INDEX=#{index}"
@@ -338,27 +495,107 @@ jobs:
             alias sl_id_original_update update
 
             def create_id_sprite(text)
-              bitmap = Bitmap.new(160, 16)
-              bitmap.font.name = "돋움체"
-              bitmap.font.size = 12
-              bitmap.font.bold = false
-              bitmap.font.color.set(0, 0, 0)
-              bitmap.draw_text(0, -1, 160, 16, text, 1)
-              bitmap.draw_text(0, +1, 160, 16, text, 1)
-              bitmap.draw_text(-1, 0, 160, 16, text, 1)
-              bitmap.draw_text(+1, 0, 160, 16, text, 1)
-              bitmap.font.color.set(255, 255, 255)
-              bitmap.draw_text(0, 0, 160, 16, text, 1)
+              bitmap =
+                Bitmap.new(
+                  160,
+                  16
+                )
 
-              @_id_sprite = Sprite.new(self.viewport)
-              @_id_sprite.bitmap = bitmap
-              @_id_sprite.opacity = 255
-              @_id_sprite.ox = 80
-              @_id_sprite.oy = 14
-              @_id_sprite.x = self.x
-              @_id_sprite.y = self.y - self.oy / 2
-              @_id_sprite.z = 9999
-              @_id_sprite_visible = true
+              bitmap.font.name =
+                "돋움체"
+
+              bitmap.font.size =
+                12
+
+              bitmap.font.bold =
+                false
+
+              bitmap.font.color.set(
+                0,
+                0,
+                0
+              )
+
+              bitmap.draw_text(
+                0,
+                -1,
+                160,
+                16,
+                text,
+                1
+              )
+
+              bitmap.draw_text(
+                0,
+                1,
+                160,
+                16,
+                text,
+                1
+              )
+
+              bitmap.draw_text(
+                -1,
+                0,
+                160,
+                16,
+                text,
+                1
+              )
+
+              bitmap.draw_text(
+                1,
+                0,
+                160,
+                16,
+                text,
+                1
+              )
+
+              bitmap.font.color.set(
+                255,
+                255,
+                255
+              )
+
+              bitmap.draw_text(
+                0,
+                0,
+                160,
+                16,
+                text,
+                1
+              )
+
+              @_id_sprite =
+                Sprite.new(
+                  self.viewport
+                )
+
+              @_id_sprite.bitmap =
+                bitmap
+
+              @_id_sprite.opacity =
+                255
+
+              @_id_sprite.ox =
+                80
+
+              @_id_sprite.oy =
+                14
+
+              @_id_sprite.x =
+                self.x
+
+              @_id_sprite.y =
+                self.y -
+                self.oy / 2
+
+              @_id_sprite.z =
+                9999
+
+              @_id_sprite_visible =
+                true
             end
 
             def dispose_id_sprite
@@ -367,21 +604,32 @@ jobs:
                 @_id_sprite = nil
               end
 
-              @_id_sprite_visible = false
+              @_id_sprite_visible =
+                false
             end
 
             def update_id_sprite
               if @character.sprite_id != nil
+
                 unless @_id_sprite_visible
                   create_id_sprite(
                     @character.sprite_id
                   )
                 end
 
-                @_id_sprite.x = self.x
-                @_id_sprite.y = self.y - self.oy
+                @_id_sprite.x =
+                  self.x
+
+                @_id_sprite.y =
+                  self.y -
+                  self.oy
+
               else
-                dispose_id_sprite if @_id_sprite_visible
+
+                if @_id_sprite_visible
+                  dispose_id_sprite
+                end
+
               end
             end
 
@@ -395,6 +643,7 @@ jobs:
               id_patch_count += 1
             end
 
+            # Fix self-inheriting Game_Event / Game_Player patch.
             if index == 112
               puts(
                 "PATCH_WEB_ID_OUTPUT_INDEX=#{index}"
@@ -409,14 +658,21 @@ jobs:
             def refresh
               sl_id_original_event_refresh
 
-              text = @event.name.dup
+              text =
+                @event.name.dup
 
-              text.gsub!(/\[[Ii][Dd](.+?)\]/) do
-                @sprite_id = $1
+              text.gsub!(
+                /\[[Ii][Dd](.+?)\]/
+              ) do
+                @sprite_id =
+                  $1
               end
 
-              @sprite_id = nil if @erased
-              @sprite_id = nil if @character_name == ""
+              @sprite_id =
+                nil if @erased
+
+              @sprite_id =
+                nil if @character_name == ""
             end
           end
 
@@ -427,7 +683,8 @@ jobs:
               sl_id_original_player_refresh
 
               if $game_party.actors.size > 0
-                @sprite_id = nil
+                @sprite_id =
+                  nil
               end
             end
           end
@@ -436,6 +693,7 @@ jobs:
               id_patch_count += 1
             end
 
+            # mkxp already provides native Plane.
             if source.match?(
               /^\s*class\s+Plane\s*<\s*Sprite\b/n
             )
@@ -445,6 +703,8 @@ jobs:
 
               source = <<'RUBY'
           puts("SLPATCH|NATIVE_PLANE_ACTIVE")
+
+          # mkxp-web already supplies RGSS Plane.
           RUBY
 
               plane_patch_count += 1
@@ -458,7 +718,8 @@ jobs:
                 patched
               )
 
-            begin_until_count += count
+            begin_until_count +=
+              count
 
             unless name == 'Main'
               patched, count =
@@ -466,7 +727,8 @@ jobs:
                   patched
                 )
 
-              scene_loop_count += count
+              scene_loop_count +=
+                count
             end
 
             if name == 'Main'
@@ -545,11 +807,16 @@ jobs:
                 e.respond_to?(:backtrace) &&
                 e.backtrace
               )
-                e.backtrace[0, 16].each do |line|
+                e.backtrace[
+                  0,
+                  16
+                ].each do |line|
+
                   puts(
                     "SLRUNTIMEBT|" +
                     line.to_s
                   )
+
                 end
               end
 
@@ -572,7 +839,8 @@ jobs:
 
               patched.gsub!(
                 '$scene = Scene_Title.new',
-                "$scene = Scene_Title.new\nputs(\"SLMAIN|SCENE_TITLE_CREATED\")"
+                "$scene = Scene_Title.new\n" +
+                "puts(\"SLMAIN|SCENE_TITLE_CREATED\")"
               )
             end
 
@@ -670,11 +938,16 @@ jobs:
           abort 'Web font-name patches not applied exactly twice' \
             unless font_name_patch_count == 2
 
+          abort 'New Game trace patch incomplete' \
+            unless new_game_trace_count >= 8
+
           main =
             scripts.find do |entry|
-              entry[1].to_s.end_with?(
-                '|Main'
-              )
+              entry[1]
+                .to_s
+                .end_with?(
+                  '|Main'
+                )
             end
 
           abort 'Main script missing' \
@@ -686,9 +959,35 @@ jobs:
             )
 
           abort 'main_update_loop missing' \
-            unless main_source.b.include?(
-              'def main_update_loop'.b
+            unless main_source
+              .b
+              .include?(
+                'def main_update_loop'.b
+              )
+
+          scene_title =
+            scripts.find do |entry|
+              entry[1]
+                .to_s
+                .end_with?(
+                  '|Scene_Title'
+                )
+            end
+
+          abort 'Scene_Title missing' \
+            if scene_title.nil?
+
+          scene_title_source =
+            Zlib::Inflate.inflate(
+              scene_title[2]
             )
+
+          abort 'New Game DONE marker missing' \
+            unless scene_title_source
+              .b
+              .include?(
+                'SLNEW|DONE'.b
+              )
 
           target_scripts =
             File.join(
@@ -705,8 +1004,12 @@ jobs:
           )
 
           unless (
-            File.expand_path(scripts_path) ==
-            File.expand_path(target_scripts)
+            File.expand_path(
+              scripts_path
+            ) ==
+            File.expand_path(
+              target_scripts
+            )
           )
             File.delete(
               scripts_path
@@ -759,6 +1062,10 @@ jobs:
           )
 
           puts(
+            "NEW_GAME_TRACE_PATCHED=#{new_game_trace_count}"
+          )
+
+          puts(
             "SCENE_LOOPS_PATCHED=#{scene_loop_count}"
           )
 
@@ -767,11 +1074,11 @@ jobs:
           )
 
           puts(
-            'SLKNIGHT_V9H_SCRIPT_PATCH_OK'
+            'SLKNIGHT_V9I_SCRIPT_PATCH_OK'
           )
           RB
 
-      - name: Verify V9H script archive
+      - name: Verify V9I script archive
         run: |
           set -e
 
@@ -801,6 +1108,7 @@ jobs:
           old_plane_found = false
           frame_trace_found = false
           main_loop_found = false
+          new_game_trace_found = false
 
           scripts.each do |entry|
             next unless (
@@ -837,6 +1145,11 @@ jobs:
                 'WEB_ID_OUTPUT_FIXED'.b
               )
 
+            new_game_trace_found = true \
+              if source.include?(
+                'SLNEW|DONE'.b
+              )
+
             font_name_array_found = true \
               if source.match?(
                 /Font\.default_name\s*=\s*\[/n
@@ -870,6 +1183,9 @@ jobs:
           abort 'Web ID output patch marker missing' \
             unless web_id_output_patch_found
 
+          abort 'New Game trace marker missing' \
+            unless new_game_trace_found
+
           abort 'Font.default_name array assignment still present' \
             if font_name_array_found
 
@@ -882,15 +1198,45 @@ jobs:
           abort 'Browser main loop missing' \
             unless main_loop_found
 
-          puts('NATIVE_PLANE_MARKER_OK')
-          puts('WEB_RESOLUTION_PATCH_OK')
-          puts('WEB_ID_SPRITE_PATCH_OK')
-          puts('WEB_ID_OUTPUT_PATCH_OK')
-          puts('WEB_FONT_NAME_PATCH_OK')
-          puts('OLD_PLANE_CLASS_REMOVED')
-          puts('FRAME_TRACE_OK')
-          puts('MAIN_LOOP_OK')
-          puts('V9H_SCRIPT_ARCHIVE_VERIFY_OK')
+          puts(
+            'NATIVE_PLANE_MARKER_OK'
+          )
+
+          puts(
+            'WEB_RESOLUTION_PATCH_OK'
+          )
+
+          puts(
+            'WEB_ID_SPRITE_PATCH_OK'
+          )
+
+          puts(
+            'WEB_ID_OUTPUT_PATCH_OK'
+          )
+
+          puts(
+            'WEB_FONT_NAME_PATCH_OK'
+          )
+
+          puts(
+            'NEW_GAME_TRACE_OK'
+          )
+
+          puts(
+            'OLD_PLANE_CLASS_REMOVED'
+          )
+
+          puts(
+            'FRAME_TRACE_OK'
+          )
+
+          puts(
+            'MAIN_LOOP_OK'
+          )
+
+          puts(
+            'V9I_SCRIPT_ARCHIVE_VERIFY_OK'
+          )
           RB
 
       - name: Convert audio to OGG
@@ -902,10 +1248,14 @@ jobs:
           import subprocess
           import sys
 
-          root = Path("player/gameasync/Audio")
+          root = Path(
+              "player/gameasync/Audio"
+          )
 
           if not root.exists():
-              print("AUDIO_DIRECTORY_NOT_PRESENT")
+              print(
+                  "AUDIO_DIRECTORY_NOT_PRESENT"
+              )
               raise SystemExit(0)
 
           convertible = {
@@ -938,18 +1288,26 @@ jobs:
           converted = 0
 
           for src in files:
-              ext = src.suffix.lower()
-              out = src.with_suffix(".ogg")
+              ext =
+                  src.suffix.lower()
+
+              out =
+                  src.with_suffix(
+                      ".ogg"
+                  )
+
               temp_wav = None
 
               try:
-                  source_for_ffmpeg = src
+                  source_for_ffmpeg =
+                      src
 
                   if ext in midi_exts:
-                      temp_wav = src.with_name(
-                          src.name +
-                          ".mkxpweb.wav"
-                      )
+                      temp_wav =
+                          src.with_name(
+                              src.name +
+                              ".mkxpweb.wav"
+                          )
 
                       subprocess.run(
                           [
@@ -962,7 +1320,8 @@ jobs:
                           check=True,
                       )
 
-                      source_for_ffmpeg = temp_wav
+                      source_for_ffmpeg =
+                          temp_wav
 
                   subprocess.run(
                       [
@@ -1039,7 +1398,9 @@ jobs:
               str(converted)
           )
 
-          print("AUDIO_CONVERSION_OK")
+          print(
+              "AUDIO_CONVERSION_OK"
+          )
           PY
 
       - name: Convert unsupported images to PNG
@@ -1083,9 +1444,10 @@ jobs:
           converted = 0
 
           for src in files:
-              out = src.with_suffix(
-                  ".png"
-              )
+              out =
+                  src.with_suffix(
+                      ".png"
+                  )
 
               try:
                   subprocess.run(
@@ -1134,7 +1496,9 @@ jobs:
               str(converted)
           )
 
-          print("IMAGE_CONVERSION_OK")
+          print(
+              "IMAGE_CONVERSION_OK"
+          )
           PY
 
       - name: Generate async filesystem mapping
@@ -1158,13 +1522,15 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          data_root = Path(
-              "player/gameasync/Data"
-          )
+          data_root =
+              Path(
+                  "player/gameasync/Data"
+              )
 
-          preload_root = Path(
-              "player/preload/Data"
-          )
+          preload_root =
+              Path(
+                  "player/preload/Data"
+              )
 
           preload_root.mkdir(
               parents=True,
@@ -1178,13 +1544,11 @@ jobs:
                   "Map*.rxdata"
               )
           ):
-              target = (
-                  preload_root /
-                  (
+              target =
+                  preload_root / (
                       source.name +
                       ".json"
                   )
-              )
 
               target.write_text(
                   "[]\n",
@@ -1199,7 +1563,7 @@ jobs:
           )
           PY
 
-      - name: Add V9H trace panel
+      - name: Add V9I trace panel
         run: |
           set -e
 
@@ -1207,13 +1571,15 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path(
-              "player/index.html"
-          )
+          path =
+              Path(
+                  "player/index.html"
+              )
 
-          html = path.read_text(
-              encoding="utf-8"
-          )
+          html =
+              path.read_text(
+                  encoding="utf-8"
+              )
 
           trace_script = r'''
           <script>
@@ -1272,7 +1638,7 @@ jobs:
                 String(value);
 
               var useful =
-                /SLLOAD\||SLSCRIPTERR\||SLBACKTRACE\||SLPATCH\||SLMAIN\||SLMAINCALL\||SLMAINREADY\||SLFRAME\||SLRUNTIMEERR\||SLRUNTIMEBT\|| - err|error|exception|PHYSFS|NO SUCH FILE/i.test(
+                /SLLOAD\||SLNEW\||SLSCRIPTERR\||SLBACKTRACE\||SLPATCH\||SLMAIN\||SLMAINCALL\||SLMAINREADY\||SLFRAME\||SLRUNTIMEERR\||SLRUNTIMEBT\|| - err|error|exception|PHYSFS|NO SUCH FILE/i.test(
                   text
                 );
 
@@ -1290,13 +1656,16 @@ jobs:
                 'block';
 
               var old =
-                p.textContent || '';
+                p.textContent ||
+                '';
 
               if (old) {
-                old += '\n';
+                old +=
+                  '\n';
               }
 
-              old += text;
+              old +=
+                text;
 
               if (
                 old.length >
@@ -1322,7 +1691,7 @@ jobs:
                 );
 
               b.textContent =
-                'V9H';
+                'V9I';
 
               b.style.cssText =
                 'position:fixed;' +
@@ -1404,15 +1773,18 @@ jobs:
                   ) +
                   ' | ' +
                   String(
-                    e.filename || ''
+                    e.filename ||
+                    ''
                   ) +
                   ':' +
                   String(
-                    e.lineno || ''
+                    e.lineno ||
+                    ''
                   ) +
                   ':' +
                   String(
-                    e.colno || ''
+                    e.colno ||
+                    ''
                   ),
                   true
                 );
@@ -1449,32 +1821,36 @@ jobs:
           </script>
           '''
 
-          html = html.replace(
-              "<head>",
-              "<head>\n" +
-              trace_script,
-              1,
-          )
+          html =
+              html.replace(
+                  "<head>",
+                  "<head>\n" +
+                  trace_script,
+                  1,
+              )
 
-          html, c1 = re.subn(
-              r"var namespace = '[^']*';",
-              "var namespace = 'slknight_native_plane_v9h';",
-              html,
-              count=1,
-          )
+          html, c1 =
+              re.subn(
+                  r"var namespace = '[^']*';",
+                  "var namespace = 'slknight_native_plane_v9i';",
+                  html,
+                  count=1,
+              )
 
-          html, c2 = re.subn(
-              r"var wTitle = '[^']*'\s*;?",
-              "var wTitle = 'SLKnight';",
-              html,
-              count=1,
-          )
+          html, c2 =
+              re.subn(
+                  r"var wTitle = '[^']*'\s*;?",
+                  "var wTitle = 'SLKnight';",
+                  html,
+                  count=1,
+              )
 
-          html = html.replace(
-              "<title>MKXP</title>",
-              "<title>SLKnight V9H</title>",
-              1,
-          )
+          html =
+              html.replace(
+                  "<title>MKXP</title>",
+                  "<title>SLKnight V9I</title>",
+                  1,
+              )
 
           if c1 != 1:
               raise SystemExit(
@@ -1492,13 +1868,13 @@ jobs:
           )
 
           print(
-              "V9H_TRACE_PANEL_OK"
+              "V9I_TRACE_PANEL_OK"
           )
           PY
 
           touch player/.nojekyll
 
-      - name: Verify final V9H package
+      - name: Verify final V9I package
         run: |
           set -e
 
@@ -1515,15 +1891,20 @@ jobs:
           test -s player/gameasync/mapping.js
           test -s player/gameasync/bitmap-map.js
 
+          if find player/gameasync -maxdepth 1 -type f -name 'Save*.rxdata' | grep -q .; then
+            echo BUNDLED_SAVE_PRESENT
+            exit 1
+          fi
+
           test -s \
             player/gameasync/Data/Scripts.rxdata
 
           grep -Fq \
-            "slknight_native_plane_v9h" \
+            "slknight_native_plane_v9i" \
             player/index.html
 
           grep -Fq \
-            "V9H" \
+            "V9I" \
             player/index.html
 
           test "$(
@@ -1539,7 +1920,7 @@ jobs:
           rm -rf player/.git
 
           echo \
-            SLKNIGHT_NATIVE_PLANE_V9H_READY
+            SLKNIGHT_NATIVE_PLANE_V9I_READY
 
           du -sh player
 
