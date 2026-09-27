@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web V10 FONT TOUCH FIX
+name: Deploy SLKnight mkxp-web V11 FULL FIX
 
 on:
   push:
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build:
-    name: Build SLKnight V10
+    name: Build SLKnight V11
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -81,6 +81,7 @@ jobs:
           test "$(git -C player rev-parse HEAD)" = "$LIVE_MKXP_REF"
           test "$(stat -c '%s' player/mkxp.js)" = "290574"
           test "$(stat -c '%s' player/mkxp.wasm)" = "5217852"
+          test -s player/index.html
           test -s player/js/drive.js
           test -s player/js/dpad.js
           test -s player/js/localforage.min.js
@@ -417,10 +418,10 @@ jobs:
             end
 
             font_rules = [
-              [/(Font\.default_name\s*=\s*)\[\s*["'][^"']*["']\s*\]/n, '\1"NanumGothic"'],
-              [/(Font\.default_name\s*=\s*)["'][^"']*["']/n, '\1"NanumGothic"'],
-              [/(\.font\.name\s*=\s*)["'][^"']*["']/n, '\1"NanumGothic"'],
-              [/(\bFONT_NAME\s*=\s*)["'][^"']*["']/n, '\1"NanumGothic"']
+              [/(Font\.default_name\s*=\s*)\[\s*["'][^"']*["']\s*\]/n, '\\1"NanumGothic"'],
+              [/(Font\.default_name\s*=\s*)["'][^"']*["']/n, '\\1"NanumGothic"'],
+              [/(\.font\.name\s*=\s*)["'][^"']*["']/n, '\\1"NanumGothic"'],
+              [/(\bFONT_NAME\s*=\s*)["'][^"']*["']/n, '\\1"NanumGothic"']
             ]
 
             font_rules.each do |regex, replacement|
@@ -635,7 +636,7 @@ jobs:
                 "\nrescue Exception => e\n" +
                 "  puts(" + error_prefix + " + e.class.to_s + '|' + e.message.to_s)\n" +
                 "  if e.respond_to?(:backtrace) && e.backtrace\n" +
-                "    e.backtrace[0, 16].each do |line|\n" +
+                "    e.backtrace[0,16].each do |line|\n" +
                 "      puts(" + backtrace_prefix + " + line.to_s)\n" +
                 "    end\n" +
                 "  end\n" +
@@ -685,10 +686,10 @@ jobs:
           puts("WEB_FONT_PATCHED=#{font_patch_count}")
           puts("SCENE_LOOPS_PATCHED=#{scene_loop_count}")
           puts("BEGIN_UNTIL_PATCHED=#{begin_until_count}")
-          puts('SLKNIGHT_V10_SCRIPT_PATCH_OK')
+          puts('SLKNIGHT_V10_BASE_SCRIPT_PATCH_OK')
           RB
 
-      - name: Verify V10 script archive
+      - name: Verify V10 base script archive
         run: |
           set -e
           test -s player/gameasync/Data/Scripts.rxdata
@@ -739,8 +740,542 @@ jobs:
           abort 'NanumGothic reference missing' unless markers[:nanum]
           abort 'Old Plane subclass still present' if markers[:old_plane]
 
-          puts('V10_SCRIPT_ARCHIVE_VERIFY_OK')
+          puts('V10_BASE_SCRIPT_ARCHIVE_VERIFY_OK')
           RB
+
+      - name: Apply V11 full game fixes
+        run: |
+          set -e
+
+          cat > /tmp/v11_postpatch.rb <<'RB'
+          # frozen_string_literal: true
+          require 'zlib'
+
+          scripts_path = ARGV[0]
+          map_path = ARGV[1]
+          abort 'usage: ruby v11_postpatch.rb Scripts.rxdata Map029.rxdata' unless scripts_path && map_path
+
+          scripts = Marshal.load(File.binread(scripts_path))
+
+          def source_for(entry)
+            Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
+          end
+
+          def set_source(entry, source)
+            entry[2] = Zlib::Deflate.deflate(source)
+          end
+
+          def find_script!(scripts, suffix)
+            hit = scripts.find { |e| e.is_a?(Array) && e.length >= 3 && e[1].to_s.dup.force_encoding(Encoding::UTF_8).end_with?(suffix) }
+            abort "missing script #{suffix}" unless hit
+            hit
+          end
+
+          compat = find_script!(scripts, '|Web Compatibility')
+          src = source_for(compat)
+
+          unless src.include?('SLAUDIO|BGM_PLAY|')
+            src << <<'RUBY'
+
+          module Audio
+            def self.sl_audio_marker(kind, *values)
+              puts((["SLAUDIO", kind] + values.collect { |v| v.to_s }).join("|"))
+            end
+
+            def self.bgm_play(filename, volume = 100, pitch = 100)
+              sl_audio_marker("BGM_PLAY", filename, volume, pitch)
+            end
+
+            def self.bgm_stop
+              sl_audio_marker("BGM_STOP")
+            end
+
+            def self.bgm_fade(time)
+              sl_audio_marker("BGM_FADE", time)
+            end
+
+            def self.bgs_play(filename, volume = 100, pitch = 100)
+              sl_audio_marker("BGS_PLAY", filename, volume, pitch)
+            end
+
+            def self.bgs_stop
+              sl_audio_marker("BGS_STOP")
+            end
+
+            def self.bgs_fade(time)
+              sl_audio_marker("BGS_FADE", time)
+            end
+
+            def self.me_play(filename, volume = 100, pitch = 100)
+              sl_audio_marker("ME_PLAY", filename, volume, pitch)
+            end
+
+            def self.me_stop
+              sl_audio_marker("ME_STOP")
+            end
+
+            def self.me_fade(time)
+              sl_audio_marker("ME_FADE", time)
+            end
+          end
+          RUBY
+          end
+
+          set_source(compat, src)
+
+          equip = find_script!(scripts, '|Scene_Equip')
+          src = source_for(equip)
+
+          old = /\n\s{4}# 메인 루프\r?\n\s{4}loop do\r?\n\s{6}# 게임 화면을 갱신\r?\n\s{6}Graphics\.update\r?\n\s{6}# 입력 정보를 갱신\r?\n\s{6}Input\.update\r?\n\s{6}# 프레임 갱신\r?\n\s{6}update\r?\n\s{6}# 화면이 바뀌면 루프를 중단\r?\n\s{6}if \$scene != self\r?\n\s*\$game_switches\[49\] = true\r?\n\s{8}break\r?\n\s{6}end\r?\n\s{4}end\r?\n\s{4}# 트란지션 준비/
+
+          replacement = <<'RUBY'
+
+              # Web: initialization ends here; main_update_loop drives update.
+            end
+
+            def dispose
+              $game_switches[49] = true
+              # 트란지션 준비
+          RUBY
+
+          count = 0
+          src = src.sub(old) { count += 1; replacement }
+          abort "Scene_Equip main loop patch count=#{count}" unless count == 1
+          set_source(equip, src)
+
+          gameover = find_script!(scripts, '|Scene_Gameover')
+          src = source_for(gameover)
+
+          old = /\n\s{4}# 메인 루프\r?\n\s{4}loop do\r?\n\s{6}\$game_system\.me_play\(\$data_system\.gameover_me\)\r?\n\s{6}# 게임 화면을 갱신\r?\n\s{6}Graphics\.update\r?\n\s{6}# 입력 정보를 갱신\r?\n\s{6}Input\.update\r?\n\s{6}# 프레임 갱신\r?\n\s{6}update\r?\n\s{6}# 화면이 바뀌면 루프를 중단\r?\n\s{6}if \$scene != self\r?\n\s{8}break\r?\n\s{6}end\r?\n\s{4}end\r?\n\s{4}# 트란지션 준비/
+
+          replacement = <<'RUBY'
+
+              # Web: initialization ends here; main_update_loop drives update.
+            end
+
+            def dispose
+              # 트란지션 준비
+          RUBY
+
+          count = 0
+          src = src.sub(old) { count += 1; replacement }
+          abort "Scene_Gameover main loop patch count=#{count}" unless count == 1
+          set_source(gameover, src)
+
+          src = source_for(gameover)
+          count = 0
+
+          src = src.sub(/^[ \t]*exit\r?\n([ \t]*# 타이틀 화면으로 전환해\r?\n[ \t]*\$scene = Scene_Title\.new)/) do
+            count += 1
+            $1
+          end
+
+          abort "Scene_Gameover exit-to-title patch count=#{count}" unless count == 1
+          set_source(gameover, src)
+
+          menu_fx = find_script!(scripts, '|메뉴 투명화')
+          src = source_for(menu_fx)
+
+          src.gsub!(
+            /  def dispose_spriteset\r?\n    # 스프라이트 세트를 해방\r?\n    @spriteset\.dispose\r?\n  end/,
+            <<'RUBY'.rstrip
+            def dispose_spriteset
+              # 스프라이트 세트를 해방
+              if @spriteset != nil
+                @spriteset.dispose
+                @spriteset = nil
+              end
+            end
+          RUBY
+          )
+
+          wrapper_re = /  alias xrxs_mp7_main main\r?\n  def main\r?\n    create_spriteset\r?\n    xrxs_mp7_main\r?\n    dispose_spriteset\r?\n  end/
+
+          wrapper_replacement = <<'RUBY'.rstrip
+            alias xrxs_mp7_main main
+            def main
+              create_spriteset
+              xrxs_mp7_main
+            end
+
+            alias xrxs_mp7_dispose dispose
+            def dispose
+              xrxs_mp7_dispose
+              dispose_spriteset
+            end
+          RUBY
+
+          wrapper_count = src.scan(wrapper_re).length
+          abort "menu transparency wrapper count=#{wrapper_count}" unless wrapper_count == 8
+          src.gsub!(wrapper_re, wrapper_replacement)
+          set_source(menu_fx, src)
+
+          multislot = find_script!(scripts, '|Multi-slot script : Windows')
+          src = source_for(multislot)
+
+          old = / alias g7_ms_scene_equip_main main\r?\n def main\r?\n  @additional_initialize_done = false\r?\n  g7_ms_scene_equip_main\r?\n  for i in 5\.\.\.@item_windows\.size\r?\n   @item_windows\[i\]\.dispose unless @item_windows\[i\]\.nil\?\r?\n  end\r?\n end/
+
+          replacement = <<'RUBY'.rstrip
+           alias g7_ms_scene_equip_main main
+           def main
+            @additional_initialize_done = false
+            g7_ms_scene_equip_main
+           end
+
+           alias g7_ms_scene_equip_dispose dispose
+           def dispose
+            if @item_windows != nil
+             for i in 5...@item_windows.size
+              window = @item_windows[i]
+              if window != nil
+               begin
+                window.dispose unless window.disposed?
+               rescue
+                window.dispose
+               end
+              end
+             end
+            end
+            g7_ms_scene_equip_dispose
+           end
+          RUBY
+
+          count = 0
+          src = src.sub(old) { count += 1; replacement }
+          abort "multi-slot cleanup patch count=#{count}" unless count == 1
+          set_source(multislot, src)
+
+          id_script = find_script!(scripts, '|아이디 설정')
+          src = source_for(id_script)
+
+          replacements = {
+            'Bitmap.new(240, 24)' => 'Bitmap.new(160, 16)',
+            'bitmap.font.size = 14' => 'bitmap.font.size = 12',
+            'bitmap.draw_text(0, -1, 240, 22, text, 1)' => 'bitmap.draw_text(0, -1, 160, 16, text, 1)',
+            'bitmap.draw_text(0, 1, 240, 22, text, 1)' => 'bitmap.draw_text(0, 1, 160, 16, text, 1)',
+            'bitmap.draw_text(-1, 0, 240, 22, text, 1)' => 'bitmap.draw_text(-1, 0, 160, 16, text, 1)',
+            'bitmap.draw_text(1, 0, 240, 22, text, 1)' => 'bitmap.draw_text(1, 0, 160, 16, text, 1)',
+            'bitmap.draw_text(0, 0, 240, 22, text, 1)' => 'bitmap.draw_text(0, 0, 160, 16, text, 1)',
+            '@_id_sprite.ox = 120' => '@_id_sprite.ox = 80',
+            '@_id_sprite.oy = 18' => '@_id_sprite.oy = 14'
+          }
+
+          replacements.each do |from, to|
+            abort "ID geometry target missing: #{from}" unless src.include?(from)
+            src.gsub!(from, to)
+          end
+
+          set_source(id_script, src)
+
+          scene_map = find_script!(scripts, '|Scene_Map')
+          src = source_for(scene_map).gsub("\r\n", "\n")
+
+          main_pos = src.index("  def main\n")
+          abort 'Scene_Map main missing' unless main_pos
+
+          loop_comment = src.index("    # 메인 루프\n", main_pos)
+          abort 'Scene_Map main loop comment missing' unless loop_comment
+
+          loop_line = src.index("    loop do #루프 시작\n", loop_comment)
+          abort 'Scene_Map loop start missing' unless loop_line
+
+          pre_start = loop_line + "    loop do #루프 시작\n".length
+
+          graphics_marker = src.index("      # 게임 화면을 갱신\n", pre_start)
+          abort 'Scene_Map graphics marker missing' unless graphics_marker
+
+          pre_frame = src[pre_start...graphics_marker]
+
+          loop_end = src.index("    end #루프 끝\n", graphics_marker)
+          abort 'Scene_Map loop end missing' unless loop_end
+
+          after_loop = loop_end + "    end #루프 끝\n".length
+
+          update_comment = src.index(
+            "  #--------------------------------------------------------------------------\n" +
+            "  # ● 프레임 갱신\n",
+            after_loop
+          )
+
+          abort 'Scene_Map update section missing' unless update_comment
+
+          cleanup_and_main_end = src[after_loop...update_comment]
+
+          abort 'Scene_Map main closing end missing' unless cleanup_and_main_end.end_with?("  end\n")
+
+          cleanup_body = cleanup_and_main_end[0...-"  end\n".length]
+
+          map_replacement = +<<'RUBY'
+              # Web/mobile: retry map BGM/BGS after the map scene is active.
+              puts("SLPATCH|MAP_AUDIO_RETRY")
+              $game_map.autoplay
+            end
+
+            # Original per-frame keyboard/hotkey block from Scene_Map#main.
+            # The browser driver calls this before Graphics.update/Input.update.
+            def web_pre_update
+          RUBY
+
+          map_replacement << pre_frame
+
+          map_replacement << <<'RUBY'
+            end
+
+            def dispose
+          RUBY
+
+          map_replacement << cleanup_body
+          map_replacement << "  end\n"
+
+          src = src[0...loop_comment] + map_replacement + src[update_comment..]
+
+          set_source(scene_map, src)
+
+          mog = find_script!(scripts, '|MOG - S HUD')
+          src = source_for(mog).gsub("\r\n", "\n")
+
+          old = <<'RUBY'
+          class Scene_Map  
+            alias shud_main main
+          #--------------------------------------------------------------------------
+          # Main 
+          #--------------------------------------------------------------------------
+            def main
+                @s_viewport = Viewport.new(0, 0, 640, 480)
+                @s_viewport.z = 9999     
+                @shud = S_Hud.new(@s_viewport)
+                shud_main    
+                @shud.dispose
+                @shud = nil
+                @s_viewport.dispose
+                @s_viewport = nil
+            end  
+          #--------------------------------------------------------------------------
+          # Update
+          #--------------------------------------------------------------------------    
+            alias shud_update update
+            def update
+              shud_update
+              @shud.update
+            end  
+          end
+          RUBY
+
+          replacement = <<'RUBY'
+          class Scene_Map  
+            alias shud_main main
+          #--------------------------------------------------------------------------
+          # Main 
+          #--------------------------------------------------------------------------
+            def main
+                @s_viewport = Viewport.new(0, 0, 640, 480)
+                @s_viewport.z = 9999     
+                @shud = S_Hud.new(@s_viewport)
+                shud_main
+            end
+          #--------------------------------------------------------------------------
+          # Dispose
+          #--------------------------------------------------------------------------
+            alias shud_dispose dispose
+            def dispose
+              shud_dispose
+              if @shud != nil
+                begin
+                  @shud.dispose unless @shud.disposed?
+                rescue
+                  @shud.dispose
+                end
+                @shud = nil
+              end
+              if @s_viewport != nil
+                begin
+                  @s_viewport.dispose unless @s_viewport.disposed?
+                rescue
+                  @s_viewport.dispose
+                end
+                @s_viewport = nil
+              end
+            end
+          #--------------------------------------------------------------------------
+          # Update
+          #--------------------------------------------------------------------------    
+            alias shud_update update
+            def update
+              shud_update
+              @shud.update if @shud != nil
+            end  
+          end
+          RUBY
+
+          count = 0
+          src = src.sub(old) { count += 1; replacement }
+          abort "MOG S-HUD lifecycle patch count=#{count}" unless count == 1
+          set_source(mog, src)
+
+          main = find_script!(scripts, '|Main')
+          src = source_for(main).gsub("\r\n", "\n")
+
+          old_driver = <<'RUBY'
+                Graphics.update
+                Input.update
+                active_scene.update if $scene == active_scene
+          RUBY
+
+          new_driver = <<'RUBY'
+                if active_scene.respond_to?(:web_pre_update)
+                  active_scene.web_pre_update
+                end
+
+                Graphics.update
+
+                skip_input =
+                  active_scene.is_a?(Scene_Map) &&
+                  defined?($game_switches) &&
+                  $game_switches != nil &&
+                  $game_switches[49] == true
+
+                Input.update unless skip_input
+                active_scene.update if $scene == active_scene
+          RUBY
+
+          count = 0
+          src = src.sub(old_driver) { count += 1; new_driver }
+          abort "main browser driver patch count=#{count}" unless count == 1
+          abort 'Graphics.frame_rate = 50 missing' unless src.include?('Graphics.frame_rate = 50')
+
+          set_source(main, src)
+
+          File.binwrite(scripts_path, Marshal.dump(scripts))
+
+          class RawMarshalObject
+            def self._load(data)
+              obj = allocate
+              obj.instance_variable_set(:@_raw_marshal_payload, data)
+              obj
+            end
+
+            def _dump(_depth)
+              @_raw_marshal_payload
+            end
+          end
+
+          class Tone < RawMarshalObject
+          end
+
+          class Color < RawMarshalObject
+          end
+
+          class Rect < RawMarshalObject
+          end
+
+          class Table < RawMarshalObject
+          end
+
+          module RPG
+            class AudioFile
+            end
+
+            class Map
+            end
+
+            class Event
+              class Page
+                class Condition
+                end
+
+                class Graphic
+                end
+              end
+            end
+
+            class EventCommand
+            end
+
+            class MoveRoute
+            end
+
+            class MoveCommand
+            end
+          end
+
+          def iv(obj, name)
+            obj.instance_variable_get("@#{name}")
+          end
+
+          def set_iv(obj, name, value)
+            obj.instance_variable_set("@#{name}", value)
+          end
+
+          map = Marshal.load(File.binread(map_path))
+          events = iv(map, :events) || {}
+          smith = events[30]
+
+          abort 'Map029 event 30 missing' unless smith
+
+          patched_sounds = 0
+
+          (iv(smith, :pages) || []).each do |page|
+            route = iv(page, :move_route)
+            next unless route
+
+            (iv(route, :list) || []).each do |cmd|
+              next unless iv(cmd, :code) == 44
+
+              params = iv(cmd, :parameters) || []
+              audio = params[0]
+              next unless audio
+
+              name = iv(audio, :name).to_s.b
+
+              next unless (
+                name == "대장간 소리".b ||
+                name == "대장간 소리2".b
+              )
+
+              vol = iv(audio, :volume).to_i
+              pitch = iv(audio, :pitch).to_i
+
+              code =
+                "dx = ($game_player.x - @x).abs; " +
+                "dy = ($game_player.y - @y).abs; " +
+                "d = [dx, dy].max; " +
+                "if d <= 8; " +
+                "v = [#{vol} - d * 3, 6].max; " +
+                "$game_system.se_play(" +
+                "RPG::AudioFile.new(#{name.dump}, v, #{pitch})" +
+                "); " +
+                "end"
+
+              set_iv(cmd, :code, 45)
+              set_iv(cmd, :parameters, [code])
+
+              patched_sounds += 1
+            end
+          end
+
+          abort "blacksmith SE patch count=#{patched_sounds}" unless patched_sounds == 4
+
+          File.binwrite(map_path, Marshal.dump(map))
+
+          puts 'V11_BROWSER_AUDIO_MARKERS_OK'
+          puts 'V11_SCENE_MAP_BROWSER_LOOP_OK'
+          puts 'V11_MOG_HUD_LIFECYCLE_OK'
+          puts 'V11_SCENE_EQUIP_OK'
+          puts 'V11_GAMEOVER_OK'
+          puts 'V11_GAMEOVER_RETURN_TITLE_OK'
+          puts "V11_MENU_WRAPPERS=#{wrapper_count}"
+          puts 'V11_MULTISLOT_DISPOSE_OK'
+          puts 'V11_ID_LAYOUT_ORIGINAL_OK'
+          puts 'V11_MAP_AUDIO_RETRY_OK'
+          puts 'V11_FRAME_RATE_50_NATIVE_OK'
+          puts "V11_BLACKSMITH_SE_PATCHED=#{patched_sounds}"
+          RB
+
+          ruby /tmp/v11_postpatch.rb \
+            player/gameasync/Data/Scripts.rxdata \
+            player/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata
+
+          echo V11_GAME_PATCH_OK
 
       - name: Convert audio to OGG
         run: |
@@ -757,10 +1292,27 @@ jobs:
               raise SystemExit(0)
 
           convertible = {
-              ".mp3", ".wav", ".wma", ".aac", ".m4a", ".flac", ".mid", ".midi"
+              ".mp3",
+              ".wav",
+              ".wma",
+              ".aac",
+              ".m4a",
+              ".flac",
+              ".mid",
+              ".midi",
           }
-          midi_exts = {".mid", ".midi"}
-          files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in convertible]
+
+          midi_exts = {
+              ".mid",
+              ".midi",
+          }
+
+          files = [
+              p
+              for p in root.rglob("*")
+              if p.is_file() and p.suffix.lower() in convertible
+          ]
+
           failures = []
           converted = 0
 
@@ -774,17 +1326,34 @@ jobs:
 
                   if ext in midi_exts:
                       temp_wav = src.with_name(src.name + ".mkxpweb.wav")
+
                       subprocess.run(
-                          ["timidity", str(src), "-Ow", "-o", str(temp_wav)],
+                          [
+                              "timidity",
+                              str(src),
+                              "-Ow",
+                              "-o",
+                              str(temp_wav),
+                          ],
                           check=True,
                       )
+
                       source_for_ffmpeg = temp_wav
 
                   subprocess.run(
                       [
-                          "ffmpeg", "-nostdin", "-v", "error", "-y",
-                          "-i", str(source_for_ffmpeg),
-                          "-c:a", "libvorbis", "-q:a", "4", str(out),
+                          "ffmpeg",
+                          "-nostdin",
+                          "-v",
+                          "error",
+                          "-y",
+                          "-i",
+                          str(source_for_ffmpeg),
+                          "-c:a",
+                          "libvorbis",
+                          "-q:a",
+                          "4",
+                          str(out),
                       ],
                       check=True,
                   )
@@ -802,12 +1371,14 @@ jobs:
 
               except Exception as exc:
                   failures.append((str(src), str(exc)))
+
                   if temp_wav is not None and temp_wav.exists():
                       temp_wav.unlink()
 
           if failures:
               for name, error in failures:
                   print(name + " -> " + error, file=sys.stderr)
+
               raise SystemExit(1)
 
           print("AUDIO_CONVERTED=" + str(converted))
@@ -828,25 +1399,49 @@ jobs:
               print("GRAPHICS_DIRECTORY_NOT_PRESENT")
               raise SystemExit(0)
 
-          convertible = {".bmp", ".gif", ".webp", ".tif", ".tiff"}
-          files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in convertible]
+          convertible = {
+              ".bmp",
+              ".gif",
+              ".webp",
+              ".tif",
+              ".tiff",
+          }
+
+          files = [
+              p
+              for p in root.rglob("*")
+              if p.is_file() and p.suffix.lower() in convertible
+          ]
+
           failures = []
           converted = 0
 
           for src in files:
               out = src.with_suffix(".png")
+
               try:
-                  subprocess.run(["convert", str(src) + "[0]", str(out)], check=True)
+                  subprocess.run(
+                      [
+                          "convert",
+                          str(src) + "[0]",
+                          str(out),
+                      ],
+                      check=True,
+                  )
+
                   if not out.exists() or out.stat().st_size == 0:
                       raise RuntimeError("PNG output missing: " + str(out))
+
                   src.unlink()
                   converted += 1
+
               except Exception as exc:
                   failures.append((str(src), str(exc)))
 
           if failures:
               for name, error in failures:
                   print(name + " -> " + error, file=sys.stderr)
+
               raise SystemExit(1)
 
           print("IMAGES_CONVERTED=" + str(converted))
@@ -856,37 +1451,56 @@ jobs:
       - name: Generate async filesystem mapping
         run: |
           set -e
+
           cd player/gameasync
+
           bash ../../mkxp-tools/extra/make_mapping.sh
+
           test -s mapping.js
           test -s bitmap-map.js
+
           grep -Fq 'Fonts/NanumGothic.ttf' mapping.js
           grep -Fq 'Fonts/NanumGothicBold.ttf' mapping.js
+
           echo FONT_MAPPING_OK
           echo MAPPING_OK
 
       - name: Create map preload files
         run: |
           set -e
+
           python3 - <<'PY'
           from pathlib import Path
 
           data_root = Path("player/gameasync/Data")
           preload_root = Path("player/preload/Data")
-          preload_root.mkdir(parents=True, exist_ok=True)
+
+          preload_root.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
 
           count = 0
-          for source in sorted(data_root.glob("Map*.rxdata")):
+
+          for source in sorted(
+              data_root.glob("Map*.rxdata")
+          ):
               target = preload_root / (source.name + ".json")
-              target.write_text("[]\n", encoding="utf-8")
+
+              target.write_text(
+                  "[]\n",
+                  encoding="utf-8",
+              )
+
               count += 1
 
           print("MAP_PRELOAD_FILES=" + str(count))
           PY
 
-      - name: Patch browser font preload and diagnostics
+      - name: Patch browser font preload and diagnostics V11
         run: |
           set -e
+
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -901,10 +1515,12 @@ jobs:
 
             function tracePanel() {
               var p = document.getElementById('sl-trace');
+
               if (p) return p;
 
               p = document.createElement('pre');
               p.id = 'sl-trace';
+
               p.style.cssText =
                 'position:fixed;' +
                 'left:8px;' +
@@ -927,16 +1543,19 @@ jobs:
                 'display:none';
 
               (document.body || document.documentElement).appendChild(p);
+
               return p;
             }
 
             function errorButton() {
               var b = document.getElementById('sl-error-button');
+
               if (b) return b;
 
               b = document.createElement('button');
               b.id = 'sl-error-button';
               b.textContent = 'ERR';
+
               b.style.cssText =
                 'position:fixed;' +
                 'top:6px;' +
@@ -951,26 +1570,35 @@ jobs:
                 'display:none;' +
                 'opacity:.95';
 
-              b.addEventListener('click', function () {
-                var p = tracePanel();
-                if (p.style.display === 'none') {
-                  p.textContent = slTraceLines.join('\n');
-                  p.scrollTop = p.scrollHeight;
-                  p.style.display = 'block';
-                } else {
-                  p.style.display = 'none';
+              b.addEventListener(
+                'click',
+                function () {
+                  var p = tracePanel();
+
+                  if (p.style.display === 'none') {
+                    p.textContent = slTraceLines.join('\n');
+                    p.scrollTop = p.scrollHeight;
+                    p.style.display = 'block';
+                  } else {
+                    p.style.display = 'none';
+                  }
                 }
-              });
+              );
 
               (document.body || document.documentElement).appendChild(b);
+
               return b;
             }
 
             function remember(text) {
               slTraceLines.push(text);
-              while (slTraceLines.length > 300) slTraceLines.shift();
+
+              while (slTraceLines.length > 300) {
+                slTraceLines.shift();
+              }
 
               var p = document.getElementById('sl-trace');
+
               if (p && p.style.display !== 'none') {
                 p.textContent = slTraceLines.join('\n');
                 p.scrollTop = p.scrollHeight;
@@ -1010,7 +1638,9 @@ jobs:
 
             function add(value, force) {
               var text = String(value);
+
               if (!force && !isUseful(text)) return;
+
               remember(text);
 
               if (force || isActualError(text)) {
@@ -1025,49 +1655,82 @@ jobs:
             }
 
             var oldLog = console.log.bind(console);
+
             console.log = function () {
               var args = Array.prototype.slice.call(arguments);
+
               oldLog.apply(console, args);
-              add(args.join(' '), false);
+
+              add(
+                args.join(' '),
+                false
+              );
             };
 
             var oldError = console.error.bind(console);
+
             console.error = function () {
               var args = Array.prototype.slice.call(arguments);
+
               oldError.apply(console, args);
-              add(args.join(' '), false);
+
+              add(
+                args.join(' '),
+                false
+              );
             };
 
-            window.addEventListener('error', function (e) {
-              add(
-                'JS ERROR | ' +
-                String(e.message) +
-                ' | ' +
-                String(e.filename || '') +
-                ':' +
-                String(e.lineno || '') +
-                ':' +
-                String(e.colno || ''),
-                true
-              );
-            });
+            window.addEventListener(
+              'error',
+              function (e) {
+                add(
+                  'JS ERROR | ' +
+                  String(e.message) +
+                  ' | ' +
+                  String(e.filename || '') +
+                  ':' +
+                  String(e.lineno || '') +
+                  ':' +
+                  String(e.colno || ''),
+                  true
+                );
+              }
+            );
 
-            window.addEventListener('unhandledrejection', function (e) {
-              add('PROMISE ERROR | ' + String(e.reason), true);
-            });
+            window.addEventListener(
+              'unhandledrejection',
+              function (e) {
+                add(
+                  'PROMISE ERROR | ' +
+                  String(e.reason),
+                  true
+                );
+              }
+            );
           })();
           </script>
           '''
 
-          html = html.replace("<head>", "<head>\n" + trace_script, 1)
+          html = html.replace(
+              "<head>",
+              "<head>\n" + trace_script,
+              1,
+          )
 
           old_prerun = "preRun: [createDummies],"
+
           new_prerun = r'''preRun: [function() {
                 createDummies();
 
                 var slFonts = [
-                    ['NanumGothic.ttf', 'gameasync/Fonts/NanumGothic.ttf?v=v10fix2'],
-                    ['NanumGothicBold.ttf', 'gameasync/Fonts/NanumGothicBold.ttf?v=v10fix2']
+                    [
+                        'NanumGothic.ttf',
+                        'gameasync/Fonts/NanumGothic.ttf?v=v11fix1'
+                    ],
+                    [
+                        'NanumGothicBold.ttf',
+                        'gameasync/Fonts/NanumGothicBold.ttf?v=v11fix1'
+                    ]
                 ];
 
                 slFonts.forEach(function(item) {
@@ -1089,10 +1752,16 @@ jobs:
                         true,
                         true,
                         function() {
-                            console.log('SLFONTREADY|' + name);
+                            console.log(
+                                'SLFONTREADY|' +
+                                name
+                            );
                         },
                         function() {
-                            console.error('SLFONTERR|' + name);
+                            console.error(
+                                'SLFONTERR|' +
+                                name
+                            );
                         }
                     );
                 });
@@ -1101,81 +1770,863 @@ jobs:
           if old_prerun not in html:
               raise SystemExit("preRun patch target missing")
 
-          html = html.replace(old_prerun, new_prerun, 1)
+          html = html.replace(
+              old_prerun,
+              new_prerun,
+              1,
+          )
 
           old_dpad = '<script src="js/dpad.js"></script>'
-          new_dpad = '<script src="js/dpad.js?v=v10fix2"></script>'
+          new_dpad = '<script src="js/dpad.js?v=v11fix1"></script>'
 
           if old_dpad not in html:
               raise SystemExit("dpad script target missing")
 
-          html = html.replace(old_dpad, new_dpad, 1)
+          html = html.replace(
+              old_dpad,
+              new_dpad,
+              1,
+          )
 
           html, c1 = re.subn(
               r"var namespace = '[^']*';",
-              "var namespace = 'slknight_v10_font_touch_fix2';",
+              "var namespace = 'slknight_v11_fullfix1';",
               html,
               count=1,
           )
 
           html, c2 = re.subn(
               r"var wTitle = '[^']*'\s*;?",
-              "var wTitle = 'SLKnight V10';",
+              "var wTitle = 'SLKnight V11';",
               html,
               count=1,
           )
 
-          html = html.replace("<title>MKXP</title>", "<title>SLKnight V10</title>", 1)
+          html = html.replace(
+              "<title>MKXP</title>",
+              "<title>SLKnight V11</title>",
+              1,
+          )
 
           if c1 != 1:
               raise SystemExit("namespace patch failed")
+
           if c2 != 1:
               raise SystemExit("title patch failed")
 
-          path.write_text(html, encoding="utf-8")
-          print("V10_BROWSER_PATCH_OK")
+          path.write_text(
+              html,
+              encoding="utf-8",
+          )
+
+          print("V11_BASE_BROWSER_PATCH_OK")
           PY
 
           touch player/.nojekyll
 
-      - name: Verify final V10 package
+      - name: Apply V11 browser audio and performance bridge
         run: |
           set -e
+
+          cat > /tmp/v11_browser_patch.py <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          html = path.read_text(encoding="utf-8")
+
+          bridge = r'''
+          <script>
+          (function () {
+            window.skfTargetFrameRate = 50;
+
+            function makeChannel(loop) {
+              var a = new Audio();
+
+              a.preload = 'auto';
+              a.loop = loop;
+              a.playsInline = true;
+
+              a.setAttribute(
+                'playsinline',
+                ''
+              );
+
+              a._slBaseVolume = 1.0;
+              a._slFadeTimer = 0;
+              a._slSource = '';
+
+              return a;
+            }
+
+            var bgm = makeChannel(true);
+            var bgs = makeChannel(true);
+            var me = makeChannel(false);
+
+            var bgmPausedForMe = false;
+            var pending = [];
+
+            function clamp(v, lo, hi) {
+              v = Number(v);
+
+              if (!isFinite(v)) {
+                v = lo;
+              }
+
+              return Math.max(
+                lo,
+                Math.min(
+                  hi,
+                  v
+                )
+              );
+            }
+
+            function clearFade(a) {
+              if (a._slFadeTimer) {
+                clearInterval(
+                  a._slFadeTimer
+                );
+
+                a._slFadeTimer = 0;
+              }
+            }
+
+            function audioUrl(filename) {
+              var p =
+                String(
+                  filename || ''
+                ).replace(
+                  /\\/g,
+                  '/'
+                );
+
+              p = p.replace(
+                /\.(ogg|mp3|wav|wma|aac|m4a|flac|mid|midi)$/i,
+                ''
+              );
+
+              return encodeURI(
+                'gameasync/' +
+                p +
+                '.ogg?v=v11audio1'
+              );
+            }
+
+            function safePlay(a) {
+              if (
+                !a ||
+                !a.src
+              ) {
+                return;
+              }
+
+              try {
+                var p = a.play();
+
+                if (
+                  p &&
+                  typeof p.catch ===
+                  'function'
+                ) {
+                  p.catch(
+                    function () {
+                      if (
+                        pending.indexOf(a) <
+                        0
+                      ) {
+                        pending.push(a);
+                      }
+                    }
+                  );
+                }
+              } catch (e) {
+                if (
+                  pending.indexOf(a) <
+                  0
+                ) {
+                  pending.push(a);
+                }
+              }
+            }
+
+            function retryPending() {
+              var list =
+                pending.slice();
+
+              pending.length =
+                0;
+
+              list.forEach(
+                function (a) {
+                  safePlay(a);
+                }
+              );
+            }
+
+            [
+              'touchstart',
+              'pointerdown',
+              'keydown',
+              'mousedown'
+            ].forEach(
+              function (type) {
+                window.addEventListener(
+                  type,
+                  retryPending,
+                  {
+                    passive: true
+                  }
+                );
+              }
+            );
+
+            function setSource(
+              a,
+              filename,
+              volume,
+              pitch
+            ) {
+              clearFade(a);
+
+              var src =
+                audioUrl(filename);
+
+              var changed =
+                a._slSource !==
+                src;
+
+              a._slBaseVolume =
+                clamp(
+                  volume,
+                  0,
+                  100
+                ) /
+                100;
+
+              a.volume =
+                a._slBaseVolume;
+
+              a.playbackRate =
+                clamp(
+                  pitch,
+                  50,
+                  150
+                ) /
+                100;
+
+              if (changed) {
+                a.pause();
+
+                a._slSource =
+                  src;
+
+                a.src =
+                  src;
+
+                a.load();
+              }
+
+              return changed;
+            }
+
+            function stop(a) {
+              clearFade(a);
+
+              pending =
+                pending.filter(
+                  function (x) {
+                    return x !== a;
+                  }
+                );
+
+              try {
+                a.pause();
+              } catch (e) {
+              }
+
+              try {
+                a.currentTime =
+                  0;
+              } catch (e) {
+              }
+            }
+
+            function fade(
+              a,
+              ms,
+              after
+            ) {
+              clearFade(a);
+
+              ms =
+                Math.max(
+                  0,
+                  Number(ms) ||
+                  0
+                );
+
+              if (
+                ms <= 0 ||
+                a.paused
+              ) {
+                stop(a);
+
+                if (after) {
+                  after();
+                }
+
+                return;
+              }
+
+              var initial =
+                a.volume;
+
+              var started =
+                performance.now();
+
+              a._slFadeTimer =
+                setInterval(
+                  function () {
+                    var p =
+                      (
+                        performance.now() -
+                        started
+                      ) /
+                      ms;
+
+                    if (p >= 1) {
+                      clearFade(a);
+                      stop(a);
+
+                      if (after) {
+                        after();
+                      }
+
+                      return;
+                    }
+
+                    a.volume =
+                      Math.max(
+                        0,
+                        initial *
+                        (
+                          1 -
+                          p
+                        )
+                      );
+                  },
+                  50
+                );
+            }
+
+            function resumeBgmAfterMe() {
+              if (!bgmPausedForMe) {
+                return;
+              }
+
+              bgmPausedForMe =
+                false;
+
+              if (bgm.src) {
+                bgm.volume =
+                  bgm._slBaseVolume;
+
+                safePlay(bgm);
+              }
+            }
+
+            me.addEventListener(
+              'ended',
+              resumeBgmAfterMe
+            );
+
+            function playBgm(
+              filename,
+              volume,
+              pitch
+            ) {
+              var changed =
+                setSource(
+                  bgm,
+                  filename,
+                  volume,
+                  pitch
+                );
+
+              var meActive =
+                !!me.src &&
+                !me.paused &&
+                !me.ended;
+
+              if (meActive) {
+                bgmPausedForMe =
+                  true;
+
+                return;
+              }
+
+              if (changed) {
+                try {
+                  bgm.currentTime =
+                    0;
+                } catch (e) {
+                }
+              }
+
+              safePlay(bgm);
+            }
+
+            function playBgs(
+              filename,
+              volume,
+              pitch
+            ) {
+              var changed =
+                setSource(
+                  bgs,
+                  filename,
+                  volume,
+                  pitch
+                );
+
+              if (changed) {
+                try {
+                  bgs.currentTime =
+                    0;
+                } catch (e) {
+                }
+              }
+
+              safePlay(bgs);
+            }
+
+            function playMe(
+              filename,
+              volume,
+              pitch
+            ) {
+              setSource(
+                me,
+                filename,
+                volume,
+                pitch
+              );
+
+              if (!bgm.paused) {
+                bgm.pause();
+
+                bgmPausedForMe =
+                  true;
+              } else if (bgm.src) {
+                bgmPausedForMe =
+                  true;
+              }
+
+              try {
+                me.currentTime =
+                  0;
+              } catch (e) {
+              }
+
+              safePlay(me);
+            }
+
+            function parsePlay(parts) {
+              return {
+                filename:
+                  parts.slice(
+                    2,
+                    -2
+                  ).join('|'),
+
+                volume:
+                  parts[
+                    parts.length -
+                    2
+                  ],
+
+                pitch:
+                  parts[
+                    parts.length -
+                    1
+                  ]
+              };
+            }
+
+            function handleMarker(text) {
+              var at =
+                text.indexOf(
+                  'SLAUDIO|'
+                );
+
+              if (at < 0) {
+                return false;
+              }
+
+              text =
+                text.slice(at);
+
+              var parts =
+                text.split('|');
+
+              var kind =
+                parts[1] ||
+                '';
+
+              var v;
+
+              switch (kind) {
+                case 'BGM_PLAY':
+                  v =
+                    parsePlay(parts);
+
+                  playBgm(
+                    v.filename,
+                    v.volume,
+                    v.pitch
+                  );
+
+                  break;
+
+                case 'BGM_STOP':
+                  stop(bgm);
+
+                  bgmPausedForMe =
+                    false;
+
+                  break;
+
+                case 'BGM_FADE':
+                  fade(
+                    bgm,
+                    parts[2]
+                  );
+
+                  bgmPausedForMe =
+                    false;
+
+                  break;
+
+                case 'BGS_PLAY':
+                  v =
+                    parsePlay(parts);
+
+                  playBgs(
+                    v.filename,
+                    v.volume,
+                    v.pitch
+                  );
+
+                  break;
+
+                case 'BGS_STOP':
+                  stop(bgs);
+                  break;
+
+                case 'BGS_FADE':
+                  fade(
+                    bgs,
+                    parts[2]
+                  );
+
+                  break;
+
+                case 'ME_PLAY':
+                  v =
+                    parsePlay(parts);
+
+                  playMe(
+                    v.filename,
+                    v.volume,
+                    v.pitch
+                  );
+
+                  break;
+
+                case 'ME_STOP':
+                  stop(me);
+                  resumeBgmAfterMe();
+                  break;
+
+                case 'ME_FADE':
+                  fade(
+                    me,
+                    parts[2],
+                    resumeBgmAfterMe
+                  );
+
+                  break;
+
+                default:
+                  return false;
+              }
+
+              return true;
+            }
+
+            var previousLog =
+              console.log.bind(
+                console
+              );
+
+            console.log =
+              function () {
+                var args =
+                  Array.prototype.slice.call(
+                    arguments
+                  );
+
+                try {
+                  handleMarker(
+                    args.join(' ')
+                  );
+                } catch (e) {
+                  previousLog(
+                    'SLAUDIOJSERR|' +
+                    String(e)
+                  );
+                }
+
+                previousLog.apply(
+                  console,
+                  args
+                );
+              };
+
+            window.slAudioBridge = {
+              bgm: bgm,
+              bgs: bgs,
+              me: me,
+              handle: handleMarker
+            };
+          })();
+          </script>
+          '''
+
+          if "window.slAudioBridge" not in html:
+              html = html.replace(
+                  "<head>",
+                  "<head>\n" + bridge,
+                  1,
+              )
+
+          html = html.replace(
+              "slknight_v10_font_touch_fix2",
+              "slknight_v11_fullfix1",
+          )
+
+          html = html.replace(
+              "SLKnight V10",
+              "SLKnight V11",
+          )
+
+          html = html.replace(
+              "v10fix2",
+              "v11fix1",
+          )
+
+          if "window.skfTargetFrameRate = 50;" not in html:
+              raise SystemExit(
+                  "frame target insert failed"
+              )
+
+          if "window.slAudioBridge" not in html:
+              raise SystemExit(
+                  "audio bridge insert failed"
+              )
+
+          if "slknight_v11_fullfix1" not in html:
+              raise SystemExit(
+                  "namespace update failed"
+              )
+
+          path.write_text(
+              html,
+              encoding="utf-8",
+          )
+
+          print(
+              "V11_BROWSER_AUDIO_AND_FPS_OK"
+          )
+          PY
+
+          python3 \
+            /tmp/v11_browser_patch.py \
+            player/index.html
+
+          grep -Fq \
+            "window.skfTargetFrameRate = 50;" \
+            player/index.html
+
+          grep -Fq \
+            "window.slAudioBridge" \
+            player/index.html
+
+          grep -Fq \
+            "slknight_v11_fullfix1" \
+            player/index.html
+
+          echo V11_BROWSER_BRIDGE_OK
+
+      - name: Verify final V11 package
+        run: |
+          set -e
+
           test -s player/index.html
           test -s player/mkxp.js
           test -s player/mkxp.wasm
+
           test -s player/js/drive.js
           test -s player/js/dpad.js
           test -s player/js/localforage.min.js
+
           test -s player/gameasync/Game.ini
           test -s player/gameasync/rgss.rb
           test -s player/gameasync/mapping.js
           test -s player/gameasync/bitmap-map.js
-          test -s player/gameasync/Data/Scripts.rxdata
-          test -s player/gameasync/Fonts/NanumGothic.ttf
-          test -s player/gameasync/Fonts/NanumGothicBold.ttf
 
-          if find player/gameasync -maxdepth 1 -type f -name 'Save*.rxdata' | grep -q .
+          test -s player/gameasync/Data/Scripts.rxdata
+
+          test -s \
+            player/gameasync/Fonts/NanumGothic.ttf
+
+          test -s \
+            player/gameasync/Fonts/NanumGothicBold.ttf
+
+          if find \
+            player/gameasync \
+            -maxdepth 1 \
+            -type f \
+            -name 'Save*.rxdata' \
+            | grep -q .
           then
             echo BUNDLED_SAVE_PRESENT
             exit 1
           fi
 
-          grep -Fq "slknight_v10_font_touch_fix2" player/index.html
-          grep -Fq "SLFONTREADY" player/index.html
-          grep -Fq "FS.createPreloadedFile" player/index.html
-          grep -Fq "NanumGothic.ttf?v=v10fix2" player/index.html
-          grep -Fq "js/dpad.js?v=v10fix2" player/index.html
-          grep -Fq "touchcancel" player/js/dpad.js
-          grep -Fq "releaseAllVirtualKeys" player/js/dpad.js
-          grep -Fq "Fonts/NanumGothic.ttf" player/gameasync/mapping.js
-          grep -Fq "Fonts/NanumGothicBold.ttf" player/gameasync/mapping.js
+          grep -Fq \
+            "slknight_v11_fullfix1" \
+            player/index.html
 
-          test "$(stat -c '%s' player/mkxp.js)" = "290574"
-          test "$(stat -c '%s' player/mkxp.wasm)" = "5217852"
+          grep -Fq \
+            "SLFONTREADY" \
+            player/index.html
+
+          grep -Fq \
+            "FS.createPreloadedFile" \
+            player/index.html
+
+          grep -Fq \
+            "NanumGothic.ttf?v=v11fix1" \
+            player/index.html
+
+          grep -Fq \
+            "js/dpad.js?v=v11fix1" \
+            player/index.html
+
+          grep -Fq \
+            "touchcancel" \
+            player/js/dpad.js
+
+          grep -Fq \
+            "releaseAllVirtualKeys" \
+            player/js/dpad.js
+
+          grep -Fq \
+            "Fonts/NanumGothic.ttf" \
+            player/gameasync/mapping.js
+
+          grep -Fq \
+            "Fonts/NanumGothicBold.ttf" \
+            player/gameasync/mapping.js
+
+          grep -Fq \
+            "window.skfTargetFrameRate = 50;" \
+            player/index.html
+
+          grep -Fq \
+            "window.slAudioBridge" \
+            player/index.html
+
+          ruby -rzlib - <<'RB'
+          scripts =
+            Marshal.load(
+              File.binread(
+                'player/gameasync/Data/Scripts.rxdata'
+              )
+            )
+
+          all =
+            scripts.map do |entry|
+              next '' unless (
+                entry.is_a?(Array) &&
+                entry.length >= 3
+              )
+
+              begin
+                Zlib::Inflate.inflate(
+                  entry[2]
+                )
+              rescue
+                ''
+              end
+            end.join("\n")
+
+          abort(
+            'web_pre_update missing'
+          ) unless all.include?(
+            'def web_pre_update'
+          )
+
+          abort(
+            'browser audio marker missing'
+          ) unless all.include?(
+            'SLAUDIO'
+          )
+
+          abort(
+            'map audio retry missing'
+          ) unless all.include?(
+            'SLPATCH|MAP_AUDIO_RETRY'
+          )
+
+          abort(
+            '50fps setting missing'
+          ) unless all.include?(
+            'Graphics.frame_rate = 50'
+          )
+
+          abort(
+            'old 240x24 ID layout remains'
+          ) if all.include?(
+            'Bitmap.new(240, 24)'
+          )
+
+          abort(
+            'MOG HUD lifecycle marker missing'
+          ) unless all.include?(
+            'alias shud_dispose dispose'
+          )
+
+          puts 'V11_SCRIPT_VERIFY_OK'
+          RB
+
+          test "$(
+            stat -c '%s' \
+              player/mkxp.js
+          )" = "290574"
+
+          test "$(
+            stat -c '%s' \
+              player/mkxp.wasm
+          )" = "5217852"
 
           rm -rf player/.git
-          echo SLKNIGHT_V10_FONT_TOUCH_READY
+
+          echo \
+            SLKNIGHT_V11_FULL_FIX_READY
+
           du -sh player
 
       - name: Upload GitHub Pages artifact
@@ -1185,9 +2636,12 @@ jobs:
 
   deploy:
     name: Deploy GitHub Pages
+
     needs:
       - build
+
     runs-on: ubuntu-24.04
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
