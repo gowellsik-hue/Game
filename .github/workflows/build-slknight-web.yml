@@ -1,4 +1,4 @@
-name: Deploy SLKnight mkxp-web V14.2 SAVE EQUIP FIX
+name: Deploy SLKnight mkxp-web V14.3 FREEZE PRELOAD CLEAN
 on:
   push:
     branches: [main]
@@ -55,7 +55,6 @@ jobs:
           s=s.replace(reg,reg+'\n\tmrb_define_module_function(mrb, module, "resize_screen", graphicsResizeScreen, MRB_ARGS_REQ(2));',1)
           p.write_text(s)
           repl('engine/binding-mruby/binding-mruby.cpp','\tif (jsSkipFrame() == 1) return;','\t/* V14: Graphics.frame_rate is the only frame limiter. */')
-          repl('engine/src/emscripten.cpp',"EM_JS(void, save_file_async_js, (const char* fullPathC), {\n\tif (window.saveFile) window.saveFile(UTF8ToString(fullPathC));\n});","EM_JS(void, save_file_async_js, (const char* fullPathC), {\n\tAsyncify.handleSleep(function(wakeUp) {\n\t\tif (!window.saveFile) return wakeUp();\n\t\tPromise.resolve(window.saveFile(UTF8ToString(fullPathC))).then(wakeUp).catch(function(e){ console.error(e); wakeUp(); });\n\t});\n});")
           repl('engine/build.sh','./emsdk install latest','./emsdk install 3.1.37')
           repl('engine/build.sh','./emsdk activate latest','./emsdk activate 3.1.37')
           p=Path('engine/extra/build_config.rb'); s=p.read_text()
@@ -70,6 +69,7 @@ jobs:
           grep -Fq 'defScreenW = 800;' engine/src/config.cpp
           grep -Fq 'defScreenH = 600;' engine/src/config.cpp
           grep -Fq 'resize_screen' engine/binding-mruby/graphics-binding.cpp
+          grep -Fq 'if (window.saveFile) window.saveFile(UTF8ToString(fullPathC));' engine/src/emscripten.cpp
           grep -Fq "checksum_hash => '25b152264cd4dfac84aa39e5fbb428ec84b95e6a'" engine/extra/build_config.rb
       - name: Build patched mkxp-web engine
         run: |
@@ -103,6 +103,7 @@ jobs:
       - name: Patch game scripts and data
         run: |
           ruby -EUTF-8:UTF-8 -rzlib - player/gameasync <<'RB'
+          # encoding: UTF-8
           game=ARGV[0]; ini_path=File.join(game,'Game.ini'); ini=File.binread(ini_path)
           rel=ini[/^Scripts=(.+)$/i,1].to_s.strip.tr('\\','/'); abort 'Scripts entry missing' if rel.empty?
           source_path=File.join(game,rel); scripts=Marshal.load(File.binread(source_path))
@@ -226,7 +227,7 @@ jobs:
             if index==111; text=id_sprite; ids+=1
             elsif index==112; text=id_output; ids+=1
             elsif text.match?(/^\s*class\s+Plane\s*<\s*Sprite\b/n); text="# native Plane used on web\n"; plane+=1; end
-            text=patch_begin_until(text); text=patch_scene_loop(text) unless name=='Main'||name=='Scene_Map'||name=='Scene_Equip'
+            text=patch_begin_until(text); text=patch_scene_loop(text) unless name=='Main'||name=='Scene_Map'
             if name=='Main'; text=browser_loop+text unless text.include?('def main_update_loop'); text.sub!(/\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,"\n"); end
             entry[2]=Zlib::Deflate.deflate(text)
           end
@@ -235,13 +236,16 @@ jobs:
           def inflate(e); Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8); end
           def deflate(e,s); e[2]=Zlib::Deflate.deflate(s); end
           resolution=scripts[97]; rt=inflate(resolution); abort 'resolution script mismatch' unless rt.include?('$WINDOW_WIDTH = 800')&&rt.include?('Graphics.resize_screen'); abort 'resolution defined? remains' if rt.include?('defined?($joiplay)'); deflate(resolution,rt)
+          equip=entry_for(scripts,'Scene_Equip'); text=inflate(equip); eqrx=/    loop do\r?\n.*?^    end\r?\n(?=    #[^\n]*\r?\n    Graphics\.freeze)/m; abort 'Scene_Equip loop patch mismatch' unless text.scan(eqrx).size==1; text.sub!(eqrx,"  end\n  def dispose\n    $game_switches[49] = true\n"); deflate(equip,text)
           save=entry_for(scripts,'Scene_Save'); text=inflate(save); n=0; text=text.sub(/    write_save_data\(file\)\r?\n    exit/){n+=1;"    write_save_data(file)\n    file.close\n    save_file_async(filename)"}; abort "Scene_Save persist patch=#{n}" unless n==1; deflate(save,text)
           menu_fx=scripts.find{|e|e.is_a?(Array)&&e.length>=3&&((inflate(e).include?('XRXS_MP7_Module')) rescue false)}; abort 'menu lifecycle script missing' unless menu_fx
-          text=inflate(menu_fx); sec=/((?:#=+\r?\n)# ■ Scene_Equip\r?\n#=+\r?\nclass Scene_Equip\r?\n.*?\r?\nend)(?=\r?\n#=+\r?\n# ■ Scene_Status)/m; m=text.match(sec); abort 'equip menu section missing' unless m; equip_sec=m[1]; text.sub!(sec,'__SL_EQUIP_SECTION__')
-          ds=/  def dispose_spriteset\r?\n.*?    @spriteset\.dispose\r?\n  end/m; abort 'dispose_spriteset mismatch' unless text.scan(ds).size==1; text.sub!(ds,"  def dispose_spriteset\n    if @spriteset != nil\n      @spriteset.dispose\n      @spriteset = nil\n    end\n  end")
-          wr=/  alias xrxs_mp7_main main\r?\n  def main\r?\n    create_spriteset\r?\n    xrxs_mp7_main\r?\n    dispose_spriteset\r?\n  end/; abort 'menu wrapper mismatch' unless text.scan(wr).size==7; text.gsub!(wr,"  alias xrxs_mp7_main main\n  def main\n    create_spriteset\n    xrxs_mp7_main\n  end\n  alias xrxs_mp7_dispose dispose\n  def dispose\n    xrxs_mp7_dispose\n    dispose_spriteset\n  end"); text.sub!('__SL_EQUIP_SECTION__',equip_sec); deflate(menu_fx,text)
-          multi=entry_for(scripts,'Multi-slot script : Windows'); text=inflate(multi); text.gsub!('if defined? xrxs_additional_refresh','if respond_to?(:xrxs_additional_refresh)'); deflate(multi,text)
+          text=inflate(menu_fx); ds=/  def dispose_spriteset\r?\n.*?    @spriteset\.dispose\r?\n  end/m; abort 'dispose_spriteset mismatch' unless text.scan(ds).size==1; text.sub!(ds,"  def dispose_spriteset\n    if @spriteset != nil\n      @spriteset.dispose\n      @spriteset = nil\n    end\n  end")
+          wr=/  alias xrxs_mp7_main main\r?\n  def main\r?\n    create_spriteset\r?\n    xrxs_mp7_main\r?\n    dispose_spriteset\r?\n  end/; abort 'menu wrapper mismatch' unless text.scan(wr).size==8; text.gsub!(wr,"  alias xrxs_mp7_main main\n  def main\n    create_spriteset\n    xrxs_mp7_main\n  end\n  alias xrxs_mp7_dispose dispose\n  def dispose\n    xrxs_mp7_dispose\n    dispose_spriteset\n  end"); deflate(menu_fx,text)
+          multi=entry_for(scripts,'Multi-slot script : Windows'); text=inflate(multi); old_ms=/ alias g7_ms_scene_equip_main main\r?\n def main\r?\n  @additional_initialize_done = false\r?\n  g7_ms_scene_equip_main\r?\n  for i in 5\.\.\.@item_windows\.size\r?\n   @item_windows\[i\]\.dispose unless @item_windows\[i\]\.nil\?\r?\n  end\r?\n end/; abort 'multislot lifecycle mismatch' unless text.scan(old_ms).size==1; text.sub!(old_ms," alias g7_ms_scene_equip_main main\n def main\n  @additional_initialize_done = false\n  g7_ms_scene_equip_main\n end\n alias g7_ms_scene_equip_dispose dispose\n def dispose\n  if @item_windows != nil\n   for i in 5...@item_windows.size\n    @item_windows[i].dispose unless @item_windows[i].nil?\n   end\n  end\n  g7_ms_scene_equip_dispose\n end"); text.gsub!('if defined? xrxs_additional_refresh','if respond_to?(:xrxs_additional_refresh)'); deflate(multi,text)
           mog=scripts.find{|e|e.is_a?(Array)&&e.length>=3&&((inflate(e).include?('alias shud_main main')) rescue false)}; abort 'MOG HUD missing' unless mog; text=inflate(mog); text.gsub!('Viewport.new(0, 0, 640, 480)','Viewport.new(0, 0, $WINDOW_WIDTH, $WINDOW_HEIGHT)'); deflate(mog,text)
+          title=entry_for(scripts,'Scene_Title'); text=inflate(title); menu_rx=/    s1 = "새로하기"\r?\n    s2 = "이어하기"\r?\n    s3 = "홈페이지"\r?\n    s4 = "종료하기"\r?\n    s5 = "만든사람"\r?\n    @command_window = Window_Command.new\(90, \[s1, s2, s3, s4, s5\]\)/; abort 'title menu cleanup mismatch' unless text.scan(menu_rx).size==1; text.sub!(menu_rx,"    s1 = \"새로하기\"\n    s2 = \"이어하기\"\n    s3 = \"종료하기\"\n    @command_window = Window_Command.new(90, [s1, s2, s3])"); case_rx=/      when 2[^\n]*\r?\n        OpenBrowser\([^\n]*\)\r?\n      when 3[^\n]*\r?\n        command_shutdown\r?\n      when 4[^\n]*\r?\n        command_made/; abort 'title command cleanup mismatch' unless text.scan(case_rx).size==1; text.sub!(case_rx,"      when 2\n        command_shutdown"); text.sub!(/  def command_made\r?\n.*?^  end\r?\n/m,''); text.sub!(/  def OpenBrowser\(url\)\r?\n.*?^  end\r?\n/m,''); deflate(title,text)
+          savewin=entry_for(scripts,'Window_SaveFile'); text=inflate(savewin); text.gsub!('일환소프트 싱글리니지','SLKnight'); deflate(savewin,text)
+          scripts.each{|e|next unless e.is_a?(Array)&&e.length>=3;begin;t=inflate(e);rescue;next;end;next unless t.downcase.include?('ihsoft')||t.include?('oilhwan')||t.include?('일환소프트');t=t.lines.reject{|ln|ln.downcase.include?('ihsoft')||ln.include?('oilhwan')||ln.include?('일환소프트')}.join;deflate(e,t)}
           main=entry_for(scripts,'Main'); abort 'defined? regression in Main' if inflate(main).include?('defined?')
           target=File.join(game,'Data','Scripts.rxdata'); File.binwrite(target,Marshal.dump(scripts)); File.delete(source_path) if File.expand_path(source_path)!=File.expand_path(target)
           lines=ini.split(/\r?\n/).map{|line|line=~/^Scripts=/i ? 'Scripts=Data\\Scripts.rxdata' : line=~/^Title=/i ? 'Title=SLKnight' : line}; File.binwrite(ini_path,lines.join("\r\n")+"\r\n")
@@ -314,13 +318,33 @@ jobs:
           test -s mapping.js && test -s bitmap-map.js
           grep -Fq 'Fonts/NanumGothic.ttf' mapping.js
           grep -Fq 'Fonts/NanumGothicBold.ttf' mapping.js
+      - name: Build startup pack
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          root=Path('player/gameasync'); prefixes=('data/','graphics/','audio/se/','audio/bgs/','audio/me/','bm/','fonts/'); files=[]
+          for p in root.rglob('*'):
+              if not p.is_file(): continue
+              rel=p.relative_to(root).as_posix(); low=rel.lower()
+              if p.name.lower()=='thumbs.db': continue
+              if low in ('rgss.rb','game.ini','lineage.ini') or low.startswith(prefixes): files.append((rel,p))
+          files.sort(key=lambda x:x[0].lower()); manifest=[]; offset=0
+          with open('player/core.pack','wb') as out:
+              for rel,p in files:
+                  data=p.read_bytes(); out.write(data); key=re.sub(r'\.[^/.]+$','',rel.lower()); manifest.append([rel,offset,len(data),key]); offset+=len(data)
+          Path('player/core-manifest.js').write_text('window.slCoreManifest='+json.dumps(manifest,ensure_ascii=False,separators=(',',':'))+';',encoding='utf-8')
+          print(f'STARTUP_PACK|files={len(files)}|bytes={offset}')
+          PY
+          test -s player/core.pack && test -s player/core-manifest.js
+          rm -f player/gameasync/bitmap-map.js
       - name: Patch browser save controls audio and layout
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p=Path('player/js/drive.js'); s=p.read_text()
           a=s.index('window.saveFile = function(filename, localOnly) {'); b=s.index('\n};',a)+3
-          save="window.saveFile = function(filename, localOnly) {\n    const fpath='/game/'+filename; if(!FS.analyzePath(fpath).exists)return Promise.resolve(false);\n    const buf=FS.readFile(fpath);\n    return localforage.setItem(namespace+filename,buf).then(()=>localforage.getItem(namespace)).then(folder=>{folder=folder||{};folder[filename]={t:Number(FS.stat(fpath).mtime)};return localforage.setItem(namespace,folder);}).then(()=>{if(!localOnly)(window.saveCloudFile||(()=>{}))(filename,buf);console.log('SLSAVED|'+filename);return true;});\n};\nwindow.restoreLocalFilesBeforeRun = function(){\n    const dep='sl-local-saves'; addRunDependency(dep);\n    localforage.getItem(namespace).then(folder=>Promise.all(Object.keys(folder||{}).map(key=>localforage.getItem(namespace+key).then(res=>{if(!res)return;const f='/game/'+key;try{if(FS.analyzePath(f).exists)FS.unlink(f);}catch(e){}FS.writeFile(f,res);const m=folder[key];if(m&&Number.isInteger(m.t))FS.utime(f,m.t,m.t);})))).then(()=>{console.log('SLRESTORE|done');removeRunDependency(dep);}).catch(e=>{console.error('SLRESTOREERR',e);removeRunDependency(dep);});\n};"
+          save="window.saveFile = function(filename, localOnly) {\n    const fpath='/game/'+filename;if(!FS.analyzePath(fpath).exists)return Promise.resolve(false);const buf=FS.readFile(fpath);return localforage.setItem(namespace+filename,buf).then(()=>localforage.getItem(namespace)).then(folder=>{folder=folder||{};folder[filename]={t:Number(FS.stat(fpath).mtime)};return localforage.setItem(namespace,folder);}).then(()=>{if(!localOnly)(window.saveCloudFile||(()=>{}))(filename,buf);console.log('SLSAVED|'+filename);return true;}).catch(e=>{console.error('SLSAVEERR',e);return false;});\n};\nwindow.restoreLocalFilesBeforeRun=function(){const dep='sl-local-saves';addRunDependency(dep);localforage.getItem(namespace).then(folder=>Promise.all(Object.keys(folder||{}).map(key=>localforage.getItem(namespace+key).then(res=>{if(!res)return;const f='/game/'+key;try{if(FS.analyzePath(f).exists)FS.unlink(f);}catch(e){}FS.writeFile(f,res);const m=folder[key];if(m&&Number.isInteger(m.t))FS.utime(f,m.t,m.t);})))).then(()=>{console.log('SLRESTORE|done');removeRunDependency(dep);}).catch(e=>{console.error('SLRESTOREERR',e);removeRunDependency(dep);});};\nwindow.preloadCorePack=function(){const dep='sl-core-pack';addRunDependency(dep);const box=document.getElementById('progress'),list=window.slCoreManifest||[];let finished=false;function end(ok,msg){if(finished)return;finished=true;console.log((ok?'SLCOREREADY|':'SLCOREERR|')+msg);if(box){box.innerHTML=ok?'Game ready':'Core preload failed - lazy mode';box.style.opacity=ok?'0':'0.8';}removeRunDependency(dep);}const x=new XMLHttpRequest();x.open('GET','core.pack?v=v143');x.responseType='arraybuffer';x.onprogress=e=>{if(box){const a=(e.loaded/1048576).toFixed(1),b=e.lengthComputable?(e.total/1048576).toFixed(1):'?';box.innerHTML='Loading game data '+a+' / '+b+' MB';box.style.opacity='0.8';}};x.onerror=()=>end(false,'network');x.onload=()=>{if(x.status<200||x.status>=400||!x.response)return end(false,'http'+x.status);try{const u=new Uint8Array(x.response);for(const q of list){const rel=q[0],off=q[1],len=q[2],key=q[3],full='/game/'+rel;try{if(FS.analyzePath(full).exists)FS.unlink(full);}catch(e){}FS.writeFile(full,u.subarray(off,off+len));window.fileAsyncCache[key]=1;}window.fileLoadedAsync=function(file){document.title=wTitle;};end(true,list.length+'|'+u.length);}catch(e){console.error(e);end(false,'unpack');}};x.send();};"
           p.write_text(s[:a]+save+s[b:])
           PY
           ruby - player/index.html <<'RB'
@@ -329,7 +353,7 @@ jobs:
           <script>
           (function(){
             var ch={BGM:new Audio(),BGS:new Audio()},pending=[];ch.BGM.loop=true;ch.BGS.loop=true;
-            function urlFor(n){var p=String(n||'').replace(/\\/g,'/').replace(/\.(ogg|mp3|wav|wma|aac|m4a|flac|mid|midi)$/i,'');return encodeURI('gameasync/'+p+'.ogg?v=v14');}
+            function urlFor(n){var p=String(n||'').replace(/\\/g,'/').replace(/\.(ogg|mp3|wav|wma|aac|m4a|flac|mid|midi)$/i,'');return encodeURI('gameasync/'+p+'.ogg?v=v143');}
             function safe(a){if(!a||!a.src)return;try{var p=a.play();if(p&&p.catch)p.catch(function(){if(pending.indexOf(a)<0)pending.push(a);});}catch(e){if(pending.indexOf(a)<0)pending.push(a);}}
             function retry(){var x=pending.slice();pending.length=0;x.forEach(safe);}['touchstart','pointerdown','keydown','mousedown'].forEach(function(n){window.addEventListener(n,retry,{passive:true});});
             function stop(k){var a=ch[k];if(!a)return;a.pause();try{a.currentTime=0;}catch(e){}}
@@ -341,19 +365,20 @@ jobs:
           </script>
           JS
           html.sub!('<head>',"<head>\n#{bridge}") or abort 'head target missing'
+          bitmap="                getLazyAsset('gameasync/bitmap-map.js', 'Primary assets', () => {\n                    const s = document.createElement('script');\n                    s.setAttribute('src', 'gameasync/bitmap-map.js');\n                    document.body.appendChild(s);\n                });\n"; html.sub!(bitmap,'') or abort 'bitmap loader missing'
           pre=<<'JS'.strip
-          preRun: [function(){createDummies();window.restoreLocalFilesBeforeRun();[['NanumGothic.ttf','gameasync/Fonts/NanumGothic.ttf?v=v14'],['NanumGothicBold.ttf','gameasync/Fonts/NanumGothicBold.ttf?v=v14']].forEach(function(x){var p='/game/Fonts/'+x[0];try{if(FS.analyzePath(p).exists)FS.unlink(p);}catch(e){}FS.createPreloadedFile('/game/Fonts',x[0],x[1],true,true,function(){console.log('SLFONTREADY|'+x[0]);},function(){console.error('SLFONTERR|'+x[0]);});});}],
+          preRun: [function(){createDummies();window.restoreLocalFilesBeforeRun();window.preloadCorePack();}],
           JS
           html.sub!('preRun: [createDummies],',pre) or abort 'preRun target missing'
           html.sub!(/var namespace = '[^']*';/,"var namespace = 'slknight_v14_engine';") or abort 'namespace missing'
-          html.sub!(/var wTitle = '[^']*'/,"var wTitle = 'SLKnight V14'") or abort 'title missing'
-          html.sub!('<script src="js/dpad.js"></script>','<script src="js/dpad.js?v=v14"></script>') or abort 'dpad missing'
+          html.sub!(/var wTitle = '[^']*'/,"var wTitle = 'SLKnight V14.3'") or abort 'title missing'
+          html.sub!('<script src="js/dpad.js"></script>','<script src="js/dpad.js?v=v143"></script><script src="core-manifest.js?v=v143"></script>') or abort 'dpad missing'
           html.sub!('width="640" height="480"','width="800" height="600"') or abort 'canvas size missing'
           html.sub!('<div id="ap-a"></div>','<div id="ap-a">I</div>') or abort 'ap-a missing'
           html.sub!('<div id="ap-ka"></div>','<div id="ap-ka">D</div>') or abort 'ap-ka missing'
           html.sub!("bindKey('ap-ka', 65);","bindKey('ap-ka', 68);") or abort 'ap-ka bind missing'
           html.sub!(/#apad \* \{\s*border-radius:\s*50%;\s*\}/m,"#apad * {\n            border-radius: 50%;\n            color: white; font: bold 14px sans-serif; text-align: center; line-height: 7vh;\n        } #ap-c, #ap-b { color: transparent; }") or abort 'apad style missing'
-          html.sub!('<title>MKXP</title>','<title>SLKnight V14</title>') if html.include?('<title>MKXP</title>')
+          html.sub!('<title>MKXP</title>','<title>SLKnight V14.3</title>') if html.include?('<title>MKXP</title>')
           File.write(path,html); puts 'BROWSER_PATCH_OK'
           RB
           touch player/.nojekyll
@@ -365,18 +390,24 @@ jobs:
           grep -Fq 'width="800" height="600"' player/index.html
           grep -Fq "bindKey('ap-ka', 68);" player/index.html
           grep -Fq "gain=k==='BGS'?0.20:1" player/index.html
+          ! grep -Fq "getLazyAsset('gameasync/bitmap-map.js'" player/index.html
           grep -Fq 'restoreLocalFilesBeforeRun' player/js/drive.js
+          grep -Fq 'preloadCorePack' player/js/drive.js
+          grep -Fq 'core-manifest.js?v=v143' player/index.html
+          test -s player/core.pack && test -s player/core-manifest.js
           grep -Fq "console.log('SLSAVED|'+filename)" player/js/drive.js
           node --check player/js/drive.js
           ruby -EUTF-8:UTF-8 -rzlib - player/gameasync/Data/Scripts.rxdata <<'RB'
+          # encoding: UTF-8
           a=Marshal.load(File.binread(ARGV[0])); def s(a,n);e=a.find{|x|x.is_a?(Array)&&x.length>=3&&x[1].to_s==n};abort("missing #{n}")unless e;Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8);end
-          abort 'equip loop missing' unless s(a,'Scene_Equip').match?(/loop do.*?Graphics\.update.*?Input\.update.*?update/m)
+          eq=s(a,'Scene_Equip'); abort 'equip still blocking' if eq.match?(/loop do.*?Graphics\.update.*?Input\.update.*?update/m); abort 'equip dispose missing' unless eq.include?('def dispose')&&eq.include?('$game_switches[49] = true')
           abort 'resolution inactive' unless Zlib::Inflate.inflate(a[97][2]).include?('Graphics.resize_screen')&&Zlib::Inflate.inflate(a[97][2]).include?('$WINDOW_WIDTH = 800')
           abort 'defined joiplay remains' if a.any?{|e|e.is_a?(Array)&&e.length>=3&&((Zlib::Inflate.inflate(e[2]).include?('defined?($joiplay)')) rescue false)}
           abort 'menu exit unavailable' unless s(a,'Web Compatibility').include?('def exit')
           abort 'audio bridge marker missing' unless s(a,'Web Compatibility').include?('BGM_PLAY')
           abort 'save persist missing' unless s(a,'Scene_Save').include?('save_file_async(filename)')&&s(a,'Scene_Save').include?('file.close')
-          abort 'multislot original lifecycle missing' unless s(a,'Multi-slot script : Windows').include?('g7_ms_scene_equip_main')&&!s(a,'Multi-slot script : Windows').include?('g7_ms_scene_equip_dispose')
+          abort 'multislot dispose lifecycle missing' unless s(a,'Multi-slot script : Windows').include?('g7_ms_scene_equip_dispose')
+          all=a.map{|e|begin Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8) rescue '' end}.join("\n"); abort 'Ihwansoft branding remains' if all.downcase.include?('ihsoft')||all.include?('oilhwan')||all.include?('일환소프트')
           puts 'SCRIPT_VERIFY_OK'
           RB
           ruby - <<'RB'
