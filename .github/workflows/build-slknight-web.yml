@@ -1,4 +1,4 @@
-name: Deploy SLKnight + SLFairy - Boot Fix + Mobile Rework
+name: Deploy SLKnight + SLFairy Clean Mobile
 
 on:
   push:
@@ -32,21 +32,17 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            autoconf automake cmake curl ffmpeg freepats git imagemagick \
-            libtool make mm-common patch pkg-config python3 rake ruby \
-            timidity unzip wget xz-utils fonts-nanum p7zip-full
+          sudo apt-get install -y autoconf automake cmake curl ffmpeg freepats git imagemagick libtool make mm-common patch pkg-config python3 rake ruby timidity unzip wget xz-utils fonts-nanum p7zip-full
 
-      - name: Create build id
+      - name: Set build id
         run: |
-          set -euo pipefail
-          echo "BUILD_ID=${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+          echo "BUILD_ID=${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
 
-      - name: Checkout proven run 60 workflow
+      - name: Checkout proven run 60
         uses: actions/checkout@v4
         with:
           repository: gowellsik-hue/Game
@@ -60,12 +56,17 @@ jobs:
           ref: ${{ env.MKXP_SRC_REF }}
           path: engine
 
-      - name: Restore exact run 60 dependency cache
+      - name: Restore proven engine dependencies
+        id: deps-cache
         uses: actions/cache@v4
         with:
           path: engine/deps
-          key: mkxp-web-deps-Linux-emsdk-3.1.37-v2-onig25b
-          fail-on-cache-miss: true
+          key: mkxp-web-deps-${{ runner.os }}-emsdk-${{ env.EMSDK_VER }}-v2-onig25b
+
+      - name: Verify proven dependency cache
+        run: |
+          test "${{ steps.deps-cache.outputs.cache-hit }}" = "true"
+          echo RUN60_DEPENDENCY_CACHE_OK
 
       - name: Extract proven run 60 steps
         run: |
@@ -78,521 +79,73 @@ jobs:
             'Build patched mkxp-web engine' => '/tmp/base60_build_engine.sh',
             'Download and install game' => '/tmp/base60_install_knight.sh',
             'Patch game scripts and data' => '/tmp/base60_patch_knight.sh',
-            'Convert media' => '/tmp/base60_convert_media.sh',
-            'Build async mappings' => '/tmp/base60_mapping.sh',
-            'Build Emscripten preload package' => '/tmp/base60_preload.sh',
-            'Patch browser save controls audio and layout' => '/tmp/base60_browser.sh'
+            'Convert media' => '/tmp/base60_convert_knight.sh'
           }
           wanted.each do |name, path|
-            step = steps.find { |s| s['name'] == name }
+            step = steps.find { |item| item['name'] == name }
             abort "BASE60_STEP_MISSING #{name}" unless step && step['run']
-            File.write(path, "set -euo pipefail\n" + step['run'] + "\n")
+            File.write(path, "set -euo pipefail\n#{step['run']}\n")
           end
-          puts 'BASE60_EXTRACT_OK'
+          puts 'BASE60_STEPS_READY'
           RB
-          for file in /tmp/base60_*.sh; do
-            bash -n "$file"
-          done
+          for file in /tmp/base60_*.sh; do bash -n "$file"; done
 
       - name: Patch engine exactly like run 60
         run: |
           bash /tmp/base60_patch_engine.sh
 
-      - name: Build engine with run 60 dependency state
+      - name: Install clean mobile shell
         run: |
-          bash /tmp/base60_build_engine.sh
-          test -s engine/build/index.html
-          test -s engine/build/mkxp.js
-          test -s engine/build/mkxp.wasm
-          sha256sum engine/build/mkxp.js engine/build/mkxp.wasm
+          rm -f engine/extra/js/dpad.js
 
-      - name: Build Knight base exactly like run 60
-        run: |
-          bash /tmp/base60_install_knight.sh
-          bash /tmp/base60_patch_knight.sh
-          test -s player/gameasync/Data/Scripts.rxdata
-          echo KNIGHT_BASE60_OK
-
-      - name: Create common mobile runtime patch
-        run: |
-          cat > /tmp/mobile_runtime.rb <<'RB'
-          # encoding: UTF-8
-          require 'zlib'
-
-          root = ARGV.fetch(0)
-          mode = ARGV.fetch(1)
-          path = File.join(root, 'gameasync', 'Data', 'Scripts.rxdata')
-          scripts = Marshal.load(File.binread(path))
-
-          def entry_for(scripts, name)
-            scripts.find do |entry|
-              entry.is_a?(Array) &&
-                entry.length >= 3 &&
-                entry[1].to_s == name
-            end
-          end
-
-          def inflate(entry)
-            Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
-          end
-
-          def deflate(entry, source)
-            entry[2] = Zlib::Deflate.deflate(source)
-          end
-
-          scripts.reject! do |entry|
-            entry.is_a?(Array) &&
-              entry.length >= 3 &&
-              entry[1].to_s == 'Mobile Diablo Assist'
-          end
-
-          map = entry_for(scripts, 'Scene_Map')
-          if map
-            source = inflate(map)
-            unless source.include?('SL_MOBILE_MAP_UNLOCK')
-              source.sub!(
-                /  def main\r?\n/,
-                "  def main\n    $game_switches[49] = false if $game_switches\n    puts('SL_MOBILE_MAP_UNLOCK')\n"
-              )
-            end
-            source.gsub!(
-              /\s*if \$game_switches\[49\] == false\r?\n\s*Input\.update\s*\r?\n\s*end\r?\n/,
-              "\n     Input.update\n"
-            )
-            deflate(map, source)
-          end
-
-          equip = entry_for(scripts, 'Scene_Equip')
-          if equip
-            source = inflate(equip)
-            source.gsub!('$game_switches[49] = true', '$game_switches[49] = false')
-            deflate(equip, source)
-          end
-
-          save = entry_for(scripts, 'Scene_Save')
-          if save
-            source = inflate(save)
-            unless source.include?('save_file_async(filename)')
-              source.sub!(
-                /    write_save_data\(file\)\r?\n    exit/,
-                "    write_save_data(file)\n    file.close\n    save_file_async(filename)"
-              )
-            end
-            unless source.include?('SL_MOBILE_SAVE_UNLOCK')
-              source.sub!(
-                '    save_file_async(filename)',
-                "    save_file_async(filename)\n    $game_switches[49] = false if $game_switches\n    puts('SL_MOBILE_SAVE_UNLOCK')"
-              )
-            end
-            source.gsub!('$scene = Scene_Menu.new(4)', '$scene = Scene_Map.new')
-            deflate(save, source)
-          end
-
-          default_slots = mode == 'knight' ? [114, 3, 17, 2] : [0, 0, 0, 0]
-
-          assist = <<RUBY
-          \$sl_attack_target_id = 0
-          \$sl_attack_pulse_event_id = 0
-          \$sl_attack_cooldown = 0
-
-          class Game_Event
-            def sl_mobile_enemy_event?
-              event_data = instance_variable_get(:@event)
-              page_data = instance_variable_get(:@page)
-              erased = instance_variable_get(:@erased)
-              return false if event_data == nil || page_data == nil || erased
-              name = event_data.instance_variable_get(:@name).to_s
-              return false unless name[0,3] == '[ID'
-              return false if self.through
-              return false unless self.trigger == 2
-              true
-            end
-          end
-
-          class Interpreter
-            alias sl_targetlock_original_command_111 command_111
-            def command_111
-              if \$sl_attack_pulse_event_id.to_i > 0 &&
-                 @event_id == \$sl_attack_pulse_event_id &&
-                 @parameters[0] == 11 &&
-                 @parameters[1] == 13
-                \$sl_attack_pulse_event_id = 0
-                @branch[@list[@index].indent] = true
-                @branch.delete(@list[@index].indent)
-                return true
-              end
-              sl_targetlock_original_command_111
-            end
-          end
-
-          class Game_System
-            def sl_quick_items
-              @sl_quick_items = #{default_slots.inspect} if @sl_quick_items == nil
-              @sl_quick_items
-            end
-            def sl_quick_items=(value)
-              @sl_quick_items = value
-            end
-          end
-
-          module SLMobileQuick
-            def self.emit_labels
-              return if \$game_system == nil
-              \$game_system.sl_quick_items.each_with_index do |id, index|
-                item = id.to_i > 0 && \$data_items ? \$data_items[id.to_i] : nil
-                name = item ? item.name.to_s.gsub('|', '/') : '비어있음'
-                puts('SLQS|' + (index + 1).to_s + '|' + name)
-              end
-            end
-
-            def self.use(slot)
-              return if \$game_party == nil || \$game_system == nil
-              id = \$game_system.sl_quick_items[slot].to_i
-              item = id > 0 && \$data_items ? \$data_items[id] : nil
-              unless item && item.is_a?(RPG::Item) && \$game_party.item_number(id) > 0
-                \$game_system.se_play(\$data_system.buzzer_se) if \$data_system
-                return
-              end
-
-              if #{mode.dump} == 'knight' && id == 114
-                if \$game_switches[367] == true && \$game_party.item_number(114) >= 1
-                  \$game_party.lose_item(114, 1)
-                  \$game_temp.common_event_id = 2
-                  if \$game_switches[1081] == true && defined?(\$p) && \$p
-                    actor = \$game_party.actors[0]
-                    \$p.drawPHP(actor.hp, actor.maxhp, actor.sp, actor.maxsp)
-                  end
-                  \$KeyIcon.ShowIcon if defined?(\$KeyIcon) && \$KeyIcon
-                else
-                  \$game_system.se_play(\$data_system.buzzer_se)
-                end
-                return
-              end
-
-              unless \$game_party.item_can_use?(id)
-                \$game_system.se_play(\$data_system.buzzer_se)
-                return
-              end
-
-              used = false
-              if item.scope >= 3
-                if item.scope == 4 || item.scope == 6
-                  for actor in \$game_party.actors
-                    used |= actor.item_effect(item)
-                  end
-                else
-                  actor = \$game_party.actors[0]
-                  used = actor ? actor.item_effect(item) : false
-                end
-              elsif item.common_event_id > 0
-                used = true
-              end
-
-              if used
-                \$game_system.se_play(item.menu_se)
-                \$game_party.lose_item(id, 1) if item.consumable
-                \$game_temp.common_event_id = item.common_event_id if item.common_event_id > 0
-                \$KeyIcon.ShowIcon if defined?(\$KeyIcon) && \$KeyIcon
-              else
-                \$game_system.se_play(\$data_system.buzzer_se)
-              end
-            end
-          end
-
-          class Scene_MobileQuick
-            def initialize(slot_index = 0)
-              @slot_index = slot_index
-            end
-
-            def main
-              @help_window = Window_Help.new
-              @help_window.set_text('빠른슬롯을 선택한 뒤 소지 아이템을 지정하세요.')
-              build_slot_window
-              @item_window = Window_Item.new
-              @item_window.help_window = @help_window
-              @item_window.active = false
-              @item_window.visible = false
-              Graphics.transition
-            end
-
-            def build_slot_window
-              old_index = @slot_window ? @slot_window.index : @slot_index
-              @slot_window.dispose if @slot_window
-              names = []
-              \$game_system.sl_quick_items.each_with_index do |id, index|
-                item = id.to_i > 0 && \$data_items ? \$data_items[id.to_i] : nil
-                names << "\#{index + 1}. \#{item ? item.name.to_s : '비어 있음'}"
-              end
-              @slot_window = Window_Command.new(300, names)
-              @slot_window.x = 0
-              @slot_window.y = 64
-              @slot_window.index = [[old_index, 0].max, 3].min
-            end
-
-            def dispose
-              Graphics.freeze
-              @help_window.dispose if @help_window
-              @slot_window.dispose if @slot_window
-              @item_window.dispose if @item_window
-            end
-
-            def update
-              @help_window.update
-              @slot_window.update
-              @item_window.update
-
-              if @slot_window.active
-                if Input.trigger?(Input::B)
-                  \$game_system.se_play(\$data_system.cancel_se)
-                  \$scene = Scene_Map.new
-                  return
-                end
-                if Input.trigger?(Input::C)
-                  \$game_system.se_play(\$data_system.decision_se)
-                  @slot_index = @slot_window.index
-                  @slot_window.active = false
-                  @item_window.visible = true
-                  @item_window.active = true
-                  @item_window.index = 0
-                  return
-                end
-              else
-                if Input.trigger?(Input::B)
-                  \$game_system.se_play(\$data_system.cancel_se)
-                  @item_window.active = false
-                  @item_window.visible = false
-                  @slot_window.active = true
-                  return
-                end
-                if Input.trigger?(Input::C)
-                  item = @item_window.item
-                  unless item && item.is_a?(RPG::Item)
-                    \$game_system.se_play(\$data_system.buzzer_se)
-                    return
-                  end
-                  \$game_system.sl_quick_items[@slot_index] = item.id
-                  \$game_system.se_play(\$data_system.decision_se)
-                  @item_window.active = false
-                  @item_window.visible = false
-                  build_slot_window
-                  @slot_window.active = true
-                  SLMobileQuick.emit_labels
-                  return
-                end
-              end
-            end
-          end
-
-          class Game_Player
-            def sl_mobile_front_enemy
-              tx = self.x
-              ty = self.y
-              case self.direction
-              when 2
-                ty += 1
-              when 4
-                tx -= 1
-              when 6
-                tx += 1
-              when 8
-                ty -= 1
-              end
-              for event in \$game_map.events.values
-                next unless event.sl_mobile_enemy_event?
-                return event if event.x == tx && event.y == ty
-              end
-              nil
-            end
-
-            def sl_mobile_target_event
-              id = \$sl_attack_target_id.to_i
-              return nil if id <= 0
-              event = \$game_map.events[id]
-              return nil if event == nil
-              return nil unless event.sl_mobile_enemy_event?
-              distance = (event.x - self.x).abs + (event.y - self.y).abs
-              return nil unless distance == 1
-              event
-            end
-
-            def sl_mobile_clear_target
-              if \$sl_attack_target_id.to_i > 0
-                \$sl_attack_target_id = 0
-                \$sl_attack_pulse_event_id = 0
-                puts('SLTARGET|0')
-              end
-            end
-
-            def sl_mobile_toggle_target
-              if sl_mobile_target_event
-                sl_mobile_clear_target
-                return
-              end
-              target = sl_mobile_front_enemy
-              if target
-                \$sl_attack_target_id = target.id
-                puts('SLTARGET|' + target.id.to_s)
-              else
-                sl_mobile_clear_target
-              end
-            end
-
-            def sl_mobile_attack_tick
-              \$sl_attack_cooldown -= 1 if \$sl_attack_cooldown > 0
-              target = sl_mobile_target_event
-              if target == nil
-                sl_mobile_clear_target
-                return
-              end
-              return if moving?
-              return if @move_route_forcing
-              return if \$game_temp.message_window_showing
-              return if \$game_system.map_interpreter.running?
-              return if \$sl_attack_cooldown > 0
-
-              dx = target.x - self.x
-              dy = target.y - self.y
-              if dx > 0
-                turn_right
-              elsif dx < 0
-                turn_left
-              elsif dy > 0
-                turn_down
-              else
-                turn_up
-              end
-
-              target.turn_toward_player
-              \$sl_attack_pulse_event_id = target.id
-              \$sl_attack_cooldown = 18
-              target.start
-            end
-          end
-
-          class Scene_Map
-            alias sl_mobile_runtime_main main
-            def main
-              puts('SLBOOT|SCENE_MAP')
-              SLMobileQuick.emit_labels
-              sl_mobile_runtime_main
-            end
-
-            alias sl_mobile_runtime_update update
-            def update
-              if Input.trigger?(Input::Z)
-                \$game_player.sl_mobile_toggle_target
-              end
-              if Input.trigger?(Input::F5)
-                \$scene = Scene_MobileQuick.new
-                return
-              end
-              SLMobileQuick.use(0) if Input.trigger?(Input::F6)
-              SLMobileQuick.use(1) if Input.trigger?(Input::F7)
-              SLMobileQuick.use(2) if Input.trigger?(Input::F8)
-              SLMobileQuick.use(3) if Input.trigger?(Input::F9)
-              \$game_player.sl_mobile_attack_tick
-              sl_mobile_runtime_update
-            end
-          end
-          RUBY
-
-          main_index = scripts.index do |entry|
-            entry.is_a?(Array) &&
-              entry.length >= 3 &&
-              entry[1].to_s == 'Main'
-          end
-          abort 'Main script missing' unless main_index
-
-          scripts.insert(
-            main_index,
-            [99999991, 'Mobile Diablo Assist', Zlib::Deflate.deflate(assist)]
-          )
-
-          main = entry_for(scripts, 'Main')
-          if main
-            source = inflate(main)
-            source = "puts('SLBOOT|RUBY_MAIN')\n" + source unless source.include?('SLBOOT|RUBY_MAIN')
-            deflate(main, source)
-          end
-
-          title = entry_for(scripts, 'Scene_Title')
-          if title
-            source = inflate(title)
-            unless source.include?('SLBOOT|SCENE_TITLE')
-              source.sub!(
-                /  def main\r?\n/,
-                "  def main\n    puts('SLBOOT|SCENE_TITLE')\n"
-              )
-            end
-            deflate(title, source)
-          end
-
-          File.binwrite(path, Marshal.dump(scripts))
-          puts "MOBILE_RUNTIME_PATCH_OK #{mode}"
-          RB
-          ruby -c /tmp/mobile_runtime.rb
-
-      - name: Apply new target-lock runtime to Knight
-        run: |
-          ruby -EUTF-8:UTF-8 /tmp/mobile_runtime.rb player knight
-
-      - name: Finish Knight using proven run 60 conversion
-        run: |
-          bash /tmp/base60_convert_media.sh
-          bash /tmp/base60_mapping.sh
-          bash /tmp/base60_preload.sh
-          bash /tmp/base60_browser.sh
-
-      - name: Create new mobile UI
-        run: |
-          cat > /tmp/mobile-ui.js <<'JS'
+          cat > engine/extra/js/mobile.js <<'JS'
           (function(){
-            "use strict";
-            const variant = window.SL_VARIANT || "game";
-            const layoutKey = "sl-layout-" + variant;
-            const keysDown = new Set();
+            'use strict';
+
+            const keys = new Set();
             const lastTap = {};
             let editMode = false;
             let dragNode = null;
             let dragOffsetX = 0;
             let dragOffsetY = 0;
             let dragMoved = false;
-            let joyPointer = null;
-            let joyOriginX = 0;
-            let joyOriginY = 0;
+            let joystickPointer = null;
+            let joystickOriginX = 0;
+            let joystickOriginY = 0;
 
             function emit(type, code) {
-              const e = document.createEventObject ? document.createEventObject() : document.createEvent("Events");
-              if (e.initEvent) e.initEvent(type, true, true);
-              e.keyCode = code;
-              e.which = code;
-              e.charCode = 0;
-              if (typeof JSEvents !== "undefined" && JSEvents.eventHandlers) {
+              const event = document.createEventObject ? document.createEventObject() : document.createEvent('Events');
+              if (event.initEvent) event.initEvent(type, true, true);
+              event.keyCode = code;
+              event.which = code;
+              event.charCode = 0;
+
+              if (typeof JSEvents !== 'undefined' && JSEvents.eventHandlers) {
                 for (let i = 0; i < JSEvents.eventHandlers.length; i++) {
-                  const h = JSEvents.eventHandlers[i];
-                  if ((h.target === Module["canvas"] || h.target === window) && h.eventTypeString === type) {
-                    h.handlerFunc(e);
+                  const handler = JSEvents.eventHandlers[i];
+                  if ((handler.target === Module['canvas'] || handler.target === window) && handler.eventTypeString === type) {
+                    handler.handlerFunc(event);
                   }
                 }
-              } else if (typeof Module !== "undefined" && Module["canvas"]) {
-                if (Module["canvas"].dispatchEvent) {
-                  Module["canvas"].dispatchEvent(e);
+              } else if (typeof Module !== 'undefined' && Module['canvas']) {
+                if (Module['canvas'].dispatchEvent) {
+                  Module['canvas'].dispatchEvent(event);
                 } else {
-                  Module["canvas"].fireEvent("on" + type, e);
+                  Module['canvas'].fireEvent('on' + type, event);
                 }
               }
             }
 
             function keyDown(code) {
-              if (keysDown.has(code)) return;
-              keysDown.add(code);
-              emit("keydown", code);
+              if (keys.has(code)) return;
+              keys.add(code);
+              emit('keydown', code);
             }
 
             function keyUp(code) {
-              if (!keysDown.has(code)) return;
-              keysDown.delete(code);
-              emit("keyup", code);
+              if (!keys.has(code)) return;
+              keys.delete(code);
+              emit('keyup', code);
             }
 
             function tap(code) {
@@ -605,64 +158,77 @@ jobs:
             }
 
             function isTouchDevice() {
-              return "ontouchstart" in window || navigator.maxTouchPoints > 0;
+              return 'ontouchstart' in window || navigator.maxTouchPoints > 0;
             }
 
             function resizeCanvas() {
-              const canvas = document.getElementById("canvas");
+              const canvas = document.getElementById('canvas');
               if (!canvas) return;
-              if (window.innerHeight > window.innerWidth) {
-                canvas.style.height = "unset";
-                canvas.style.width = "100%";
+
+              if (innerHeight > innerWidth) {
+                canvas.style.height = 'unset';
+                canvas.style.width = '100%';
               } else {
-                canvas.style.width = "unset";
-                canvas.style.height = "100%";
+                canvas.style.width = 'unset';
+                canvas.style.height = '100%';
               }
+            }
+
+            function layoutKey() {
+              return 'sl-layout-' + (window.SL_VARIANT || 'game');
             }
 
             function saveLayout() {
               const data = {};
-              document.querySelectorAll(".sl-movable").forEach(function(node){
+
+              document.querySelectorAll('.sl-movable').forEach(function(node){
                 const rect = node.getBoundingClientRect();
                 data[node.id] = {
-                  x: rect.left / window.innerWidth,
-                  y: rect.top / window.innerHeight,
+                  x: rect.left / innerWidth,
+                  y: rect.top / innerHeight,
                   scale: Number(node.dataset.scale || 1)
                 };
               });
-              localStorage.setItem(layoutKey, JSON.stringify(data));
+
+              localStorage.setItem(layoutKey(), JSON.stringify(data));
             }
 
             function loadLayout() {
               let data = {};
+
               try {
-                data = JSON.parse(localStorage.getItem(layoutKey) || "{}");
-              } catch (e) {}
-              document.querySelectorAll(".sl-movable").forEach(function(node){
+                data = JSON.parse(localStorage.getItem(layoutKey()) || '{}');
+              } catch (error) {}
+
+              document.querySelectorAll('.sl-movable').forEach(function(node){
                 const item = data[node.id];
                 if (!item) return;
-                node.style.left = Math.max(0, item.x * window.innerWidth) + "px";
-                node.style.top = Math.max(0, item.y * window.innerHeight) + "px";
-                node.style.right = "auto";
-                node.style.bottom = "auto";
+
+                node.style.left = Math.max(0, item.x * innerWidth) + 'px';
+                node.style.top = Math.max(0, item.y * innerHeight) + 'px';
+                node.style.right = 'auto';
+                node.style.bottom = 'auto';
                 node.dataset.scale = String(item.scale || 1);
-                node.style.transform = "scale(" + (item.scale || 1) + ")";
+                node.style.transform = 'scale(' + (item.scale || 1) + ')';
               });
             }
 
             function cycleScale(node) {
-              const scale = Number(node.dataset.scale || 1);
-              const next = scale < 0.9 ? 1 : scale < 1.1 ? 1.2 : 0.82;
+              const current = Number(node.dataset.scale || 1);
+              const next = current < 0.9 ? 1 : current < 1.1 ? 1.2 : 0.82;
+
               node.dataset.scale = String(next);
-              node.style.transform = "scale(" + next + ")";
+              node.style.transform = 'scale(' + next + ')';
               saveLayout();
             }
 
             function setEditMode(enabled) {
               editMode = !!enabled;
-              document.body.classList.toggle("sl-editing", editMode);
-              const button = document.getElementById("sl-edit");
-              if (button) button.textContent = editMode ? "완료" : "배치";
+              document.body.classList.toggle('sl-editing', editMode);
+
+              const button = document.getElementById('sl-edit');
+              if (button) button.textContent = editMode ? '완료' : '배치';
+
               releaseDirections();
             }
 
@@ -670,21 +236,24 @@ jobs:
               const node = document.getElementById(id);
               if (!node) return;
 
-              node.addEventListener("pointerdown", function(e){
-                e.preventDefault();
-                e.stopPropagation();
+              node.addEventListener('pointerdown', function(event){
+                event.preventDefault();
+                event.stopPropagation();
 
                 if (editMode) {
                   dragNode = node;
                   dragMoved = false;
+
                   const rect = node.getBoundingClientRect();
-                  dragOffsetX = e.clientX - rect.left;
-                  dragOffsetY = e.clientY - rect.top;
-                  if (node.setPointerCapture) node.setPointerCapture(e.pointerId);
+                  dragOffsetX = event.clientX - rect.left;
+                  dragOffsetY = event.clientY - rect.top;
+
+                  if (node.setPointerCapture) node.setPointerCapture(event.pointerId);
                   return;
                 }
 
-                node.classList.add("active");
+                node.classList.add('active');
+
                 if (tapOnly) {
                   tap(code);
                 } else {
@@ -692,60 +261,68 @@ jobs:
                 }
               });
 
-              node.addEventListener("pointermove", function(e){
+              node.addEventListener('pointermove', function(event){
                 if (!editMode || dragNode !== node) return;
-                e.preventDefault();
+
+                event.preventDefault();
                 dragMoved = true;
 
                 const rect = node.getBoundingClientRect();
-                let x = e.clientX - dragOffsetX;
-                let y = e.clientY - dragOffsetY;
+                let x = event.clientX - dragOffsetX;
+                let y = event.clientY - dragOffsetY;
 
-                x = Math.max(0, Math.min(window.innerWidth - rect.width, x));
-                y = Math.max(0, Math.min(window.innerHeight - rect.height, y));
+                x = Math.max(0, Math.min(innerWidth - rect.width, x));
+                y = Math.max(0, Math.min(innerHeight - rect.height, y));
 
-                node.style.left = x + "px";
-                node.style.top = y + "px";
-                node.style.right = "auto";
-                node.style.bottom = "auto";
+                node.style.left = x + 'px';
+                node.style.top = y + 'px';
+                node.style.right = 'auto';
+                node.style.bottom = 'auto';
               });
 
-              function release(e) {
-                if (e && e.preventDefault) e.preventDefault();
-                node.classList.remove("active");
+              function release(event) {
+                if (event && event.preventDefault) event.preventDefault();
+
+                node.classList.remove('active');
 
                 if (editMode) {
                   if (dragNode === node) {
                     dragNode = null;
+
                     const now = Date.now();
+
                     if (!dragMoved && lastTap[id] && now - lastTap[id] < 350) {
                       cycleScale(node);
                       lastTap[id] = 0;
                     } else {
                       lastTap[id] = now;
                     }
+
                     saveLayout();
                   }
+
                   return;
                 }
 
                 if (!tapOnly) keyUp(code);
               }
 
-              node.addEventListener("pointerup", release);
-              node.addEventListener("pointercancel", release);
-              node.addEventListener("lostpointercapture", release);
+              node.addEventListener('pointerup', release);
+              node.addEventListener('pointercancel', release);
+              node.addEventListener('lostpointercapture', release);
             }
 
             function initJoystick() {
-              const zone = document.getElementById("sl-stick-zone");
-              const stick = document.getElementById("sl-joystick");
-              const knob = document.getElementById("sl-joy-knob");
-              if (!zone || !stick || !knob) return;
+              const zone = document.getElementById('sl-stick-zone');
+              const joystick = document.getElementById('sl-joystick');
+              const knob = document.getElementById('sl-joy-knob');
 
-              function update(e) {
-                let dx = e.clientX - joyOriginX;
-                let dy = e.clientY - joyOriginY;
+              if (!zone || !joystick || !knob) return;
+
+              function update(event) {
+                let dx = event.clientX - joystickOriginX;
+                let dy = event.clientY - joystickOriginY;
+
                 const max = 48;
                 const length = Math.hypot(dx, dy) || 1;
                 const scale = Math.min(1, max / length);
@@ -753,7 +330,7 @@ jobs:
                 dx *= scale;
                 dy *= scale;
 
-                knob.style.transform = "translate(" + dx + "px," + dy + "px)";
+                knob.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
 
                 const nx = dx / max;
                 const ny = dy / max;
@@ -771,395 +348,1084 @@ jobs:
                 });
               }
 
-              zone.addEventListener("pointerdown", function(e){
+              zone.addEventListener('pointerdown', function(event){
                 if (editMode) return;
-                e.preventDefault();
 
-                joyPointer = e.pointerId;
-                joyOriginX = e.clientX;
-                joyOriginY = e.clientY;
+                event.preventDefault();
 
-                stick.style.display = "block";
-                stick.style.left = (joyOriginX - 70) + "px";
-                stick.style.top = (joyOriginY - 70) + "px";
+                joystickPointer = event.pointerId;
+                joystickOriginX = event.clientX;
+                joystickOriginY = event.clientY;
 
-                if (zone.setPointerCapture) zone.setPointerCapture(e.pointerId);
-                update(e);
+                joystick.style.display = 'block';
+                joystick.style.left = (joystickOriginX - 70) + 'px';
+                joystick.style.top = (joystickOriginY - 70) + 'px';
+
+                if (zone.setPointerCapture) zone.setPointerCapture(event.pointerId);
+
+                update(event);
               });
 
-              zone.addEventListener("pointermove", function(e){
-                if (e.pointerId !== joyPointer) return;
-                e.preventDefault();
-                update(e);
+              zone.addEventListener('pointermove', function(event){
+                if (event.pointerId !== joystickPointer) return;
+                event.preventDefault();
+                update(event);
               });
 
-              function end(e) {
-                if (joyPointer !== null && e && e.pointerId !== undefined && e.pointerId !== joyPointer) return;
-                joyPointer = null;
+              function end(event) {
+                if (joystickPointer !== null && event && event.pointerId !== undefined && event.pointerId !== joystickPointer) return;
+
+                joystickPointer = null;
                 releaseDirections();
-                knob.style.transform = "translate(0px,0px)";
-                stick.style.display = "none";
+
+                knob.style.transform = 'translate(0,0)';
+                joystick.style.display = 'none';
               }
 
-              zone.addEventListener("pointerup", end);
-              zone.addEventListener("pointercancel", end);
-              zone.addEventListener("lostpointercapture", end);
+              zone.addEventListener('pointerup', end);
+              zone.addEventListener('pointercancel', end);
+              zone.addEventListener('lostpointercapture', end);
             }
 
             window.slSetQuickLabel = function(slot, label) {
-              const node = document.getElementById("sl-q" + String(slot));
+              const node = document.getElementById('sl-q' + slot);
               if (!node) return;
-              const text = String(label || "").trim();
+
+              const text = String(label || '').trim();
               node.textContent = text ? text.slice(0, 8) : String(slot);
               node.title = text;
             };
 
-            window.addEventListener("sl-log", function(e){
-              const text = String(e.detail || "");
+            window.addEventListener('sl-log', function(event){
+              const text = String(event.detail || '');
 
-              if (text.indexOf("SLTARGET|") >= 0) {
-                const target = text.slice(text.indexOf("SLTARGET|")).split("|")[1];
-                const attack = document.getElementById("sl-attack");
-                if (attack) attack.classList.toggle("locked", !!target && target !== "0");
+              if (text.indexOf('SLTARGET|') >= 0) {
+                const target = text.slice(text.indexOf('SLTARGET|')).split('|')[1];
+                const attack = document.getElementById('sl-attack');
+
+                if (attack) attack.classList.toggle('locked', !!target && target !== '0');
               }
 
-              if (text.indexOf("SLQS|") >= 0) {
-                const parts = text.slice(text.indexOf("SLQS|")).split("|");
+              if (text.indexOf('SLQS|') >= 0) {
+                const parts = text.slice(text.indexOf('SLQS|')).split('|');
+
                 if (parts.length >= 3) {
-                  window.slSetQuickLabel(parts[1], parts.slice(2).join("|"));
+                  window.slSetQuickLabel(parts[1], parts.slice(2).join('|'));
                 }
               }
             });
 
-            function init() {
-              const ui = document.getElementById("sl-mobile-ui");
+            window.addEventListener('load', function(){
+              const ui = document.getElementById('sl-mobile-ui');
               if (!ui) return;
 
               if (!isTouchDevice()) {
-                ui.style.display = "none";
+                ui.style.display = 'none';
                 resizeCanvas();
                 return;
               }
 
               initJoystick();
-              bindButton("sl-attack", 68, true);
-              bindButton("sl-confirm", 67, false);
-              bindButton("sl-cancel", 88, false);
-              bindButton("sl-bag", 83, false);
-              bindButton("sl-equip", 65, false);
-              bindButton("sl-slots", 116, true);
-              bindButton("sl-q1", 117, true);
-              bindButton("sl-q2", 118, true);
-              bindButton("sl-q3", 119, true);
-              bindButton("sl-q4", 120, true);
 
-              const edit = document.getElementById("sl-edit");
-              if (edit) {
-                edit.addEventListener("pointerdown", function(e){
-                  e.preventDefault();
-                  e.stopPropagation();
+              bindButton('sl-attack', 68, true);
+              bindButton('sl-confirm', 67, false);
+              bindButton('sl-cancel', 88, false);
+              bindButton('sl-bag', 83, false);
+              bindButton('sl-equip', 65, false);
+              bindButton('sl-slots', 116, true);
+              bindButton('sl-q1', 117, true);
+              bindButton('sl-q2', 118, true);
+              bindButton('sl-q3', 119, true);
+              bindButton('sl-q4', 120, true);
+
+              const editButton = document.getElementById('sl-edit');
+
+              if (editButton) {
+                editButton.addEventListener('pointerdown', function(event){
+                  event.preventDefault();
+                  event.stopPropagation();
                   setEditMode(!editMode);
                 });
               }
 
               loadLayout();
               resizeCanvas();
-              window.addEventListener("resize", resizeCanvas);
-            }
-
-            window.addEventListener("load", init);
+              addEventListener('resize', resizeCanvas);
+            });
           })();
           JS
-          node --check /tmp/mobile-ui.js
 
-      - name: Create browser finalizer
-        run: |
-          cat > /tmp/finalize_site.py <<'PY'
-          from pathlib import Path
-          import re
-          import shutil
-          import sys
+          cat > engine/extra/shell.html <<'HTML'
+          <!doctype html>
+          <html lang="ko">
+          <head>
+            <meta charset="utf-8">
+            <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+            <meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+            <meta http-equiv="Pragma" content="no-cache">
+            <meta http-equiv="Expires" content="0">
+            <link rel="manifest" href="manifest.webmanifest">
+            <title>__TITLE__</title>
 
-          site = Path(sys.argv[1])
-          variant = sys.argv[2]
-          title = sys.argv[3]
-          namespace = sys.argv[4]
-          old_core = sys.argv[5]
-          build_id = sys.argv[6]
+            <script>
+              var namespace = '__NAMESPACE__';
+              var wTitle = '__TITLE__';
+              window.SL_VARIANT = '__VARIANT__';
+              window.SL_BUILD_ID = '__BUILD_ID__';
+              document.title = wTitle;
+            </script>
 
-          index = site / 'index.html'
-          html = index.read_text()
+            <script src="js/localforage.min.js"></script>
+            <script src="gameasync/mapping.js?v=__BUILD_ID__"></script>
+            <script src="js/drive.js?v=__BUILD_ID__"></script>
+            <script src="js/mobile.js?v=__BUILD_ID__"></script>
 
-          old_core_js = site / f'{old_core}.js'
-          old_core_data = site / f'{old_core}.data'
-          if not old_core_js.exists() or not old_core_data.exists():
-              raise SystemExit(f'core package missing: {old_core}')
+            <style>
+              html,body,#main{margin:0;width:100%;height:100%;overflow:hidden;background:#000}
+              #canvas{padding:0;margin:0 auto;display:block;border:0;background:#000;height:100%;max-height:100vh;max-width:100vw}
+              #spinner{position:fixed;left:18px;bottom:38px;z-index:9000;opacity:.55}
+              .spinner{width:28px;height:28px;border:8px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
+              @keyframes spin{to{transform:rotate(360deg)}}
+              #progress{position:fixed;left:0;bottom:0;z-index:9001;background:rgba(255,255,255,.85);color:#000;padding:4px 10px;border-radius:0 7px 0 0;font:13px monospace;white-space:pre-wrap}
+              #fullscreen{position:fixed;right:8px;bottom:8px;z-index:5300;color:#fff;opacity:.6;font-size:26px;cursor:pointer}
+              #sl-mobile-ui{position:fixed;inset:0;z-index:5000;pointer-events:none;touch-action:none;user-select:none;-webkit-user-select:none}
+              #sl-stick-zone{position:fixed;left:0;top:0;width:48vw;height:100vh;z-index:5001;pointer-events:auto;touch-action:none}
+              #sl-joystick{display:none;position:fixed;width:140px;height:140px;border-radius:50%;z-index:5002;pointer-events:none}
+              #sl-joy-base{position:absolute;inset:12px;border-radius:50%;border:2px solid rgba(255,255,255,.36);background:rgba(0,0,0,.25);box-shadow:inset 0 0 22px rgba(0,0,0,.45)}
+              #sl-joy-knob{position:absolute;left:45px;top:45px;width:50px;height:50px;border-radius:50%;border:2px solid rgba(255,255,255,.82);background:rgba(35,35,35,.75);box-shadow:0 3px 14px rgba(0,0,0,.5)}
+              .sl-btn{position:fixed;z-index:5100;box-sizing:border-box;border-radius:50%;border:2px solid rgba(255,255,255,.48);background:rgba(0,0,0,.48);color:#fff;font:600 12px system-ui,sans-serif;pointer-events:auto;touch-action:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transform-origin:center}
+              .sl-btn.active{background:rgba(255,255,255,.24);border-color:#fff}
+              .sl-btn.locked{border-color:#ffb347;background:rgba(140,70,0,.62);box-shadow:0 0 12px rgba(255,160,40,.7)}
+              #sl-attack{width:92px;height:92px;right:18px;bottom:18px;font-size:18px}
+              #sl-confirm{width:60px;height:60px;right:118px;bottom:22px}
+              #sl-cancel{width:56px;height:56px;right:102px;bottom:92px}
+              #sl-bag{width:52px;height:52px;right:34px;bottom:124px}
+              #sl-equip{width:52px;height:52px;right:94px;bottom:154px}
+              #sl-slots{width:48px;height:48px;right:158px;bottom:104px}
+              #sl-q1{width:52px;height:52px;right:232px;bottom:164px}
+              #sl-q2{width:52px;height:52px;right:174px;bottom:180px}
+              #sl-q3{width:52px;height:52px;right:116px;bottom:196px}
+              #sl-q4{width:52px;height:52px;right:58px;bottom:212px}
+              #sl-edit{position:fixed;right:10px;top:10px;width:58px;height:36px;border-radius:10px;z-index:5200;border:1px solid rgba(255,255,255,.5);background:rgba(0,0,0,.55);color:#fff;pointer-events:auto;touch-action:none}
+              .sl-editing .sl-movable{outline:2px dashed rgba(255,210,70,.9)}
+            </style>
+          </head>
+          <body>
+            <div id="main">
+              <div id="spinner"><div class="spinner"></div></div>
+              <div id="progress">HTML READY</div>
+              <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1" width="800" height="600"></canvas>
+            </div>
 
-          new_core = f'{variant}-core-{build_id}'
-          new_core_js = site / f'{new_core}.js'
-          new_core_data = site / f'{new_core}.data'
+            <div id="sl-mobile-ui">
+              <div id="sl-stick-zone"></div>
+              <div id="sl-joystick">
+                <div id="sl-joy-base"></div>
+                <div id="sl-joy-knob"></div>
+              </div>
+              <button id="sl-attack" class="sl-btn sl-movable">공격</button>
+              <button id="sl-confirm" class="sl-btn sl-movable">확인</button>
+              <button id="sl-cancel" class="sl-btn sl-movable">취소</button>
+              <button id="sl-bag" class="sl-btn sl-movable">가방</button>
+              <button id="sl-equip" class="sl-btn sl-movable">장비</button>
+              <button id="sl-slots" class="sl-btn sl-movable">슬롯</button>
+              <button id="sl-q1" class="sl-btn sl-movable">1</button>
+              <button id="sl-q2" class="sl-btn sl-movable">2</button>
+              <button id="sl-q3" class="sl-btn sl-movable">3</button>
+              <button id="sl-q4" class="sl-btn sl-movable">4</button>
+              <button id="sl-edit">배치</button>
+            </div>
 
-          core_text = old_core_js.read_text()
-          old_data_name = f'{old_core}.data'
-          new_data_name = f'{new_core}.data'
-          if old_data_name not in core_text:
-              raise SystemExit(f'core data reference missing: {old_data_name}')
+            <div onclick="fullscreen()" id="fullscreen">⛶</div>
 
-          core_text = core_text.replace(old_data_name, new_data_name)
-          new_core_js.write_text(core_text)
-          old_core_data.rename(new_core_data)
-          old_core_js.unlink()
+            <script>
+              var bitmapSizeMapping = {};
+              window.SL_BOOT_STAGE = 'HTML READY';
 
-          js_dir = site / 'js'
-          js_dir.mkdir(parents=True, exist_ok=True)
-          shutil.copy('/tmp/mobile-ui.js', js_dir / 'dpad.js')
-
-          html = re.sub(
-              r'var namespace = \'[^\']*\';',
-              f"var namespace = '{namespace}';",
-              html,
-              count=1
-          )
-          html = re.sub(
-              r'var wTitle = \'[^\']*\'',
-              f"var wTitle = '{title}'",
-              html,
-              count=1
-          )
-          html = html.replace(f'{old_core}.js', f'{new_core}.js')
-          html = re.sub(r'js/drive\.js(?:\?v=[^"\']+)?', f'js/drive.js?v={build_id}', html)
-          html = re.sub(r'js/dpad\.js(?:\?v=[^"\']+)?', f'js/dpad.js?v={build_id}', html)
-          html = re.sub(r'gameasync/mapping\.js(?:\?v=[^"\']+)?', f'gameasync/mapping.js?v={build_id}', html)
-          html = re.sub(r'mkxp\.wasm(?:\?v=[^"\']+)?', f'mkxp.wasm?v={build_id}', html)
-          html = re.sub(r'mkxp\.js(?:\?v=[^"\']+)?', f'mkxp.js?v={build_id}', html)
-          html = re.sub(
-              rf'{re.escape(new_core)}\.js(?:\?v=[^"\']+)?',
-              f'{new_core}.js?v={build_id}',
-              html
-          )
-          html = html.replace('?v=v144b', f'?v={build_id}')
-          html = html.replace('?v=v144', f'?v={build_id}')
-
-          if '<meta http-equiv="Cache-Control"' not in html:
-              html = html.replace(
-                  '<meta charset="utf-8">',
-                  '<meta charset="utf-8">\n'
-                  '    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">\n'
-                  '    <meta http-equiv="Pragma" content="no-cache">\n'
-                  '    <meta http-equiv="Expires" content="0">',
-                  1
-              )
-
-          boot = r'''
-          <script id="sl-boot-monitor">
-          (function(){
-            window.SL_VARIANT = "__VARIANT__";
-            window.SL_BUILD_ID = "__BUILD__";
-            window.SL_BOOT_STAGE = "HTML";
-
-            function progressNode() {
-              return document.getElementById("progress");
-            }
-
-            window.slBootStage = function(stage) {
-              window.SL_BOOT_STAGE = String(stage || "");
-              var node = progressNode();
-              if (node) {
-                node.style.display = "block";
-                node.textContent = window.SL_BOOT_STAGE;
-              }
-            };
-
-            window.slBootReady = function(stage) {
-              window.SL_BOOT_STAGE = String(stage || "READY");
-              var progress = progressNode();
-              var spinner = document.getElementById("spinner");
-              if (progress) progress.style.display = "none";
-              if (spinner) spinner.style.display = "none";
-            };
-
-            window.slBootFail = function(message) {
-              var node = progressNode();
-              if (!node) {
-                node = document.createElement("pre");
-                node.id = "progress";
-                document.body.appendChild(node);
-              }
-              node.style.display = "block";
-              node.style.position = "fixed";
-              node.style.left = "8px";
-              node.style.right = "8px";
-              node.style.top = "8px";
-              node.style.zIndex = "999999";
-              node.style.background = "#000";
-              node.style.color = "#fff";
-              node.style.border = "2px solid #d33";
-              node.style.padding = "10px";
-              node.style.whiteSpace = "pre-wrap";
-              node.textContent = "BOOT ERROR\n" + message;
-            };
-
-            var originalLog = console.log.bind(console);
-            console.log = function() {
-              var args = Array.prototype.slice.call(arguments);
-              var text = args.join(" ");
-
-              try {
-                window.dispatchEvent(new CustomEvent("sl-log", {detail: text}));
-              } catch (e) {}
-
-              if (text.indexOf("SLBOOT|RUBY_MAIN") >= 0) {
-                window.slBootStage("RUBY MAIN");
-              }
-              if (text.indexOf("SLBOOT|SCENE_TITLE") >= 0) {
-                window.slBootReady("SCENE TITLE");
-              }
-              if (text.indexOf("SLBOOT|SCENE_MAP") >= 0) {
-                window.slBootReady("SCENE MAP");
-              }
-              if (text.indexOf("SLRUNTIMEERR|") >= 0 || text.indexOf("SLSCRIPTERR|") >= 0) {
-                window.slBootFail(text);
+              function slProgress() {
+                return document.getElementById('progress');
               }
 
-              originalLog.apply(console, args);
-            };
+              function slBootStage(stage) {
+                window.SL_BOOT_STAGE = String(stage || '');
+                const node = slProgress();
 
-            window.addEventListener("error", function(e) {
-              window.slBootFail("JS ERROR: " + e.message);
-            });
-
-            window.addEventListener("unhandledrejection", function(e) {
-              window.slBootFail("PROMISE ERROR: " + String(e.reason));
-            });
-
-            var hooked = false;
-            var hookTimer = setInterval(function(){
-              if (hooked || typeof Module === "undefined") return;
-
-              hooked = true;
-              clearInterval(hookTimer);
-
-              var oldMonitor = Module.monitorRunDependencies;
-              Module.monitorRunDependencies = function(left) {
-                window.slBootStage("RUN DEPENDENCIES: " + left);
-                if (oldMonitor) oldMonitor(left);
-              };
-
-              var oldAbort = Module.onAbort;
-              Module.onAbort = function(reason) {
-                window.slBootFail("WASM ABORT: " + String(reason));
-                if (oldAbort) oldAbort(reason);
-              };
-            }, 20);
-
-            window.slBootStage("HTML READY / __BUILD__");
-
-            setTimeout(function(){
-              if (
-                window.SL_BOOT_STAGE !== "SCENE TITLE" &&
-                window.SL_BOOT_STAGE !== "SCENE MAP"
-              ) {
-                var node = progressNode();
-                if (node && node.style.display !== "none") {
-                  node.textContent =
-                    "STILL LOADING\n" +
-                    window.SL_BOOT_STAGE +
-                    "\nBUILD __BUILD__";
+                if (node) {
+                  node.style.display = 'block';
+                  node.style.opacity = '.85';
+                  node.textContent = window.SL_BOOT_STAGE;
                 }
               }
-            }, 25000);
-          })();
-          </script>
-          '''
-          boot = boot.replace('__VARIANT__', variant).replace('__BUILD__', build_id)
 
-          css = r'''
-          <style id="sl-mobile-v2-style">
-          #dpad,#apad{display:none!important}
-          #sl-mobile-ui{position:fixed;inset:0;z-index:5000;pointer-events:none;touch-action:none;user-select:none;-webkit-user-select:none}
-          #sl-stick-zone{position:fixed;left:0;top:0;width:48vw;height:100vh;z-index:5001;pointer-events:auto;touch-action:none}
-          #sl-joystick{display:none;position:fixed;width:140px;height:140px;border-radius:50%;z-index:5002;pointer-events:none}
-          #sl-joy-base{position:absolute;inset:12px;border-radius:50%;border:2px solid rgba(255,255,255,.36);background:rgba(0,0,0,.25);box-shadow:inset 0 0 22px rgba(0,0,0,.45)}
-          #sl-joy-knob{position:absolute;left:45px;top:45px;width:50px;height:50px;border-radius:50%;border:2px solid rgba(255,255,255,.82);background:rgba(35,35,35,.75);box-shadow:0 3px 14px rgba(0,0,0,.5)}
-          .sl-btn{position:fixed;z-index:5100;box-sizing:border-box;border-radius:50%;border:2px solid rgba(255,255,255,.48);background:rgba(0,0,0,.48);color:#fff;font:600 12px system-ui,sans-serif;pointer-events:auto;touch-action:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transform-origin:center}
-          .sl-btn.active{background:rgba(255,255,255,.24);border-color:#fff}
-          .sl-btn.locked{border-color:#ffb347;background:rgba(140,70,0,.62);box-shadow:0 0 12px rgba(255,160,40,.7)}
-          #sl-attack{width:92px;height:92px;right:18px;bottom:18px;font-size:18px}
-          #sl-confirm{width:60px;height:60px;right:118px;bottom:22px}
-          #sl-cancel{width:56px;height:56px;right:102px;bottom:92px}
-          #sl-bag{width:52px;height:52px;right:34px;bottom:124px}
-          #sl-equip{width:52px;height:52px;right:94px;bottom:154px}
-          #sl-slots{width:48px;height:48px;right:158px;bottom:104px}
-          #sl-q1{width:52px;height:52px;right:232px;bottom:164px}
-          #sl-q2{width:52px;height:52px;right:174px;bottom:180px}
-          #sl-q3{width:52px;height:52px;right:116px;bottom:196px}
-          #sl-q4{width:52px;height:52px;right:58px;bottom:212px}
-          #sl-edit{position:fixed;right:10px;top:10px;width:58px;height:36px;border-radius:10px;z-index:5200;border:1px solid rgba(255,255,255,.5);background:rgba(0,0,0,.55);color:#fff;pointer-events:auto;touch-action:none}
-          .sl-editing .sl-movable{outline:2px dashed rgba(255,210,70,.9)}
-          </style>
-          '''
+              function slBootReady(stage) {
+                window.SL_BOOT_STAGE = stage || 'READY';
 
-          controls = r'''
-          <div id="sl-mobile-ui">
-            <div id="sl-stick-zone"></div>
-            <div id="sl-joystick">
-              <div id="sl-joy-base"></div>
-              <div id="sl-joy-knob"></div>
-            </div>
-            <button id="sl-attack" class="sl-btn sl-movable">공격</button>
-            <button id="sl-confirm" class="sl-btn sl-movable">확인</button>
-            <button id="sl-cancel" class="sl-btn sl-movable">취소</button>
-            <button id="sl-bag" class="sl-btn sl-movable">가방</button>
-            <button id="sl-equip" class="sl-btn sl-movable">장비</button>
-            <button id="sl-slots" class="sl-btn sl-movable">슬롯</button>
-            <button id="sl-q1" class="sl-btn sl-movable">1</button>
-            <button id="sl-q2" class="sl-btn sl-movable">2</button>
-            <button id="sl-q3" class="sl-btn sl-movable">3</button>
-            <button id="sl-q4" class="sl-btn sl-movable">4</button>
-            <button id="sl-edit">배치</button>
-          </div>
-          '''
+                const progress = slProgress();
+                const spinner = document.getElementById('spinner');
 
-          if 'sl-boot-monitor' not in html:
-              html = html.replace('<head>', '<head>\n' + boot, 1)
-          if 'sl-mobile-v2-style' not in html:
-              html = html.replace('</head>', css + '\n</head>', 1)
-          if 'id="sl-mobile-ui"' not in html:
-              html = html.replace('</body>', controls + '\n</body>', 1)
+                if (progress) progress.style.display = 'none';
+                if (spinner) spinner.style.display = 'none';
+              }
 
-          index.write_text(html)
-          print(f'FINALIZE_OK {variant} {build_id} {new_core}')
+              function slBootFail(message) {
+                const node = slProgress();
+                if (!node) return;
+
+                node.style.display = 'block';
+                node.style.left = '8px';
+                node.style.right = '8px';
+                node.style.top = '8px';
+                node.style.bottom = 'auto';
+                node.style.opacity = '1';
+                node.style.background = '#000';
+                node.style.color = '#fff';
+                node.style.border = '2px solid #d33';
+                node.style.padding = '10px';
+                node.textContent = 'BOOT ERROR\n' + message;
+              }
+
+              (function(){
+                const channels = {BGM:new Audio(), BGS:new Audio()};
+                const pending = [];
+
+                channels.BGM.loop = true;
+                channels.BGS.loop = true;
+
+                function audioUrl(name) {
+                  const path = String(name || '').replace(/\\/g, '/').replace(/\.(ogg|mp3|wav|wma|aac|m4a|flac|mid|midi)$/i, '');
+                  return encodeURI('gameasync/' + path + '.ogg?v=__BUILD_ID__');
+                }
+
+                function safePlay(audio) {
+                  if (!audio || !audio.src) return;
+
+                  try {
+                    const promise = audio.play();
+
+                    if (promise && promise.catch) {
+                      promise.catch(function(){
+                        if (pending.indexOf(audio) < 0) pending.push(audio);
+                      });
+                    }
+                  } catch (error) {
+                    if (pending.indexOf(audio) < 0) pending.push(audio);
+                  }
+                }
+
+                ['touchstart','pointerdown','keydown','mousedown'].forEach(function(name){
+                  addEventListener(name, function(){
+                    pending.splice(0).forEach(safePlay);
+                  }, {passive:true});
+                });
+
+                function stop(kind) {
+                  const audio = channels[kind];
+                  if (!audio) return;
+
+                  audio.pause();
+
+                  try {
+                    audio.currentTime = 0;
+                  } catch (error) {}
+                }
+
+                function play(kind, name, volume, pitch) {
+                  const audio = channels[kind];
+                  if (!audio || !name) return;
+
+                  const url = audioUrl(name);
+
+                  if (audio.dataset.slSrc !== url) {
+                    audio.pause();
+                    audio.src = url;
+                    audio.dataset.slSrc = url;
+                    audio.load();
+                  }
+
+                  audio.volume = Math.max(0, Math.min(1, Number(volume || 100) / 100 * (kind === 'BGS' ? 0.2 : 1)));
+                  audio.playbackRate = Math.max(0.5, Math.min(1.5, Number(pitch || 100) / 100));
+
+                  safePlay(audio);
+                }
+
+                const originalLog = console.log.bind(console);
+
+                console.log = function(){
+                  const args = Array.prototype.slice.call(arguments);
+                  const text = args.join(' ');
+
+                  try {
+                    dispatchEvent(new CustomEvent('sl-log', {detail:text}));
+                  } catch (error) {}
+
+                  if (text.indexOf('SLAUDIO|') >= 0) {
+                    const parts = text.slice(text.indexOf('SLAUDIO|')).split('|');
+                    const command = parts[1] || '';
+                    const kind = command.split('_')[0];
+
+                    if (/_PLAY$/.test(command)) {
+                      play(kind, parts.slice(2, -2).join('|'), parts[parts.length - 2], parts[parts.length - 1]);
+                    } else if (/_STOP$/.test(command)) {
+                      stop(kind);
+                    } else if (/_FADE$/.test(command)) {
+                      setTimeout(function(){ stop(kind); }, Number(parts[2]) || 0);
+                    }
+                  }
+
+                  if (text.indexOf('SLBOOT|RUBY_MAIN') >= 0) slBootStage('RUBY MAIN');
+
+                  if (text.indexOf('SLBOOT|SCENE_TITLE') >= 0 || text.indexOf('SLFRAME|Scene_Title') >= 0) {
+                    slBootReady('SCENE TITLE');
+                  }
+
+                  if (text.indexOf('SLBOOT|SCENE_MAP') >= 0 || text.indexOf('SLFRAME|Scene_Map') >= 0) {
+                    slBootReady('SCENE MAP');
+                  }
+
+                  if (text.indexOf('SLRUNTIMEERR|') >= 0 || text.indexOf('SLSCRIPTERR|') >= 0) {
+                    slBootFail(text);
+                  }
+
+                  originalLog.apply(console, args);
+                };
+              })();
+
+              addEventListener('error', function(event){
+                slBootFail('JS ERROR | ' + event.message);
+              });
+
+              addEventListener('unhandledrejection', function(event){
+                slBootFail('PROMISE ERROR | ' + String(event.reason));
+              });
+
+              var Module = {
+                preRun: [
+                  function(){
+                    if (window.restoreLocalFilesBeforeRun) window.restoreLocalFilesBeforeRun();
+                  }
+                ],
+                postRun: [],
+                noAudioDecoding: true,
+                print: function(text){ console.log(text); },
+                printErr: function(text){
+                  if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+                  console.error(text);
+                },
+                canvas: document.getElementById('canvas'),
+                setStatus: function(text){
+                  if (text) slBootStage(text);
+                },
+                monitorRunDependencies: function(left){
+                  slBootStage('RUN DEPENDENCIES: ' + left);
+                },
+                locateFile: function(path, prefix){
+                  if (path === 'mkxp.wasm') return 'mkxp.wasm?v=__BUILD_ID__';
+                  return prefix + path;
+                },
+                onAbort: function(reason){
+                  slBootFail('WASM ABORT | ' + String(reason));
+                }
+              };
+            </script>
+
+            <script src="__CORE_JS__.js?v=__BUILD_ID__"></script>
+
+            <script>
+              function fullscreen() {
+                const main = document.getElementById('main');
+
+                if (main.requestFullscreen) main.requestFullscreen();
+
+                try {
+                  if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape');
+                } catch (error) {}
+              }
+
+              slBootStage('ENGINE DOWNLOAD');
+
+              setTimeout(function(){
+                getLazyAsset('mkxp.wasm?v=__BUILD_ID__', 'Game engine', function(){
+                  const script = document.createElement('script');
+                  script.src = 'mkxp.js?v=__BUILD_ID__';
+                  document.body.appendChild(script);
+                });
+              }, 200);
+
+              setTimeout(function(){
+                if (window.SL_BOOT_STAGE !== 'SCENE TITLE' && window.SL_BOOT_STAGE !== 'SCENE MAP') {
+                  const node = slProgress();
+
+                  if (node && node.style.display !== 'none') {
+                    node.textContent = 'STILL LOADING\n' + (window.SL_BOOT_STAGE || 'UNKNOWN') + '\nBUILD __BUILD_ID__';
+                  }
+                }
+              }, 25000);
+            </script>
+
+            <!-- {{{ SCRIPT }}} -->
+          </body>
+          </html>
+          HTML
+
+          node --check engine/extra/js/mobile.js
+          ! grep -Fq 'is_touch_device' engine/extra/shell.html
+          ! grep -Fq 'bindKey(' engine/extra/shell.html
+          ! grep -Fq 'id="dpad"' engine/extra/shell.html
+          ! grep -Fq 'id="apad"' engine/extra/shell.html
+
+      - name: Patch save loader before engine build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/extra/js/drive.js')
+          source = path.read_text()
+
+          marker = '    if (window.fileAsyncCache.hasOwnProperty(mappingKey)) return callback();'
+          replacement = marker + "\n    try { const mv=mappingValue; if(mv){ const fp='/game/'+mv.split('?')[0]; if(FS.analyzePath(fp).exists && FS.stat(fp).size>1){ window.fileAsyncCache[mappingKey]=1; return callback(); } } } catch(e) {}"
+
+          if source.count(marker) != 1:
+              raise SystemExit('loadFileAsync marker mismatch')
+
+          source = source.replace(marker, replacement, 1)
+
+          start = source.index('window.saveFile = function(filename, localOnly) {')
+          end = source.index('\n};', start) + 3
+
+          replacement = """window.saveFile = function(filename, localOnly) {
+              const fpath='/game/'+filename;
+              if(!FS.analyzePath(fpath).exists) return Promise.resolve(false);
+              const buf=FS.readFile(fpath);
+              return localforage.setItem(namespace+filename,buf)
+                .then(()=>localforage.getItem(namespace))
+                .then(folder=>{
+                  folder=folder||{};
+                  folder[filename]={t:Number(FS.stat(fpath).mtime)};
+                  return localforage.setItem(namespace,folder);
+                })
+                .then(()=>{
+                  if(!localOnly)(window.saveCloudFile||(()=>{}))(filename,buf);
+                  console.log('SLSAVED|'+filename);
+                  return true;
+                })
+                .catch(e=>{
+                  console.error('SLSAVEERR',e);
+                  return false;
+                });
+          };
+          window.restoreLocalFilesBeforeRun=function(){
+              const dep='sl-local-saves';
+              addRunDependency(dep);
+
+              try{
+                  if(!FS.analyzePath('/game').exists)FS.mkdir('/game');
+              }catch(e){}
+
+              localforage.getItem(namespace)
+                .then(folder=>Promise.all(Object.keys(folder||{}).map(key=>
+                  localforage.getItem(namespace+key).then(res=>{
+                    if(!res)return;
+                    const f='/game/'+key;
+
+                    try{
+                      if(FS.analyzePath(f).exists)FS.unlink(f);
+                    }catch(e){}
+
+                    FS.writeFile(f,res);
+                    const meta=folder[key];
+
+                    if(meta&&Number.isInteger(meta.t))FS.utime(f,meta.t,meta.t);
+                  })
+                )))
+                .then(()=>{
+                  console.log('SLRESTORE|done');
+                  removeRunDependency(dep);
+                })
+                .catch(e=>{
+                  console.error('SLRESTOREERR',e);
+                  removeRunDependency(dep);
+                });
+          };"""
+
+          path.write_text(source[:start] + replacement + source[end:])
           PY
 
-      - name: Finalize Knight browser
+          node --check engine/extra/js/drive.js
+
+      - name: Build clean mobile engine
         run: |
-          python3 /tmp/finalize_site.py \
-            player \
-            knight \
-            SLKnight \
-            slknight_v14_engine \
-            slknight-core-v144 \
-            "$BUILD_ID"
-          node --check player/js/dpad.js
+          bash /tmp/base60_build_engine.sh
+          test -s engine/build/index.html
+          test -s engine/build/mkxp.js
+          test -s engine/build/mkxp.wasm
+          test -s engine/build/js/mobile.js
+          test ! -e engine/build/js/dpad.js
+          ! grep -Fq 'is_touch_device' engine/build/index.html
+          ! grep -Fq 'bindKey(' engine/build/index.html
+          echo CLEAN_ENGINE_OK
+
+      - name: Create mobile runtime patch
+        run: |
+          cat > /tmp/mobile_runtime.rb <<'RB'
+          # encoding: UTF-8
+          require 'zlib'
+
+          root = ARGV.fetch(0)
+          mode = ARGV.fetch(1)
+          path = File.join(root, 'gameasync', 'Data', 'Scripts.rxdata')
+          scripts = Marshal.load(File.binread(path))
+
+          def entry_for(scripts, name)
+            scripts.find { |entry| entry.is_a?(Array) && entry.length >= 3 && entry[1].to_s == name }
+          end
+
+          def inflate(entry)
+            Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
+          end
+
+          def deflate(entry, source)
+            entry[2] = Zlib::Deflate.deflate(source)
+          end
+
+          scripts.reject! { |entry| entry.is_a?(Array) && entry.length >= 3 && entry[1].to_s == 'Mobile Diablo Assist' }
+
+          map = entry_for(scripts, 'Scene_Map')
+
+          if map
+            source = inflate(map)
+
+            unless source.include?('SL_MOBILE_MAP_UNLOCK')
+              source.sub!(/  def main\r?\n/, "  def main\n    $game_switches[49] = false if $game_switches\n    puts('SL_MOBILE_MAP_UNLOCK')\n")
+            end
+
+            source.gsub!(/\s*if \$game_switches\[49\] == false\r?\n\s*Input\.update\s*\r?\n\s*end\r?\n/, "\n     Input.update\n")
+            deflate(map, source)
+          end
+
+          equip = entry_for(scripts, 'Scene_Equip')
+
+          if equip
+            source = inflate(equip)
+            source.gsub!('$game_switches[49] = true', '$game_switches[49] = false')
+            deflate(equip, source)
+          end
+
+          save = entry_for(scripts, 'Scene_Save')
+
+          if save
+            source = inflate(save)
+
+            unless source.include?('save_file_async(filename)')
+              source.sub!(/    write_save_data\(file\)\r?\n    exit/, "    write_save_data(file)\n    file.close\n    save_file_async(filename)")
+            end
+
+            unless source.include?('SL_MOBILE_SAVE_UNLOCK')
+              source.sub!('    save_file_async(filename)', "    save_file_async(filename)\n    $game_switches[49] = false if $game_switches\n    puts('SL_MOBILE_SAVE_UNLOCK')")
+            end
+
+            source.gsub!('$scene = Scene_Menu.new(4)', '$scene = Scene_Map.new')
+            deflate(save, source)
+          end
+
+          defaults = mode == 'knight' ? [114, 3, 17, 2] : [0, 0, 0, 0]
+
+          assist = <<RUBY
+          \$sl_attack_target_id=0
+          \$sl_attack_pulse_event_id=0
+          \$sl_attack_cooldown=0
+
+          class Game_Event
+            def sl_mobile_enemy_event?
+              event_data=instance_variable_get(:@event)
+              page_data=instance_variable_get(:@page)
+              erased=instance_variable_get(:@erased)
+
+              return false if event_data==nil||page_data==nil||erased
+
+              name=event_data.instance_variable_get(:@name).to_s
+
+              return false unless name[0,3]=='[ID'
+              return false if self.through
+              return false unless self.trigger==2
+
+              true
+            end
+          end
+
+          class Interpreter
+            alias sl_targetlock_original_command_111 command_111
+
+            def command_111
+              if \$sl_attack_pulse_event_id.to_i>0 &&
+                 @event_id==\$sl_attack_pulse_event_id &&
+                 @parameters[0]==11 &&
+                 @parameters[1]==13
+
+                \$sl_attack_pulse_event_id=0
+                @branch[@list[@index].indent]=true
+                @branch.delete(@list[@index].indent)
+                return true
+              end
+
+              sl_targetlock_original_command_111
+            end
+          end
+
+          class Game_System
+            def sl_quick_items
+              @sl_quick_items=#{defaults.inspect} if @sl_quick_items==nil
+              @sl_quick_items
+            end
+
+            def sl_quick_items=(value)
+              @sl_quick_items=value
+            end
+          end
+
+          module SLMobileQuick
+            def self.emit_labels
+              return if \$game_system==nil
+
+              \$game_system.sl_quick_items.each_with_index do |id,index|
+                item=id.to_i>0&&\$data_items ? \$data_items[id.to_i] : nil
+                name=item ? item.name.to_s.gsub('|','/') : '비어있음'
+                puts('SLQS|'+(index+1).to_s+'|'+name)
+              end
+            end
+
+            def self.use(slot)
+              return if \$game_party==nil||\$game_system==nil
+
+              id=\$game_system.sl_quick_items[slot].to_i
+              item=id>0&&\$data_items ? \$data_items[id] : nil
+
+              unless item&&item.is_a?(RPG::Item)&&\$game_party.item_number(id)>0
+                \$game_system.se_play(\$data_system.buzzer_se) if \$data_system
+                return
+              end
+
+              if #{mode.dump}=='knight'&&id==114
+                if \$game_switches[367]==true&&\$game_party.item_number(114)>=1
+                  \$game_party.lose_item(114,1)
+                  \$game_temp.common_event_id=2
+
+                  if \$game_switches[1081]==true&&defined?(\$p)&&\$p
+                    actor=\$game_party.actors[0]
+                    \$p.drawPHP(actor.hp,actor.maxhp,actor.sp,actor.maxsp)
+                  end
+
+                  \$KeyIcon.ShowIcon if defined?(\$KeyIcon)&&\$KeyIcon
+                else
+                  \$game_system.se_play(\$data_system.buzzer_se)
+                end
+
+                return
+              end
+
+              unless \$game_party.item_can_use?(id)
+                \$game_system.se_play(\$data_system.buzzer_se)
+                return
+              end
+
+              used=false
+
+              if item.scope>=3
+                if item.scope==4||item.scope==6
+                  for actor in \$game_party.actors
+                    used|=actor.item_effect(item)
+                  end
+                else
+                  actor=\$game_party.actors[0]
+                  used=actor ? actor.item_effect(item) : false
+                end
+              elsif item.common_event_id>0
+                used=true
+              end
+
+              if used
+                \$game_system.se_play(item.menu_se)
+                \$game_party.lose_item(id,1) if item.consumable
+                \$game_temp.common_event_id=item.common_event_id if item.common_event_id>0
+                \$KeyIcon.ShowIcon if defined?(\$KeyIcon)&&\$KeyIcon
+              else
+                \$game_system.se_play(\$data_system.buzzer_se)
+              end
+            end
+          end
+
+          class Scene_MobileQuick
+            def initialize(slot_index=0)
+              @slot_index=slot_index
+            end
+
+            def main
+              @help_window=Window_Help.new
+              @help_window.set_text('빠른슬롯을 선택한 뒤 소지 아이템을 지정하세요.')
+              build_slot_window
+
+              @item_window=Window_Item.new
+              @item_window.help_window=@help_window
+              @item_window.active=false
+              @item_window.visible=false
+
+              Graphics.transition
+            end
+
+            def build_slot_window
+              old_index=@slot_window ? @slot_window.index : @slot_index
+              @slot_window.dispose if @slot_window
+
+              names=[]
+
+              \$game_system.sl_quick_items.each_with_index do |id,index|
+                item=id.to_i>0&&\$data_items ? \$data_items[id.to_i] : nil
+                names << "\#{index+1}. \#{item ? item.name.to_s : '비어 있음'}"
+              end
+
+              @slot_window=Window_Command.new(300,names)
+              @slot_window.x=0
+              @slot_window.y=64
+              @slot_window.index=[[old_index,0].max,3].min
+            end
+
+            def dispose
+              Graphics.freeze
+              @help_window.dispose if @help_window
+              @slot_window.dispose if @slot_window
+              @item_window.dispose if @item_window
+            end
+
+            def update
+              @help_window.update
+              @slot_window.update
+              @item_window.update
+
+              if @slot_window.active
+                if Input.trigger?(Input::B)
+                  \$game_system.se_play(\$data_system.cancel_se)
+                  \$scene=Scene_Map.new
+                  return
+                end
+
+                if Input.trigger?(Input::C)
+                  \$game_system.se_play(\$data_system.decision_se)
+                  @slot_index=@slot_window.index
+                  @slot_window.active=false
+                  @item_window.visible=true
+                  @item_window.active=true
+                  @item_window.index=0
+                  return
+                end
+              else
+                if Input.trigger?(Input::B)
+                  \$game_system.se_play(\$data_system.cancel_se)
+                  @item_window.active=false
+                  @item_window.visible=false
+                  @slot_window.active=true
+                  return
+                end
+
+                if Input.trigger?(Input::C)
+                  item=@item_window.item
+
+                  unless item&&item.is_a?(RPG::Item)
+                    \$game_system.se_play(\$data_system.buzzer_se)
+                    return
+                  end
+
+                  \$game_system.sl_quick_items[@slot_index]=item.id
+                  \$game_system.se_play(\$data_system.decision_se)
+
+                  @item_window.active=false
+                  @item_window.visible=false
+
+                  build_slot_window
+                  @slot_window.active=true
+                  SLMobileQuick.emit_labels
+                  return
+                end
+              end
+            end
+          end
+
+          class Game_Player
+            def sl_mobile_front_enemy
+              tx=self.x
+              ty=self.y
+
+              case self.direction
+              when 2 then ty+=1
+              when 4 then tx-=1
+              when 6 then tx+=1
+              when 8 then ty-=1
+              end
+
+              for event in \$game_map.events.values
+                next unless event.sl_mobile_enemy_event?
+                return event if event.x==tx&&event.y==ty
+              end
+
+              nil
+            end
+
+            def sl_mobile_target_event
+              id=\$sl_attack_target_id.to_i
+              return nil if id<=0
+
+              event=\$game_map.events[id]
+
+              return nil if event==nil
+              return nil unless event.sl_mobile_enemy_event?
+              return nil unless (event.x-self.x).abs+(event.y-self.y).abs==1
+
+              event
+            end
+
+            def sl_mobile_clear_target
+              if \$sl_attack_target_id.to_i>0
+                \$sl_attack_target_id=0
+                \$sl_attack_pulse_event_id=0
+                puts('SLTARGET|0')
+              end
+            end
+
+            def sl_mobile_toggle_target
+              if sl_mobile_target_event
+                sl_mobile_clear_target
+                return
+              end
+
+              event=sl_mobile_front_enemy
+
+              if event
+                \$sl_attack_target_id=event.id
+                puts('SLTARGET|'+event.id.to_s)
+              else
+                sl_mobile_clear_target
+              end
+            end
+
+            def sl_mobile_attack_tick
+              \$sl_attack_cooldown-=1 if \$sl_attack_cooldown>0
+
+              event=sl_mobile_target_event
+
+              if event==nil
+                sl_mobile_clear_target
+                return
+              end
+
+              return if moving?
+              return if @move_route_forcing
+              return if \$game_temp.message_window_showing
+              return if \$game_system.map_interpreter.running?
+              return if \$sl_attack_cooldown>0
+
+              dx=event.x-self.x
+              dy=event.y-self.y
+
+              if dx>0
+                turn_right
+              elsif dx<0
+                turn_left
+              elsif dy>0
+                turn_down
+              else
+                turn_up
+              end
+
+              event.turn_toward_player
+
+              \$sl_attack_pulse_event_id=event.id
+              \$sl_attack_cooldown=18
+              event.start
+            end
+          end
+
+          class Scene_Map
+            alias sl_mobile_runtime_main main
+
+            def main
+              puts('SLBOOT|SCENE_MAP')
+              SLMobileQuick.emit_labels
+              sl_mobile_runtime_main
+            end
+
+            alias sl_mobile_runtime_update update
+
+            def update
+              \$game_player.sl_mobile_toggle_target if Input.trigger?(Input::Z)
+
+              if Input.trigger?(Input::F5)
+                \$scene=Scene_MobileQuick.new
+                return
+              end
+
+              SLMobileQuick.use(0) if Input.trigger?(Input::F6)
+              SLMobileQuick.use(1) if Input.trigger?(Input::F7)
+              SLMobileQuick.use(2) if Input.trigger?(Input::F8)
+              SLMobileQuick.use(3) if Input.trigger?(Input::F9)
+
+              \$game_player.sl_mobile_attack_tick
+              sl_mobile_runtime_update
+            end
+          end
+          RUBY
+
+          main_index=scripts.index { |entry| entry.is_a?(Array)&&entry.length>=3&&entry[1].to_s=='Main' }
+          abort 'Main missing' unless main_index
+
+          scripts.insert(main_index,[99999991,'Mobile Diablo Assist',Zlib::Deflate.deflate(assist)])
+
+          main=entry_for(scripts,'Main')
+
+          if main
+            source=inflate(main)
+            source="puts('SLBOOT|RUBY_MAIN')\n"+source unless source.include?('SLBOOT|RUBY_MAIN')
+            deflate(main,source)
+          end
+
+          title=entry_for(scripts,'Scene_Title')
+
+          if title
+            source=inflate(title)
+
+            unless source.include?('SLBOOT|SCENE_TITLE')
+              source.sub!(/  def main\r?\n/,"  def main\n    puts('SLBOOT|SCENE_TITLE')\n")
+            end
+
+            deflate(title,source)
+          end
+
+          File.binwrite(path,Marshal.dump(scripts))
+          puts "MOBILE_RUNTIME_OK #{mode}"
+          RB
+
+          ruby -c /tmp/mobile_runtime.rb
+
+      - name: Create independent site helpers
+        run: |
+          cat > /tmp/build_core.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          site="$1"
+          core="$2"
+
+          (
+            cd "$site/gameasync"
+            bash "$GITHUB_WORKSPACE/engine/extra/make_mapping.sh"
+          )
+
+          test -s "$site/gameasync/mapping.js"
+          rm -f "$site/gameasync/bitmap-map.js"
+
+          source engine/deps/emsdk/emsdk_env.sh >/dev/null
+
+          args=(
+            --preload "$site/gameasync/Data@/game/Data"
+            --preload "$site/gameasync/Graphics@/game/Graphics"
+            --preload "$site/gameasync/Fonts@/game/Fonts"
+            --preload "$site/gameasync/Game.ini@/game/Game.ini"
+            --preload "$site/gameasync/rgss.rb@/game/rgss.rb"
+          )
+
+          [ -d "$site/gameasync/Audio/SE" ] && args+=(--preload "$site/gameasync/Audio/SE@/game/Audio/SE)
+          [ -d "$site/gameasync/Audio/ME" ] && args+=(--preload "$site/gameasync/Audio/ME@/game/Audio/ME)
+          [ -d "$site/gameasync/BM" ] && args+=(--preload "$site/gameasync/BM@/game/BM)
+          [ -f "$site/gameasync/Lineage.ini" ] && args+=(--preload "$site/gameasync/Lineage.ini@/game/Lineage.ini)
+
+          python3 engine/deps/emsdk/upstream/emscripten/tools/file_packager.py "$site/$core.data" "${args[@]}" --js-output="$site/$core.js" --no-node
+
+          test -s "$site/$core.data"
+          test -s "$site/$core.js"
+          SH
+
+          chmod +x /tmp/build_core.sh
+
+          cat > /tmp/configure_site.py <<'PY'
+          from pathlib import Path
+          import sys
+
+          site=Path(sys.argv[1])
+          title=sys.argv[2]
+          variant=sys.argv[3]
+          namespace=sys.argv[4]
+          core=sys.argv[5]
+          build=sys.argv[6]
+
+          path=site/'index.html'
+          html=path.read_text()
+
+          values={
+              '__TITLE__':title,
+              '__VARIANT__':variant,
+              '__NAMESPACE__':namespace,
+              '__CORE_JS__':core,
+              '__BUILD_ID__':build
+          }
+
+          for key,value in values.items():
+              if key not in html:
+                  raise SystemExit(f'missing shell token {key}')
+              html=html.replace(key,value)
+
+          for key in values:
+              if key in html:
+                  raise SystemExit(f'unresolved shell token {key}')
+
+          path.write_text(html)
+          (site/'.nojekyll').touch()
+
+          print(f'SITE_CONFIG_OK {variant} {build}')
+          PY
+
+      - name: Build Knight independently
+        run: |
+          set -euo pipefail
+
+          bash /tmp/base60_install_knight.sh
+          bash /tmp/base60_patch_knight.sh
+
+          ruby -EUTF-8:UTF-8 /tmp/mobile_runtime.rb player knight
+          bash /tmp/base60_convert_knight.sh
+
+          CORE="knight-core-${BUILD_ID}"
+
+          /tmp/build_core.sh player "$CORE"
+
+          python3 /tmp/configure_site.py player SLKnight knight slknight_independent_save "$CORE" "$BUILD_ID"
+
+          test -s "player/$CORE.data"
+          test -s "player/$CORE.js"
+          node --check player/js/mobile.js
           node --check player/js/drive.js
+
+          ! grep -Fq 'is_touch_device' player/index.html
+          ! grep -Fq 'bindKey(' player/index.html
+          ! grep -Fq 'id="dpad"' player/index.html
+          ! grep -Fq 'id="apad"' player/index.html
+
+          grep -Fq 'id="sl-attack"' player/index.html
+          grep -Fq "window.SL_VARIANT = 'knight'" player/index.html
+
+          echo KNIGHT_READY
 
       - name: Prepare Fairy source independently
         run: |
           set -euo pipefail
-          curl -L --fail --retry 3 -o fairy-source.zip "$FAIRY_URL"
-          echo "$FAIRY_SHA256  fairy-source.zip" | sha256sum -c -
+
+          curl -L --fail --retry 3 -o fairy.zip "$FAIRY_URL"
+          echo "$FAIRY_SHA256  fairy.zip" | sha256sum -c -
 
           rm -rf /tmp/fairy_pkg /tmp/fairy_raw /tmp/fairy_game fairy_player
           mkdir -p /tmp/fairy_pkg /tmp/fairy_raw /tmp/fairy_game
 
-          unzip -q fairy-source.zip -d /tmp/fairy_pkg
+          unzip -q fairy.zip -d /tmp/fairy_pkg
           test -s /tmp/fairy_pkg/SLFairy_Win_241226.7z
 
-          7z x \
-            /tmp/fairy_pkg/SLFairy_Win_241226.7z \
-            -p"$FAIRY_7Z_PASSWORD" \
-            -o/tmp/fairy_raw \
-            -y >/tmp/fairy_7z.log
+          7z x /tmp/fairy_pkg/SLFairy_Win_241226.7z -p"$FAIRY_7Z_PASSWORD" -o/tmp/fairy_raw -y >/tmp/fairy_7z.log
 
           test -s /tmp/fairy_raw/Game.rgssad
           test -s /tmp/fairy_raw/Game.ini
@@ -1169,99 +1435,100 @@ jobs:
           import struct
           import sys
 
-          MASK = 0xffffffff
-          KEY0 = 0xDEADCAFE
+          MASK=0xffffffff
+          KEY0=0xDEADCAFE
 
           def rotate(key):
-              return ((key * 7) + 3) & MASK
+              return ((key*7)+3)&MASK
 
-          src = Path(sys.argv[1])
-          out = Path(sys.argv[2])
-          out.mkdir(parents=True, exist_ok=True)
+          src=Path(sys.argv[1])
+          out=Path(sys.argv[2])
+          out.mkdir(parents=True,exist_ok=True)
 
           with src.open('rb') as handle:
-              header = handle.read(8)
-              if header[:7] != b'RGSSAD\0' or len(header) != 8 or header[7] != 1:
+              header=handle.read(8)
+
+              if header[:7]!=b'RGSSAD\0' or len(header)!=8 or header[7]!=1:
                   raise SystemExit(f'unsupported RGSSAD header: {header!r}')
 
-              key = KEY0
-              count = 0
+              key=KEY0
+              count=0
 
               while True:
-                  raw = handle.read(4)
+                  raw=handle.read(4)
+
                   if not raw:
                       break
-                  if len(raw) != 4:
+
+                  if len(raw)!=4:
                       raise SystemExit('truncated filename length')
 
-                  length = struct.unpack('<I', raw)[0] ^ key
-                  key = rotate(key)
+                  name_length=struct.unpack('<I',raw)[0]^key
+                  key=rotate(key)
 
-                  if length > 4096:
-                      raise SystemExit(f'bad filename length: {length}')
+                  if name_length>4096:
+                      raise SystemExit(f'bad filename length: {name_length}')
 
-                  encoded = bytearray(handle.read(length))
-                  if len(encoded) != length:
+                  encoded=bytearray(handle.read(name_length))
+
+                  if len(encoded)!=name_length:
                       raise SystemExit('truncated filename')
 
-                  for i in range(length):
-                      encoded[i] ^= key & 0xff
-                      key = rotate(key)
+                  for i in range(name_length):
+                      encoded[i]^=key&0xff
+                      key=rotate(key)
 
-                  raw = handle.read(4)
-                  if len(raw) != 4:
+                  raw=handle.read(4)
+
+                  if len(raw)!=4:
                       raise SystemExit('truncated file length')
 
-                  size = struct.unpack('<I', raw)[0] ^ key
-                  key = rotate(key)
+                  size=struct.unpack('<I',raw)[0]^key
+                  key=rotate(key)
 
                   try:
-                      name = bytes(encoded).decode('cp949')
+                      name=bytes(encoded).decode('cp949')
                   except UnicodeDecodeError:
-                      name = bytes(encoded).decode('utf-8', 'replace')
+                      name=bytes(encoded).decode('utf-8','replace')
 
-                  parts = [
-                      part for part in name.replace('\\', '/').split('/')
-                      if part not in ('', '.', '..')
-                  ]
+                  parts=[part for part in name.replace('\\','/').split('/') if part not in ('','.','..')]
 
                   if not parts:
                       raise SystemExit('unsafe path')
 
-                  target = out.joinpath(*parts)
-                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target=out.joinpath(*parts)
+                  target.parent.mkdir(parents=True,exist_ok=True)
 
-                  data_key = key
-                  counter = 0
-                  remaining = size
+                  data_key=key
+                  counter=0
+                  remaining=size
 
                   with target.open('wb') as writer:
                       while remaining:
-                          chunk = bytearray(handle.read(min(1 << 20, remaining)))
+                          chunk=bytearray(handle.read(min(1<<20,remaining)))
+
                           if not chunk:
                               raise SystemExit(f'truncated data: {name}')
 
-                          key_bytes = data_key.to_bytes(4, 'little')
+                          key_bytes=data_key.to_bytes(4,'little')
 
                           for i in range(len(chunk)):
-                              chunk[i] ^= key_bytes[counter]
-                              counter = (counter + 1) & 3
+                              chunk[i]^=key_bytes[counter]
+                              counter=(counter+1)&3
 
-                              if counter == 0:
-                                  data_key = rotate(data_key)
-                                  key_bytes = data_key.to_bytes(4, 'little')
+                              if counter==0:
+                                  data_key=rotate(data_key)
+                                  key_bytes=data_key.to_bytes(4,'little')
 
                           writer.write(chunk)
-                          remaining -= len(chunk)
+                          remaining-=len(chunk)
 
-                  count += 1
+                  count+=1
 
           print(f'FAIRY_RGSSAD_EXTRACT_OK {count}')
           PY
 
-          python3 /tmp/rgssad_extract.py \
-            /tmp/fairy_raw/Game.rgssad \
-            /tmp/fairy_game
+          python3 /tmp/rgssad_extract.py /tmp/fairy_raw/Game.rgssad /tmp/fairy_game
 
           cp /tmp/fairy_raw/Game.ini /tmp/fairy_game/Game.ini
 
@@ -1283,8 +1550,9 @@ jobs:
           cp /usr/share/fonts/truetype/nanum/NanumGothic.ttf fairy_player/gameasync/Fonts/NanumGothic.ttf
           cp /usr/share/fonts/truetype/nanum/NanumGothicBold.ttf fairy_player/gameasync/Fonts/NanumGothicBold.ttf
 
-          rm -f fairy_player/gameasync/Game.rgssad
-          rm -f fairy_player/gameasync/Save*.rxdata
+          rm -f fairy_player/gameasync/Game.rgssad fairy_player/gameasync/Save*.rxdata
+
+          echo FAIRY_SOURCE_READY
 
       - name: Patch Fairy web compatibility
         run: |
@@ -1292,57 +1560,43 @@ jobs:
           # encoding: UTF-8
           require 'zlib'
 
-          game = ARGV.fetch(0)
-          ini_path = File.join(game, 'Game.ini')
-          ini = File.binread(ini_path)
+          game=ARGV.fetch(0)
+          ini_path=File.join(game,'Game.ini')
+          ini=File.binread(ini_path)
 
-          rel = ini[/^Scripts=(.+)$/i, 1].to_s.strip.tr('\\', '/')
-          abort 'Fairy Scripts entry missing' if rel.empty?
+          relative=ini[/^Scripts=(.+)$/i,1].to_s.strip.tr('\\','/')
+          abort 'Fairy Scripts entry missing' if relative.empty?
 
-          source_path = File.join(game, rel)
+          source_path=File.join(game,relative)
           abort "Fairy scripts missing: #{source_path}" unless File.file?(source_path)
 
-          scripts = Marshal.load(File.binread(source_path))
+          scripts=Marshal.load(File.binread(source_path))
 
           def inflate(entry)
             Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
           end
 
-          def deflate(entry, source)
-            entry[2] = Zlib::Deflate.deflate(source)
+          def deflate(entry,source)
+            entry[2]=Zlib::Deflate.deflate(source)
           end
 
-          def entry_for(scripts, name)
-            scripts.find do |entry|
-              entry.is_a?(Array) &&
-                entry.length >= 3 &&
-                entry[1].to_s == name
-            end
+          def entry_for(scripts,name)
+            scripts.find { |entry| entry.is_a?(Array)&&entry.length>=3&&entry[1].to_s==name }
           end
 
           scripts.reject! do |entry|
-            entry.is_a?(Array) &&
-              entry.length >= 3 &&
-              [
-                'Web Compatibility',
-                'Web Resolution 800x600',
-                'Mobile Diablo Assist'
-              ].include?(entry[1].to_s)
+            entry.is_a?(Array)&&entry.length>=3&&['Web Compatibility','Web Resolution 800x600','Mobile Diablo Assist'].include?(entry[1].to_s)
           end
 
-          compatibility = <<'RUBY'
-          $joiplay = true
+          compatibility=<<'RUBY'
+          $joiplay=true
 
           module Kernel
-            def exit(*args)
-              nil
-            end
+            def exit(*args);nil;end
           end
 
           class Win32API
-            def initialize(*args)
-              @func = args[1].to_s
-            end
+            def initialize(*args);@func=args[1].to_s;end
 
             def web_input(key)
               case key.to_i
@@ -1362,73 +1616,49 @@ jobs:
             end
 
             def call(*args)
-              code = web_input(args[0])
-              return code && Input.trigger?(code) ? 1 : 0 if @func == 'GetAsyncKeyState'
-              return code && Input.press?(code) ? -1 : 0 if @func == 'GetKeyState'
+              code=web_input(args[0])
+              return(code&&Input.trigger?(code) ? 1 : 0) if @func=='GetAsyncKeyState'
+              return(code&&Input.press?(code) ? -1 : 0) if @func=='GetKeyState'
               0
             end
 
-            def Call(*args)
-              call(*args)
-            end
+            def Call(*args);call(*args);end
           end
 
-          Font.default_name = 'NanumGothic'
+          Font.default_name='NanumGothic'
 
           module Audio
-            def self.sl_stream(kind, *parts)
-              puts((['SLAUDIO', kind] + parts.collect { |v| v.to_s }).join('|'))
-            end
-
-            def self.bgm_play(filename, volume = 100, pitch = 100)
-              sl_stream('BGM_PLAY', filename, volume, pitch)
-            end
-
-            def self.bgm_stop
-              sl_stream('BGM_STOP')
-            end
-
-            def self.bgm_fade(time)
-              sl_stream('BGM_FADE', time)
-            end
-
-            def self.bgs_play(filename, volume = 100, pitch = 100)
-              sl_stream('BGS_PLAY', filename, volume, pitch)
-            end
-
-            def self.bgs_stop
-              sl_stream('BGS_STOP')
-            end
-
-            def self.bgs_fade(time)
-              sl_stream('BGS_FADE', time)
-            end
+            def self.sl_stream(kind,*parts);puts((['SLAUDIO',kind]+parts.collect{|value|value.to_s}).join('|'));end
+            def self.bgm_play(filename,volume=100,pitch=100);sl_stream('BGM_PLAY',filename,volume,pitch);end
+            def self.bgm_stop;sl_stream('BGM_STOP');end
+            def self.bgm_fade(time);sl_stream('BGM_FADE',time);end
+            def self.bgs_play(filename,volume=100,pitch=100);sl_stream('BGS_PLAY',filename,volume,pitch);end
+            def self.bgs_stop;sl_stream('BGS_STOP');end
+            def self.bgs_fade(time);sl_stream('BGS_FADE',time);end
           end
           RUBY
 
-          scripts.insert(
-            0,
-            [0, 'Web Compatibility', Zlib::Deflate.deflate(compatibility)]
-          )
+          scripts.insert(0,[0,'Web Compatibility',Zlib::Deflate.deflate(compatibility)])
 
           def patch_begin_until(source)
-            lines = source.lines
+            lines=source.lines
 
             lines.each_index do |i|
-              match = lines[i].match(/^(\s*)end\s+until\s+(.+?)\s*$/)
+              match=lines[i].match(/^(\s*)end\s+until\s+(.+?)\s*$/)
               next unless match
 
-              indent = match[1]
-              condition = match[2]
-              j = i - 1
+              indent=match[1]
+              condition=match[2]
+              j=i-1
 
-              while j >= 0
-                if lines[j][/^\s*/] == indent && lines[j].strip == 'begin'
-                  lines[j] = indent + "loop do\n"
-                  lines[i] = indent + "  break if #{condition}\n#{indent}end\n"
+              while j>=0
+                if lines[j][/^\s*/]==indent&&lines[j].strip=='begin'
+                  lines[j]=indent+"loop do\n"
+                  lines[i]=indent+"  break if #{condition}\n#{indent}end\n"
                   break
                 end
-                j -= 1
+
+                j-=1
               end
             end
 
@@ -1436,170 +1666,134 @@ jobs:
           end
 
           def patch_scene_loop(source)
-            lines = source.lines
-            i = 0
+            lines=source.lines
+            i=0
 
-            while i < lines.length
-              unless lines[i].strip == 'loop do'
-                i += 1
+            while i<lines.length
+              unless lines[i].strip=='loop do'
+                i+=1
                 next
               end
 
-              indent = lines[i][/^\s*/]
-              significant = []
-              k = i + 1
+              indent=lines[i][/^\s*/]
+              significant=[]
+              k=i+1
 
-              while k < lines.length && significant.length < 8
-                text = lines[k].strip
-                significant << [k, text, lines[k][/^\s*/]] unless text.empty? || text.start_with?('#')
-                k += 1
+              while k<lines.length&&significant.length<8
+                text=lines[k].strip
+                significant << [k,text,lines[k][/^\s*/]] unless text.empty?||text.start_with?('#')
+                k+=1
               end
 
-              finish = nil
+              finish=nil
 
-              if significant.length >= 7 &&
-                 significant[0][1] == 'Graphics.update' &&
-                 significant[1][1] == 'Input.update' &&
-                 significant[2][1] == 'update' &&
-                 significant[3][1] == 'if $scene != self' &&
-                 significant[4][1] == 'break' &&
-                 significant[5][1] == 'end' &&
-                 significant[6][1] == 'end' &&
-                 significant[6][2] == indent
-                finish = significant[6][0]
-              elsif significant.length >= 5 &&
-                    significant[0][1] == 'Graphics.update' &&
-                    significant[1][1] == 'Input.update' &&
-                    significant[2][1] == 'update' &&
-                    significant[3][1] == 'break if $scene != self' &&
-                    significant[4][1] == 'end' &&
-                    significant[4][2] == indent
-                finish = significant[4][0]
+              if significant.length>=7&&significant[0][1]=='Graphics.update'&&significant[1][1]=='Input.update'&&significant[2][1]=='update'&&significant[3][1]=='if $scene != self'&&significant[4][1]=='break'&&significant[5][1]=='end'&&significant[6][1]=='end'&&significant[6][2]==indent
+                finish=significant[6][0]
+              elsif significant.length>=5&&significant[0][1]=='Graphics.update'&&significant[1][1]=='Input.update'&&significant[2][1]=='update'&&significant[3][1]=='break if $scene != self'&&significant[4][1]=='end'&&significant[4][2]==indent
+                finish=significant[4][0]
               end
 
-              lines[i..finish] = [indent + "end\n\n" + indent + "def dispose\n"] if finish
-              i += 1
+              lines[i..finish]=[indent+"end\n\n"+indent+"def dispose\n"] if finish
+              i+=1
             end
 
             lines.join
           end
 
-          browser_loop = <<'RUBY'
-          $prev_scene = nil
-          $sl_last_scene_name = nil
+          browser_loop=<<'RUBY'
+          $prev_scene=nil
+          $sl_last_scene_name=nil
 
           def main_update_loop
             begin
-              if $scene != nil
-                active_scene = $scene
-                name = active_scene.class.to_s
+              if $scene!=nil
+                active_scene=$scene
+                name=active_scene.class.to_s
 
-                if $sl_last_scene_name != name
-                  puts('SLFRAME|' + name)
-                  $sl_last_scene_name = name
+                if $sl_last_scene_name!=name
+                  puts('SLFRAME|'+name)
+                  $sl_last_scene_name=name
                 end
 
-                if active_scene != $prev_scene
-                  $prev_scene.dispose if $prev_scene != nil && $prev_scene.respond_to?(:dispose)
+                if active_scene!=$prev_scene
+                  $prev_scene.dispose if $prev_scene!=nil&&$prev_scene.respond_to?(:dispose)
                   active_scene.main
-                  $prev_scene = active_scene
-                  return if $scene != active_scene
+                  $prev_scene=active_scene
+                  return if $scene!=active_scene
                 end
 
                 Graphics.update
                 Input.update
-                active_scene.update if $scene == active_scene
+                active_scene.update if $scene==active_scene
               end
-            rescue Exception => e
-              puts('SLRUNTIMEERR|' + e.class.to_s + '|' + e.message.to_s)
-              if e.respond_to?(:backtrace) && e.backtrace
-                e.backtrace[0,16].each do |line|
-                  puts('SLRUNTIMEBT|' + line.to_s)
-                end
-              end
+            rescue Exception=>error
+              puts('SLRUNTIMEERR|'+error.class.to_s+'|'+error.message.to_s)
+              error.backtrace[0,16].each{|line|puts('SLRUNTIMEBT|'+line.to_s)} if error.respond_to?(:backtrace)&&error.backtrace
             end
           end
           RUBY
 
-          font_rules = [
-            [/((?:Font\.default_name)\s*=\s*)\[\s*["'][^"']*["']\s*\]/n, '\\1"NanumGothic"'],
-            [/(Font\.default_name\s*=\s*)["'][^"']*["']/n, '\\1"NanumGothic"'],
-            [/(\.font\.name\s*=\s*)["'][^"']*["']/n, '\\1"NanumGothic"'],
-            [/(\bFONT_NAME\s*=\s*)["'][^"']*["']/n, '\\1"NanumGothic"']
+          font_rules=[
+            [/((?:Font\.default_name)\s*=\s*)\[\s*["'][^"']*["']\s*\]/n,'\1"NanumGothic"'],
+            [/(Font\.default_name\s*=\s*)["'][^"']*["']/n,'\1"NanumGothic"'],
+            [/(\.font\.name\s*=\s*)["'][^"']*["']/n,'\1"NanumGothic"'],
+            [/(\bFONT_NAME\s*=\s*)["'][^"']*["']/n,'\1"NanumGothic"']
           ]
 
           scripts.each do |entry|
-            next unless entry.is_a?(Array) && entry.length >= 3
+            next unless entry.is_a?(Array)&&entry.length>=3
 
-            name = entry[1].to_s
+            name=entry[1].to_s
 
             begin
-              source = inflate(entry)
+              source=inflate(entry)
             rescue
               next
             end
 
-            font_rules.each do |rule, replacement|
-              source.gsub!(rule, replacement)
+            font_rules.each { |rule,replacement| source.gsub!(rule,replacement) }
+
+            source.gsub!('defined?($joiplay) && $joiplay','$joiplay == true')
+            source="# native Plane used on web\n" if source.match?(/^\s*class\s+Plane\s*<\s*Sprite\b/n)
+            source=patch_begin_until(source)
+            source=patch_scene_loop(source) unless name=='Main'||name=='Scene_Map'
+
+            if name=='Main'
+              source=browser_loop+source unless source.include?('def main_update_loop')
+              source.sub!(/\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,"\n")
             end
 
-            source.gsub!(
-              'defined?($joiplay) && $joiplay',
-              '$joiplay == true'
-            )
-
-            if source.match?(/^\s*class\s+Plane\s*<\s*Sprite\b/n)
-              source = "# native Plane used on web\n"
-            end
-
-            source = patch_begin_until(source)
-            source = patch_scene_loop(source) unless name == 'Main' || name == 'Scene_Map'
-
-            if name == 'Main'
-              source = browser_loop + source unless source.include?('def main_update_loop')
-              source.sub!(
-                /\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,
-                "\n"
-              )
-            end
-
-            deflate(entry, source)
+            deflate(entry,source)
           end
 
-          resolution = entry_for(scripts, '해상도')
+          resolution=entry_for(scripts,'해상도')
+
           if resolution
-            source = inflate(resolution)
-            source.gsub!('$WINDOW_WIDTH = 640', '$WINDOW_WIDTH = 800')
-            source.gsub!('$WINDOW_HEIGHT = 480', '$WINDOW_HEIGHT = 600')
-            source.gsub!('640, 480', '800, 600')
-            deflate(resolution, source)
+            source=inflate(resolution)
+            source.gsub!('$WINDOW_WIDTH = 640','$WINDOW_WIDTH = 800')
+            source.gsub!('$WINDOW_HEIGHT = 480','$WINDOW_HEIGHT = 600')
+            source.gsub!('640, 480','800, 600')
+            deflate(resolution,source)
           end
 
           scripts.each do |entry|
-            next unless entry.is_a?(Array) && entry.length >= 3
+            next unless entry.is_a?(Array)&&entry.length>=3
 
             begin
-              source = inflate(entry)
+              source=inflate(entry)
             rescue
               next
             end
 
-            if source.include?('XRXS_MP7_Module')
-              deflate(entry, "# web: XRXS menu transparency disabled\n")
-            end
+            deflate(entry,"# web: XRXS menu transparency disabled\n") if source.include?('XRXS_MP7_Module')
           end
 
-          main_index = scripts.index do |entry|
-            entry.is_a?(Array) &&
-              entry.length >= 3 &&
-              entry[1].to_s == 'Main'
-          end
+          main_index=scripts.index { |entry| entry.is_a?(Array)&&entry.length>=3&&entry[1].to_s=='Main' }
+          abort 'Fairy Main missing' unless main_index
 
-          abort 'Fairy Main script missing' unless main_index
-
-          resolution_shim = <<'RUBY'
-          $WINDOW_WIDTH = 800
-          $WINDOW_HEIGHT = 600
+          resolution_shim=<<'RUBY'
+          $WINDOW_WIDTH=800
+          $WINDOW_HEIGHT=600
 
           begin
             Graphics.resize_screen(800,600)
@@ -1607,307 +1801,216 @@ jobs:
           end
           RUBY
 
-          scripts.insert(
-            main_index,
-            [99999990, 'Web Resolution 800x600', Zlib::Deflate.deflate(resolution_shim)]
-          )
+          scripts.insert(main_index,[99999990,'Web Resolution 800x600',Zlib::Deflate.deflate(resolution_shim)])
 
-          output = File.join(game, 'Data', 'Scripts.rxdata')
-          File.binwrite(output, Marshal.dump(scripts))
+          output=File.join(game,'Data','Scripts.rxdata')
+          File.binwrite(output,Marshal.dump(scripts))
 
-          if File.expand_path(source_path) != File.expand_path(output) && File.exist?(source_path)
+          if File.expand_path(source_path)!=File.expand_path(output)&&File.exist?(source_path)
             File.delete(source_path)
           end
 
-          lines = ini.split(/\r?\n/).map do |line|
-            if line =~ /^Scripts=/i
+          lines=ini.split(/\r?\n/).map do |line|
+            if line=~/^Scripts=/i
               'Scripts=Data\\Scripts.rxdata'
-            elsif line =~ /^Title=/i
+            elsif line=~/^Title=/i
               'Title=SLFairy'
             else
               line
             end
           end
 
-          File.binwrite(ini_path, lines.join("\r\n") + "\r\n")
+          File.binwrite(ini_path,lines.join("\r\n")+"\r\n")
           puts 'FAIRY_WEB_PATCH_OK'
           RB
 
           ruby -c /tmp/patch_fairy.rb
+
+      - name: Patch and convert Fairy
+        run: |
           ruby -EUTF-8:UTF-8 /tmp/patch_fairy.rb fairy_player/gameasync
           ruby -EUTF-8:UTF-8 /tmp/mobile_runtime.rb fairy_player fairy
 
-      - name: Convert Fairy media
-        run: |
           python3 - <<'PY'
           from pathlib import Path
           import subprocess
           import sys
 
-          root = Path('fairy_player/gameasync')
-          audio = root / 'Audio'
-          extensions = {'.mp3', '.wav', '.wma', '.aac', '.m4a', '.flac', '.mid', '.midi'}
-          failures = []
+          root=Path('fairy_player/gameasync')
+          audio=root/'Audio'
+          extensions={'.mp3','.wav','.wma','.aac','.m4a','.flac','.mid','.midi'}
+          failures=[]
 
           if audio.exists():
               for src in [p for p in audio.rglob('*') if p.is_file() and p.suffix.lower() in extensions]:
-                  out = src.with_suffix('.ogg')
-                  temp = None
+                  out=src.with_suffix('.ogg')
+                  temp=None
 
                   try:
-                      inp = src
+                      input_file=src
 
-                      if src.suffix.lower() in {'.mid', '.midi'}:
-                          temp = src.with_name(src.name + '.wav')
-                          subprocess.run(
-                              ['timidity', str(src), '-Ow', '-o', str(temp)],
-                              check=True
-                          )
-                          inp = temp
+                      if src.suffix.lower() in {'.mid','.midi'}:
+                          temp=src.with_name(src.name+'.wav')
+                          subprocess.run(['timidity',str(src),'-Ow','-o',str(temp)],check=True)
+                          input_file=temp
 
-                      subprocess.run(
-                          [
-                              'ffmpeg',
-                              '-nostdin',
-                              '-v',
-                              'error',
-                              '-y',
-                              '-i',
-                              str(inp),
-                              '-c:a',
-                              'libvorbis',
-                              '-q:a',
-                              '4',
-                              str(out)
-                          ],
-                          check=True
-                      )
+                      subprocess.run(['ffmpeg','-nostdin','-v','error','-y','-i',str(input_file),'-c:a','libvorbis','-q:a','4',str(out)],check=True)
 
-                      if not out.exists() or out.stat().st_size == 0:
+                      if not out.exists() or out.stat().st_size==0:
                           raise RuntimeError('empty output')
 
                       if temp and temp.exists():
                           temp.unlink()
 
-                      if src != out and src.exists():
+                      if src!=out and src.exists():
                           src.unlink()
 
-                  except Exception as exc:
-                      failures.append((str(src), str(exc)))
+                  except Exception as error:
+                      failures.append((str(src),str(error)))
 
                       if temp and temp.exists():
                           temp.unlink()
 
           if failures:
-              for file, error in failures:
-                  print(file + ' -> ' + error, file=sys.stderr)
+              for file,error in failures:
+                  print(file+' -> '+error,file=sys.stderr)
+
               raise SystemExit(1)
 
-          graphics = root / 'Graphics'
+          graphics=root/'Graphics'
 
           if graphics.exists():
-              for src in [
-                  p for p in graphics.rglob('*')
-                  if p.is_file() and p.suffix.lower() in {'.bmp', '.gif', '.webp', '.tif', '.tiff'}
-              ]:
-                  out = src.with_suffix('.png')
+              for src in [p for p in graphics.rglob('*') if p.is_file() and p.suffix.lower() in {'.bmp','.gif','.webp','.tif','.tiff'}]:
+                  out=src.with_suffix('.png')
+                  subprocess.run(['convert',str(src)+'[0]',str(out)],check=True)
 
-                  subprocess.run(
-                      ['convert', str(src) + '[0]', str(out)],
-                      check=True
-                  )
-
-                  if not out.exists() or out.stat().st_size == 0:
-                      raise SystemExit('image conversion failed: ' + str(src))
+                  if not out.exists() or out.stat().st_size==0:
+                      raise SystemExit('image conversion failed: '+str(src))
 
                   src.unlink()
 
           print('FAIRY_MEDIA_OK')
           PY
 
-      - name: Build Fairy mapping
-        run: |
-          set -euo pipefail
-          (
-            cd fairy_player/gameasync
-            bash "$GITHUB_WORKSPACE/engine/extra/make_mapping.sh"
-          )
-          test -s fairy_player/gameasync/mapping.js
-
-      - name: Build Fairy preload
-        run: |
-          set -euo pipefail
-          source engine/deps/emsdk/emsdk_env.sh >/dev/null
-
-          args=(
-            --preload fairy_player/gameasync/Data@/game/Data
-            --preload fairy_player/gameasync/Graphics@/game/Graphics
-            --preload fairy_player/gameasync/Fonts@/game/Fonts
-            --preload fairy_player/gameasync/Game.ini@/game/Game.ini
-            --preload fairy_player/gameasync/rgss.rb@/game/rgss.rb
-          )
-
-          [ -d fairy_player/gameasync/Audio/SE ] && args+=(--preload fairy_player/gameasync/Audio/SE@/game/Audio/SE)
-          [ -d fairy_player/gameasync/Audio/ME ] && args+=(--preload fairy_player/gameasync/Audio/ME@/game/Audio/ME)
-          [ -d fairy_player/gameasync/BM ] && args+=(--preload fairy_player/gameasync/BM@/game/BM)
-          [ -f fairy_player/gameasync/Lineage.ini ] && args+=(--preload fairy_player/gameasync/Lineage.ini@/game/Lineage.ini)
-
-          python3 \
-            engine/deps/emsdk/upstream/emscripten/tools/file_packager.py \
-            fairy_player/slfairy-core-v144.data \
-            "${args[@]}" \
-            --js-output=fairy_player/slfairy-core-v144.js \
-            --no-node
-
-          test -s fairy_player/slfairy-core-v144.data
-          test -s fairy_player/slfairy-core-v144.js
-          rm -f fairy_player/gameasync/bitmap-map.js
-
-      - name: Apply run 60 browser persistence pattern to Fairy
+      - name: Build Fairy independently
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from pathlib import Path
+          CORE="elf-core-${BUILD_ID}"
 
-          source = Path('/tmp/base60_browser.sh').read_text()
+          /tmp/build_core.sh fairy_player "$CORE"
 
-          replacements = [
-              ('player/js/drive.js', 'fairy_player/js/drive.js'),
-              ('player/index.html', 'fairy_player/index.html'),
-              ('player/.nojekyll', 'fairy_player/.nojekyll'),
-              ('slknight-core-v144', 'slfairy-core-v144'),
-              ('slknight_v14_engine', 'slfairy_v14_engine'),
-              ('SLKnight V14.4b', 'SLFairy'),
-              ('SLKnight', 'SLFairy')
-          ]
+          python3 /tmp/configure_site.py fairy_player SLFairy elf slfairy_independent_save "$CORE" "$BUILD_ID"
 
-          for old, new in replacements:
-              source = source.replace(old, new)
-
-          Path('/tmp/fairy_browser.sh').write_text(source)
-          PY
-
-          bash -n /tmp/fairy_browser.sh
-          bash /tmp/fairy_browser.sh
-
-      - name: Finalize Fairy browser
-        run: |
-          python3 /tmp/finalize_site.py \
-            fairy_player \
-            elf \
-            SLFairy \
-            slfairy_v14_engine \
-            slfairy-core-v144 \
-            "$BUILD_ID"
-
-          node --check fairy_player/js/dpad.js
+          test -s "fairy_player/$CORE.data"
+          test -s "fairy_player/$CORE.js"
+          node --check fairy_player/js/mobile.js
           node --check fairy_player/js/drive.js
+
+          ! grep -Fq 'is_touch_device' fairy_player/index.html
+          ! grep -Fq 'bindKey(' fairy_player/index.html
+          ! grep -Fq 'id="dpad"' fairy_player/index.html
+          ! grep -Fq 'id="apad"' fairy_player/index.html
+
+          grep -Fq 'id="sl-attack"' fairy_player/index.html
+          grep -Fq "window.SL_VARIANT = 'elf'" fairy_player/index.html
+
+          echo FAIRY_READY
 
       - name: Assemble launcher
         run: |
           set -euo pipefail
 
-          rm -rf /tmp/sl_dual_site
-          mkdir -p /tmp/sl_dual_site/knight
-          mkdir -p /tmp/sl_dual_site/elf
+          rm -rf /tmp/site
+          mkdir -p /tmp/site/knight /tmp/site/elf
 
-          cp -a player/. /tmp/sl_dual_site/knight/
-          cp -a fairy_player/. /tmp/sl_dual_site/elf/
+          cp -a player/. /tmp/site/knight/
+          cp -a fairy_player/. /tmp/site/elf/
 
-          cat > /tmp/sl_dual_site/index.html <<'HTML'
+          cat > /tmp/site/index.html <<HTML
           <!doctype html>
           <html lang="ko">
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-            <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+            <meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
             <meta http-equiv="Pragma" content="no-cache">
             <meta http-equiv="Expires" content="0">
             <title>SL Mobile</title>
             <style>
               html,body{margin:0;width:100%;height:100%;background:#080808;color:#fff;font-family:system-ui,sans-serif}
               .wrap{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:22px}
-              h1{font-size:30px;margin:0 0 12px}
               .choices{display:flex;gap:18px}
-              .card{width:150px;height:170px;border:1px solid #777;border-radius:14px;background:#171717;color:#fff;font-size:25px;cursor:pointer}
+              .card{width:150px;height:170px;border:1px solid #777;border-radius:14px;background:#171717;color:#fff;font-size:25px}
               .card:active{transform:scale(.97)}
-              .sub{font-size:13px;color:#aaa;text-align:center;max-width:360px;line-height:1.5}
             </style>
           </head>
           <body>
             <div class="wrap">
               <h1>캐릭터 선택</h1>
               <div class="choices">
-                <button class="card" onclick="location.href='knight/?v=BUILD_ID'">기사</button>
-                <button class="card" onclick="location.href='elf/?v=BUILD_ID'">요정</button>
+                <button class="card" onclick="location.href='knight/?v=${BUILD_ID}'">기사</button>
+                <button class="card" onclick="location.href='elf/?v=${BUILD_ID}'">요정</button>
               </div>
-              <div class="sub">기사와 요정은 독립 빌드이며 저장 데이터도 서로 분리됩니다.</div>
             </div>
           </body>
           </html>
           HTML
 
-          sed -i "s/BUILD_ID/${BUILD_ID}/g" /tmp/sl_dual_site/index.html
-          touch /tmp/sl_dual_site/.nojekyll
+          touch /tmp/site/.nojekyll
 
           rm -rf player fairy_player
-          mv /tmp/sl_dual_site player
+          mv /tmp/site player
 
-      - name: Verify final package and runtime fixes
+      - name: Verify clean mobile package
         run: |
           set -euo pipefail
 
           test -s player/index.html
-          test -s player/knight/index.html
-          test -s player/elf/index.html
-          test -s player/knight/mkxp.js
-          test -s player/knight/mkxp.wasm
-          test -s player/elf/mkxp.js
-          test -s player/elf/mkxp.wasm
-          test -s player/knight/gameasync/Data/Scripts.rxdata
-          test -s player/elf/gameasync/Data/Scripts.rxdata
+          test -s "player/knight/knight-core-${BUILD_ID}.data"
+          test -s "player/knight/knight-core-${BUILD_ID}.js"
+          test -s "player/elf/elf-core-${BUILD_ID}.data"
+          test -s "player/elf/elf-core-${BUILD_ID}.js"
 
-          test "$(find player/knight -maxdepth 1 -name "knight-core-${BUILD_ID}.data" | wc -l)" -eq 1
-          test "$(find player/knight -maxdepth 1 -name "knight-core-${BUILD_ID}.js" | wc -l)" -eq 1
-          test "$(find player/elf -maxdepth 1 -name "elf-core-${BUILD_ID}.data" | wc -l)" -eq 1
-          test "$(find player/elf -maxdepth 1 -name "elf-core-${BUILD_ID}.js" | wc -l)" -eq 1
+          for variant in knight elf; do
+            test -s "player/$variant/index.html"
+            test -s "player/$variant/mkxp.js"
+            test -s "player/$variant/mkxp.wasm"
+            test -s "player/$variant/js/mobile.js"
+            test -s "player/$variant/js/drive.js"
+            test -s "player/$variant/gameasync/mapping.js"
+            test -s "player/$variant/gameasync/Data/Scripts.rxdata"
+            test ! -e "player/$variant/js/dpad.js"
 
-          grep -Fq "mkxp.js?v=${BUILD_ID}" player/knight/index.html
-          grep -Fq "mkxp.wasm?v=${BUILD_ID}" player/knight/index.html
-          grep -Fq "js/dpad.js?v=${BUILD_ID}" player/knight/index.html
-          grep -Fq "gameasync/mapping.js?v=${BUILD_ID}" player/knight/index.html
+            ! grep -Fq 'is_touch_device' "player/$variant/index.html"
+            ! grep -Fq 'bindKey(' "player/$variant/index.html"
+            ! grep -Fq 'id="dpad"' "player/$variant/index.html"
+            ! grep -Fq 'id="apad"' "player/$variant/index.html"
 
-          grep -Fq "mkxp.js?v=${BUILD_ID}" player/elf/index.html
-          grep -Fq "mkxp.wasm?v=${BUILD_ID}" player/elf/index.html
-          grep -Fq "js/dpad.js?v=${BUILD_ID}" player/elf/index.html
-          grep -Fq "gameasync/mapping.js?v=${BUILD_ID}" player/elf/index.html
+            grep -Fq 'id="sl-stick-zone"' "player/$variant/index.html"
+            grep -Fq 'id="sl-attack"' "player/$variant/index.html"
+            grep -Fq 'id="sl-edit"' "player/$variant/index.html"
+            grep -Fq "v=${BUILD_ID}" "player/$variant/index.html"
+            grep -Fq 'sl-layout-' "player/$variant/js/mobile.js"
+            grep -Fq "bindButton('sl-attack', 68, true)" "player/$variant/js/mobile.js"
 
-          grep -Fq 'id="sl-stick-zone"' player/knight/index.html
-          grep -Fq 'id="sl-attack"' player/knight/index.html
-          grep -Fq 'id="sl-edit"' player/knight/index.html
-          grep -Fq 'sl-layout-' player/knight/js/dpad.js
-          grep -Fq 'sl_mobile_toggle_target' <(strings player/knight/gameasync/Data/Scripts.rxdata) || true
+            node --check "player/$variant/js/mobile.js"
+            node --check "player/$variant/js/drive.js"
+          done
 
-          grep -Fq 'id="sl-stick-zone"' player/elf/index.html
-          grep -Fq 'id="sl-attack"' player/elf/index.html
-          grep -Fq 'id="sl-edit"' player/elf/index.html
-          grep -Fq 'sl-layout-' player/elf/js/dpad.js
-
-          node --check player/knight/js/dpad.js
-          node --check player/knight/js/drive.js
-          node --check player/elf/js/dpad.js
-          node --check player/elf/js/drive.js
+          grep -Fq "knight-core-${BUILD_ID}.js?v=${BUILD_ID}" player/knight/index.html
+          grep -Fq "elf-core-${BUILD_ID}.js?v=${BUILD_ID}" player/elf/index.html
 
           ruby -EUTF-8:UTF-8 -rzlib - <<'RB'
-          paths = [
+          paths=[
             'player/knight/gameasync/Data/Scripts.rxdata',
             'player/elf/gameasync/Data/Scripts.rxdata'
           ]
 
           paths.each do |path|
-            scripts = Marshal.load(File.binread(path))
-            all = scripts.map do |entry|
+            scripts=Marshal.load(File.binread(path))
+
+            all=scripts.map do |entry|
               begin
                 Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
               rescue
@@ -1916,20 +2019,38 @@ jobs:
             end.join("\n")
 
             abort "#{path}: target lock missing" unless all.include?('sl_mobile_toggle_target')
-            abort "#{path}: target tick missing" unless all.include?('sl_mobile_attack_tick')
-            abort "#{path}: ruby boot marker missing" unless all.include?('SLBOOT|RUBY_MAIN')
-            abort "#{path}: old automatic target scan still present" if all.include?('$mobile_auto_attack_active')
+            abort "#{path}: attack tick missing" unless all.include?('sl_mobile_attack_tick')
+            abort "#{path}: boot marker missing" unless all.include?('SLBOOT|RUBY_MAIN')
+            abort "#{path}: old auto attack remains" if all.include?('$mobile_auto_attack_active')
           end
 
-          puts 'RUNTIME_VERIFY_OK'
+          puts 'RUBY_RUNTIME_VERIFY_OK'
           RB
 
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          for base in [Path('player/knight'),Path('player/elf')]:
+              html=(base/'index.html').read_text()
+              scripts=re.findall(r'<script(?:\s+[^>]*)?>(.*?)</script>',html,re.S)
+
+              for index,source in enumerate(scripts):
+                  if not source.strip():
+                      continue
+
+                  path=Path(f'/tmp/{base.name}-{index}.js')
+                  path.write_text(source)
+                  subprocess.run(['node','--check',str(path)],check=True)
+
+          print('INLINE_JS_VERIFY_OK')
+          PY
+
           ! grep -R -Fq 'tools-v149-complete.zip' player
-          ! grep -R -Fq 'slknight-core-v144.data' player/knight/index.html
-          ! grep -R -Fq 'slfairy-core-v144.data' player/elf/index.html
 
           echo "BUILD_ID=${BUILD_ID}"
-          echo BOOT_CACHE_MOBILE_VERIFY_OK
+          echo CLEAN_MOBILE_VERIFY_OK
           du -sh player
 
       - name: Upload Pages artifact
@@ -1943,9 +2064,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - uses: actions/configure-pages@v6
-
       - id: deployment
         uses: actions/deploy-pages@v5
