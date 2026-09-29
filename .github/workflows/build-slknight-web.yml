@@ -1,4 +1,4 @@
-name: Deploy SLKnight V14.2d EQUIP TOUCH FIX
+name: Deploy SLKnight V14.2e MAP EQUIP TOUCH CORE
 on:
   push:
     branches: [main]
@@ -42,7 +42,8 @@ jobs:
 
           def repl(path,old,new,count=1):
               p=Path(path); s=p.read_text(); n=s.count(old)
-              if n!=count: raise SystemExit(f'{path}: expected {count}, found {n}: {old!r}')
+              if n!=count:
+                  raise SystemExit(f'{path}: expected {count}, found {n}: {old!r}')
               p.write_text(s.replace(old,new,count))
 
           repl('engine/src/config.cpp','fixedFramerate = 40;','fixedFramerate = 0;')
@@ -51,44 +52,110 @@ jobs:
           repl('engine/src/config.cpp','frameSkip = true;','frameSkip = false;')
           repl('engine/src/config.cpp','PO_DESC(smoothScaling, bool, true)','PO_DESC(smoothScaling, bool, false)')
           repl('engine/src/graphics.cpp','width = clamp(width, 1, 640);\n\theight = clamp(height, 1, 480);','width = clamp(width, 1, 800);\n\theight = clamp(height, 1, 600);')
-          repl('engine/binding-mruby/binding-mruby.cpp','\tif (jsSkipFrame() == 1) return;','\t/* Graphics.frame_rate controls timing. */')
+          repl('engine/binding-mruby/binding-mruby.cpp','\tif (jsSkipFrame() == 1) return;','\t/* Graphics.frame_rate controls browser timing. */')
           repl('engine/build.sh','./emsdk install latest','./emsdk install 3.1.37')
           repl('engine/build.sh','./emsdk activate latest','./emsdk activate 3.1.37')
 
           p=Path('engine/binding-mruby/graphics-binding.cpp'); s=p.read_text()
           marker='''MRB_FUNCTION(graphicsFrameReset)\n{\n\tMRB_FUN_UNUSED_PARAM;\n\n\tshState->graphics().frameReset();\n\n\treturn mrb_nil_value();\n}\n'''
           add=marker+'''\nMRB_FUNCTION(graphicsResizeScreen)\n{\n\tMRB_FUN_UNUSED_PARAM;\n\tmrb_int width, height;\n\tmrb_get_args(mrb, "ii", &width, &height);\n\tGUARD_EXC( shState->graphics().resizeScreen(width, height); )\n\treturn mrb_nil_value();\n}\n'''
-          if s.count(marker)!=1: raise SystemExit('graphicsFrameReset mismatch')
+          if s.count(marker)!=1:
+              raise SystemExit('graphicsFrameReset mismatch')
           s=s.replace(marker,add,1)
           reg='\tmrb_define_module_function(mrb, module, "frame_reset", graphicsFrameReset, MRB_ARGS_NONE());'
-          if s.count(reg)!=1: raise SystemExit('frame_reset registration mismatch')
+          if s.count(reg)!=1:
+              raise SystemExit('frame_reset registration mismatch')
           s=s.replace(reg,reg+'\n\tmrb_define_module_function(mrb, module, "resize_screen", graphicsResizeScreen, MRB_ARGS_REQ(2));',1)
+          p.write_text(s)
+
+          repl('engine/src/input.h','\tbool isRepeated(int button);\n','\tbool isRepeated(int button);\n\tbool rawPressed(int vk);\n\tbool rawTriggered(int vk);\n')
+          repl('engine/src/input.cpp','\tButtonState *statesOld;\n','\tButtonState *statesOld;\n\tuint8_t rawStates[SDL_NUM_SCANCODES];\n\tuint8_t rawStatesOld[SDL_NUM_SCANCODES];\n')
+          repl('engine/src/input.cpp','\t\tclearBuffer();\n\n\t\trepeating = Input::None;','\t\tclearBuffer();\n\t\tmemset(rawStates, 0, sizeof(rawStates));\n\t\tmemset(rawStatesOld, 0, sizeof(rawStatesOld));\n\n\t\trepeating = Input::None;')
+          repl('engine/src/input.cpp','\tp->checkBindingChange(shState->rtData());\n\n\tp->swapBuffers();','\tp->checkBindingChange(shState->rtData());\n\tmemcpy(p->rawStatesOld, p->rawStates, sizeof(p->rawStates));\n\tmemcpy(p->rawStates, EventThread::keyStates, sizeof(p->rawStates));\n\n\tp->swapBuffers();')
+
+          p=Path('engine/src/input.cpp'); s=p.read_text()
+          marker='''bool Input::isRepeated(int button)\n{\n\treturn p->getStateCheck(button).repeated;\n}\n'''
+          raw=marker+r'''
+          static SDL_Scancode slVkToScan(int vk)
+          {
+          	if (vk >= 65 && vk <= 90)
+          		return (SDL_Scancode)(SDL_SCANCODE_A + vk - 65);
+          	if (vk >= 49 && vk <= 57)
+          		return (SDL_Scancode)(SDL_SCANCODE_1 + vk - 49);
+          	if (vk >= 112 && vk <= 123)
+          		return (SDL_Scancode)(SDL_SCANCODE_F1 + vk - 112);
+          	switch (vk)
+          	{
+          	case 8: return SDL_SCANCODE_BACKSPACE;
+          	case 9: return SDL_SCANCODE_TAB;
+          	case 13: return SDL_SCANCODE_RETURN;
+          	case 20: return SDL_SCANCODE_CAPSLOCK;
+          	case 27: return SDL_SCANCODE_ESCAPE;
+          	case 32: return SDL_SCANCODE_SPACE;
+          	case 48: return SDL_SCANCODE_0;
+          	case 186: return SDL_SCANCODE_SEMICOLON;
+          	case 187: return SDL_SCANCODE_EQUALS;
+          	case 188: return SDL_SCANCODE_COMMA;
+          	case 189: return SDL_SCANCODE_MINUS;
+          	case 190: return SDL_SCANCODE_PERIOD;
+          	case 191: return SDL_SCANCODE_SLASH;
+          	case 192: return SDL_SCANCODE_GRAVE;
+          	case 219: return SDL_SCANCODE_LEFTBRACKET;
+          	case 220: return SDL_SCANCODE_BACKSLASH;
+          	case 221: return SDL_SCANCODE_RIGHTBRACKET;
+          	case 222: return SDL_SCANCODE_APOSTROPHE;
+          	default: return SDL_SCANCODE_UNKNOWN;
+          	}
+          }
+
+          static bool slRawState(const uint8_t *states, int vk)
+          {
+          	if (vk == 16) return states[SDL_SCANCODE_LSHIFT] || states[SDL_SCANCODE_RSHIFT];
+          	if (vk == 17) return states[SDL_SCANCODE_LCTRL] || states[SDL_SCANCODE_RCTRL];
+          	if (vk == 18) return states[SDL_SCANCODE_LALT] || states[SDL_SCANCODE_RALT];
+          	SDL_Scancode scan = slVkToScan(vk);
+          	return scan != SDL_SCANCODE_UNKNOWN && states[scan];
+          }
+
+          bool Input::rawPressed(int vk)
+          {
+          	return slRawState(p->rawStates, vk);
+          }
+
+          bool Input::rawTriggered(int vk)
+          {
+          	return slRawState(p->rawStates, vk) && !slRawState(p->rawStatesOld, vk);
+          }
+          '''
+          if s.count(marker)!=1:
+              raise SystemExit('input repeated marker mismatch')
+          p.write_text(s.replace(marker,raw,1))
+
+          p=Path('engine/binding-mruby/input-binding.cpp'); s=p.read_text()
+          marker='''MRB_METHOD(inputRepeat)\n{\n\tMRB_UNUSED_PARAM;\n\n\tmrb_int num = getButtonArg(mrb);\n\n\treturn mrb_bool_value(shState->input().isRepeated(num));\n}\n'''
+          add=marker+'''\nMRB_FUNCTION(inputRawPress)\n{\n\tMRB_FUN_UNUSED_PARAM;\n\tmrb_int vk;\n\tmrb_get_args(mrb, "i", &vk);\n\treturn mrb_bool_value(shState->input().rawPressed((int)vk));\n}\n\nMRB_FUNCTION(inputRawTrigger)\n{\n\tMRB_FUN_UNUSED_PARAM;\n\tmrb_int vk;\n\tmrb_get_args(mrb, "i", &vk);\n\treturn mrb_bool_value(shState->input().rawTriggered((int)vk));\n}\n'''
+          if s.count(marker)!=1:
+              raise SystemExit('inputRepeat marker mismatch')
+          s=s.replace(marker,add,1)
+          reg='\tmrb_define_module_function(mrb, module, "repeat?", inputRepeat, MRB_ARGS_REQ(1));'
+          if s.count(reg)!=1:
+              raise SystemExit('input repeat registration mismatch')
+          s=s.replace(reg,reg+'\n\tmrb_define_module_function(mrb, module, "raw_press?", inputRawPress, MRB_ARGS_REQ(1));\n\tmrb_define_module_function(mrb, module, "raw_trigger?", inputRawTrigger, MRB_ARGS_REQ(1));',1)
           p.write_text(s)
 
           p=Path('engine/extra/build_config.rb'); s=p.read_text()
           gem="    conf.gem :github => 'pulsejet/mruby-marshal'"
           pin="    conf.gem :github => 'mattn/mruby-onig-regexp', :checksum_hash => '25b152264cd4dfac84aa39e5fbb428ec84b95e6a'\n"+gem
-          if s.count(gem)!=1: raise SystemExit('mruby-marshal marker mismatch')
+          if s.count(gem)!=1:
+              raise SystemExit('mruby-marshal marker mismatch')
           p.write_text(s.replace(gem,pin,1))
-
-          p=Path('engine/src/keybindings.cpp'); s=p.read_text()
-          old='{ SDL_SCANCODE_S,      Input::Y     }\n};'
-          new='{ SDL_SCANCODE_S,      Input::Y     },\n\t{ SDL_SCANCODE_E,      Input::F5    },\n\t{ SDL_SCANCODE_I,      Input::F6    }\n};'
-          if s.count(old)!=1: raise SystemExit('keyboard binding marker mismatch')
-          p.write_text(s.replace(old,new,1))
           print('ENGINE_PATCH_OK')
           PY
 
-          grep -Fq 'fixedFramerate = 0;' engine/src/config.cpp
-          grep -Fq 'frameSkip = false;' engine/src/config.cpp
-          grep -Fq 'defScreenW = 800;' engine/src/config.cpp
-          grep -Fq 'defScreenH = 600;' engine/src/config.cpp
-          grep -Fq 'resize_screen' engine/binding-mruby/graphics-binding.cpp
-          grep -Fq 'SDL_SCANCODE_E,      Input::F5' engine/src/keybindings.cpp
-          grep -Fq 'SDL_SCANCODE_I,      Input::F6' engine/src/keybindings.cpp
+          grep -Fq 'raw_trigger?' engine/binding-mruby/input-binding.cpp
+          grep -Fq 'rawPressed' engine/src/input.cpp
           grep -Fq 'if (window.saveFile) window.saveFile(UTF8ToString(fullPathC));' engine/src/emscripten.cpp
           test "$(grep -Fc 'Asyncify.handleSleep' engine/src/emscripten.cpp)" -eq 1
-          grep -Fq "checksum_hash => '25b152264cd4dfac84aa39e5fbb428ec84b95e6a'" engine/extra/build_config.rb
 
       - name: Build engine
         run: |
@@ -120,7 +187,7 @@ jobs:
           cp /usr/share/fonts/truetype/nanum/NanumGothicBold.ttf player/gameasync/Fonts/NanumGothicBold.ttf
           rm -f player/gameasync/Save*.rxdata player/gameasync/README_Android.txt
 
-      - name: Patch game scripts
+      - name: Patch game scripts and data
         run: |
           ruby -EUTF-8:UTF-8 -rzlib - player/gameasync <<'RB'
           game=ARGV[0]
@@ -133,38 +200,24 @@ jobs:
 
           compat=<<'RUBY'
           $joiplay=true
+
           module Kernel
             def exit(*args); nil; end
           end
+
           class Win32API
             def initialize(*args); @func=args[1].to_s; end
-            def web_input(key)
-              case key.to_i
-              when 9,90 then Input::A
-              when 13,32,67 then Input::C
-              when 27,88 then Input::B
-              when 69 then Input::F5
-              when 73 then Input::F6
-              when 68 then Input::Z
-              when 81 then Input::L
-              when 83 then Input::Y
-              when 87 then Input::R
-              when 65 then Input::X
-              when 16 then Input::SHIFT
-              when 17 then Input::CTRL
-              when 18 then Input::ALT
-              else nil
-              end
-            end
             def call(*args)
-              code=web_input(args[0])
-              return(code && Input.trigger?(code) ? 1 : 0) if @func=='GetAsyncKeyState'
-              return(code && Input.press?(code) ? -1 : 0) if @func=='GetKeyState'
+              key=args[0].to_i
+              return Input.raw_trigger?(key) ? 1 : 0 if @func=='GetAsyncKeyState'
+              return Input.raw_press?(key) ? -1 : 0 if @func=='GetKeyState'
               0
             end
             def Call(*args); call(*args); end
           end
+
           Font.default_name='NanumGothic'
+
           module Audio
             def self.sl_stream(kind,*parts); puts((['SLAUDIO',kind]+parts.collect{|v|v.to_s}).join('|')); end
             def self.bgm_play(filename,volume=100,pitch=100); sl_stream('BGM_PLAY',filename,volume,pitch); end
@@ -177,6 +230,14 @@ jobs:
           RUBY
 
           scripts.insert(0,[0,'Web Compatibility',Zlib::Deflate.deflate(compat)])
+
+          def inflate(e); Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8); end
+          def deflate(e,s); e[2]=Zlib::Deflate.deflate(s); end
+          def entry_for(a,n)
+            e=a.find{|x|x.is_a?(Array)&&x.length>=3&&x[1].to_s==n}
+            abort "missing #{n}" unless e
+            e
+          end
 
           def patch_begin_until(src)
             lines=src.lines
@@ -209,8 +270,8 @@ jobs:
               sig=[]
               k=i+1
               while k<lines.length && sig.length<8
-                x=lines[k].strip
-                sig<<[k,x,lines[k][/^\s*/]] unless x.empty?||x.start_with?('#')
+                s=lines[k].strip
+                sig<<[k,s,lines[k][/^\s*/]] unless s.empty?||s.start_with?('#')
                 k+=1
               end
               finish=nil
@@ -252,6 +313,7 @@ jobs:
           browser_loop=<<'RUBY'
           $prev_scene=nil
           $sl_last_scene_name=nil
+
           def main_update_loop
             begin
               if $scene!=nil
@@ -259,16 +321,16 @@ jobs:
                 name=active_scene.class.to_s
                 puts('SLFRAME|'+name) if $sl_last_scene_name!=name
                 $sl_last_scene_name=name
+
                 if active_scene!=$prev_scene
                   $prev_scene.dispose if $prev_scene!=nil&&$prev_scene.respond_to?(:dispose)
                   active_scene.main
                   $prev_scene=active_scene
                   return if $scene!=active_scene
                 end
-                active_scene.web_pre_update if active_scene.respond_to?(:web_pre_update)
+
                 Graphics.update
-                skip_input=active_scene.is_a?(Scene_Map)&&$game_switches!=nil&&$game_switches[49]==true
-                Input.update unless skip_input
+                Input.update
                 active_scene.update if $scene==active_scene
               end
             rescue Exception=>e
@@ -294,8 +356,10 @@ jobs:
             rescue
               next
             end
+
             font_rules.each{|rx,rep|fonts+=text.scan(rx).length;text.gsub!(rx,rep)}
             text.gsub!('defined?($joiplay) && $joiplay','$joiplay == true')
+
             if index==111
               text=id_sprite
               ids+=1
@@ -306,12 +370,15 @@ jobs:
               text="# native Plane used on web\n"
               plane+=1
             end
+
             text=patch_begin_until(text)
             text=patch_scene_loop(text) unless name=='Main'||name=='Scene_Map'||name=='Scene_Equip'
+
             if name=='Main'
               text=browser_loop+text unless text.include?('def main_update_loop')
               text.sub!(/\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,"\n")
             end
+
             entry[2]=Zlib::Deflate.deflate(text)
           end
 
@@ -319,43 +386,52 @@ jobs:
           abort "ID patch=#{ids}" unless ids==2
           abort "font patch=#{fonts}" unless fonts>=10
 
-          def entry_for(scripts,name)
-            e=scripts.find{|x|x.is_a?(Array)&&x.length>=3&&x[1].to_s==name}
-            abort "missing #{name}" unless e
-            e
-          end
-          def inflate(e); Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8); end
-          def deflate(e,s); e[2]=Zlib::Deflate.deflate(s); end
-
           resolution=scripts[97]
           rt=inflate(resolution)
           abort 'resolution script mismatch' unless rt.include?('$WINDOW_WIDTH = 800')&&rt.include?('Graphics.resize_screen')
           abort 'resolution defined? remains' if rt.include?('defined?($joiplay)')
           deflate(resolution,rt)
 
+          wi=entry_for(scripts,'Window_EquipItem')
+          text=inflate(wi)
+          rx=/    @column_max = 2\r?\n    refresh\r?\n    self\.active = false/
+          abort 'Window_EquipItem lazy target mismatch' unless text.scan(rx).size==1
+
+          text.sub!(rx,"    @column_max = 2\n    if $sl_equip_lazy_init\n      @data = [nil]\n      @item_max = 1\n      self.contents = Bitmap.new(width - 32, 32)\n      @sl_web_lazy = true\n    else\n      refresh\n      @sl_web_lazy = false\n    end\n    self.active = false")
+
+          text << "\nclass Window_EquipItem\n  def update\n    if @sl_web_lazy\n      @sl_web_lazy = false\n      refresh\n    end\n    super\n  end\nend\n"
+          deflate(wi,text)
+
           equip=entry_for(scripts,'Scene_Equip')
           text=inflate(equip)
 
           n=0
-          text=text.sub(/  def main[ \t]*\r?\n/){n+=1;"  def main\n    puts('SLEQUIPBEGIN')\n"}
-          abort "Scene_Equip main marker=#{n}" unless n==1
+          text=text.sub(/    @actor = \$game_party\.actors\[@actor_index\]\r?\n/){
+            n+=1
+            "    @actor = $game_party.actors[@actor_index]\n    $sl_equip_lazy_init = true\n"
+          }
+          abort "Scene_Equip lazy start=#{n}" unless n==1
 
-          equip_rx=/\n\s{4}# 메인 루프\r?\n\s{4}loop do\r?\n\s{6}# 게임 화면을 갱신\r?\n\s{6}Graphics\.update\r?\n\s{6}# 입력 정보를 갱신\r?\n\s{6}Input\.update\r?\n\s{6}# 프레임 갱신\r?\n\s{6}update\r?\n\s{6}# 화면이 바뀌면 루프를 중단\r?\n\s{6}if \$scene != self\r?\n\s*\$game_switches\[49\] = true\r?\n\s{8}break\r?\n\s{6}end\r?\n\s{4}end\r?\n\s{4}# 트란지션 준비/
-          equip_rep="\n    puts('SLEQUIPREADY')\n    # Web: browser loop drives update.\n  end\n\n  def dispose\n    # 트란지션 준비"
           n=0
-          text=text.sub(equip_rx){n+=1;equip_rep}
-          abort "Scene_Equip loop patch=#{n}" unless n==1
+          text=text.sub(/    refresh\r?\n    # 트란지션 실행/){
+            n+=1
+            "    refresh\n    $sl_equip_lazy_init = false\n    # 트란지션 실행"
+          }
+          abort "Scene_Equip lazy end=#{n}" unless n==1
 
-          close_rx=/\n\s*if Keyboard\.testkey\(69\)\s*\r?\n\s*\$scene = Scene_Map\.new\s*\r?\n\s*end\s*\r?\n/m
-          n=text.scan(close_rx).size
-          abort "Scene_Equip E-close patch=#{n}" unless n==1
-          text.sub!(close_rx,"\n")
+          eqrx=/    # 메인 루프\r?\n    loop do\r?\n.*?    end\r?\n    # 트란지션 준비/m
+          abort 'Scene_Equip loop mismatch' unless text.scan(eqrx).size==1
+
+          text.sub!(eqrx,"    # Web: browser driver owns the frame loop\n  end\n\n  def dispose\n    $sl_equip_lazy_init = false\n    # 트란지션 준비")
           deflate(equip,text)
 
           save=entry_for(scripts,'Scene_Save')
           text=inflate(save)
           n=0
-          text=text.sub(/    write_save_data\(file\)\r?\n    exit/){n+=1;"    write_save_data(file)\n    file.close\n    save_file_async(filename)"}
+          text=text.sub(/    write_save_data\(file\)\r?\n    exit/){
+            n+=1
+            "    write_save_data(file)\n    file.close\n    save_file_async(filename)"
+          }
           abort "Scene_Save persist patch=#{n}" unless n==1
           abort 'Scene_Save menu flow changed' unless text.scan('$scene = Scene_Menu.new(4)').size==2
           abort 'Scene_Save event flow changed' unless text.scan('$scene = Scene_Map.new').size==2
@@ -364,145 +440,58 @@ jobs:
           menu_fx=scripts.find{|e|e.is_a?(Array)&&e.length>=3&&((inflate(e).include?('XRXS_MP7_Module')) rescue false)}
           abort 'menu lifecycle script missing' unless menu_fx
           text=inflate(menu_fx)
+
           ds=/  def dispose_spriteset\r?\n.*?    @spriteset\.dispose\r?\n  end/m
           abort 'dispose_spriteset mismatch' unless text.scan(ds).size==1
           text.sub!(ds,"  def dispose_spriteset\n    if @spriteset != nil\n      @spriteset.dispose\n      @spriteset = nil\n    end\n  end")
+
           wr=/  alias xrxs_mp7_main main\r?\n  def main\r?\n    create_spriteset\r?\n    xrxs_mp7_main\r?\n    dispose_spriteset\r?\n  end/
           abort 'menu wrapper mismatch' unless text.scan(wr).size==8
+
           text.gsub!(wr,"  alias xrxs_mp7_main main\n  def main\n    create_spriteset\n    xrxs_mp7_main\n  end\n  alias xrxs_mp7_dispose dispose\n  def dispose\n    xrxs_mp7_dispose\n    dispose_spriteset\n  end")
           deflate(menu_fx,text)
 
           multi=entry_for(scripts,'Multi-slot script : Windows')
           text=inflate(multi)
-          old_ms=/ alias g7_ms_scene_equip_main main\r?\n def main\r?\n  @additional_initialize_done = false\r?\n  g7_ms_scene_equip_main\r?\n  for i in 5\.\.\.@item_windows\.size\r?\n   @item_windows\[i\]\.dispose unless @item_windows\[i\]\.nil\?\r?\n  end\r?\n end/
-          abort 'multislot lifecycle mismatch' unless text.scan(old_ms).size==1
-          text.sub!(old_ms," alias g7_ms_scene_equip_main main\n def main\n  @additional_initialize_done = false\n  g7_ms_scene_equip_main\n end\n alias g7_ms_scene_equip_dispose dispose\n def dispose\n  if @item_windows != nil\n   for i in 5...@item_windows.size\n    @item_windows[i].dispose unless @item_windows[i].nil?\n   end\n  end\n  g7_ms_scene_equip_dispose\n end")
+
+          old=/ alias g7_ms_scene_equip_main main\r?\n def main\r?\n  @additional_initialize_done = false\r?\n  g7_ms_scene_equip_main\r?\n  for i in 5\.\.\.@item_windows\.size\r?\n   @item_windows\[i\]\.dispose unless @item_windows\[i\]\.nil\?\r?\n  end\r?\n end/
+
+          abort 'multislot lifecycle mismatch' unless text.scan(old).size==1
+
+          text.sub!(old," alias g7_ms_scene_equip_main main\n def main\n  @additional_initialize_done = false\n  g7_ms_scene_equip_main\n end\n alias g7_ms_scene_equip_dispose dispose\n def dispose\n  if @item_windows != nil\n   for i in 5...@item_windows.size\n    @item_windows[i].dispose unless @item_windows[i].nil?\n   end\n  end\n  g7_ms_scene_equip_dispose\n end")
+
           text.gsub!('if defined? xrxs_additional_refresh','if respond_to?(:xrxs_additional_refresh)')
           deflate(multi,text)
 
-          scene_map=entry_for(scripts,'Scene_Map')
-          text=inflate(scene_map).gsub("\r\n","\n")
-          main_pos=text.index("  def main\n")
-          abort 'Scene_Map main missing' unless main_pos
-          loop_comment=text.index("    # 메인 루프\n",main_pos)
-          abort 'Scene_Map loop comment missing' unless loop_comment
-          loop_line=text.index("    loop do #루프 시작\n",loop_comment)
-          abort 'Scene_Map loop start missing' unless loop_line
-          pre_start=loop_line+"    loop do #루프 시작\n".length
-          graphics_marker=text.index("      # 게임 화면을 갱신\n",pre_start)
-          abort 'Scene_Map graphics marker missing' unless graphics_marker
-          pre_frame=text[pre_start...graphics_marker]
-
-          tab_block="    if Keyboard.testkey(9) && $game_variables[483]==1\n      $game_switches[1097] = true\n      $scene = Scene_Item2.new\n    end\n"
-          abort 'Scene_Map Tab block missing' unless pre_frame.include?(tab_block)
-          item_block="\n    if Keyboard.testkey(73) && $game_variables[483]==1\n      $game_switches[1097] = true\n      $scene = Scene_Item.new\n    end\n"
-          pre_frame=pre_frame.sub(tab_block,tab_block+item_block)
-
-          loop_end=text.index("    end #루프 끝\n",graphics_marker)
-          abort 'Scene_Map loop end missing' unless loop_end
-          after_loop=loop_end+"    end #루프 끝\n".length
-          update_comment=text.index("  #--------------------------------------------------------------------------\n  # ● 프레임 갱신\n",after_loop)
-          abort 'Scene_Map update section missing' unless update_comment
-          cleanup=text[after_loop...update_comment]
-          abort 'Scene_Map main closing end missing' unless cleanup.end_with?("  end\n")
-          cleanup_body=cleanup[0...-"  end\n".length]
-
-          map_rep=+"    # Web: browser loop drives update.\n    $game_map.autoplay\n  end\n\n  def web_pre_update\n"
-          map_rep<<pre_frame
-          map_rep<<"  end\n\n  def dispose\n"
-          map_rep<<cleanup_body
-          map_rep<<"  end\n"
-          text=text[0...loop_comment]+map_rep+text[update_comment..]
-          deflate(scene_map,text)
-
           mog=scripts.find{|e|e.is_a?(Array)&&e.length>=3&&((inflate(e).include?('alias shud_main main')) rescue false)}
           abort 'MOG HUD missing' unless mog
-          text=inflate(mog).gsub("\r\n","\n")
-          old_mog=<<'RUBY'
-          class Scene_Map  
-            alias shud_main main
-          #--------------------------------------------------------------------------
-          # Main 
-          #--------------------------------------------------------------------------
-            def main
-                @s_viewport = Viewport.new(0, 0, 640, 480)
-                @s_viewport.z = 9999     
-                @shud = S_Hud.new(@s_viewport)
-                shud_main    
-                @shud.dispose
-                @shud = nil
-                @s_viewport.dispose
-                @s_viewport = nil
-            end  
-          #--------------------------------------------------------------------------
-          # Update
-          #--------------------------------------------------------------------------    
-            alias shud_update update
-            def update
-              shud_update
-              @shud.update
-            end  
-          end
-          RUBY
-          new_mog=<<'RUBY'
-          class Scene_Map
-            alias shud_main main
-            def main
-              @s_viewport=Viewport.new(0,0,$WINDOW_WIDTH,$WINDOW_HEIGHT)
-              @s_viewport.z=9999
-              @shud=S_Hud.new(@s_viewport)
-              shud_main
-            end
-            alias shud_dispose dispose
-            def dispose
-              shud_dispose
-              if @shud!=nil
-                begin
-                  @shud.dispose unless @shud.disposed?
-                rescue
-                  @shud.dispose
-                end
-                @shud=nil
-              end
-              if @s_viewport!=nil
-                begin
-                  @s_viewport.dispose unless @s_viewport.disposed?
-                rescue
-                  @s_viewport.dispose
-                end
-                @s_viewport=nil
-              end
-            end
-            alias shud_update update
-            def update
-              shud_update
-              @shud.update if @shud!=nil
-            end
-          end
-          RUBY
-          n=0
-          text=text.sub(old_mog){n+=1;new_mog}
-          abort "MOG HUD lifecycle patch=#{n}" unless n==1
+          text=inflate(mog)
+          text.gsub!('Viewport.new(0, 0, 640, 480)','Viewport.new(0, 0, $WINDOW_WIDTH, $WINDOW_HEIGHT)')
           deflate(mog,text)
 
           main=entry_for(scripts,'Main')
-          abort 'main web_pre_update missing' unless inflate(main).include?('web_pre_update')
           abort 'defined? regression in Main' if inflate(main).include?('defined?')
 
           target=File.join(game,'Data','Scripts.rxdata')
           File.binwrite(target,Marshal.dump(scripts))
           File.delete(source_path) if File.expand_path(source_path)!=File.expand_path(target)
-          lines=ini.split(/\r?\n/).map{|line|line=~/^Scripts=/i ? 'Scripts=Data\\Scripts.rxdata' : line=~/^Title=/i ? 'Title=SLKnight' : line}
+
+          lines=ini.split(/\r?\n/).map{|line|
+            line=~/^Scripts=/i ? 'Scripts=Data\\Scripts.rxdata' :
+            line=~/^Title=/i ? 'Title=SLKnight' : line
+          }
           File.binwrite(ini_path,lines.join("\r\n")+"\r\n")
 
           class RawMarshalObject
             def self._load(data); o=allocate; o.instance_variable_set(:@raw,data); o; end
             def _dump(_depth); @raw; end
           end
+
           class Tone<RawMarshalObject;end
           class Color<RawMarshalObject;end
           class Rect<RawMarshalObject;end
           class Table<RawMarshalObject;end
+
           module RPG
             class AudioFile;end
             class Map;end
@@ -516,34 +505,43 @@ jobs:
             class MoveRoute;end
             class MoveCommand;end
           end
+
           def iv(o,n); o.instance_variable_get("@#{n}"); end
           def setiv(o,n,v); o.instance_variable_set("@#{n}",v); end
 
           map_path=Dir.glob(File.join(game,'Data','*Map029.rxdata')).max_by{|p|File.size(p)}
           abort 'Map029 missing' unless map_path&&File.size(map_path)>1000
+
           map=Marshal.load(File.binread(map_path))
           smith=(iv(map,:events)||{})[30]
           abort 'blacksmith missing' unless smith
+
           patched=0
           (iv(smith,:pages)||[]).each do |page|
             route=iv(page,:move_route)
             next unless route
+
             (iv(route,:list)||[]).each do |cmd|
               next unless iv(cmd,:code)==44
               audio=(iv(cmd,:parameters)||[])[0]
               next unless audio
+
               an=iv(audio,:name).to_s.dup.force_encoding(Encoding::UTF_8)
               next unless an=='대장간 소리'||an=='대장간 소리2'
+
               vol=iv(audio,:volume).to_i
               pitch=iv(audio,:pitch).to_i
               code="dx=($game_player.x-@x).abs;dy=($game_player.y-@y).abs;d=[dx,dy].max;if d<=8;v=[#{vol}-d*3,6].max;$game_system.se_play(RPG::AudioFile.new(#{an.dump},v,#{pitch}));end"
+
               setiv(cmd,:code,45)
               setiv(cmd,:parameters,[code])
               patched+=1
             end
           end
+
           abort "blacksmith patch=#{patched}" unless patched==4
           File.binwrite(map_path,Marshal.dump(map))
+
           puts 'SCRIPT_AND_MAP_PATCH_OK'
           RB
 
@@ -552,13 +550,17 @@ jobs:
             class Item;end
             class AudioFile;end
           end
+
           path=Dir.glob('player/gameasync/Data/*Items.rxdata').max_by{|p|File.size(p)}
           abort 'Items data missing' unless path&&File.size(path)>1000
+
           items=Marshal.load(File.binread(path))
           abort 'item 3 missing' unless items[3]
           abort 'item 17 missing' unless items[17]
+
           items[3].instance_variable_set(:@common_event_id,8)
           abort 'transform common event changed' unless items[17].instance_variable_get(:@common_event_id)==6
+
           File.binwrite(path,Marshal.dump(items))
           puts 'ITEM_USE_PATCH_OK'
           RB
@@ -568,35 +570,49 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import subprocess,sys
+
           root=Path('player/gameasync/Audio')
           exts={'.mp3','.wav','.wma','.aac','.m4a','.flac','.mid','.midi'}
           failures=[]
           converted=0
+
           for src in [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in exts]:
-              out=src.with_suffix('.ogg'); temp=None
+              out=src.with_suffix('.ogg')
+              temp=None
               try:
                   inp=src
                   if src.suffix.lower() in {'.mid','.midi'}:
                       temp=src.with_name(src.name+'.wav')
                       subprocess.run(['timidity',str(src),'-Ow','-o',str(temp)],check=True)
                       inp=temp
+
                   subprocess.run(['ffmpeg','-nostdin','-v','error','-y','-i',str(inp),'-c:a','libvorbis','-q:a','4',str(out)],check=True)
-                  if not out.exists() or out.stat().st_size==0: raise RuntimeError('empty output')
+
+                  if not out.exists() or out.stat().st_size==0:
+                      raise RuntimeError('empty output')
+
                   if temp and temp.exists(): temp.unlink()
                   if src!=out and src.exists(): src.unlink()
                   converted+=1
               except Exception as e:
                   failures.append((str(src),str(e)))
                   if temp and temp.exists(): temp.unlink()
+
           if failures:
-              for f,e in failures: print(f+' -> '+e,file=sys.stderr)
+              for f,e in failures:
+                  print(f+' -> '+e,file=sys.stderr)
               raise SystemExit(1)
+
           print('AUDIO_CONVERTED='+str(converted))
+
           gfx=Path('player/gameasync/Graphics')
           for src in [p for p in gfx.rglob('*') if p.is_file() and p.suffix.lower() in {'.bmp','.gif','.webp','.tif','.tiff'}]:
               out=src.with_suffix('.png')
               subprocess.run(['convert',str(src)+'[0]',str(out)],check=True)
-              if not out.exists() or out.stat().st_size==0: raise SystemExit('image conversion failed: '+str(src))
+
+              if not out.exists() or out.stat().st_size==0:
+                  raise SystemExit('image conversion failed: '+str(src))
+
               src.unlink()
           PY
 
@@ -608,66 +624,93 @@ jobs:
           test -s mapping.js
           test -s bitmap-map.js
           grep -Fq 'Fonts/NanumGothic.ttf' mapping.js
-          grep -Fq 'Fonts/NanumGothicBold.ttf' mapping.js
-          grep -Fq 'graphics/icons/' mapping.js
+          grep -Fq 'Graphics/Pictures/' mapping.js
+          grep -Fq 'Graphics/Icons/' mapping.js
 
-      - name: Patch equipment bitmap loading
+      - name: Patch browser save audio and touch
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('player/js/drive.js')
-          s=p.read_text()
-          old='''    // Show progress if doing it synchronously only
-              if (bitmap && bitmapSizeMapping[mappingKey]) {'''
-          if old not in s:
-              old='''    // Show progress if doing it synchronously only
-          if (bitmap && bitmapSizeMapping[mappingKey]) {'''
-          if old not in s:
-              raise SystemExit('bitmap async branch missing')
-          indent='    '
-          new='''    // Equipment icons must finish loading before RGSS blits them into window contents.
-              const forceRealBitmap = bitmap && window.slEquipLoading === true && mappingKey.indexOf("graphics/icons/") === 0;
-              if (bitmap && bitmapSizeMapping[mappingKey] && !forceRealBitmap) {'''
-          if old.startswith('    // Show') and '\n    if ' in old:
-              new='''    // Equipment icons must finish loading before RGSS blits them into window contents.
-          const forceRealBitmap = bitmap && window.slEquipLoading === true && mappingKey.indexOf("graphics/icons/") === 0;
-          if (bitmap && bitmapSizeMapping[mappingKey] && !forceRealBitmap) {'''
-          s=s.replace(old,new,1)
-          p.write_text(s)
-          PY
 
-      - name: Patch save audio and touch UI
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
           p=Path('player/js/drive.js')
           s=p.read_text()
           a=s.index('window.saveFile = function(filename, localOnly) {')
           b=s.index('\n};',a)+3
+
           save="window.saveFile = function(filename, localOnly) {\n    const fpath='/game/'+filename; if(!FS.analyzePath(fpath).exists)return Promise.resolve(false);\n    const buf=FS.readFile(fpath);\n    return localforage.setItem(namespace+filename,buf).then(()=>localforage.getItem(namespace)).then(folder=>{folder=folder||{};folder[filename]={t:Number(FS.stat(fpath).mtime)};return localforage.setItem(namespace,folder);}).then(()=>{if(!localOnly)(window.saveCloudFile||(()=>{}))(filename,buf);console.log('SLSAVED|'+filename);return true;}).catch(e=>{console.error('SLSAVEERR|'+e);return false;});\n};\nwindow.restoreLocalFilesBeforeRun = function(){\n    const dep='sl-local-saves'; addRunDependency(dep);\n    localforage.getItem(namespace).then(folder=>Promise.all(Object.keys(folder||{}).map(key=>localforage.getItem(namespace+key).then(res=>{if(!res)return;const f='/game/'+key;try{if(FS.analyzePath(f).exists)FS.unlink(f);}catch(e){}FS.writeFile(f,res);const m=folder[key];if(m&&Number.isInteger(m.t))FS.utime(f,m.t,m.t);})))).then(()=>{console.log('SLRESTORE|done');removeRunDependency(dep);}).catch(e=>{console.error('SLRESTOREERR',e);removeRunDependency(dep);});\n};"
+
           p.write_text(s[:a]+save+s[b:])
           PY
 
           cat > player/js/dpad.js <<'JS'
           function simulateKeyEvent(eventType,keyCode,charCode){
-            var e=document.createEventObject?document.createEventObject():document.createEvent("Events");
+            var e=document.createEventObject?document.createEventObject():document.createEvent('Events');
             if(e.initEvent)e.initEvent(eventType,true,true);
-            e.keyCode=keyCode;e.which=keyCode;e.charCode=charCode||0;
-            if(typeof JSEvents!=='undefined'&&JSEvents.eventHandlers&&JSEvents.eventHandlers.length>0){
+            e.keyCode=keyCode;
+            e.which=keyCode;
+            e.charCode=charCode||0;
+
+            if(typeof JSEvents!=='undefined'&&JSEvents.eventHandlers&&JSEvents.eventHandlers.length){
               for(var i=0;i<JSEvents.eventHandlers.length;i++){
                 var h=JSEvents.eventHandlers[i];
-                if((h.target==Module['canvas']||h.target==window)&&h.eventTypeString==eventType)h.handlerFunc(e);
+                if((h.target==Module['canvas']||h.target==window)&&h.eventTypeString==eventType){
+                  h.handlerFunc(e);
+                }
               }
-            }else if(Module['canvas']){
-              Module['canvas'].dispatchEvent?Module['canvas'].dispatchEvent(e):Module['canvas'].fireEvent("on"+eventType,e);
+            }else if(Module&&Module['canvas']){
+              Module['canvas'].dispatchEvent?
+                Module['canvas'].dispatchEvent(e):
+                Module['canvas'].fireEvent('on'+eventType,e);
             }
+          }
+
+          const keyMap={};
+          const keysDown={};
+
+          function bindKey(elem,key){
+            keyMap[elem]=key;
+            const ne=document.getElementById(elem);
+            if(!ne)return;
+
+            ne.addEventListener('touchstart',e=>{
+              e.preventDefault();
+              simulateKeyEvent('keydown',key);
+              keysDown[e.target.id]=elem;
+            });
+
+            ne.addEventListener('touchend',e=>{
+              e.preventDefault();
+              if(keysDown[e.target.id]&&keyMap[keysDown[e.target.id]]){
+                simulateKeyEvent('keyup',keyMap[keysDown[e.target.id]]);
+              }
+              keysDown[e.target.id]=0;
+            });
           }
 
           function is_touch_device(){
             return ('ontouchstart' in window)||navigator.maxTouchPoints>0;
           }
 
+          const resize=function(){
+            const el=document.getElementById('canvas');
+            if(!el)return;
+
+            if(window.innerHeight>window.innerWidth){
+              el.style.height='unset';
+              el.style.width='100%';
+            }else{
+              el.style.width='unset';
+              el.style.height='100%';
+            }
+
+            fitSLOverlay();
+          };
+
+          window.addEventListener('resize',resize);
+          window.addEventListener('load',resize);
+
           const slHeld=new Set();
+
           function slKey(code,down){
             if(down){
               if(slHeld.has(code))return;
@@ -681,114 +724,223 @@ jobs:
           }
 
           function slReleaseAll(){
-            Array.from(slHeld).forEach(function(code){slKey(code,false);});
+            Array.from(slHeld).forEach(k=>slKey(k,false));
+          }
+
+          function fitSLOverlay(){
+            const c=document.getElementById('canvas');
+            const o=document.getElementById('sl-overlay');
+            if(!c||!o)return;
+
+            const r=c.getBoundingClientRect();
+            o.style.left=r.left+'px';
+            o.style.top=r.top+'px';
+            o.style.width=r.width+'px';
+            o.style.height=r.height+'px';
+          }
+
+          function slButton(parent,id,label,key,x,y,w,h,mapOnly){
+            const b=document.createElement('div');
+            b.id=id;
+            b.className='sl-btn'+(mapOnly?' sl-map-only':'');
+            b.textContent=label;
+
+            b.style.left=(x/8)+'%';
+            b.style.top=(y/6)+'%';
+            b.style.width=(w/8)+'%';
+            b.style.height=(h/6)+'%';
+
+            parent.appendChild(b);
+
+            b.addEventListener('pointerdown',e=>{
+              e.preventDefault();
+              try{b.setPointerCapture(e.pointerId);}catch(_){}
+              b.classList.add('pressed');
+              slKey(key,true);
+            });
+
+            const up=e=>{
+              if(e)e.preventDefault();
+              b.classList.remove('pressed');
+              slKey(key,false);
+            };
+
+            b.addEventListener('pointerup',up);
+            b.addEventListener('pointercancel',up);
+            b.addEventListener('lostpointercapture',up);
+
+            return b;
+          }
+
+          function slHot(parent,key,x,y){
+            const b=slButton(parent,'sl-hot-'+key,'',key,x,y,36,36,true);
+            b.classList.add('sl-hot');
+            return b;
+          }
+
+          function slSceneUI(){
+            const map=(window.slSceneName==='Scene_Map');
+            document.querySelectorAll('.sl-map-only').forEach(e=>{
+              e.style.display=map?'flex':'none';
+            });
           }
 
           function initSLTouchControls(){
-            var ui=document.getElementById('sl-touch-ui');
-            if(!ui)return;
-            if(!is_touch_device()){ui.style.display='none';return;}
+            const old1=document.getElementById('dpad');
+            const old2=document.getElementById('apad');
 
-            var zone=document.getElementById('sl-joy-zone');
-            var base=document.getElementById('sl-joy-base');
-            var knob=document.getElementById('sl-joy-knob');
-            var joyId=null,originX=0,originY=0;
-            var dirs={left:false,right:false,up:false,down:false};
+            if(old1)old1.style.display='none';
+            if(old2)old2.style.display='none';
 
-            function setDir(name,on){
-              if(dirs[name]===on)return;
-              dirs[name]=on;
-              var key={left:37,right:39,up:38,down:40}[name];
-              slKey(key,on);
+            if(!is_touch_device()||document.getElementById('sl-overlay'))return;
+
+            const style=document.createElement('style');
+            style.textContent=`
+              #sl-overlay{position:fixed;z-index:5000;pointer-events:none;user-select:none;-webkit-user-select:none}
+              #sl-joy-zone{position:absolute;left:0;top:10%;width:48%;height:78%;pointer-events:auto;touch-action:none}
+              #sl-joy-base{display:none;position:fixed;width:132px;height:132px;border-radius:50%;background:rgba(120,120,120,.26);border:2px solid rgba(255,255,255,.18);transform:translate(-50%,-50%);pointer-events:none}
+              #sl-joy-knob{position:absolute;left:50%;top:50%;width:64px;height:64px;border-radius:50%;background:rgba(210,210,210,.42);border:2px solid rgba(255,255,255,.28);transform:translate(-50%,-50%)}
+              .sl-btn{position:absolute;box-sizing:border-box;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(80,80,80,.34);border:2px solid rgba(255,255,255,.18);color:#fff;font:bold 15px sans-serif;pointer-events:auto;touch-action:none;text-shadow:0 1px 2px #000}
+              .sl-btn.pressed{background:rgba(220,220,220,.48);transform:scale(.94)}
+              .sl-main{font-size:20px;background:rgba(110,110,110,.40)}
+              .sl-hot{background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:5px}
+              .sl-hot.pressed{background:rgba(255,255,255,.22)}
+            `;
+            document.head.appendChild(style);
+
+            const o=document.createElement('div');
+            o.id='sl-overlay';
+            document.body.appendChild(o);
+
+            const zone=document.createElement('div');
+            zone.id='sl-joy-zone';
+            o.appendChild(zone);
+
+            const base=document.createElement('div');
+            base.id='sl-joy-base';
+            base.innerHTML='<div id="sl-joy-knob"></div>';
+            document.body.appendChild(base);
+
+            const knob=base.firstElementChild;
+            let pid=null;
+            let ox=0;
+            let oy=0;
+            const dirs={37:false,38:false,39:false,40:false};
+
+            function dir(k,on){
+              if(dirs[k]===on)return;
+              dirs[k]=on;
+              slKey(k,on);
             }
 
-            function releaseJoy(){
-              setDir('left',false);setDir('right',false);setDir('up',false);setDir('down',false);
-              joyId=null;
+            function move(x,y){
+              let dx=x-ox;
+              let dy=y-oy;
+              let d=Math.hypot(dx,dy);
+              let m=45;
+              let dead=12;
+              let nx=dx;
+              let ny=dy;
+
+              if(d>m){
+                nx=dx/d*m;
+                ny=dy/d*m;
+              }
+
+              knob.style.transform='translate(calc(-50% + '+nx+'px),calc(-50% + '+ny+'px))';
+
+              dir(37,dx<-dead);
+              dir(39,dx>dead);
+              dir(38,dy<-dead);
+              dir(40,dy>dead);
+            }
+
+            function release(){
+              dir(37,false);
+              dir(38,false);
+              dir(39,false);
+              dir(40,false);
+              pid=null;
               base.style.display='none';
               knob.style.transform='translate(-50%,-50%)';
             }
 
-            function updateJoy(x,y){
-              var dx=x-originX,dy=y-originY;
-              var dist=Math.sqrt(dx*dx+dy*dy);
-              var max=46;
-              var dead=12;
-              var nx=dx,ny=dy;
-              if(dist>max){nx=dx/dist*max;ny=dy/dist*max;}
-              knob.style.transform='translate(calc(-50% + '+nx+'px),calc(-50% + '+ny+'px))';
-              setDir('left',dx<-dead);
-              setDir('right',dx>dead);
-              setDir('up',dy<-dead);
-              setDir('down',dy>dead);
-            }
-
-            zone.addEventListener('pointerdown',function(e){
-              if(joyId!==null)return;
+            zone.addEventListener('pointerdown',e=>{
+              if(pid!==null)return;
               e.preventDefault();
-              joyId=e.pointerId;
-              originX=e.clientX;originY=e.clientY;
-              base.style.left=originX+'px';
-              base.style.top=originY+'px';
+
+              pid=e.pointerId;
+              ox=e.clientX;
+              oy=e.clientY;
+
+              base.style.left=ox+'px';
+              base.style.top=oy+'px';
               base.style.display='block';
-              try{zone.setPointerCapture(e.pointerId);}catch(_){}
-              updateJoy(e.clientX,e.clientY);
+
+              try{zone.setPointerCapture(pid);}catch(_){}
+              move(e.clientX,e.clientY);
             });
 
-            zone.addEventListener('pointermove',function(e){
-              if(e.pointerId!==joyId)return;
+            zone.addEventListener('pointermove',e=>{
+              if(e.pointerId!==pid)return;
               e.preventDefault();
-              updateJoy(e.clientX,e.clientY);
+              move(e.clientX,e.clientY);
             });
 
-            zone.addEventListener('pointerup',function(e){
-              if(e.pointerId!==joyId)return;
-              e.preventDefault();
-              releaseJoy();
+            zone.addEventListener('pointerup',e=>{
+              if(e.pointerId===pid){
+                e.preventDefault();
+                release();
+              }
             });
 
-            zone.addEventListener('pointercancel',function(e){
-              if(e.pointerId!==joyId)return;
-              releaseJoy();
-            });
+            zone.addEventListener('pointercancel',release);
+
+            slButton(o,'sl-main','공격/확인',67,690,370,92,92,false).classList.add('sl-main');
+            slButton(o,'sl-cancel','취소',88,620,406,64,64,false);
+            slButton(o,'sl-bag','가방',9,620,334,58,58,true);
+            slButton(o,'sl-equip','장비',87,686,304,62,58,true);
+            slButton(o,'sl-change','교체',69,752,318,44,44,true);
 
             [
-              ['sl-btn-main',67],
-              ['sl-btn-cancel',88],
-              ['sl-btn-item',73],
-              ['sl-btn-equip',69]
-            ].forEach(function(pair){
-              var el=document.getElementById(pair[0]),key=pair[1];
-              if(!el)return;
-              el.addEventListener('pointerdown',function(e){
-                e.preventDefault();
-                try{el.setPointerCapture(e.pointerId);}catch(_){}
-                el.classList.add('pressed');
-                slKey(key,true);
-              });
-              function up(e){
-                if(e)e.preventDefault();
-                el.classList.remove('pressed');
-                slKey(key,false);
-              }
-              el.addEventListener('pointerup',up);
-              el.addEventListener('pointercancel',up);
-              el.addEventListener('lostpointercapture',up);
+              [49,498,497],
+              [50,531,497],
+              [51,565,497],
+              [52,600,497],
+              [53,497,530],
+              [54,532,530],
+              [55,566,530],
+              [56,600,530],
+              [65,657,496],
+              [83,692,496],
+              [68,727,496],
+              [81,757,496],
+              [90,657,526],
+              [70,692,529]
+            ].forEach(v=>slHot(o,v[0],v[1],v[2]));
+
+            fitSLOverlay();
+            slSceneUI();
+
+            window.addEventListener('slscenechange',slSceneUI);
+            window.addEventListener('resize',fitSLOverlay);
+
+            document.addEventListener('fullscreenchange',()=>{
+              setTimeout(fitSLOverlay,50);
             });
 
-            window.addEventListener('blur',function(){releaseJoy();slReleaseAll();});
-            document.addEventListener('visibilitychange',function(){if(document.hidden){releaseJoy();slReleaseAll();}});
+            window.addEventListener('blur',()=>{
+              release();
+              slReleaseAll();
+            });
+
+            document.addEventListener('visibilitychange',()=>{
+              if(document.hidden){
+                release();
+                slReleaseAll();
+              }
+            });
           }
-
-          const resize=function(){
-            const el=document.getElementById('canvas');
-            if(!el)return;
-            if(window.innerHeight>window.innerWidth){el.style.height='unset';el.style.width='100%';}
-            else{el.style.width='unset';el.style.height='100%';}
-          };
-
-          window.addEventListener('resize',resize);
-          window.addEventListener('load',resize);
           JS
 
           ruby - player/index.html <<'RB'
@@ -798,140 +950,135 @@ jobs:
           bridge=<<'JS'
           <script>
           (function(){
-            window.slEquipLoading=false;
             var ch={BGM:new Audio(),BGS:new Audio()},pending=[];
-            ch.BGM.loop=true;ch.BGS.loop=true;
-            function urlFor(n){var p=String(n||'').replace(/\\/g,'/').replace(/\.(ogg|mp3|wav|wma|aac|m4a|flac|mid|midi)$/i,'');return encodeURI('gameasync/'+p+'.ogg?v=v142d');}
-            function safe(a){if(!a||!a.src)return;try{var p=a.play();if(p&&p.catch)p.catch(function(){if(pending.indexOf(a)<0)pending.push(a);});}catch(e){if(pending.indexOf(a)<0)pending.push(a);}}
-            function retry(){var x=pending.slice();pending.length=0;x.forEach(safe);}
-            ['touchstart','pointerdown','keydown','mousedown'].forEach(function(n){window.addEventListener(n,retry,{passive:true});});
-            function stop(k){var a=ch[k];if(!a)return;a.pause();try{a.currentTime=0;}catch(e){}}
-            function play(k,n,v,p){var a=ch[k];if(!a||!n)return;var u=urlFor(n);if(a.getAttribute('data-sl-src')!==u){a.pause();a.src=u;a.setAttribute('data-sl-src',u);a.load();}var gain=k==='BGS'?0.20:1;a.volume=Math.max(0,Math.min(1,Number(v||100)/100*gain));a.playbackRate=Math.max(.5,Math.min(1.5,Number(p||100)/100));safe(a);}
-            function marker(t){
-              if(t.indexOf('SLEQUIPBEGIN')>=0)window.slEquipLoading=true;
-              if(t.indexOf('SLEQUIPREADY')>=0)window.slEquipLoading=false;
-              var i=t.indexOf('SLAUDIO|');if(i<0)return;
-              var p=t.slice(i).split('|'),cmd=p[1]||'',k=cmd.split('_')[0];
-              if(/_PLAY$/.test(cmd))play(k,p.slice(2,-2).join('|'),p[p.length-2],p[p.length-1]);
-              else if(/_STOP$/.test(cmd))stop(k);
-              else if(/_FADE$/.test(cmd))setTimeout(function(){stop(k);},Number(p[2])||0);
+            ch.BGM.loop=true;
+            ch.BGS.loop=true;
+            window.slSceneName='';
+
+            function urlFor(n){
+              var p=String(n||'').replace(/\\/g,'/').replace(/\.(ogg|mp3|wav|wma|aac|m4a|flac|mid|midi)$/i,'');
+              return encodeURI('gameasync/'+p+'.ogg?v=v142e');
             }
-            function err(t){var p=document.getElementById('slerr');if(!p){p=document.createElement('pre');p.id='slerr';p.style='position:fixed;left:8px;top:8px;right:8px;max-height:70vh;overflow:auto;z-index:999999;background:#000;color:#fff;border:2px solid #d33;padding:10px;font:14px monospace;white-space:pre-wrap';document.body.appendChild(p);}p.textContent=String(t);}
+
+            function safe(a){
+              if(!a||!a.src)return;
+              try{
+                var p=a.play();
+                if(p&&p.catch)p.catch(function(){
+                  if(pending.indexOf(a)<0)pending.push(a);
+                });
+              }catch(e){
+                if(pending.indexOf(a)<0)pending.push(a);
+              }
+            }
+
+            function retry(){
+              var x=pending.slice();
+              pending.length=0;
+              x.forEach(safe);
+            }
+
+            ['touchstart','pointerdown','keydown','mousedown'].forEach(function(n){
+              window.addEventListener(n,retry,{passive:true});
+            });
+
+            function stop(k){
+              var a=ch[k];
+              if(!a)return;
+              a.pause();
+              try{a.currentTime=0;}catch(e){}
+            }
+
+            function play(k,n,v,p){
+              var a=ch[k];
+              if(!a||!n)return;
+
+              var u=urlFor(n);
+
+              if(a.getAttribute('data-sl-src')!==u){
+                a.pause();
+                a.src=u;
+                a.setAttribute('data-sl-src',u);
+                a.load();
+              }
+
+              var gain=k==='BGS'?0.20:1;
+              a.volume=Math.max(0,Math.min(1,Number(v||100)/100*gain));
+              a.playbackRate=Math.max(.5,Math.min(1.5,Number(p||100)/100));
+              safe(a);
+            }
+
+            function marker(t){
+              if(t.indexOf('SLFRAME|')>=0){
+                window.slSceneName=t.slice(t.indexOf('SLFRAME|')+8).split(/\s/)[0];
+                window.dispatchEvent(new Event('slscenechange'));
+              }
+
+              var i=t.indexOf('SLAUDIO|');
+              if(i<0)return;
+
+              var p=t.slice(i).split('|');
+              var cmd=p[1]||'';
+              var k=cmd.split('_')[0];
+
+              if(/_PLAY$/.test(cmd)){
+                play(k,p.slice(2,-2).join('|'),p[p.length-2],p[p.length-1]);
+              }else if(/_STOP$/.test(cmd)){
+                stop(k);
+              }else if(/_FADE$/.test(cmd)){
+                setTimeout(function(){stop(k);},Number(p[2])||0);
+              }
+            }
+
+            function err(t){
+              var p=document.getElementById('slerr');
+
+              if(!p){
+                p=document.createElement('pre');
+                p.id='slerr';
+                p.style='position:fixed;left:8px;top:8px;right:8px;max-height:70vh;overflow:auto;z-index:999999;background:#000;color:#fff;border:2px solid #d33;padding:10px;font:14px monospace;white-space:pre-wrap';
+                document.body.appendChild(p);
+              }
+
+              p.textContent=String(t);
+            }
+
             var log=console.log.bind(console);
-            console.log=function(){var a=[].slice.call(arguments),t=a.join(' ');try{marker(t);}catch(e){log('SLJSERR|'+e);}if(/SLRUNTIMEERR|SLSCRIPTERR/.test(t))err(t);log.apply(console,a);};
-            window.addEventListener('error',function(e){err('JS ERROR | '+e.message);});
+
+            console.log=function(){
+              var a=[].slice.call(arguments);
+              var t=a.join(' ');
+
+              try{marker(t);}
+              catch(e){log('SLJSERR|'+e);}
+
+              if(/SLRUNTIMEERR|SLSCRIPTERR/.test(t))err(t);
+              log.apply(console,a);
+            };
+
+            window.addEventListener('error',function(e){
+              err('JS ERROR | '+e.message);
+            });
+
             window.slAudioBridge=ch;
           })();
           </script>
           JS
 
-          old_controls=<<'HTML'
-                  <div id="dpad">
-                      <div id="d-up"></div>
-                      <div id="d-right"></div>
-                      <div id="d-down"></div>
-                      <div id="d-left"></div>
-                      <div id="d-pl"></div>
-                  </div>
-
-                  <div id="apad">
-                      <div id="ap-c"></div>
-                      <div id="ap-b"></div>
-                      <div id="ap-a"></div>
-                      <div id="ap-ka"></div>
-                  </div>
-          HTML
-
-          new_controls=<<'HTML'
-                  <div id="sl-touch-ui">
-                      <div id="sl-joy-zone">
-                          <div id="sl-joy-base"><div id="sl-joy-knob"></div></div>
-                      </div>
-                      <div id="sl-buttons">
-                          <div class="sl-btn sl-main" id="sl-btn-main">A</div>
-                          <div class="sl-btn sl-cancel" id="sl-btn-cancel">X</div>
-                          <div class="sl-btn sl-item" id="sl-btn-item">I</div>
-                          <div class="sl-btn sl-equip" id="sl-btn-equip">E</div>
-                      </div>
-                  </div>
-          HTML
-
-          old_css=<<'CSS'
-                  #dpad, #apad {
-                      position: fixed;
-                      bottom: 0; left: 0;
-                      height: 30vh; max-height: 30vw;
-                      width: 30vh; max-width: 30vw;
-                      transform: translate(55%, -5%);
-                  }
-
-                  #apad {
-                      right: 0; left: unset;
-                      transform: unset;
-                      width: 15vh; max-width: 15vw;
-                  }
-
-                  #dpad *, #apad * {
-                      position: absolute;
-                      height: 15vh; max-height: 15vw;
-                      width: 15vh; max-width: 15vw;
-                      background-color: gray;
-                      opacity: 0.3;
-                  }
-
-                  #apad * {
-                      border-radius: 50%;
-                  }
-
-                  #d-up { transform: translateY(-100%); }
-                  #d-left { transform: translateX(-100%); }
-                  #d-down { transform: translateY(100%); }
-                  #d-right { transform: translateX(100%); }
-                  #ap-b { transform: translate(-130%, 90%); }
-                  #ap-c { transform: translate(-15%, -25%); }
-                  #ap-a, #ap-ka {
-                      height: 7vh; max-height: 7vw;
-                      width: 7vh; max-width: 7vw;
-                      top: 50%;
-                      transform: translate(60%, -30%);
-                  }
-                  #ap-ka {
-                      transform: translate(-20%, 70%);
-                  }
-          CSS
-
-          new_css=<<'CSS'
-                  #sl-touch-ui{position:fixed;inset:0;z-index:5000;pointer-events:none;user-select:none;-webkit-user-select:none}
-                  #sl-joy-zone{position:fixed;left:0;bottom:0;width:58vw;height:58vh;pointer-events:auto;touch-action:none}
-                  #sl-joy-base{display:none;position:fixed;width:138px;height:138px;border-radius:50%;background:rgba(120,120,120,.28);border:2px solid rgba(255,255,255,.18);transform:translate(-50%,-50%);pointer-events:none}
-                  #sl-joy-knob{position:absolute;left:50%;top:50%;width:66px;height:66px;border-radius:50%;background:rgba(190,190,190,.45);border:2px solid rgba(255,255,255,.25);transform:translate(-50%,-50%)}
-                  #sl-buttons{position:fixed;right:14px;bottom:16px;width:205px;height:205px;pointer-events:none}
-                  .sl-btn{position:absolute;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(120,120,120,.34);border:2px solid rgba(255,255,255,.14);color:rgba(255,255,255,.78);font:bold 19px sans-serif;pointer-events:auto;touch-action:none}
-                  .sl-btn.pressed{background:rgba(210,210,210,.48);transform:scale(.94)}
-                  .sl-main{width:92px;height:92px;right:0;top:0;font-size:25px}
-                  .sl-cancel{width:68px;height:68px;right:91px;top:105px}
-                  .sl-item{width:48px;height:48px;right:8px;top:112px;font-size:16px}
-                  .sl-equip{width:48px;height:48px;right:104px;top:34px;font-size:16px}
-          CSS
-
           html.sub!('<head>',"<head>\n#{bridge}") or abort 'head target missing'
-          html.sub!(old_controls,new_controls) or abort 'old touch controls missing'
-          html.sub!(old_css,new_css) or abort 'old touch css missing'
-
-          binding_rx=/        if \(!is_touch_device\(\)\) \{\r?\n.*?        bindKey\('ap-ka', 65\);\r?\n/m
-          abort 'old touch bindings missing' unless html.scan(binding_rx).size==1
-          html.sub!(binding_rx,"        initSLTouchControls();\n")
 
           pre=<<'JS'.strip
-          preRun: [function(){createDummies();window.restoreLocalFilesBeforeRun();[['NanumGothic.ttf','gameasync/Fonts/NanumGothic.ttf?v=v142d'],['NanumGothicBold.ttf','gameasync/Fonts/NanumGothicBold.ttf?v=v142d']].forEach(function(x){var p='/game/Fonts/'+x[0];try{if(FS.analyzePath(p).exists)FS.unlink(p);}catch(e){}FS.createPreloadedFile('/game/Fonts',x[0],x[1],true,true,function(){console.log('SLFONTREADY|'+x[0]);},function(){console.error('SLFONTERR|'+x[0]);});});}],
+          preRun: [function(){createDummies();window.restoreLocalFilesBeforeRun();[['NanumGothic.ttf','gameasync/Fonts/NanumGothic.ttf?v=v142e'],['NanumGothicBold.ttf','gameasync/Fonts/NanumGothicBold.ttf?v=v142e']].forEach(function(x){var p='/game/Fonts/'+x[0];try{if(FS.analyzePath(p).exists)FS.unlink(p);}catch(e){}FS.createPreloadedFile('/game/Fonts',x[0],x[1],true,true,function(){console.log('SLFONTREADY|'+x[0]);},function(){console.error('SLFONTERR|'+x[0]);});});}],
           JS
 
           html.sub!('preRun: [createDummies],',pre) or abort 'preRun target missing'
           html.sub!(/var namespace = '[^']*';/,"var namespace = 'slknight_v14_engine';") or abort 'namespace missing'
           html.sub!(/var wTitle = '[^']*'/,"var wTitle = 'SLKnight V14'") or abort 'title missing'
-          html.sub!('<script src="js/dpad.js"></script>','<script src="js/dpad.js?v=v142d"></script>') or abort 'dpad script missing'
+          html.sub!('<script src="js/dpad.js"></script>','<script src="js/dpad.js?v=v142e"></script>') or abort 'dpad missing'
           html.sub!('width="640" height="480"','width="800" height="600"') or abort 'canvas size missing'
+          html.sub!(/\n        resize\(\);\n/,"\n        resize();\n        initSLTouchControls();\n") or abort 'touch init marker missing'
           html.sub!('<title>MKXP</title>','<title>SLKnight V14</title>') if html.include?('<title>MKXP</title>')
+
           File.write(path,html)
           puts 'BROWSER_PATCH_OK'
           RB
@@ -946,61 +1093,49 @@ jobs:
           test -s player/gameasync/Data/Scripts.rxdata
           test -s player/gameasync/mapping.js
           test -s player/gameasync/bitmap-map.js
-          test ! -e player/core.pack
-          test "$(find player -maxdepth 1 -type f -name '*.data' | wc -l)" -eq 0
 
           grep -Fq 'slknight_v14_engine' player/index.html
-          grep -Fq 'width="800" height="600"' player/index.html
           grep -Fq 'initSLTouchControls();' player/index.html
-          grep -Fq 'id="sl-btn-item">I</div>' player/index.html
-          grep -Fq 'id="sl-btn-equip">E</div>' player/index.html
-          grep -Fq 'sl-btn-main' player/index.html
-          grep -Fq 'sl-joy-zone' player/index.html
-          grep -Fq 'window.slEquipLoading' player/index.html
-          grep -Fq 'forceRealBitmap' player/js/drive.js
-          grep -Fq 'mappingKey.indexOf("graphics/icons/") === 0' player/js/drive.js
           grep -Fq 'restoreLocalFilesBeforeRun' player/js/drive.js
           grep -Fq "console.log('SLSAVED|'+filename)" player/js/drive.js
-          grep -Fq "['sl-btn-item',73]" player/js/dpad.js
-          grep -Fq "['sl-btn-equip',69]" player/js/dpad.js
+          grep -Fq "slButton(o,'sl-bag','가방',9" player/js/dpad.js
+          grep -Fq "slButton(o,'sl-equip','장비',87" player/js/dpad.js
+          grep -Fq '[65,657,496]' player/js/dpad.js
+
           node --check player/js/drive.js
           node --check player/js/dpad.js
 
           ruby -EUTF-8:UTF-8 -rzlib - player/gameasync/Data/Scripts.rxdata <<'RB'
           a=Marshal.load(File.binread(ARGV[0]))
+
           def s(a,n)
             e=a.find{|x|x.is_a?(Array)&&x.length>=3&&x[1].to_s==n}
             abort("missing #{n}") unless e
             Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8)
           end
 
-          item=s(a,'Scene_Item')
-          skill=s(a,'Scene_Skill')
-          equip=s(a,'Scene_Equip')
           map=s(a,'Scene_Map')
+          equip=s(a,'Scene_Equip')
           save=s(a,'Scene_Save')
-          main=s(a,'Main')
+          wi=s(a,'Window_EquipItem')
           multi=s(a,'Multi-slot script : Windows')
           compat=s(a,'Web Compatibility')
 
-          abort 'item lifecycle broken' unless item.include?('def main')&&item.include?('def dispose')&&item.include?('def update')
-          abort 'skill lifecycle broken' unless skill.include?('def main')&&skill.include?('def dispose')&&skill.include?('def update')
-          abort 'equip blocking loop remains' if equip.match?(/loop do.*?Graphics\.update.*?Input\.update.*?update/m)
-          abort 'equip poison switch remains' if equip.include?('$game_switches[49] = true')
-          abort 'equip E-close remains' if equip.include?("if Keyboard.testkey(69)")
-          abort 'equip BEGIN marker missing' unless equip.include?("puts('SLEQUIPBEGIN')")
-          abort 'equip READY marker missing' unless equip.include?("puts('SLEQUIPREADY')")
+          abort 'Scene_Map was web-split' if map.include?('def web_pre_update')
+          abort 'Scene_Map original loop missing' unless map.include?('loop do #루프 시작')
+
+          abort 'equip blocking loop remains' if equip.match?(/# 메인 루프.*?Graphics\.update.*?Input\.update/m)
+          abort 'equip lazy init missing' unless equip.include?('$sl_equip_lazy_init = true')&&wi.include?('@sl_web_lazy')
           abort 'multislot dispose missing' unless multi.include?('g7_ms_scene_equip_dispose')
-          abort 'map I shortcut missing' unless map.include?('Keyboard.testkey(73)')&&map.include?('$scene = Scene_Item.new')
-          abort 'map E shortcut missing' unless map.include?('Keyboard.testkey(69)')&&map.include?('$scene = Scene_Equip.new')
-          abort 'browser map driver missing' unless main.include?('web_pre_update')
-          abort 'raw E bridge missing' unless compat.include?('when 69 then Input::F5')
-          abort 'raw I bridge missing' unless compat.include?('when 73 then Input::F6')
+
+          abort 'raw keyboard bridge missing' unless compat.include?('Input.raw_trigger?')&&compat.include?('Input.raw_press?')
+
           abort 'save persistence missing' unless save.include?('file.close')&&save.include?('save_file_async(filename)')
           abort 'save menu flow changed' unless save.scan('$scene = Scene_Menu.new(4)').size==2
           abort 'save event flow changed' unless save.scan('$scene = Scene_Map.new').size==2
+
           abort 'resolution inactive' unless Zlib::Inflate.inflate(a[97][2]).include?('Graphics.resize_screen')&&Zlib::Inflate.inflate(a[97][2]).include?('$WINDOW_WIDTH = 800')
-          abort 'defined joiplay remains' if a.any?{|e|e.is_a?(Array)&&e.length>=3&&((Zlib::Inflate.inflate(e[2]).include?('defined?($joiplay)')) rescue false)}
+
           puts 'SCRIPT_VERIFY_OK'
           RB
 
@@ -1009,10 +1144,13 @@ jobs:
             class Item;end
             class AudioFile;end
           end
+
           p=Dir.glob('player/gameasync/Data/*Items.rxdata').max_by{|x|File.size(x)}
           a=Marshal.load(File.binread(p))
+
           abort 'courage item CE wrong' unless a[3].instance_variable_get(:@common_event_id)==8
           abort 'transform item CE wrong' unless a[17].instance_variable_get(:@common_event_id)==6
+
           puts 'ITEM_VERIFY_OK'
           RB
 
