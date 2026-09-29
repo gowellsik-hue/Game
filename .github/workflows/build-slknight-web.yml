@@ -1,3 +1,835 @@
+name: Deploy SLKnight + SLFairy Independent Web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-slknight-web.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: slknight-github-pages
+  cancel-in-progress: true
+
+env:
+  KNIGHT_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLKnight_Android_JoiPlay.zip
+  KNIGHT_SHA256: 9f007d46d2410742aca5e14c3901f63586084007e7f52c4d199116191824132a
+  FAIRY_URL: https://github.com/gowellsik-hue/Game/releases/download/v1.0.0/SLFairy_Source_v1.zip
+  FAIRY_SHA256: 67b88b5fe0cde3c9f2fada889815f9aa7d0fc94b378025529e9950d55151c70e
+  FAIRY_7Z_PASSWORD: http://nemo838.tistory.com/
+  MKXP_SRC_REF: e0437fdc5be29507e78d148a2b3f02d26ee1c779
+  EMSDK_VER: 3.1.37
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake cmake curl ffmpeg freepats git imagemagick \
+            libtool make mm-common patch pkg-config python3 rake ruby \
+            timidity unzip wget xz-utils fonts-nanum p7zip-full
+
+      - name: Checkout clean mkxp-web source
+        uses: actions/checkout@v4
+        with:
+          repository: pulsejet/mkxp-web
+          ref: ${{ env.MKXP_SRC_REF }}
+          path: engine
+
+      - name: Patch mkxp-web engine
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def repl(path, old, new, count=1):
+              p = Path(path)
+              s = p.read_text()
+              n = s.count(old)
+              if n != count:
+                  raise SystemExit(f'{path}: expected {count} copies, found {n}: {old!r}')
+              p.write_text(s.replace(old, new, count))
+
+          repl('engine/src/config.cpp', 'fixedFramerate = 40;', 'fixedFramerate = 0;')
+          repl('engine/src/config.cpp', 'defScreenW = 640;', 'defScreenW = 800;')
+          repl('engine/src/config.cpp', 'defScreenH = 480;', 'defScreenH = 600;')
+          repl('engine/src/config.cpp', 'frameSkip = true;', 'frameSkip = false;')
+          repl('engine/src/config.cpp', 'PO_DESC(smoothScaling, bool, true)', 'PO_DESC(smoothScaling, bool, false)')
+          repl(
+              'engine/src/graphics.cpp',
+              'width = clamp(width, 1, 640);\n\theight = clamp(height, 1, 480);',
+              'width = clamp(width, 1, 800);\n\theight = clamp(height, 1, 600);'
+          )
+
+          p = Path('engine/binding-mruby/graphics-binding.cpp')
+          s = p.read_text()
+          marker = '''MRB_FUNCTION(graphicsFrameReset)\n{\n\tMRB_FUN_UNUSED_PARAM;\n\n\tshState->graphics().frameReset();\n\n\treturn mrb_nil_value();\n}\n'''
+          addition = marker + '''\nMRB_FUNCTION(graphicsResizeScreen)\n{\n\tMRB_FUN_UNUSED_PARAM;\n\tmrb_int width, height;\n\tmrb_get_args(mrb, "ii", &width, &height);\n\tGUARD_EXC( shState->graphics().resizeScreen(width, height); )\n\treturn mrb_nil_value();\n}\n'''
+          if s.count(marker) != 1:
+              raise SystemExit('graphicsFrameReset marker mismatch')
+          s = s.replace(marker, addition, 1)
+          reg = '\tmrb_define_module_function(mrb, module, "frame_reset", graphicsFrameReset, MRB_ARGS_NONE());'
+          if s.count(reg) != 1:
+              raise SystemExit('frame_reset registration mismatch')
+          s = s.replace(reg, reg + '\n\tmrb_define_module_function(mrb, module, "resize_screen", graphicsResizeScreen, MRB_ARGS_REQ(2));', 1)
+          p.write_text(s)
+
+          repl(
+              'engine/binding-mruby/binding-mruby.cpp',
+              '\tif (jsSkipFrame() == 1) return;',
+              '\t/* web build: Graphics.frame_rate is the only frame limiter. */'
+          )
+          repl('engine/build.sh', './emsdk install latest', './emsdk install 3.1.37')
+          repl('engine/build.sh', './emsdk activate latest', './emsdk activate 3.1.37')
+
+          p = Path('engine/extra/build_config.rb')
+          s = p.read_text()
+          gem = "    conf.gem :github => 'pulsejet/mruby-marshal'"
+          pin = "    conf.gem :github => 'mattn/mruby-onig-regexp', :checksum_hash => '25b152264cd4dfac84aa39e5fbb428ec84b95e6a'\n" + gem
+          if s.count(gem) != 1:
+              raise SystemExit('mruby build config marker mismatch')
+          p.write_text(s.replace(gem, pin, 1))
+          print('ENGINE_PATCH_OK')
+          PY
+
+      - name: Build clean mkxp-web engine
+        run: |
+          set -euo pipefail
+          mkdir -p engine/build/gameasync
+          cd engine
+          bash build.sh
+          cd ..
+          rm -rf engine/build/gameasync
+          test -s engine/build/index.html
+          test -s engine/build/mkxp.js
+          test -s engine/build/mkxp.wasm
+          echo ENGINE_BUILD_OK
+
+      - name: Download Knight and Fairy releases
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 -o knight.zip "$KNIGHT_URL"
+          echo "$KNIGHT_SHA256  knight.zip" | sha256sum -c -
+          curl -L --fail --retry 3 -o fairy.zip "$FAIRY_URL"
+          echo "$FAIRY_SHA256  fairy.zip" | sha256sum -c -
+
+      - name: Prepare independent Knight source
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/knight-src /tmp/knight-unzip
+          mkdir -p /tmp/knight-unzip
+          unzip -q knight.zip -d /tmp/knight-unzip
+          test -d /tmp/knight-unzip/SLKnight_Android_JoiPlay
+          cp -a /tmp/knight-unzip/SLKnight_Android_JoiPlay /tmp/knight-src
+          test -s /tmp/knight-src/Game.ini
+          echo KNIGHT_SOURCE_READY
+
+      - name: Prepare independent Fairy source
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/fairy-pkg /tmp/fairy-raw /tmp/fairy-src
+          mkdir -p /tmp/fairy-pkg /tmp/fairy-raw /tmp/fairy-src
+          unzip -q fairy.zip -d /tmp/fairy-pkg
+          test -s /tmp/fairy-pkg/SLFairy_Win_241226.7z
+          7z x /tmp/fairy-pkg/SLFairy_Win_241226.7z -p"$FAIRY_7Z_PASSWORD" -o/tmp/fairy-raw -y >/tmp/fairy-7z.log
+          test -s /tmp/fairy-raw/Game.rgssad
+          test -s /tmp/fairy-raw/Game.ini
+
+          cat > /tmp/rgssad_extract.py <<'PY'
+          from pathlib import Path
+          import struct
+          import sys
+
+          MASK = 0xffffffff
+          KEY0 = 0xDEADCAFE
+
+          def rot(k):
+              return ((k * 7) + 3) & MASK
+
+          def extract(src, out):
+              src = Path(src)
+              out = Path(out)
+              out.mkdir(parents=True, exist_ok=True)
+              with src.open('rb') as f:
+                  hdr = f.read(8)
+                  if hdr[:7] != b'RGSSAD\0' or len(hdr) != 8 or hdr[7] != 1:
+                      raise SystemExit(f'unsupported RGSSAD header: {hdr!r}')
+                  key = KEY0
+                  count = 0
+                  while True:
+                      raw = f.read(4)
+                      if not raw:
+                          break
+                      if len(raw) != 4:
+                          raise SystemExit('truncated filename length')
+                      n = struct.unpack('<I', raw)[0] ^ key
+                      key = rot(key)
+                      if n > 4096:
+                          raise SystemExit(f'bad filename length: {n}')
+                      enc = bytearray(f.read(n))
+                      if len(enc) != n:
+                          raise SystemExit('truncated filename')
+                      for i in range(n):
+                          enc[i] ^= key & 0xff
+                          key = rot(key)
+                      raw = f.read(4)
+                      if len(raw) != 4:
+                          raise SystemExit('truncated file size')
+                      size = struct.unpack('<I', raw)[0] ^ key
+                      key = rot(key)
+                      try:
+                          name = bytes(enc).decode('cp949')
+                      except UnicodeDecodeError:
+                          name = bytes(enc).decode('utf-8', 'replace')
+                      name = name.replace('\\', '/')
+                      parts = [p for p in name.split('/') if p not in ('', '.', '..')]
+                      if not parts:
+                          raise SystemExit('unsafe empty path')
+                      target = out.joinpath(*parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      data_key = key
+                      counter = 0
+                      remain = size
+                      with target.open('wb') as w:
+                          while remain:
+                              chunk = bytearray(f.read(min(1 << 20, remain)))
+                              if not chunk:
+                                  raise SystemExit(f'truncated data: {name}')
+                              kb = data_key.to_bytes(4, 'little')
+                              for i in range(len(chunk)):
+                                  chunk[i] ^= kb[counter]
+                                  counter = (counter + 1) & 3
+                                  if counter == 0:
+                                      data_key = rot(data_key)
+                                      kb = data_key.to_bytes(4, 'little')
+                              w.write(chunk)
+                              remain -= len(chunk)
+                      count += 1
+              print(f'RGSSAD_EXTRACT_OK files={count}')
+
+          extract(sys.argv[1], sys.argv[2])
+          PY
+
+          python3 /tmp/rgssad_extract.py /tmp/fairy-raw/Game.rgssad /tmp/fairy-src
+          cp /tmp/fairy-raw/Game.ini /tmp/fairy-src/Game.ini
+          if [ -d /tmp/fairy-raw/Audio ]; then
+            mkdir -p /tmp/fairy-src/Audio
+            cp -a /tmp/fairy-raw/Audio/. /tmp/fairy-src/Audio/
+          fi
+          test -s /tmp/fairy-src/Data/Scripts.rxdata
+          test -d /tmp/fairy-src/Graphics
+          echo FAIRY_SOURCE_READY
+
+      - name: Create common web patcher
+        run: |
+          cat > /tmp/patch_game.rb <<'RB'
+          # encoding: UTF-8
+          require 'zlib'
+
+          game = ARGV.fetch(0)
+          variant = ARGV.fetch(1)
+          title = variant == 'knight' ? 'SLKnight' : 'SLFairy'
+          ini_path = File.join(game, 'Game.ini')
+          ini = File.binread(ini_path)
+          rel = ini[/^Scripts=(.+)$/i, 1].to_s.strip.tr('\\', '/')
+          abort 'Scripts entry missing' if rel.empty?
+          source_path = File.join(game, rel)
+          abort "Scripts file missing: #{source_path}" unless File.file?(source_path)
+          scripts = Marshal.load(File.binread(source_path))
+
+          def inflate(e)
+            Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8)
+          end
+
+          def deflate(e, s)
+            e[2] = Zlib::Deflate.deflate(s)
+          end
+
+          def entry_for(scripts, name)
+            scripts.find { |x| x.is_a?(Array) && x.length >= 3 && x[1].to_s == name }
+          end
+
+          scripts.reject! do |e|
+            e.is_a?(Array) && e.length >= 3 && ['Web Compatibility', 'Web Resolution 800x600', 'Mobile Diablo Assist'].include?(e[1].to_s)
+          end
+
+          compat = <<'RUBY'
+          $joiplay=true
+          module Kernel
+            def exit(*args); nil; end
+          end
+          class Win32API
+            def initialize(*args); @func=args[1].to_s; end
+            def web_input(key)
+              case key.to_i
+              when 9,90 then Input::A
+              when 13,32,67 then Input::C
+              when 27,88 then Input::B
+              when 68 then Input::Z
+              when 81 then Input::L
+              when 83 then Input::Y
+              when 87 then Input::R
+              when 65 then Input::X
+              when 16 then Input::SHIFT
+              when 17 then Input::CTRL
+              when 18 then Input::ALT
+              else nil
+              end
+            end
+            def call(*args)
+              code=web_input(args[0])
+              return(code && Input.trigger?(code) ? 1 : 0) if @func=='GetAsyncKeyState'
+              return(code && Input.press?(code) ? -1 : 0) if @func=='GetKeyState'
+              0
+            end
+            def Call(*args); call(*args); end
+          end
+          Font.default_name='NanumGothic'
+          module Audio
+            def self.sl_stream(kind,*parts); puts((['SLAUDIO',kind]+parts.collect{|v|v.to_s}).join('|')); end
+            def self.bgm_play(filename,volume=100,pitch=100); sl_stream('BGM_PLAY',filename,volume,pitch); end
+            def self.bgm_stop; sl_stream('BGM_STOP'); end
+            def self.bgm_fade(time); sl_stream('BGM_FADE',time); end
+            def self.bgs_play(filename,volume=100,pitch=100); sl_stream('BGS_PLAY',filename,volume,pitch); end
+            def self.bgs_stop; sl_stream('BGS_STOP'); end
+            def self.bgs_fade(time); sl_stream('BGS_FADE',time); end
+          end
+          RUBY
+          scripts.insert(0, [0, 'Web Compatibility', Zlib::Deflate.deflate(compat)])
+
+          def patch_begin_until(src)
+            lines=src.lines
+            lines.each_index do |i|
+              m=lines[i].match(/^(\s*)end\s+until\s+(.+?)\s*$/)
+              next unless m
+              indent,cond=m[1],m[2]
+              j=i-1
+              while j>=0
+                if lines[j][/^\s*/]==indent && lines[j].strip=='begin'
+                  lines[j]=indent+"loop do\n"
+                  lines[i]=indent+"  break if #{cond}\n#{indent}end\n"
+                  break
+                end
+                j-=1
+              end
+            end
+            lines.join
+          end
+
+          def patch_scene_loop(src)
+            lines=src.lines
+            i=0
+            while i<lines.length
+              unless lines[i].strip=='loop do'
+                i+=1
+                next
+              end
+              indent=lines[i][/^\s*/]
+              sig=[]
+              k=i+1
+              while k<lines.length && sig.length<8
+                s=lines[k].strip
+                sig << [k,s,lines[k][/^\s*/]] unless s.empty? || s.start_with?('#')
+                k+=1
+              end
+              finish=nil
+              if sig.length>=7 && sig[0][1]=='Graphics.update' && sig[1][1]=='Input.update' && sig[2][1]=='update' && sig[3][1]=='if $scene != self' && sig[4][1]=='break' && sig[5][1]=='end' && sig[6][1]=='end' && sig[6][2]==indent
+                finish=sig[6][0]
+              elsif sig.length>=5 && sig[0][1]=='Graphics.update' && sig[1][1]=='Input.update' && sig[2][1]=='update' && sig[3][1]=='break if $scene != self' && sig[4][1]=='end' && sig[4][2]==indent
+                finish=sig[4][0]
+              end
+              lines[i..finish]=[indent+"end\n\n"+indent+"def dispose\n"] if finish
+              i+=1
+            end
+            lines.join
+          end
+
+          browser_loop = <<'RUBY'
+          $prev_scene=nil
+          $sl_last_scene_name=nil
+          def main_update_loop
+            begin
+              if $scene!=nil
+                active_scene=$scene
+                name=active_scene.class.to_s
+                if $sl_last_scene_name!=name
+                  puts('SLFRAME|'+name)
+                  $sl_last_scene_name=name
+                end
+                if active_scene!=$prev_scene
+                  $prev_scene.dispose if $prev_scene!=nil && $prev_scene.respond_to?(:dispose)
+                  active_scene.main
+                  $prev_scene=active_scene
+                  return if $scene!=active_scene
+                end
+                Graphics.update
+                Input.update
+                active_scene.update if $scene==active_scene
+              end
+            rescue Exception=>e
+              puts('SLRUNTIMEERR|'+e.class.to_s+'|'+e.message.to_s)
+              e.backtrace[0,16].each{|line| puts('SLRUNTIMEBT|'+line.to_s)} if e.respond_to?(:backtrace) && e.backtrace
+            end
+          end
+          RUBY
+
+          font_rules=[
+            [/((?:Font\.default_name)\s*=\s*)\[\s*["'][^"']*["']\s*\]/n,'\\1"NanumGothic"'],
+            [/(Font\.default_name\s*=\s*)["'][^"']*["']/n,'\\1"NanumGothic"'],
+            [/(\.font\.name\s*=\s*)["'][^"']*["']/n,'\\1"NanumGothic"'],
+            [/(\bFONT_NAME\s*=\s*)["'][^"']*["']/n,'\\1"NanumGothic"']
+          ]
+
+          scripts.each do |entry|
+            next unless entry.is_a?(Array) && entry.length>=3
+            name=entry[1].to_s
+            begin
+              text=inflate(entry)
+            rescue
+              next
+            end
+            font_rules.each{|rx,rep| text.gsub!(rx,rep)}
+            text.gsub!('defined?($joiplay) && $joiplay','$joiplay == true')
+            text="# native Plane used on web\n" if text.match?(/^\s*class\s+Plane\s*<\s*Sprite\b/n)
+            text=patch_begin_until(text)
+            text=patch_scene_loop(text) unless name=='Main' || name=='Scene_Map'
+            if name=='Main'
+              text=browser_loop+text unless text.include?('def main_update_loop')
+              text.sub!(/\n\s*while\s+\$scene\s*!=\s*nil\s*\r?\n\s*\$scene\.main\s*\r?\n\s*end\s*/m,"\n")
+            end
+            deflate(entry,text)
+          end
+
+          shim = <<'RUBY'
+          $WINDOW_WIDTH = 800
+          $WINDOW_HEIGHT = 600
+          begin
+            Graphics.resize_screen(800,600)
+          rescue
+          end
+          RUBY
+          main_index=scripts.index{|e| e.is_a?(Array) && e.length>=3 && e[1].to_s=='Main'}
+          abort 'Main script missing' unless main_index
+          scripts.insert(main_index,[99999990,'Web Resolution 800x600',Zlib::Deflate.deflate(shim)])
+
+          map=entry_for(scripts,'Scene_Map')
+          if map
+            t=inflate(map)
+            t.gsub!(/\s*if \$game_switches\[49\] == false\r?\n\s*Input\.update\s*\r?\n\s*end\r?\n/, "     Input.update\n")
+            deflate(map,t)
+          end
+
+          equip=entry_for(scripts,'Scene_Equip')
+          if equip
+            t=inflate(equip)
+            t.gsub!('$game_switches[49] = true','$game_switches[49] = false')
+            deflate(equip,t)
+          end
+
+          save=entry_for(scripts,'Scene_Save')
+          if save
+            t=inflate(save)
+            unless t.include?('save_file_async(filename)')
+              t.sub!(/    write_save_data\(file\)\r?\n    exit/, "    write_save_data(file)\n    file.close\n    save_file_async(filename)")
+            end
+            t.gsub!('$scene = Scene_Menu.new(4)','$scene = Scene_Map.new')
+            deflate(save,t)
+          end
+
+          scripts.each do |e|
+            next unless e.is_a?(Array) && e.length>=3
+            begin
+              t=inflate(e)
+            rescue
+              next
+            end
+            deflate(e,"# web: XRXS menu transparency disabled\n") if t.include?('XRXS_MP7_Module')
+          end
+
+          assist = <<'RUBY'
+          $mobile_auto_attack_active=false
+          $mobile_auto_attack_event_id=0
+          $mobile_auto_attack_cooldown=0
+
+          class Game_Event
+            def sl_mobile_enemy_event?
+              event_data=instance_variable_get(:@event)
+              page_data=instance_variable_get(:@page)
+              erased=instance_variable_get(:@erased)
+              return false if event_data==nil || page_data==nil || erased
+              name=event_data.instance_variable_get(:@name).to_s
+              return false unless name[0,3]=='[ID'
+              return false if self.through
+              return false unless self.trigger==2
+              true
+            end
+          end
+
+          class Interpreter
+            alias sl_mobile_original_command_111 command_111
+            def command_111
+              if $mobile_auto_attack_active && @event_id==$mobile_auto_attack_event_id && @parameters[0]==11 && @parameters[1]==13
+                $mobile_auto_attack_active=false
+                @branch[@list[@index].indent]=true
+                @branch.delete(@list[@index].indent)
+                return true
+              end
+              sl_mobile_original_command_111
+            end
+          end
+
+          class Game_System
+            def sl_quick_items
+              @sl_quick_items=[0,0,0,0] if @sl_quick_items==nil
+              @sl_quick_items
+            end
+            def sl_quick_items=(v); @sl_quick_items=v; end
+          end
+
+          module SLMobileQuick
+            def self.emit_labels
+              $game_system.sl_quick_items.each_with_index do |id,i|
+                item=(id.to_i>0 && $data_items) ? $data_items[id.to_i] : nil
+                name=item ? item.name.to_s.gsub('|','/') : '-'
+                puts('SLQS|'+(i+1).to_s+'|'+name)
+              end
+            end
+            def self.use(slot)
+              return if $game_party==nil || $game_system==nil
+              id=$game_system.sl_quick_items[slot].to_i
+              item=(id>0 && $data_items) ? $data_items[id] : nil
+              unless item && item.is_a?(RPG::Item) && $game_party.item_number(id)>0 && $game_party.item_can_use?(id)
+                $game_system.se_play($data_system.buzzer_se) if $data_system
+                return
+              end
+              used=false
+              if item.scope>=3
+                if item.scope==4 || item.scope==6
+                  for actor in $game_party.actors
+                    used |= actor.item_effect(item)
+                  end
+                else
+                  actor=$game_party.actors[0]
+                  used=actor ? actor.item_effect(item) : false
+                end
+              elsif item.common_event_id>0
+                used=true
+              end
+              if used
+                $game_system.se_play(item.menu_se)
+                $game_party.lose_item(id,1) if item.consumable
+                $game_temp.common_event_id=item.common_event_id if item.common_event_id>0
+              else
+                $game_system.se_play($data_system.buzzer_se)
+              end
+            end
+          end
+
+          class Scene_MobileQuick
+            def initialize(slot_index=0); @slot_index=slot_index; end
+            def main
+              @help_window=Window_Help.new
+              @help_window.set_text('Quick slot setup')
+              build_slot_window
+              @item_window=Window_Item.new
+              @item_window.help_window=@help_window
+              @item_window.active=false
+              @item_window.visible=false
+              Graphics.transition
+            end
+            def build_slot_window
+              old_index=@slot_window ? @slot_window.index : @slot_index
+              @slot_window.dispose if @slot_window
+              names=[]
+              $game_system.sl_quick_items.each_with_index do |id,i|
+                item=(id.to_i>0 && $data_items) ? $data_items[id.to_i] : nil
+                names << "#{i+1}. #{item ? item.name.to_s : '-'}"
+              end
+              @slot_window=Window_Command.new(300,names)
+              @slot_window.x=0
+              @slot_window.y=64
+              @slot_window.index=[[old_index,0].max,3].min
+            end
+            def dispose
+              Graphics.freeze
+              @help_window.dispose if @help_window
+              @slot_window.dispose if @slot_window
+              @item_window.dispose if @item_window
+            end
+            def update
+              @help_window.update
+              @slot_window.update
+              @item_window.update
+              if @slot_window.active
+                if Input.trigger?(Input::B)
+                  $game_system.se_play($data_system.cancel_se)
+                  $scene=Scene_Map.new
+                  return
+                end
+                if Input.trigger?(Input::C)
+                  $game_system.se_play($data_system.decision_se)
+                  @slot_index=@slot_window.index
+                  @slot_window.active=false
+                  @item_window.visible=true
+                  @item_window.active=true
+                  @item_window.index=0
+                  return
+                end
+              else
+                if Input.trigger?(Input::B)
+                  $game_system.se_play($data_system.cancel_se)
+                  @item_window.active=false
+                  @item_window.visible=false
+                  @slot_window.active=true
+                  return
+                end
+                if Input.trigger?(Input::C)
+                  item=@item_window.item
+                  unless item && item.is_a?(RPG::Item)
+                    $game_system.se_play($data_system.buzzer_se)
+                    return
+                  end
+                  $game_system.sl_quick_items[@slot_index]=item.id
+                  $game_system.se_play($data_system.decision_se)
+                  @item_window.active=false
+                  @item_window.visible=false
+                  build_slot_window
+                  @slot_window.active=true
+                  SLMobileQuick.emit_labels
+                  return
+                end
+              end
+            end
+          end
+
+          class Game_Player
+            alias sl_mobile_original_update update
+            def update
+              sl_mobile_original_update
+              $mobile_auto_attack_cooldown-=1 if $mobile_auto_attack_cooldown>0
+              $mobile_auto_attack_active=false if $mobile_auto_attack_active && $mobile_auto_attack_cooldown<=8
+              return if moving? || @move_route_forcing || $game_temp.message_window_showing || $game_system.map_interpreter.running? || $mobile_auto_attack_cooldown>0
+              return if $game_switches[743]
+              target=nil
+              for event in $game_map.events.values
+                next unless event.sl_mobile_enemy_event?
+                if (event.x-self.x).abs+(event.y-self.y).abs==1
+                  target=event
+                  break
+                end
+              end
+              return if target==nil
+              dx=target.x-self.x
+              dy=target.y-self.y
+              if dx>0; turn_right
+              elsif dx<0; turn_left
+              elsif dy>0; turn_down
+              else; turn_up
+              end
+              target.turn_toward_player
+              $mobile_auto_attack_event_id=target.id
+              $mobile_auto_attack_active=true
+              $mobile_auto_attack_cooldown=20
+              target.start
+            end
+          end
+
+          class Scene_Map
+            alias sl_mobile_quick_main main
+            def main
+              SLMobileQuick.emit_labels
+              sl_mobile_quick_main
+            end
+            alias sl_mobile_quick_update update
+            def update
+              if Input.trigger?(Input::F5)
+                $scene=Scene_MobileQuick.new
+                return
+              end
+              SLMobileQuick.use(0) if Input.trigger?(Input::F6)
+              SLMobileQuick.use(1) if Input.trigger?(Input::F7)
+              SLMobileQuick.use(2) if Input.trigger?(Input::F8)
+              SLMobileQuick.use(3) if Input.trigger?(Input::F9)
+              sl_mobile_quick_update
+            end
+          end
+          RUBY
+          main_index=scripts.index{|e| e.is_a?(Array) && e.length>=3 && e[1].to_s=='Main'}
+          scripts.insert(main_index,[99999992,'Mobile Diablo Assist',Zlib::Deflate.deflate(assist)])
+
+          out_path=File.join(game,'Data','Scripts.rxdata')
+          File.binwrite(out_path,Marshal.dump(scripts))
+          if File.expand_path(source_path)!=File.expand_path(out_path) && File.exist?(source_path)
+            File.delete(source_path)
+          end
+          lines=ini.split(/\r?\n/).map do |line|
+            if line =~ /^Scripts=/i
+              'Scripts=Data\\Scripts.rxdata'
+            elsif line =~ /^Title=/i
+              "Title=#{title}"
+            else
+              line
+            end
+          end
+          File.binwrite(ini_path,lines.join("\r\n")+"\r\n")
+          puts "COMMON_SCRIPT_PATCH_OK variant=#{variant} scripts=#{scripts.length}"
+          RB
+          ruby -c /tmp/patch_game.rb
+
+      - name: Create common independent site builder
+        run: |
+          cat > /tmp/build_variant.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          variant="$1"
+          src="$2"
+          site="$3"
+          title="$4"
+          namespace="$5"
+          core="$6"
+
+          rm -rf "$site"
+          cp -a engine/build "$site"
+          rm -rf "$site/gameasync" "$site/preload"
+          mkdir -p "$site/gameasync/Fonts" "$site/preload"
+          cp -a "$src/." "$site/gameasync/"
+          cp engine/extra/rgss.rb "$site/gameasync/rgss.rb"
+          cp engine/COPYING "$site/COPYING-mkxp-web.txt"
+          cp /usr/share/fonts/truetype/nanum/NanumGothic.ttf "$site/gameasync/Fonts/NanumGothic.ttf"
+          cp /usr/share/fonts/truetype/nanum/NanumGothicBold.ttf "$site/gameasync/Fonts/NanumGothicBold.ttf"
+          rm -f "$site/gameasync"/Save*.rxdata "$site/gameasync/Game.rgssad"
+
+          ruby -EUTF-8:UTF-8 /tmp/patch_game.rb "$site/gameasync" "$variant"
+
+          if [ "$variant" = knight ]; then
+            ruby - "$site/gameasync" <<'RB'
+          module RPG; class Item; end; class AudioFile; end; end
+          game=ARGV[0]
+          path=Dir.glob(File.join(game,'Data','*Items.rxdata')).max_by{|p|File.size(p)}
+          if path && File.size(path)>1000
+            items=Marshal.load(File.binread(path))
+            if items[3]
+              items[3].instance_variable_set(:@common_event_id,8)
+              File.binwrite(path,Marshal.dump(items))
+              puts 'KNIGHT_ITEM_PATCH_OK'
+            end
+          end
+          RB
+          fi
+
+          python3 - "$site/gameasync" <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+          root=Path(sys.argv[1])
+          audio=root/'Audio'
+          exts={'.mp3','.wav','.wma','.aac','.m4a','.flac','.mid','.midi'}
+          if audio.exists():
+              for src in list(audio.rglob('*')):
+                  if not src.is_file() or src.suffix.lower() not in exts:
+                      continue
+                  out=src.with_suffix('.ogg')
+                  temp=None
+                  inp=src
+                  if src.suffix.lower() in {'.mid','.midi'}:
+                      temp=src.with_name(src.name+'.wav')
+                      subprocess.run(['timidity',str(src),'-Ow','-o',str(temp)],check=True)
+                      inp=temp
+                  subprocess.run(['ffmpeg','-nostdin','-v','error','-y','-i',str(inp),'-c:a','libvorbis','-q:a','4',str(out)],check=True)
+                  if not out.exists() or out.stat().st_size==0:
+                      raise SystemExit('audio conversion failed: '+str(src))
+                  if temp and temp.exists(): temp.unlink()
+                  if src != out and src.exists(): src.unlink()
+          gfx=root/'Graphics'
+          if gfx.exists():
+              for src in list(gfx.rglob('*')):
+                  if src.is_file() and src.suffix.lower() in {'.bmp','.gif','.webp','.tif','.tiff'}:
+                      out=src.with_suffix('.png')
+                      subprocess.run(['convert',str(src)+'[0]',str(out)],check=True)
+                      if not out.exists() or out.stat().st_size==0:
+                          raise SystemExit('image conversion failed: '+str(src))
+                      src.unlink()
+          print('MEDIA_CONVERT_OK')
+          PY
+
+          (
+            cd "$site/gameasync"
+            bash ../../engine/extra/make_mapping.sh
+          )
+          test -s "$site/gameasync/mapping.js"
+
+          source engine/deps/emsdk/emsdk_env.sh >/dev/null
+          pack_args=(
+            --preload "$site/gameasync/Data@/game/Data"
+            --preload "$site/gameasync/Graphics@/game/Graphics"
+            --preload "$site/gameasync/Fonts@/game/Fonts"
+            --preload "$site/gameasync/Game.ini@/game/Game.ini"
+            --preload "$site/gameasync/rgss.rb@/game/rgss.rb"
+          )
+          if [ -d "$site/gameasync/Audio/SE" ]; then pack_args+=(--preload "$site/gameasync/Audio/SE@/game/Audio/SE"); fi
+          if [ -d "$site/gameasync/Audio/ME" ]; then pack_args+=(--preload "$site/gameasync/Audio/ME@/game/Audio/ME"); fi
+          if [ -d "$site/gameasync/BM" ]; then pack_args+=(--preload "$site/gameasync/BM@/game/BM"); fi
+          if [ -f "$site/gameasync/Lineage.ini" ]; then pack_args+=(--preload "$site/gameasync/Lineage.ini@/game/Lineage.ini"); fi
+
+          python3 engine/deps/emsdk/upstream/emscripten/tools/file_packager.py \
+            "$site/$core.data" \
+            "${pack_args[@]}" \
+            --js-output="$site/$core.js" \
+            --no-node
+
+          test -s "$site/$core.data"
+          test -s "$site/$core.js"
+
+          python3 - "$site/js/drive.js" <<'PY'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          start=s.index('window.saveFile = function(filename, localOnly) {')
+          end=s.index('\n};',start)+3
+          replacement=r'''window.saveFile = function(filename, localOnly) {
+              const fpath='/game/'+filename;
+              if(!FS.analyzePath(fpath).exists) return Promise.resolve(false);
+              const buf=FS.readFile(fpath);
+              return localforage.setItem(namespace+filename,buf)
+                .then(()=>localforage.getItem(namespace))
+                .then(folder=>{
+                  folder=folder||{};
+                  folder[filename]={t:Number(FS.stat(fpath).mtime)};
+                  return localforage.setItem(namespace,folder);
+                })
+                .then(()=>{
+                  if(!localOnly)(window.saveCloudFile||(()=>{}))(filename,buf);
+                  console.log('SLSAVED|'+filename);
+                  return true;
+                })
+                .catch(e=>{console.error('SLSAVEERR',e);return false;});
+          };
+          window.restoreLocalFilesBeforeRun=function(){
+              const dep='sl-local-saves';
+              addRunDependency(dep);
+              try{if(!FS.analyzePath('/game').exists)FS.mkdir('/game');}catch(e){}
+              localforage.getItem(namespace)
+                .then(folder=>Promise.all(Object.keys(folder||{}).map(key=>
+                  localforage.getItem(namespace+key).then(res=>{
+                    if(!res)return;
+                    const f='/game/'+key;
+                    try{if(FS.analyzePath(f).exists)FS.unlink(f);}catch(e){}
+                    FS.writeFile(f,res);
+                    const m=folder[key];
+                    if(m&&Number.isInteger(m.t))FS.utime(f,m.t,m.t);
+                  })
+                )))
+                .then(()=>{console.log('SLRESTORE|done');removeRunDependency(dep);})
                 .catch(e=>{console.error('SLRESTOREERR',e);removeRunDependency(dep);});
           };'''
           p.write_text(s[:start]+replacement+s[end:])
