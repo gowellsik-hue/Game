@@ -1,4 +1,4 @@
-name: Deploy SLKnight V14.3q MONSTER ATTACK COORDINATE SWAP
+name: Deploy SLKnight V14.3r MONSTER ATTACK COORDINATE SWAP
 on:
   push:
     branches: [main]
@@ -76,8 +76,218 @@ jobs:
       - name: Install game
         run: bash /tmp/base_install_game.sh
 
+      - name: Backup pristine potion event
+        run: |
+          ruby - <<'RB'
+          game='player/gameasync'
+          path=Dir.glob(File.join(game,'Data','*CommonEvents.rxdata')).max_by{|p|File.size(p)}
+          abort 'pristine CommonEvents missing' unless path&&File.size(path)>1000
+          File.binwrite('/tmp/pristine_common_events.rxdata',File.binread(path))
+          puts 'PRISTINE_POTION_BACKUP_OK'
+          RB
+
       - name: Patch game from V14.3l
         run: bash /tmp/base_patch_game.sh
+
+      - name: Restore ordinary potion logic
+        run: |
+          cat > /tmp/fix_potion_restore.rb <<'RB'
+          # encoding: UTF-8
+          game=ARGV.fetch(0)
+          pristine_path=ARGV.fetch(1)
+
+          class RawMarshalObject
+            def self._load(data)
+              o=allocate
+              o.instance_variable_set(:@raw,data)
+              o
+            end
+            def _dump(_depth)
+              @raw
+            end
+          end
+
+          class Tone < RawMarshalObject; end
+          class Color < RawMarshalObject; end
+          class Rect < RawMarshalObject; end
+          class Table < RawMarshalObject; end
+
+          module RPG
+            class AudioFile; end
+            class Animation
+              class Frame; end
+              class Timing; end
+            end
+            class Map; end
+            class CommonEvent; end
+            class Event
+              class Page
+                class Condition; end
+                class Graphic; end
+              end
+            end
+            class EventCommand; end
+            class MoveRoute; end
+            class MoveCommand; end
+          end
+
+          def iv(o,n)
+            o.instance_variable_get("@#{n}")
+          end
+
+          def setiv(o,n,v)
+            o.instance_variable_set("@#{n}",v)
+          end
+
+          def deep(o)
+            Marshal.load(Marshal.dump(o))
+          end
+
+          ce_path=Dir.glob(
+            File.join(game,'Data','*CommonEvents.rxdata')
+          ).max_by{|p|File.size(p)}
+
+          abort 'CommonEvents missing' unless ce_path&&File.size(ce_path)>1000
+          abort 'pristine CommonEvents missing' unless File.size?(pristine_path)
+
+          current=Marshal.load(File.binread(ce_path))
+          pristine=Marshal.load(File.binread(pristine_path))
+          orig=pristine[8]
+
+          abort 'pristine CE8 missing' unless orig
+
+          orig_list=iv(orig,:list)||[]
+
+          abort "pristine CE8 length=#{orig_list.length}" unless orig_list.length==40
+
+          abort 'pristine CE8 condition mismatch' unless
+            iv(orig_list[0],:code)==111&&
+            iv(orig_list[0],:parameters)==[8,2]
+
+          abort 'pristine CE8 switch368 mismatch' unless
+            iv(orig_list[1],:code)==121&&
+            iv(orig_list[1],:parameters)==[368,368,1]
+
+          abort 'pristine CE8 bravery consume mismatch' unless
+            iv(orig_list[3],:code)==126&&
+            iv(orig_list[3],:parameters)==[3,1,0,1]
+
+          abort 'pristine CE8 green consume mismatch' unless
+            iv(orig_list[4],:code)==126&&
+            iv(orig_list[4],:parameters)==[2,1,0,1]
+
+          abort 'pristine CE8 outer else mismatch' unless
+            iv(orig_list[33],:code)==411
+
+          abort 'pristine CE8 outer end mismatch' unless
+            iv(orig_list[36],:code)==412
+
+          current[8]=deep(orig)
+          regular=current[8]
+          regular_list=iv(regular,:list)||[]
+
+          enhanced_id=current.length
+          enhanced=deep(orig)
+
+          setiv(enhanced,:id,enhanced_id)
+          setiv(enhanced,:name,'SL Enhanced Green Bravery')
+          setiv(enhanced,:trigger,0)
+          setiv(enhanced,:switch_id,1)
+
+          enhanced_list=[]
+
+          [2,3].each do |idx|
+            cmd=deep(orig_list[idx])
+            setiv(cmd,:indent,[iv(cmd,:indent).to_i-1,0].max)
+            enhanced_list<<cmd
+          end
+
+          (5..31).each do |idx|
+            cmd=deep(orig_list[idx])
+            setiv(cmd,:indent,[iv(cmd,:indent).to_i-1,0].max)
+            enhanced_list<<cmd
+          end
+
+          [37,38,39].each do |idx|
+            enhanced_list<<deep(orig_list[idx])
+          end
+
+          setiv(enhanced,:list,enhanced_list)
+          current<<enhanced
+
+          guard=RPG::EventCommand.new
+          setiv(guard,:code,111)
+          setiv(guard,:indent,0)
+          setiv(guard,:parameters,[0,368,0])
+
+          call=RPG::EventCommand.new
+          setiv(call,:code,117)
+          setiv(call,:indent,1)
+          setiv(call,:parameters,[enhanced_id])
+
+          exit_cmd=RPG::EventCommand.new
+          setiv(exit_cmd,:code,115)
+          setiv(exit_cmd,:indent,1)
+          setiv(exit_cmd,:parameters,[])
+
+          branch_end=RPG::EventCommand.new
+          setiv(branch_end,:code,412)
+          setiv(branch_end,:indent,0)
+          setiv(branch_end,:parameters,[])
+
+          setiv(
+            regular,
+            :list,
+            [guard,call,exit_cmd,branch_end]+regular_list
+          )
+
+          restored_tail=iv(current[8],:list)[4,orig_list.length]
+
+          abort 'regular CE8 not restored exactly' unless
+            Marshal.dump(restored_tail)==Marshal.dump(orig_list)
+
+          enh_list=iv(enhanced,:list)||[]
+
+          abort 'enhanced path consumes normal green' if
+            enh_list.any? do |c|
+              iv(c,:code)==126&&
+              (iv(c,:parameters)||[])[0].to_i==2
+            end
+
+          abort 'enhanced path disables switch368' if
+            enh_list.any? do |c|
+              iv(c,:code)==121&&
+              iv(c,:parameters)==[368,368,1]
+            end
+
+          abort 'enhanced path does not consume bravery' unless
+            enh_list.any? do |c|
+              iv(c,:code)==126&&
+              iv(c,:parameters)==[3,1,0,1]
+            end
+
+          abort 'old enhanced global hack remains' if
+            (iv(current[8],:list)||[]).any? do |c|
+              (iv(c,:parameters)||[]).any? do |v|
+                v.to_s.include?('$sl_enhanced_green')
+              end
+            end
+
+          File.binwrite(ce_path,Marshal.dump(current))
+
+          puts(
+            "POTION_RESTORE_OK " \
+            "regular_tail=#{restored_tail.length} " \
+            "enhanced_ce=#{enhanced_id} " \
+            "enhanced_len=#{enh_list.length}"
+          )
+          RB
+
+          ruby -c /tmp/fix_potion_restore.rb
+          ruby -EUTF-8:UTF-8 \
+            /tmp/fix_potion_restore.rb \
+            player/gameasync \
+            /tmp/pristine_common_events.rxdata
 
       - name: Patch monster attack motion
         run: |
@@ -173,12 +383,16 @@ jobs:
                 8=>[21,22,0,1,2,3,4]
               }
             end
+
             cmd="convert #{Shellwords.escape(path)} -crop 192x192 +repage -channel A -format '%[fx:mean]\\n' info: 2>/dev/null"
             means=`#{cmd}`.lines.map{|x|x.to_f}
             used=[]
             means.each_with_index{|v,i|used<<i if v>0.00001}
+
             return nil if used.length<8
+
             runs=sl_runs(used)
+
             groups=
               if runs.length>=4
                 runs[0,4]
@@ -187,19 +401,32 @@ jobs:
               else
                 sl_split_balanced(used,4)
               end
-            return nil unless groups&&groups.length==4&&groups.all?{|g|!g.empty?}
-            {2=>groups[0],4=>groups[1],6=>groups[2],8=>groups[3]}
+
+            return nil unless
+              groups&&
+              groups.length==4&&
+              groups.all?{|g|!g.empty?}
+
+            {
+              2=>groups[0],
+              4=>groups[1],
+              6=>groups[2],
+              8=>groups[3]
+            }
           end
 
           def sl_fit(seq,target)
             return [] if seq.empty?||target<=0
             return Array.new(target,seq[0]) if seq.length==1
             return [seq[0]] if target==1
+
             out=[]
+
             target.times do |i|
               src=((i*(seq.length-1).to_f)/(target-1)).round
               out<<seq[src]
             end
+
             out
           end
 
@@ -209,9 +436,19 @@ jobs:
             [target,wait].min
           end
 
-          ce_path=Dir.glob(File.join(game,'Data','*CommonEvents.rxdata')).max_by{|p|File.size(p)}
-          anim_path=Dir.glob(File.join(game,'Data','*Animations.rxdata')).max_by{|p|File.size(p)}
-          scripts_path=File.join(game,'Data','Scripts.rxdata')
+          ce_path=Dir.glob(
+            File.join(game,'Data','*CommonEvents.rxdata')
+          ).max_by{|p|File.size(p)}
+
+          anim_path=Dir.glob(
+            File.join(game,'Data','*Animations.rxdata')
+          ).max_by{|p|File.size(p)}
+
+          scripts_path=File.join(
+            game,
+            'Data',
+            'Scripts.rxdata'
+          )
 
           abort 'CommonEvents missing' unless ce_path&&File.size(ce_path)>1000
           abort 'Animations missing' unless anim_path&&File.size(anim_path)>1000
@@ -230,12 +467,14 @@ jobs:
               return if frames<=0
               return if coord_name==nil
               return if coord_name.to_s==''
+
               unless @sl_attack_swap_active
                 @sl_attack_original_name=@character_name
                 @sl_attack_original_hue=@character_hue
                 @sl_attack_original_tile_id=@tile_id
                 @sl_attack_original_transparent=@transparent
               end
+
               @sl_attack_swap_active=true
               @sl_attack_swap_frames=frames
               @sl_attack_coord_name=coord_name.to_s
@@ -251,12 +490,14 @@ jobs:
 
             def sl_attack_finish
               return unless @sl_attack_swap_active
+
               if @character_name==@sl_attack_coord_name
                 @tile_id=@sl_attack_original_tile_id
                 @character_name=@sl_attack_original_name
                 @character_hue=@sl_attack_original_hue
                 @transparent=@sl_attack_original_transparent
               end
+
               @sl_attack_swap_active=false
               @sl_attack_swap_frames=0
               @sl_attack_coord_name=nil
@@ -269,6 +510,7 @@ jobs:
 
           class Sprite_Character
             alias sl_attack_coordinate_original_update update
+
             def update
               sl_attack_coordinate_original_update
               @character.sl_attack_tick if @character!=nil
@@ -279,39 +521,66 @@ jobs:
           scripts.delete_if do |e|
             e.is_a?(Array)&&
             e.length>=3&&
-            ['Monster Attack Body Hide','Monster Attack Coordinate Swap'].include?(e[1].to_s)
+            [
+              'Monster Attack Body Hide',
+              'Monster Attack Coordinate Swap'
+            ].include?(e[1].to_s)
           end
 
           main_pos=scripts.index do |e|
-            e.is_a?(Array)&&e.length>=3&&e[1].to_s=='Main'
+            e.is_a?(Array)&&
+            e.length>=3&&
+            e[1].to_s=='Main'
           end
+
           abort 'Main insertion point missing' unless main_pos
 
           scripts.insert(
             main_pos,
-            [999997,'Monster Attack Coordinate Swap',Zlib::Deflate.deflate(runtime)]
+            [
+              999997,
+              'Monster Attack Coordinate Swap',
+              Zlib::Deflate.deflate(runtime)
+            ]
           )
 
-          anim_dir=File.join(game,'Graphics','Animations')
+          anim_dir=File.join(
+            game,
+            'Graphics',
+            'Animations'
+          )
+
           motion_assets={}
 
           Dir.glob(File.join(anim_dir,'*.png')).sort.each do |p|
             sheet=File.basename(p,'.png').dup.force_encoding(Encoding::UTF_8)
+
             next unless sheet.include?('모션')
             next if sheet.include?('죽음')
             next if sheet.include?('맞음')
             next if sheet.start_with?('물약')
             next if sheet.match?(/모션\d+\z/)
-            key=sl_norm_name(sheet.sub(/[\s\-]*모션\z/,''))
+
+            key=sl_norm_name(
+              sheet.sub(/[\s\-]*모션\z/,'')
+            )
+
             motion_assets[key]||=[sheet,p] unless key.empty?
           end
 
-          char_dir=File.join(game,'Graphics','Characters')
+          char_dir=File.join(
+            game,
+            'Graphics',
+            'Characters'
+          )
+
           coord_assets={}
 
           Dir.glob(File.join(char_dir,'*좌표.png')).sort.each do |p|
             name=File.basename(p,'.png').dup.force_encoding(Encoding::UTF_8)
-            key=sl_norm_name(name.sub(/[\s\-]*좌표\z/,''))
+            key=sl_norm_name(
+              name.sub(/[\s\-]*좌표\z/,'')
+            )
             coord_assets[key]||=name unless key.empty?
           end
 
@@ -320,6 +589,7 @@ jobs:
           Dir.glob(File.join(char_dir,'*.png')).sort.each do |p|
             name=File.basename(p,'.png').dup.force_encoding(Encoding::UTF_8)
             next if name.end_with?('좌표')
+
             key=sl_norm_name(name)
             normal_assets[key]||=[name,p] unless key.empty?
           end
@@ -328,13 +598,20 @@ jobs:
 
           motion_assets.each_key do |sheet_key|
             next if coord_assets[sheet_key]
+
             normal=normal_assets[sheet_key]
             next unless normal
+
             coord_name=normal[0]+'좌표'
-            coord_path=File.join(char_dir,coord_name+'.png')
+            coord_path=File.join(
+              char_dir,
+              coord_name+'.png'
+            )
 
             dims=`identify -format '%wx%h' #{Shellwords.escape(normal[1])}`.strip
-            abort "coordinate size failed #{normal[0]}" unless dims.match?(/\A\d+x\d+\z/)
+
+            abort "coordinate size failed #{normal[0]}" unless
+              dims.match?(/\A\d+x\d+\z/)
 
             ok=system(
               'convert',
@@ -343,7 +620,9 @@ jobs:
               coord_path
             )
 
-            abort "coordinate generation failed #{normal[0]}" unless ok&&File.size?(coord_path)
+            abort "coordinate generation failed #{normal[0]}" unless
+              ok&&File.size?(coord_path)
+
             coord_assets[sheet_key]=coord_name
             generated_coord_files[coord_name]=true
           end
@@ -352,16 +631,33 @@ jobs:
 
           common_events.each_with_index do |ce,id|
             next unless ce
-            name=iv(ce,:name).to_s.dup.force_encoding(Encoding::UTF_8)
+
+            name=iv(
+              ce,
+              :name
+            ).to_s.dup.force_encoding(Encoding::UTF_8)
+
             next unless name.start_with?('[공격]')
+
             monster=sl_norm_name(name)
-            candidates=motion_assets.keys.select{|k|monster.include?(k)}
+
+            candidates=motion_assets.keys.select do |k|
+              monster.include?(k)
+            end
+
             next if candidates.empty?
+
             key=candidates.max_by{|k|k.length}
             sheet=motion_assets[key][0]
-            sheet_key=sl_norm_name(sheet.sub(/[\s\-]*모션\z/,''))
+
+            sheet_key=sl_norm_name(
+              sheet.sub(/[\s\-]*모션\z/,'')
+            )
+
             coord=coord_assets[sheet_key]
+
             abort "coordinate missing for #{sheet}" unless coord
+
             attack_ids[id]={
               name:name,
               sheet:sheet,
@@ -375,19 +671,26 @@ jobs:
           common_events.compact.each do |ce|
             list=iv(ce,:list)||[]
             before=list.length
+
             list.delete_if do |cmd|
               next false unless iv(cmd,:code)==355
+
               (iv(cmd,:parameters)||[])[0].to_s.include?(
                 'aid={2=>500,4=>501,6=>502,8=>503}'
               )
             end
+
             removed_old+=before-list.length
           end
 
           base_attack=animations.compact.find do |a|
             frames=iv(a,:frames)
-            frames.is_a?(Array)&&frames[0]&&iv(frames[0],:cell_data)
+
+            frames.is_a?(Array)&&
+            frames[0]&&
+            iv(frames[0],:cell_data)
           end
+
           abort 'animation frame template missing' unless base_attack
 
           next_anim=[animations.length,600].max
@@ -400,6 +703,7 @@ jobs:
           make_anim=lambda do |id,sheet,patterns,wait,dir,target|
             timeline=sl_fit(patterns,target)
             anim=Marshal.load(Marshal.dump(base_attack))
+
             setiv(anim,:id,id)
             setiv(anim,:name,"SLM #{sheet} #{dir} W#{wait} F#{target}")
             setiv(anim,:animation_name,sheet)
@@ -407,18 +711,27 @@ jobs:
             setiv(anim,:position,1)
             setiv(anim,:frame_max,timeline.length)
             setiv(anim,:timings,[])
+
             frames=[]
 
             timeline.each do |pattern|
-              frame=Marshal.load(Marshal.dump(iv(base_attack,:frames)[0]))
+              frame=Marshal.load(
+                Marshal.dump(
+                  iv(base_attack,:frames)[0]
+                )
+              )
+
               setiv(frame,:cell_max,1)
+
               table=Table.allocate
+
               setiv(
                 table,
                 :raw,
                 [2,1,8,1,8].pack('L<5')+
                 [pattern,0,0,100,0,0,255,0].pack('s<8')
               )
+
               setiv(frame,:cell_data,table)
               frames<<frame
             end
@@ -429,8 +742,10 @@ jobs:
 
           common_events.each_with_index do |ce,cid|
             next unless ce
+
             switch_id=iv(ce,:switch_id).to_i
             next if switch_id<=0
+
             list=iv(ce,:list)||[]
             i=0
 
@@ -476,7 +791,10 @@ jobs:
                 next
               end
 
-              groups=sl_direction_groups(meta[:path],meta[:sheet])
+              groups=sl_direction_groups(
+                meta[:path],
+                meta[:sheet]
+              )
 
               unless groups
                 i+=1
@@ -501,6 +819,7 @@ jobs:
                 [2,4,6,8].each do |dir|
                   id=next_anim
                   next_anim+=1
+
                   make_anim.call(
                     id,
                     meta[:sheet],
@@ -509,6 +828,7 @@ jobs:
                     dir,
                     target
                   )
+
                   ids[dir]=id
                 end
 
@@ -524,7 +844,9 @@ jobs:
                 used_coords[meta[:coord]]=true
               end
 
-              if switch_anim[switch_id]&&switch_anim[switch_id][:ids]!=data[:ids]
+              if switch_anim[switch_id]&&
+                 switch_anim[switch_id][:ids]!=data[:ids]
+
                 abort "switch collision #{switch_id}"
               end
 
@@ -543,13 +865,16 @@ jobs:
               windup=wait-2 if windup>wait-2
               recovery=wait-windup
 
-              abort "wait split mismatch caller=#{cid}" unless windup+recovery==wait
+              abort "wait split mismatch caller=#{cid}" unless
+                windup+recovery==wait
 
               windup_cmd=RPG::EventCommand.new
+
               setiv(windup_cmd,:code,106)
               setiv(windup_cmd,:indent,indent)
               setiv(windup_cmd,:parameters,[windup])
               setiv(wait_cmd,:parameters,[recovery])
+
               list.insert(i,windup_cmd)
 
               caller_patched+=1
@@ -557,7 +882,8 @@ jobs:
             end
           end
 
-          abort 'no monster attack callers patched' if caller_patched==0
+          abort 'no monster attack callers patched' if
+            caller_patched==0
 
           map_patched=0
           maps_touched={}
@@ -565,14 +891,24 @@ jobs:
           coord_triggers=0
 
           map_groups=Dir.glob(
-            File.join(game,'Data','*Map[0-9][0-9][0-9].rxdata')
+            File.join(
+              game,
+              'Data',
+              '*Map[0-9][0-9][0-9].rxdata'
+            )
           ).group_by{|p|File.basename(p)[/Map\d{3}/]}
 
           map_groups.each do |map_key,paths|
             map_path=paths.max_by{|p|File.size(p)}
-            next unless map_path&&File.size(map_path)>100
 
-            map=Marshal.load(File.binread(map_path))
+            next unless
+              map_path&&
+              File.size(map_path)>100
+
+            map=Marshal.load(
+              File.binread(map_path)
+            )
+
             changed=false
 
             (iv(map,:events)||{}).each do |eid,event|
@@ -611,8 +947,14 @@ jobs:
                   coord_literal=coord.dump
 
                   anim_cmd=RPG::EventCommand.new
+
                   setiv(anim_cmd,:code,355)
-                  setiv(anim_cmd,:indent,iv(cmd,:indent).to_i)
+                  setiv(
+                    anim_cmd,
+                    :indent,
+                    iv(cmd,:indent).to_i
+                  )
+
                   setiv(
                     anim_cmd,
                     :parameters,
@@ -629,6 +971,7 @@ jobs:
                   )
 
                   list.insert(i,anim_cmd)
+
                   map_patched+=1
                   coord_triggers+=1
                   switches_seen[first]=true
@@ -639,30 +982,50 @@ jobs:
             end
 
             if changed
-              File.binwrite(map_path,Marshal.dump(map))
+              File.binwrite(
+                map_path,
+                Marshal.dump(map)
+              )
+
               maps_touched[map_key]=true
             end
           end
 
           missing=switch_anim.keys.reject{|sid|switches_seen[sid]}
-          puts "UNSEEN_SWITCHES=#{missing.sort.join(',')}" unless missing.empty?
 
-          abort 'no map attack triggers patched' if map_patched==0
+          puts "UNSEEN_SWITCHES=#{missing.sort.join(',')}" unless
+            missing.empty?
 
-          File.binwrite(ce_path,Marshal.dump(common_events))
-          File.binwrite(anim_path,Marshal.dump(animations))
-          File.binwrite(scripts_path,Marshal.dump(scripts))
+          abort 'no map attack triggers patched' if
+            map_patched==0
+
+          File.binwrite(
+            ce_path,
+            Marshal.dump(common_events)
+          )
+
+          File.binwrite(
+            anim_path,
+            Marshal.dump(animations)
+          )
+
+          File.binwrite(
+            scripts_path,
+            Marshal.dump(scripts)
+          )
+
           File.write(
             File.join(game,'sl_attack_sheets.txt'),
             used_sheets.keys.sort.join("\n")+"\n"
           )
+
           File.write(
             File.join(game,'sl_attack_coords.txt'),
             used_coords.keys.sort.join("\n")+"\n"
           )
 
           puts(
-            "MONSTER_ATTACK_MOTION_V143Q " \
+            "MONSTER_ATTACK_MOTION_V143R " \
             "callers=#{caller_patched} " \
             "map_triggers=#{map_patched} " \
             "coord_triggers=#{coord_triggers} " \
@@ -699,22 +1062,41 @@ jobs:
           coords_path=ARGV.fetch(2)
           html=File.read(path)
 
-          sheets=File.readlines(sheets_path,chomp:true).reject{|x|x.empty?}
-          coords=File.readlines(coords_path,chomp:true).reject{|x|x.empty?}
+          sheets=File.readlines(
+            sheets_path,
+            chomp:true
+          ).reject{|x|x.empty?}
+
+          coords=File.readlines(
+            coords_path,
+            chomp:true
+          ).reject{|x|x.empty?}
 
           abort 'attack sheet list too small' if sheets.length<20
           abort 'attack coordinate list too small' if coords.length<20
 
-          start_marker="  var ka='/game/Graphics/Animations/흑기사모션.png';"
-          load_marker="FS.createPreloadedFile('/game/Graphics/Animations','흑기사모션.png'"
+          start_marker=
+            "  var ka='/game/Graphics/Animations/흑기사모션.png';"
+
+          load_marker=
+            "FS.createPreloadedFile('/game/Graphics/Animations','흑기사모션.png'"
 
           start=html.index(start_marker)
+
           abort 'black knight preload start missing' unless start
 
-          load_pos=html.index(load_marker,start)
+          load_pos=html.index(
+            load_marker,
+            start
+          )
+
           abort 'black knight preload loader missing' unless load_pos
 
-          finish=html.index("\n",load_pos)
+          finish=html.index(
+            "\n",
+            load_pos
+          )
+
           abort 'black knight preload end missing' unless finish
 
           replacement=<<JS.chomp
@@ -723,23 +1105,29 @@ jobs:
               var file=name+'.png';
               var p='/game/Graphics/Animations/'+file;
               try{if(FS.analyzePath(p).exists)FS.unlink(p);}catch(e){}
-              FS.createPreloadedFile('/game/Graphics/Animations',file,encodeURI('gameasync/Graphics/Animations/'+file+'?v=v143q'),true,true,function(){},function(){console.error('SLANIMERR|'+file);});
+              FS.createPreloadedFile('/game/Graphics/Animations',file,encodeURI('gameasync/Graphics/Animations/'+file+'?v=v143r'),true,true,function(){},function(){console.error('SLANIMERR|'+file);});
             });
             var slAttackCoords=#{coords.inspect};
             slAttackCoords.forEach(function(name){
               var file=name+'.png';
               var p='/game/Graphics/Characters/'+file;
               try{if(FS.analyzePath(p).exists)FS.unlink(p);}catch(e){}
-              FS.createPreloadedFile('/game/Graphics/Characters',file,encodeURI('gameasync/Graphics/Characters/'+file+'?v=v143q'),true,true,function(){},function(){console.error('SLCOORDERR|'+file);});
+              FS.createPreloadedFile('/game/Graphics/Characters',file,encodeURI('gameasync/Graphics/Characters/'+file+'?v=v143r'),true,true,function(){},function(){console.error('SLCOORDERR|'+file);});
             });
           JS
 
           html[start...finish]=replacement
-          html.gsub!('V14.3l','V14.3q')
-          html.gsub!('v143l','v143q')
-          File.write(path,html)
+          html.gsub!('V14.3l','V14.3r')
+          html.gsub!('v143l','v143r')
 
-          puts "MONSTER_PRELOAD_OK sheets=#{sheets.length} coords=#{coords.length}"
+          File.write(
+            path,
+            html
+          )
+
+          puts(
+            "MONSTER_PRELOAD_OK sheets=#{sheets.length} coords=#{coords.length}"
+          )
           RB
 
           ruby -c /tmp/preload_patch.rb
@@ -749,20 +1137,24 @@ jobs:
             player/gameasync/sl_attack_sheets.txt \
             player/gameasync/sl_attack_coords.txt
 
-      - name: Verify V14.3q monster attack package
+      - name: Verify V14.3r monster attack package
         run: |
           set -e
 
           test -s player/index.html
           test -s player/gameasync/sl_attack_sheets.txt
           test -s player/gameasync/sl_attack_coords.txt
+
           test "$(wc -l < player/gameasync/sl_attack_sheets.txt)" -ge 20
           test "$(wc -l < player/gameasync/sl_attack_coords.txt)" -ge 20
 
           grep -Fq 'slAttackSheets' player/index.html
           grep -Fq 'slAttackCoords' player/index.html
-          grep -Fq 'v143q' player/index.html
-          ! grep -Fq "var ka='/game/Graphics/Animations/흑기사모션.png'" player/index.html
+          grep -Fq 'v143r' player/index.html
+
+          ! grep -Fq \
+            "var ka='/game/Graphics/Animations/흑기사모션.png'" \
+            player/index.html
 
           cat > /tmp/monster_verify.rb <<'RB'
           # encoding: UTF-8
@@ -816,11 +1208,21 @@ jobs:
             File.join(game,'Data','*Animations.rxdata')
           ).max_by{|p|File.size(p)}
 
-          ce=Marshal.load(File.binread(cp))
-          an=Marshal.load(File.binread(ap))
+          ce=Marshal.load(
+            File.binread(cp)
+          )
+
+          an=Marshal.load(
+            File.binread(ap)
+          )
+
           scripts=Marshal.load(
             File.binread(
-              File.join(game,'Data','Scripts.rxdata')
+              File.join(
+                game,
+                'Data',
+                'Scripts.rxdata'
+              )
             )
           )
 
@@ -835,28 +1237,49 @@ jobs:
 
           src=Zlib::Inflate.inflate(
             coordinate_script[0][2]
-          ).force_encoding(Encoding::UTF_8)
+          ).force_encoding(
+            Encoding::UTF_8
+          )
 
-          abort 'sl_attack_begin missing' unless src.include?('def sl_attack_begin')
-          abort 'sl_attack_tick missing' unless src.include?('def sl_attack_tick')
-          abort 'old src_rect zero hide remains' if src.include?('src_rect.set(0,0,0,0)')
+          abort 'sl_attack_begin missing' unless
+            src.include?('def sl_attack_begin')
+
+          abort 'sl_attack_tick missing' unless
+            src.include?('def sl_attack_tick')
+
+          abort 'old src_rect zero hide remains' if
+            src.include?('src_rect.set(0,0,0,0)')
 
           bad=[]
           slm=0
 
           an.compact.each do |a|
-            name=iv(a,:name).to_s.dup.force_encoding(Encoding::UTF_8)
+            name=iv(
+              a,
+              :name
+            ).to_s.dup.force_encoding(Encoding::UTF_8)
+
             next unless name.start_with?('SLM ')
+
             slm+=1
             m=name.match(/ W(\d+) F(\d+)$/)
             next unless m
+
             wait=m[1].to_i
             frames=m[2].to_i
-            bad<<[iv(a,:id),frames,wait] if frames>wait
+
+            bad<<[
+              iv(a,:id),
+              frames,
+              wait
+            ] if frames>wait
           end
 
-          abort "animation exceeds wait units #{bad.inspect}" unless bad.empty?
-          abort "generated animations too small=#{slm}" unless slm>=80
+          abort "animation exceeds wait units #{bad.inspect}" unless
+            bad.empty?
+
+          abort "generated animations too small=#{slm}" unless
+            slm>=80
 
           [
             [24,110,851,25],
@@ -865,19 +1288,30 @@ jobs:
             [424,407,853,30]
           ].each do |cid,sid,aid,total|
             x=ce[cid]
+
             abort "caller #{cid} missing" unless x
-            abort "caller #{cid} switch mismatch" unless iv(x,:switch_id).to_i==sid
+
+            abort "caller #{cid} switch mismatch" unless
+              iv(x,:switch_id).to_i==sid
 
             list=iv(x,:list)||[]
-            waits=list.select{|c|iv(c,:code)==106}.map do |c|
+
+            waits=list.select do |c|
+              iv(c,:code)==106
+            end.map do |c|
               (iv(c,:parameters)||[])[0].to_i
             end
 
-            abort "caller #{cid} wait sum #{waits.inspect}" unless waits.sum==total
+            abort "caller #{cid} wait sum #{waits.inspect}" unless
+              waits.sum==total
 
-            call=list.find{|c|iv(c,:code)==117}
+            call=list.find do |c|
+              iv(c,:code)==117
+            end
+
             abort "caller #{cid} attack mismatch" unless
-              call&&(iv(call,:parameters)||[])[0].to_i==aid
+              call&&
+              (iv(call,:parameters)||[])[0].to_i==aid
           end
 
           expected={
@@ -888,10 +1322,18 @@ jobs:
 
           expected.each do |sheet,frames|
             found=an.compact.select do |a|
-              iv(a,:animation_name).to_s.dup.force_encoding(Encoding::UTF_8)==sheet&&
-              iv(a,:name).to_s.include?(" F#{frames}")
+              iv(
+                a,
+                :animation_name
+              ).to_s.dup.force_encoding(Encoding::UTF_8)==sheet&&
+              iv(
+                a,
+                :name
+              ).to_s.include?(" F#{frames}")
             end
-            abort "#{sheet} frame target missing" if found.empty?
+
+            abort "#{sheet} frame target missing" if
+              found.empty?
           end
 
           map_triggers=0
@@ -899,19 +1341,31 @@ jobs:
           specific={}
 
           map_groups=Dir.glob(
-            File.join(game,'Data','*Map[0-9][0-9][0-9].rxdata')
+            File.join(
+              game,
+              'Data',
+              '*Map[0-9][0-9][0-9].rxdata'
+            )
           ).group_by{|p|File.basename(p)[/Map\d{3}/]}
 
           map_groups.each do |key,paths|
             pth=paths.max_by{|p|File.size(p)}
-            next unless pth&&File.size(pth)>100
-            map=Marshal.load(File.binread(pth))
+
+            next unless
+              pth&&
+              File.size(pth)>100
+
+            map=Marshal.load(
+              File.binread(pth)
+            )
 
             (iv(map,:events)||{}).each do |eid,event|
               (iv(event,:pages)||[]).each do |page|
                 (iv(page,:list)||[]).each do |cmd|
                   next unless iv(cmd,:code)==355
+
                   txt=(iv(cmd,:parameters)||[])[0].to_s
+
                   next unless
                     txt.include?('sl_attack_begin(')&&
                     txt.include?('e.animation_id=aid')
@@ -927,18 +1381,36 @@ jobs:
             end
           end
 
-          abort "map triggers too small=#{map_triggers}" unless map_triggers>=100
-          abort "coordinate triggers too small=#{coord_triggers}" unless coord_triggers>=1000
+          abort "map triggers too small=#{map_triggers}" unless
+            map_triggers>=100
+
+          abort "coordinate triggers too small=#{coord_triggers}" unless
+            coord_triggers>=1000
 
           def attack_coord_call(txt)
-            m=txt.to_s.match(/sl_attack_begin\((.+?),(\d+)\)/)
+            m=txt.to_s.match(
+              /sl_attack_begin\((.+?),(\d+)\)/
+            )
+
             return [nil,nil] unless m
-            [eval(m[1]),m[2].to_i]
+
+            [
+              eval(m[1]),
+              m[2].to_i
+            ]
           end
 
-          orc=attack_coord_call(specific[19])
-          gnoll=attack_coord_call(specific[6])
-          black=attack_coord_call(specific[23])
+          orc=attack_coord_call(
+            specific[19]
+          )
+
+          gnoll=attack_coord_call(
+            specific[6]
+          )
+
+          black=attack_coord_call(
+            specific[23]
+          )
 
           abort "orc coordinate mapping #{orc.inspect}" unless
             orc==['오크전사좌표',32]
@@ -950,7 +1422,7 @@ jobs:
             black==['흑기사좌표',48]
 
           puts(
-            "MONSTER_VERIFY_V143Q " \
+            "MONSTER_VERIFY_V143R " \
             "map_triggers=#{map_triggers} " \
             "coord=#{coord_triggers} " \
             "animations=#{slm} " \
@@ -959,7 +1431,9 @@ jobs:
           RB
 
           ruby -c /tmp/monster_verify.rb
-          ruby -EUTF-8:UTF-8 /tmp/monster_verify.rb player/gameasync
+          ruby -EUTF-8:UTF-8 \
+            /tmp/monster_verify.rb \
+            player/gameasync
 
           for n in '오크전사' '놀' '흑기사' '드레이크' '오크'; do
             normal="$(identify -format '%wx%h' "player/gameasync/Graphics/Characters/${n}.png")"
