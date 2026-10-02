@@ -1,4 +1,4 @@
-name: Deploy SLKnight V14.3y MONSTER ATTACK CE TRIGGER
+name: Deploy SLKnight V14.3z MONSTER ATTACK DIRECTION LOCK SYNC
 on:
   push:
     branches: [main]
@@ -221,7 +221,17 @@ jobs:
               end
 
             return nil unless groups&&groups.length==4&&groups.all?{|g|!g.empty?}
-            {2=>groups[0],4=>groups[1],6=>groups[2],8=>groups[3]}
+
+            # Motion sheets follow the same verified directional order
+            # as the black knight:
+            # group 0 = up, group 1 = right,
+            # group 2 = down, group 3 = left.
+            {
+              8=>groups[0],
+              6=>groups[1],
+              2=>groups[2],
+              4=>groups[3]
+            }
           end
 
           def sl_fit(seq,target)
@@ -297,57 +307,106 @@ jobs:
           end
 
           class Game_Character
+            alias sl_attack_lock_original_update update
+
+            def update
+              return if @sl_attack_active
+              sl_attack_lock_original_update
+            end
+
             def sl_attack_begin(coord_name,frames)
               frames=frames.to_i
               return if frames<=0
               return if coord_name==nil
               return if coord_name.to_s==''
 
-              unless @sl_attack_swap_active
-                @sl_attack_original_name=@character_name
-                @sl_attack_original_hue=@character_hue
-                @sl_attack_original_tile_id=@tile_id
-                @sl_attack_original_transparent=@transparent
-              end
+              sl_attack_finish if @sl_attack_active
 
-              @sl_attack_swap_active=true
-              @sl_attack_swap_frames=frames
+              @sl_attack_active=true
               @sl_attack_coord_name=coord_name.to_s
-              @tile_id=0
-              @character_name=@sl_attack_coord_name
+              @sl_attack_expected_frames=frames
+              @sl_attack_animation_seen=false
+
+              # If the animation somehow fails to start,
+              # never leave the monster frozen forever.
+              @sl_attack_start_guard=6
+
+              @sl_attack_original_direction_fix=@direction_fix
+              @sl_attack_locked_direction=@direction
+              @direction_fix=true
             end
 
-            def sl_attack_tick
-              return unless @sl_attack_swap_active
-              @sl_attack_swap_frames=@sl_attack_swap_frames.to_i-1
-              sl_attack_finish if @sl_attack_swap_frames<=0
+            def sl_attack_active?
+              @sl_attack_active==true
+            end
+
+            def sl_attack_animation_seen?
+              @sl_attack_animation_seen==true
+            end
+
+            def sl_attack_animation_seen
+              return unless @sl_attack_active
+              @sl_attack_animation_seen=true
+            end
+
+            def sl_attack_start_guard_tick
+              return unless @sl_attack_active
+              return if @sl_attack_animation_seen
+
+              @sl_attack_start_guard=@sl_attack_start_guard.to_i-1
+
+              if @sl_attack_start_guard<=0
+                sl_attack_finish
+              end
             end
 
             def sl_attack_finish
-              return unless @sl_attack_swap_active
+              return unless @sl_attack_active
 
-              if @character_name==@sl_attack_coord_name
-                @tile_id=@sl_attack_original_tile_id
-                @character_name=@sl_attack_original_name
-                @character_hue=@sl_attack_original_hue
-                @transparent=@sl_attack_original_transparent
+              unless @sl_attack_original_direction_fix.nil?
+                @direction_fix=@sl_attack_original_direction_fix
               end
 
-              @sl_attack_swap_active=false
-              @sl_attack_swap_frames=0
+              unless @sl_attack_locked_direction.nil?
+                @direction=@sl_attack_locked_direction
+              end
+
+              @sl_attack_active=false
               @sl_attack_coord_name=nil
-              @sl_attack_original_name=nil
-              @sl_attack_original_hue=nil
-              @sl_attack_original_tile_id=nil
-              @sl_attack_original_transparent=nil
+              @sl_attack_expected_frames=0
+              @sl_attack_animation_seen=false
+              @sl_attack_start_guard=0
+              @sl_attack_original_direction_fix=nil
+              @sl_attack_locked_direction=nil
             end
           end
 
           class Sprite_Character
-            alias sl_attack_coordinate_original_update update
+            alias sl_attack_visual_original_update update
+
             def update
-              sl_attack_coordinate_original_update
-              @character.sl_attack_tick if @character!=nil
+              sl_attack_visual_original_update
+
+              return if @character==nil
+              return unless @character.sl_attack_active?
+
+              if @_animation!=nil
+                # The real attack animation has actually started.
+                # Keep the original character graphic intact,
+                # but hide its sprite while the attack animation is visible.
+                @character.sl_attack_animation_seen
+                self.visible=false
+
+              elsif @character.sl_attack_animation_seen?
+                # RPG::Sprite has disposed the animation.
+                # Restore movement and the normal monster sprite now.
+                @character.sl_attack_finish
+
+              else
+                # Do not hide the monster while waiting for the
+                # animation to start. This removes the disappear gap.
+                @character.sl_attack_start_guard_tick
+              end
             end
           end
           RUBY
@@ -424,19 +483,26 @@ jobs:
             coord=coord_assets[sheet_key]
             abort "coordinate missing for #{sheet}" unless coord
 
-            attack_ids[id]={sheet:sheet,path:motion_assets[key][1],coord:coord}
+            attack_ids[id]={
+              sheet:sheet,
+              path:motion_assets[key][1],
+              coord:coord
+            }
           end
 
           removed_old=0
           common_events.compact.each do |ce|
             list=iv(ce,:list)||[]
             before=list.length
+
             list.delete_if do |cmd|
               next false unless iv(cmd,:code)==355
               txt=(iv(cmd,:parameters)||[])[0].to_s
+
               txt.include?('aid={2=>500,4=>501,6=>502,8=>503}')||
                 txt.include?('SLMonsterAttackContext.start(')
             end
+
             removed_old+=before-list.length
           end
 
@@ -455,6 +521,7 @@ jobs:
 
           make_anim=lambda do |id,sheet,patterns,wait,dir,target|
             timeline=sl_fit(patterns,target)
+
             anim=Marshal.load(Marshal.dump(base_attack))
             setiv(anim,:id,id)
             setiv(anim,:name,"SLM #{sheet} #{dir} W#{wait} F#{target}")
@@ -465,27 +532,39 @@ jobs:
             setiv(anim,:timings,[])
 
             frames=[]
+
             timeline.each do |pattern|
               frame=Marshal.load(Marshal.dump(iv(base_attack,:frames)[0]))
               setiv(frame,:cell_max,1)
+
               table=Table.allocate
-              setiv(table,:raw,[2,1,8,1,8].pack('L<5')+[pattern,0,0,100,0,0,255,0].pack('s<8'))
+              setiv(
+                table,
+                :raw,
+                [2,1,8,1,8].pack('L<5')+
+                  [pattern,0,0,100,0,0,255,0].pack('s<8')
+              )
+
               setiv(frame,:cell_data,table)
               frames<<frame
             end
+
             setiv(anim,:frames,frames)
             animations[id]=anim
           end
 
           common_events.each_with_index do |ce,cid|
             next unless ce
+
             switch_id=iv(ce,:switch_id).to_i
             next if switch_id<=0
 
             list=iv(ce,:list)||[]
             i=0
+
             while i<list.length
               call=list[i]
+
               unless iv(call,:code)==117
                 i+=1
                 next
@@ -493,6 +572,7 @@ jobs:
 
               attack_id=(iv(call,:parameters)||[])[0].to_i
               meta=attack_ids[attack_id]
+
               unless meta
                 i+=1
                 next
@@ -500,10 +580,13 @@ jobs:
 
               indent=iv(call,:indent).to_i
               wait_cmd=nil
+
               ((i+1)...[i+10,list.length].min).each do |j|
                 c=list[j]
                 ci=iv(c,:indent).to_i
+
                 break if ci<indent
+
                 if iv(c,:code)==106&&ci==indent
                   wait_cmd=c
                   break
@@ -516,12 +599,14 @@ jobs:
               end
 
               cycle_wait=(iv(wait_cmd,:parameters)||[])[0].to_i
+
               unless cycle_wait>=8
                 i+=1
                 next
               end
 
               groups=sl_direction_groups(meta[:path],meta[:sheet])
+
               unless groups
                 i+=1
                 next
@@ -531,19 +616,40 @@ jobs:
               target=sl_target_frames(cycle_wait,source_max)
               duration_frames=target*2
               cycle_frames=cycle_wait*2
-              abort "animation exceeds cycle #{meta[:sheet]} cycle=#{cycle_frames} duration=#{duration_frames}" if duration_frames>cycle_frames
+
+              abort(
+                "animation exceeds cycle #{meta[:sheet]} " \
+                "cycle=#{cycle_frames} duration=#{duration_frames}"
+              ) if duration_frames>cycle_frames
 
               key=[meta[:sheet],cycle_wait,target]
               data=generated[key]
+
               unless data
                 ids={}
+
                 [2,4,6,8].each do |dir|
                   id=next_anim
                   next_anim+=1
-                  make_anim.call(id,meta[:sheet],groups[dir],cycle_wait,dir,target)
+
+                  make_anim.call(
+                    id,
+                    meta[:sheet],
+                    groups[dir],
+                    cycle_wait,
+                    dir,
+                    target
+                  )
+
                   ids[dir]=id
                 end
-                data={ids:ids,swap_frames:duration_frames,coord:meta[:coord]}
+
+                data={
+                  ids:ids,
+                  swap_frames:duration_frames,
+                  coord:meta[:coord]
+                }
+
                 generated[key]=data
                 used_sheets[meta[:sheet]]=true
                 used_coords[meta[:coord]]=true
@@ -552,17 +658,24 @@ jobs:
               if switch_anim[switch_id]&&switch_anim[switch_id][:ids]!=data[:ids]
                 abort "switch collision #{switch_id}"
               end
+
               switch_anim[switch_id]=data
 
               ids=data[:ids]
+
               start_cmd=RPG::EventCommand.new
               setiv(start_cmd,:code,355)
               setiv(start_cmd,:indent,indent)
+
               setiv(
                 start_cmd,
                 :parameters,
                 [
-                  "SLMonsterAttackContext.start(#{switch_id},{2=>#{ids[2]},4=>#{ids[4]},6=>#{ids[6]},8=>#{ids[8]}},#{data[:coord].dump},#{data[:swap_frames]})"
+                  "SLMonsterAttackContext.start(" \
+                  "#{switch_id}," \
+                  "{2=>#{ids[2]},4=>#{ids[4]},6=>#{ids[6]},8=>#{ids[8]}}," \
+                  "#{data[:coord].dump}," \
+                  "#{data[:swap_frames]})"
                 ]
               )
 
@@ -570,16 +683,20 @@ jobs:
               windup=2 if windup<2
               windup=cycle_wait-2 if windup>cycle_wait-2
               recovery=cycle_wait-windup
-              abort "wait split mismatch caller=#{cid}" unless windup+recovery==cycle_wait
+
+              abort "wait split mismatch caller=#{cid}" unless
+                windup+recovery==cycle_wait
 
               windup_cmd=RPG::EventCommand.new
               setiv(windup_cmd,:code,106)
               setiv(windup_cmd,:indent,indent)
               setiv(windup_cmd,:parameters,[windup])
+
               setiv(wait_cmd,:parameters,[recovery])
 
               list.insert(i,start_cmd)
               list.insert(i+1,windup_cmd)
+
               caller_patched+=1
               i+=3
             end
@@ -591,6 +708,7 @@ jobs:
           maps_touched={}
           switches_seen={}
           removed_map_old=0
+
           map_groups=Dir.glob(
             File.join(game,'Data','*Map[0-9][0-9][0-9].rxdata')
           ).group_by{|p|File.basename(p)[/Map\d{3}/]}
@@ -607,20 +725,29 @@ jobs:
                 list=iv(page,:list)||[]
 
                 before=list.length
+
                 list.delete_if do |cmd|
                   next false unless iv(cmd,:code)==355
+
                   txt=(iv(cmd,:parameters)||[])[0].to_s
-                  (txt.include?('sl_attack_begin(')&&txt.include?('e.animation_id=aid'))||
+
+                  (
+                    txt.include?('sl_attack_begin(')&&
+                    txt.include?('e.animation_id=aid')
+                  )||
                     txt.include?('SLMonsterAttackContext.register(')
                 end
+
                 if list.length!=before
                   removed_map_old+=before-list.length
                   changed=true
                 end
 
                 i=0
+
                 while i<list.length
                   cmd=list[i]
+
                   unless iv(cmd,:code)==121
                     i+=1
                     next
@@ -630,12 +757,14 @@ jobs:
                   first=p[0].to_i
                   last=p[1].to_i
                   state=p[2].to_i
+
                   unless state==0&&first==last
                     i+=1
                     next
                   end
 
                   info=switch_anim[first]
+
                   unless info
                     i+=1
                     next
@@ -644,15 +773,20 @@ jobs:
                   reg_cmd=RPG::EventCommand.new
                   setiv(reg_cmd,:code,355)
                   setiv(reg_cmd,:indent,iv(cmd,:indent).to_i)
+
                   setiv(
                     reg_cmd,
                     :parameters,
                     [
-                      "SLMonsterAttackContext.register(#{first},$game_map.map_id,#{eid}) unless $game_switches[#{first}]"
+                      "SLMonsterAttackContext.register(" \
+                      "#{first}," \
+                      "$game_map.map_id," \
+                      "#{eid}) unless $game_switches[#{first}]"
                     ]
                   )
 
                   list.insert(i,reg_cmd)
+
                   map_patched+=1
                   switches_seen[first]=true
                   changed=true
@@ -668,17 +802,27 @@ jobs:
           end
 
           missing=switch_anim.keys.reject{|sid|switches_seen[sid]}
+
           puts "UNSEEN_SWITCHES=#{missing.sort.join(',')}" unless missing.empty?
+
           abort 'no map attack registrations patched' if map_patched==0
 
           File.binwrite(ce_path,Marshal.dump(common_events))
           File.binwrite(anim_path,Marshal.dump(animations))
           File.binwrite(scripts_path,Marshal.dump(scripts))
-          File.write(File.join(game,'sl_attack_sheets.txt'),used_sheets.keys.sort.join("\n")+"\n")
-          File.write(File.join(game,'sl_attack_coords.txt'),used_coords.keys.sort.join("\n")+"\n")
+
+          File.write(
+            File.join(game,'sl_attack_sheets.txt'),
+            used_sheets.keys.sort.join("\n")+"\n"
+          )
+
+          File.write(
+            File.join(game,'sl_attack_coords.txt'),
+            used_coords.keys.sort.join("\n")+"\n"
+          )
 
           puts(
-            "MONSTER_ATTACK_CE_V143Y " \
+            "MONSTER_ATTACK_CE_V143Z " \
             "callers=#{caller_patched} " \
             "registrations=#{map_patched} " \
             "maps=#{maps_touched.length} " \
@@ -712,22 +856,23 @@ jobs:
       - name: Preload monster attack assets
         run: |
           bash /tmp/x2_preload_monster.sh
-          sed -i 's/V14\.3x2/V14.3y/g; s/v143x2/v143y/g' player/index.html
-          grep -Fq 'v143y' player/index.html
+          sed -i 's/V14\.3x2/V14.3z/g; s/v143x2/v143z/g' player/index.html
+          grep -Fq 'v143z' player/index.html
 
-      - name: Verify V14.3y package
+      - name: Verify V14.3z package
         run: |
           set -e
 
           test -s player/index.html
           test -s player/gameasync/sl_attack_sheets.txt
           test -s player/gameasync/sl_attack_coords.txt
+
           test "$(wc -l < player/gameasync/sl_attack_sheets.txt)" -ge 20
           test "$(wc -l < player/gameasync/sl_attack_coords.txt)" -ge 20
 
           grep -Fq 'slAttackSheets' player/index.html
           grep -Fq 'slAttackCoords' player/index.html
-          grep -Fq 'v143y' player/index.html
+          grep -Fq 'v143z' player/index.html
           grep -Fq 'function attackButton(parent)' player/js/dpad.js
           grep -Fq "b.textContent=(auto||ready)?'AUTO':'ATK'" player/js/dpad.js
           grep -Fq 'window.slAttackAutoCancel=cancelAuto' player/js/dpad.js
@@ -758,15 +903,18 @@ jobs:
 
           module RPG
             class AudioFile; end
+
             class Animation
               class Frame; end
               class Timing; end
             end
+
             class CommonEvent; end
             class EventCommand; end
             class MoveRoute; end
             class MoveCommand; end
             class Map; end
+
             class Event
               class Page
                 class Condition; end
@@ -775,10 +923,18 @@ jobs:
             end
           end
 
-          def iv(o,n); o.instance_variable_get("@#{n}"); end
+          def iv(o,n)
+            o.instance_variable_get("@#{n}")
+          end
 
-          cp=Dir.glob(File.join(game,'Data','*CommonEvents.rxdata')).max_by{|p|File.size(p)}
-          ap=Dir.glob(File.join(game,'Data','*Animations.rxdata')).max_by{|p|File.size(p)}
+          cp=Dir.glob(
+            File.join(game,'Data','*CommonEvents.rxdata')
+          ).max_by{|p|File.size(p)}
+
+          ap=Dir.glob(
+            File.join(game,'Data','*Animations.rxdata')
+          ).max_by{|p|File.size(p)}
+
           ce=Marshal.load(File.binread(cp))
           an=Marshal.load(File.binread(ap))
 
@@ -786,63 +942,106 @@ jobs:
           final_bravery=iv(ce[8],:list)||[]
 
           abort 'final green stack effect missing' unless
-            iv(final_green[2],:code)==207&&iv(final_green[2],:parameters)==[-1,2]
-          abort 'final green stack exit missing' unless iv(final_green[3],:code)==115
-          abort 'final bravery stack effect missing' unless
-            iv(final_bravery[2],:code)==207&&iv(final_bravery[2],:parameters)==[-1,270]
-          abort 'final bravery stack effect event missing' unless
-            iv(final_bravery[3],:code)==117&&iv(final_bravery[3],:parameters)==[589]
-          abort 'final bravery stack exit missing' unless iv(final_bravery[4],:code)==115
+            iv(final_green[2],:code)==207&&
+            iv(final_green[2],:parameters)==[-1,2]
 
-          scripts=Marshal.load(File.binread(File.join(game,'Data','Scripts.rxdata')))
+          abort 'final green stack exit missing' unless
+            iv(final_green[3],:code)==115
+
+          abort 'final bravery stack effect missing' unless
+            iv(final_bravery[2],:code)==207&&
+            iv(final_bravery[2],:parameters)==[-1,270]
+
+          abort 'final bravery stack effect event missing' unless
+            iv(final_bravery[3],:code)==117&&
+            iv(final_bravery[3],:parameters)==[589]
+
+          abort 'final bravery stack exit missing' unless
+            iv(final_bravery[4],:code)==115
+
+          scripts=Marshal.load(
+            File.binread(
+              File.join(game,'Data','Scripts.rxdata')
+            )
+          )
 
           custom_auto=scripts.select do |e|
-            e.is_a?(Array)&&e.length>=3&&[
-              'Persistent Auto Attack',
-              'Lineage Auto Attack',
-              'Mobile Diablo Assist'
-            ].include?(e[1].to_s)
+            e.is_a?(Array)&&
+              e.length>=3&&
+              [
+                'Persistent Auto Attack',
+                'Lineage Auto Attack',
+                'Mobile Diablo Assist'
+              ].include?(e[1].to_s)
           end
-          abort "custom auto attack remains=#{custom_auto.length}" unless custom_auto.empty?
+
+          abort "custom auto attack remains=#{custom_auto.length}" unless
+            custom_auto.empty?
 
           monster_scripts=scripts.select do |e|
-            e.is_a?(Array)&&e.length>=3&&e[1].to_s=='Monster Attack CE Trigger'
+            e.is_a?(Array)&&
+              e.length>=3&&
+              e[1].to_s=='Monster Attack CE Trigger'
           end
-          abort "monster CE runtime count=#{monster_scripts.length}" unless monster_scripts.length==1
 
-          runtime=Zlib::Inflate.inflate(monster_scripts[0][2]).force_encoding(Encoding::UTF_8)
+          abort "monster CE runtime count=#{monster_scripts.length}" unless
+            monster_scripts.length==1
+
+          runtime=Zlib::Inflate.inflate(
+            monster_scripts[0][2]
+          ).force_encoding(Encoding::UTF_8)
+
           [
             'module SLMonsterAttackContext',
             'data=@pending.delete(switch_id.to_i)',
             'event.sl_attack_begin(coord_name,frames)',
             'event.animation_id=aid',
-            'def sl_attack_tick'
+            'alias sl_attack_lock_original_update update',
+            'return if @sl_attack_active',
+            '@character.sl_attack_animation_seen',
+            'self.visible=false',
+            'def sl_attack_finish'
           ].each do |needle|
-            abort "monster runtime marker missing #{needle}" unless runtime.include?(needle)
+            abort "monster runtime marker missing #{needle}" unless
+              runtime.include?(needle)
           end
 
           old_monster=scripts.select do |e|
-            e.is_a?(Array)&&e.length>=3&&[
-              'Monster Attack Body Hide',
-              'Monster Attack Coordinate Swap'
-            ].include?(e[1].to_s)
+            e.is_a?(Array)&&
+              e.length>=3&&
+              [
+                'Monster Attack Body Hide',
+                'Monster Attack Coordinate Swap'
+              ].include?(e[1].to_s)
           end
-          abort "old monster runtime remains=#{old_monster.length}" unless old_monster.empty?
+
+          abort "old monster runtime remains=#{old_monster.length}" unless
+            old_monster.empty?
 
           bad=[]
           slm=0
+
           an.compact.each do |a|
             name=iv(a,:name).to_s.dup.force_encoding(Encoding::UTF_8)
+
             next unless name.start_with?('SLM ')
+
             slm+=1
             m=name.match(/ W(\d+) F(\d+)$/)
+
             next unless m
+
             wait=m[1].to_i
             frames=m[2].to_i
+
             bad<<[iv(a,:id),frames,wait] if frames>wait
           end
-          abort "animation exceeds cycle units #{bad.inspect}" unless bad.empty?
-          abort "generated animations too small=#{slm}" unless slm>=80
+
+          abort "animation exceeds cycle units #{bad.inspect}" unless
+            bad.empty?
+
+          abort "generated animations too small=#{slm}" unless
+            slm>=80
 
           expected_callers={
             24=>[110,851,[11,14],'놀좌표',40],
@@ -854,58 +1053,91 @@ jobs:
           expected_callers.each do |cid,data|
             sid,aid,waits_expected,coord,frames=data
             x=ce[cid]
+
             abort "caller #{cid} missing" unless x
-            abort "caller #{cid} switch mismatch" unless iv(x,:switch_id).to_i==sid
+
+            abort "caller #{cid} switch mismatch" unless
+              iv(x,:switch_id).to_i==sid
+
             list=iv(x,:list)||[]
 
             start=list.find do |c|
               iv(c,:code)==355&&
-              (iv(c,:parameters)||[])[0].to_s.include?("SLMonsterAttackContext.start(#{sid},")
+                (iv(c,:parameters)||[])[0].to_s.include?(
+                  "SLMonsterAttackContext.start(#{sid},"
+                )
             end
+
             abort "caller #{cid} CE animation start missing" unless start
 
             txt=(iv(start,:parameters)||[])[0].to_s
-            m=txt.match(/SLMonsterAttackContext\.start\(\d+,\{[^}]+\},(.+),(\d+)\)\z/)
+
+            m=txt.match(
+              /SLMonsterAttackContext\.start\(\d+,\{[^}]+\},(.+),(\d+)\)\z/
+            )
+
             abort "caller #{cid} start parse failed" unless m
+
             actual_coord=eval(m[1])
             actual_frames=m[2].to_i
-            abort "caller #{cid} coord=#{actual_coord.inspect}" unless actual_coord==coord
-            abort "caller #{cid} swap frames=#{actual_frames}" unless actual_frames==frames
 
-            waits=list.select{|c|iv(c,:code)==106}.map{|c|(iv(c,:parameters)||[])[0].to_i}
-            abort "caller #{cid} waits=#{waits.inspect}" unless waits==waits_expected
+            abort "caller #{cid} coord=#{actual_coord.inspect}" unless
+              actual_coord==coord
 
-            call=list.find{|c|iv(c,:code)==117}
+            abort "caller #{cid} swap frames=#{actual_frames}" unless
+              actual_frames==frames
+
+            waits=list.select do |c|
+              iv(c,:code)==106
+            end.map do |c|
+              (iv(c,:parameters)||[])[0].to_i
+            end
+
+            abort "caller #{cid} waits=#{waits.inspect}" unless
+              waits==waits_expected
+
+            call=list.find do |c|
+              iv(c,:code)==117
+            end
+
             abort "caller #{cid} attack mismatch" unless
-              call&&(iv(call,:parameters)||[])[0].to_i==aid
+              call&&
+              (iv(call,:parameters)||[])[0].to_i==aid
           end
 
           registrations=0
           map_motion_starts=0
           specific={}
+
           map_groups=Dir.glob(
             File.join(game,'Data','*Map[0-9][0-9][0-9].rxdata')
-          ).group_by{|p|File.basename(p)[/Map\d{3}/]}
+          ).group_by do |p|
+            File.basename(p)[/Map\d{3}/]
+          end
 
           map_groups.each do |key,paths|
             pth=paths.max_by{|p|File.size(p)}
             next unless pth&&File.size(pth)>100
+
             map=Marshal.load(File.binread(pth))
 
             (iv(map,:events)||{}).each do |eid,event|
               (iv(event,:pages)||[]).each do |page|
                 (iv(page,:list)||[]).each do |cmd|
                   next unless iv(cmd,:code)==355
+
                   txt=(iv(cmd,:parameters)||[])[0].to_s
 
                   if txt.include?('SLMonsterAttackContext.register(')
                     registrations+=1
+
                     if key=='Map029'&&[6,19,23,15].include?(eid)
                       specific[eid]=txt
                     end
                   end
 
-                  if txt.include?('sl_attack_begin(')&&txt.include?('e.animation_id=aid')
+                  if txt.include?('sl_attack_begin(')&&
+                     txt.include?('e.animation_id=aid')
                     map_motion_starts+=1
                   end
                 end
@@ -913,8 +1145,11 @@ jobs:
             end
           end
 
-          abort "registrations too small=#{registrations}" unless registrations>=1000
-          abort "map animation reset scripts remain=#{map_motion_starts}" unless map_motion_starts==0
+          abort "registrations too small=#{registrations}" unless
+            registrations>=1000
+
+          abort "map animation reset scripts remain=#{map_motion_starts}" unless
+            map_motion_starts==0
 
           {
             6=>'SLMonsterAttackContext.register(110,$game_map.map_id,6)',
@@ -934,16 +1169,21 @@ jobs:
 
           expected.each do |sheet,frames|
             found=an.compact.select do |a|
-              iv(a,:animation_name).to_s.dup.force_encoding(Encoding::UTF_8)==sheet&&
-              iv(a,:name).to_s.include?(" F#{frames}")
+              iv(a,:animation_name).to_s.dup.force_encoding(
+                Encoding::UTF_8
+              )==sheet&&
+                iv(a,:name).to_s.include?(" F#{frames}")
             end
+
             abort "#{sheet} frame target missing" if found.empty?
           end
 
           puts(
-            "FINAL_VERIFY_V143Y " \
+            "FINAL_VERIFY_V143Z " \
             "native_hold_auto=ok " \
             "ce_motion=ok " \
+            "movement_lock=ok " \
+            "sprite_sync=ok " \
             "registrations=#{registrations} " \
             "map_resets=#{map_motion_starts} " \
             "animations=#{slm}"
@@ -956,14 +1196,18 @@ jobs:
           for n in '오크전사' '놀' '흑기사' '드레이크' '오크'; do
             normal="$(identify -format '%wx%h' "player/gameasync/Graphics/Characters/${n}.png")"
             coord="$(identify -format '%wx%h' "player/gameasync/Graphics/Characters/${n}좌표.png")"
+
             echo "$n normal=$normal coord=$coord"
             test "$normal" = "$coord"
           done
 
           for n in '드레이크' '오크'; do
             alpha_max="$(convert "player/gameasync/Graphics/Characters/${n}좌표.png" -alpha extract -format '%[fx:maxima]' info: 2>/dev/null)"
+
             echo "$n coord_alpha_max=$alpha_max"
-            awk -v value="$alpha_max" 'BEGIN { exit !((value+0.0)==0.0) }'
+
+            awk -v value="$alpha_max" \
+              'BEGIN { exit !((value+0.0)==0.0) }'
           done
 
           du -sh player
@@ -979,7 +1223,9 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - uses: actions/configure-pages@v6
+
       - id: deployment
         uses: actions/deploy-pages@v5
