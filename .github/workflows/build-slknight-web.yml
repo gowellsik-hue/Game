@@ -1,4 +1,4 @@
-name: Deploy SLKnight V14.3z10.5d + SLFairy ERROR BOTTOM
+name: Deploy SLKnight V14.3z10.5e + SLFairy BOOT FIX
 
 on:
   push:
@@ -224,6 +224,360 @@ jobs:
           done
 
           echo Z105_PREPARATION_OK
+
+      - name: Fix SLFairy pre-Main boot crashes
+        run: |
+          set -euo pipefail
+
+          ruby -EUTF-8:UTF-8 -rzlib - fairy_player/gameasync/Data/Scripts.rxdata <<'RB'
+          # encoding: UTF-8
+
+          path=ARGV.fetch(0)
+          scripts=Marshal.load(File.binread(path))
+
+          def inflate(entry)
+            Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
+          end
+
+          def store(entry, source)
+            entry[2]=Zlib::Deflate.deflate(source)
+          end
+
+          def entry_for(scripts, name)
+            entry=scripts.find do |e|
+              e.is_a?(Array) &&
+                e.length>=3 &&
+                e[1].to_s==name
+            end
+
+            abort(
+              "FAIRY SCRIPT MISSING: #{name}"
+            ) unless entry
+
+            entry
+          end
+
+          scene_equip=entry_for(
+            scripts,
+            'Scene_Equip'
+          )
+
+          equip_src=inflate(
+            scene_equip
+          )
+
+          equip_lifecycle=
+            /    Graphics\.transition\r?\n    # 메인 루프\r?\n    loop do\r?\n.*?    @item_window5\.dispose\r?\n  end/m
+
+          count=equip_src.scan(
+            equip_lifecycle
+          ).length
+
+          abort(
+            "FAIRY Scene_Equip lifecycle count=#{count}"
+          ) unless count==1
+
+          equip_src.sub!(
+            equip_lifecycle,
+            <<'RUBY'.chomp
+    Graphics.transition
+  end
+
+  def dispose
+    $game_switches[49] = false if $game_switches
+    Graphics.freeze
+
+    @help_window.dispose if @help_window != nil
+    @left_window.dispose if @left_window != nil
+    @right_window.dispose if @right_window != nil
+
+    @item_window1.dispose if @item_window1 != nil
+    @item_window2.dispose if @item_window2 != nil
+    @item_window3.dispose if @item_window3 != nil
+    @item_window4.dispose if @item_window4 != nil
+    @item_window5.dispose if @item_window5 != nil
+  end
+RUBY
+          )
+
+          store(
+            scene_equip,
+            equip_src
+          )
+
+          id_sprite_entry=scripts.find do |e|
+            next false unless (
+              e.is_a?(Array) &&
+              e.length>=3
+            )
+
+            begin
+              inflate(e).include?(
+                'class Sprite_Character < Sprite_Character'
+              )
+            rescue
+              false
+            end
+          end
+
+          abort(
+            'FAIRY broken Sprite_Character ID script missing'
+          ) unless id_sprite_entry
+
+          id_output_entry=scripts.find do |e|
+            next false unless (
+              e.is_a?(Array) &&
+              e.length>=3
+            )
+
+            begin
+              source=inflate(e)
+
+              source.include?(
+                'class Game_Event < Game_Event'
+              ) &&
+                source.include?(
+                  'class Game_Player < Game_Player'
+                )
+            rescue
+              false
+            end
+          end
+
+          abort(
+            'FAIRY broken Game_Event ID script missing'
+          ) unless id_output_entry
+
+          id_sprite=<<'RUBY'
+class Game_Character
+  attr_accessor :sprite_id
+end
+
+class Sprite_Character
+  alias sl_id_original_update update
+
+  def create_id_sprite(text)
+    bitmap=Bitmap.new(160,16)
+
+    bitmap.font.name='NanumGothic'
+    bitmap.font.size=12
+    bitmap.font.bold=false
+
+    bitmap.font.color.set(0,0,0)
+
+    bitmap.draw_text(0,-1,160,16,text,1)
+    bitmap.draw_text(0,1,160,16,text,1)
+    bitmap.draw_text(-1,0,160,16,text,1)
+    bitmap.draw_text(1,0,160,16,text,1)
+
+    bitmap.font.color.set(255,255,255)
+    bitmap.draw_text(0,0,160,16,text,1)
+
+    @_id_sprite=Sprite.new(self.viewport)
+    @_id_sprite.bitmap=bitmap
+    @_id_sprite.opacity=255
+    @_id_sprite.ox=80
+    @_id_sprite.oy=14
+    @_id_sprite.x=self.x
+    @_id_sprite.y=self.y-self.oy/2
+    @_id_sprite.z=9999
+    @_id_sprite_visible=true
+  end
+
+  def dispose_id_sprite
+    if @_id_sprite!=nil
+      if (
+        @_id_sprite.bitmap!=nil &&
+        !@_id_sprite.bitmap.disposed?
+      )
+        @_id_sprite.bitmap.dispose
+      end
+
+      @_id_sprite.dispose
+      @_id_sprite=nil
+    end
+
+    @_id_sprite_visible=false
+  end
+
+  def update_id_sprite
+    if (
+      @character.sprite_id!=nil &&
+      @character.sprite_id.to_s!=''
+    )
+      create_id_sprite(
+        @character.sprite_id
+      ) unless @_id_sprite_visible
+
+      @_id_sprite.x=self.x
+      @_id_sprite.y=self.y-self.oy
+
+    elsif @_id_sprite_visible
+      dispose_id_sprite
+    end
+  end
+
+  def update
+    sl_id_original_update
+    update_id_sprite
+  end
+end
+RUBY
+
+          id_output=<<'RUBY'
+class Game_Event
+  alias sl_id_original_event_refresh refresh
+
+  def refresh
+    sl_id_original_event_refresh
+
+    text=@event.name.dup
+
+    text.gsub!(
+      /\x5b[Ii][Dd](.+?)\x5d/
+    ) do
+      @sprite_id=$1
+    end
+
+    @sprite_id=nil if (
+      @erased ||
+      @character_name==''
+    )
+  end
+end
+
+class Game_Player
+  alias sl_id_original_player_refresh refresh
+
+  def refresh
+    sl_id_original_player_refresh
+
+    if $game_party.actors.size>0
+      @sprite_id=nil
+    end
+  end
+end
+RUBY
+
+          store(
+            id_sprite_entry,
+            id_sprite
+          )
+
+          store(
+            id_output_entry,
+            id_output
+          )
+
+          File.binwrite(
+            path,
+            Marshal.dump(
+              scripts
+            )
+          )
+
+          puts(
+            'FAIRY_PREMAIN_BOOT_PATCH_OK'
+          )
+          RB
+
+          ruby -EUTF-8:UTF-8 -rzlib - fairy_player/gameasync/Data/Scripts.rxdata <<'RB'
+          path=ARGV.fetch(0)
+          scripts=Marshal.load(File.binread(path))
+
+          def inflate(entry)
+            Zlib::Inflate.inflate(entry[2]).force_encoding(Encoding::UTF_8)
+          end
+
+          scene=scripts.find do |e|
+            e.is_a?(Array) &&
+              e.length>=3 &&
+              e[1].to_s=='Scene_Equip'
+          end
+
+          abort(
+            'FAIRY Scene_Equip missing after patch'
+          ) unless scene
+
+          scene_src=inflate(
+            scene
+          )
+
+          abort(
+            'FAIRY Scene_Equip dispose missing after patch'
+          ) unless scene_src.include?(
+            'def dispose'
+          )
+
+          broken=[]
+
+          scripts.each_with_index do |e,i|
+            next unless (
+              e.is_a?(Array) &&
+              e.length>=3
+            )
+
+            begin
+              source=inflate(e)
+            rescue
+              next
+            end
+
+            if source.include?(
+              'class Sprite_Character < Sprite_Character'
+            )
+              broken << [
+                i,
+                'Sprite_Character self inheritance'
+              ]
+            end
+
+            if source.include?(
+              'class Game_Event < Game_Event'
+            )
+              broken << [
+                i,
+                'Game_Event self inheritance'
+              ]
+            end
+
+            if source.include?(
+              'class Game_Player < Game_Player'
+            )
+              broken << [
+                i,
+                'Game_Player self inheritance'
+              ]
+            end
+          end
+
+          abort(
+            "FAIRY PREMAIN BROKEN SCRIPTS REMAIN: #{broken.inspect}"
+          ) unless broken.empty?
+
+          multi=scripts.find do |e|
+            next false unless (
+              e.is_a?(Array) &&
+              e.length>=3
+            )
+
+            begin
+              inflate(e).include?(
+                'alias g7_ms_scene_equip_dispose dispose'
+              )
+            rescue
+              false
+            end
+          end
+
+          abort(
+            'FAIRY multislot dispose wrapper missing'
+          ) unless multi
+
+          puts(
+            'FAIRY_PREMAIN_BOOT_VERIFY_OK'
+          )
+          RB
 
       - name: Move JS error overlay to bottom
         run: |
