@@ -1,4 +1,4 @@
-name: Deploy SLKnight V14.3z10.4 + SLFairy SCREEN FIX
+name: Deploy SLKnight V14.3z10.5 + SLFairy CANONICAL BOOT FIX
 
 on:
   push:
@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  Z104_SHA: e044e1b6c53646b4c4f21f2dfee4967a68fabbc4
   DUAL_BASE_SHA: 04ce66ec99abc10f77143de53650685db8949532
   CURRENT_Z10_SHA: f545634bafbe1e1e55aaf6489126ad17b07da382
   BASELINE_SHA: c6815cd461dba60ec131898e6d5dd8690dd915ae
@@ -33,7 +34,14 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout frozen dual base
+      - name: Checkout z10.4 successful workflow
+        uses: actions/checkout@v4
+        with:
+          repository: gowellsik-hue/Game
+          ref: ${{ env.Z104_SHA }}
+          path: z104src
+
+      - name: Checkout frozen z10.2 dual base
         uses: actions/checkout@v4
         with:
           repository: gowellsik-hue/Game
@@ -78,7 +86,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake cmake curl ffmpeg freepats git imagemagick libtool make mm-common patch pkg-config python3 rake ruby timidity unzip wget xz-utils fonts-nanum p7zip-full
+          sudo apt-get install -y autoconf automake cmake curl ffmpeg freepats git imagemagick libtool make mm-common patch pkg-config python3 rake ruby timidity unzip wget xz-utils fonts-nanum p7zip-full nodejs
 
       - name: Checkout engine
         uses: actions/checkout@v4
@@ -93,149 +101,319 @@ jobs:
           path: engine/deps
           key: mkxp-web-${{ runner.os }}-${{ env.EMSDK_VER }}-onig25b
 
-      - name: Extract passed build steps from z10.2 through Fairy media
+      - name: Extract already-passed z10.4 build steps
         run: |
           ruby -ryaml - <<'RB'
-          doc=YAML.load_file('dualbase/.github/workflows/build-slknight-web.yml')
+          doc=YAML.load_file('z104src/.github/workflows/build-slknight-web.yml')
           steps=doc.fetch('jobs').fetch('build').fetch('steps')
 
-          first='Extract exact current z10 run steps'
-          last='Convert SLFairy media'
-
-          a=steps.index{|s|s['name']==first}
-          b=steps.index{|s|s['name']==last}
-
-          abort "DUAL BASE START STEP MISSING: #{first}" unless a
-          abort "DUAL BASE END STEP MISSING: #{last}" unless b
-          abort 'DUAL BASE STEP ORDER INVALID' unless a<=b
-
-          selected=steps[a..b]
-          bad=selected.reject{|s|s['run']}
-          abort "NON-RUN STEP INSIDE FROZEN RANGE: #{bad.map{|s|s['name']}.inspect}" unless bad.empty?
-
-          selected.each_with_index do |step,i|
-            path=format('/tmp/dual_pass_%02d.sh',i)
-            File.write(path,step.fetch('run'))
-            puts "FROZEN_STEP #{i}: #{step['name']}"
-          end
-
-          File.write('/tmp/dual_pass_count',selected.length.to_s)
-          puts "FROZEN_PASSED_RANGE_OK count=#{selected.length}"
-          RB
-
-      - name: Run frozen build through Fairy media
-        run: |
-          set -euo pipefail
-          count="$(cat /tmp/dual_pass_count)"
-          i=0
-          while [ "$i" -lt "$count" ]; do
-            f="$(printf '/tmp/dual_pass_%02d.sh' "$i")"
-            echo "===== RUN FROZEN STEP $i/$count : $f ====="
-            bash -e "$f"
-            i=$((i+1))
-          done
-          echo FROZEN_BUILD_THROUGH_FAIRY_MEDIA_OK
-
-      - name: Repair SLFairy Ruby boot syntax
-        run: |
-          set -euo pipefail
-
-          ruby -EUTF-8:UTF-8 -rzlib - fairy_player/gameasync/Data/Scripts.rxdata <<'RB'
-          path=ARGV.fetch(0)
-          scripts=Marshal.load(File.binread(path))
-
-          def entry(scripts,name)
-            scripts.find{|e|e.is_a?(Array)&&e.length>=3&&e[1].to_s==name} || abort("FAIRY SCRIPT MISSING: #{name}")
-          end
-
-          def inflate(e)
-            Zlib::Inflate.inflate(e[2]).force_encoding(Encoding::UTF_8)
-          end
-
-          def store(e,src)
-            e[2]=Zlib::Deflate.deflate(src)
-          end
-
-          web=entry(scripts,'Web Compatibility')
-          src=inflate(web)
-
-          fixes=[
-            [
-              /return\(\s*code\s*&&\s*Input\.trigger\?\(code\)\s*\?\s*1\s*:\s*0\s*\)/m,
-              'return(code && Input.trigger?(code) ? 1 : 0)',
-              'GetAsyncKeyState ternary'
-            ],
-            [
-              /return\(\s*code\s*&&\s*Input\.press\?\(code\)\s*\?\s*-1\s*:\s*0\s*\)/m,
-              'return(code && Input.press?(code) ? -1 : 0)',
-              'GetKeyState ternary'
-            ]
+          names=[
+            'Extract passed build steps from z10.2 through Fairy media',
+            'Run frozen build through Fairy media',
+            'Repair SLFairy Ruby boot syntax',
+            'Build SLFairy mappings after syntax repair'
           ]
 
-          fixes.each do |rx,replacement,label|
-            count=src.scan(rx).length
-            abort "FAIRY WEB REPAIR COUNT #{label}=#{count}" unless count==1
-            src.sub!(rx,replacement)
+          names.each_with_index do |name,i|
+            step=steps.find{|s|s['name']==name}
+            abort "Z104 STEP MISSING: #{name}" unless step&&step['run']
+            File.write(format('/tmp/z104_pass_%02d.sh',i),step['run'])
           end
 
-          store(web,src)
+          puts "Z104_PASSED_STEPS_EXTRACTED=#{names.length}"
+          RB
 
-          mobile=entry(scripts,'Mobile Diablo Assist')
-          src=inflate(mobile)
+      - name: Run frozen successful build through repaired Fairy mappings
+        run: |
+          set -euo pipefail
 
-          distance_rx=/if\s*\(\s*\(\s*event\.x-self\.x\s*\)\.abs\s*\+\s*\(\s*event\.y-self\.y\s*\)\.abs\s*==\s*1\s*\)/m
-          count=src.scan(distance_rx).length
-          abort "FAIRY MOBILE DISTANCE REPAIR COUNT=#{count}" unless count==1
+          for i in 0 1 2 3; do
+            f="$(printf '/tmp/z104_pass_%02d.sh' "$i")"
+            echo "===== RUN $f ====="
+            bash -e "$f"
+          done
 
-          src.sub!(
-            distance_rx,
-            'if (event.x-self.x).abs+(event.y-self.y).abs==1'
+          echo Z104_BUILD_AND_FAIRY_SYNTAX_REPAIR_OK
+
+      - name: Canonicalize SLFairy protected data paths and title
+        run: |
+          set -euo pipefail
+
+          ruby -EUTF-8:UTF-8 -rzlib - fairy_player <<'RB'
+          # encoding: UTF-8
+          require 'fileutils'
+
+          game=ARGV.fetch(0)
+          data=File.join(game,'gameasync','Data')
+
+          bases=%w[
+            Actors Classes Skills Items Weapons Armors Enemies
+            Troops States Animations Tilesets CommonEvents System MapInfos
+          ]
+
+          bases.each do |name|
+            candidates=Dir.glob(
+              File.join(
+                data,
+                "*#{name}.rxdata"
+              )
+            )
+
+            src=candidates.max_by do |p|
+              File.size(p)
+            end
+
+            dst=File.join(
+              data,
+              "#{name}.rxdata"
+            )
+
+            abort(
+              "FAIRY REAL DATA MISSING #{name}"
+            ) unless src&&File.size(src)>4
+
+            unless File.expand_path(src)==File.expand_path(dst)
+              FileUtils.cp(
+                src,
+                dst
+              )
+            end
+
+            abort(
+              "FAIRY CANONICAL DATA EMPTY #{name}"
+            ) unless File.size(dst)>4
+
+            puts(
+              "FAIRY_CANONICAL_DATA " \
+              "#{name}=#{File.size(dst)}"
+            )
+          end
+
+          map_count=0
+
+          Dir.glob(
+            File.join(
+              data,
+              '*Map[0-9][0-9][0-9].rxdata'
+            )
+          ).sort.each do |src|
+
+            bn=File.basename(src)
+
+            m=bn.match(
+              /^[A-Z]{20,}(Map\d{3}\.rxdata)$/
+            )
+
+            next unless m
+
+            dst=File.join(
+              data,
+              m[1]
+            )
+
+            FileUtils.cp(
+              src,
+              dst
+            )
+
+            abort(
+              "FAIRY CANONICAL MAP EMPTY #{m[1]}"
+            ) unless File.size(dst)>4
+
+            map_count+=1
+          end
+
+          abort(
+            "FAIRY CANONICAL MAP COUNT=#{map_count}"
+          ) unless map_count>=16
+
+          sp=File.join(
+            data,
+            'Scripts.rxdata'
           )
 
-          store(mobile,src)
+          scripts=Marshal.load(
+            File.binread(sp)
+          )
 
-          File.binwrite(path,Marshal.dump(scripts))
+          db_re=
+            /Data\/[A-Z]{20,}(Actors|Classes|Skills|Items|Weapons|Armors|Enemies|Troops|States|Animations|Tilesets|CommonEvents|System)\.rxdata/
 
-          scripts.each_with_index do |e,i|
-            next unless e.is_a?(Array)&&e.length>=3
+          map_re=
+            /Data\/[A-Z]{20,}Map%03d\.rxdata/
+
+          path_changes=0
+          title_changes=0
+
+          scripts.each do |e|
+            next unless (
+              e.is_a?(Array) &&
+              e.length>=3
+            )
 
             begin
-              code=Zlib::Inflate.inflate(e[2])
+              src=
+                Zlib::Inflate
+                .inflate(
+                  e[2]
+                )
+                .force_encoding(
+                  Encoding::UTF_8
+                )
             rescue Zlib::DataError
               next
             end
 
-            begin
-              RubyVM::InstructionSequence.compile(
-                code,
-                "fairy_script_#{i}_#{e[1]}"
-              )
-            rescue SyntaxError=>ex
+            changed=false
+
+            src=src.gsub(
+              db_re
+            ) do
+              path_changes+=1
+              changed=true
+              "Data/#{$1}.rxdata"
+            end
+
+            src=src.gsub(
+              map_re
+            ) do
+              path_changes+=1
+              changed=true
+              'Data/Map%03d.rxdata'
+            end
+
+            if e[1].to_s=='Scene_Title'
+
+              old=
+                '@sprite.bitmap = RPG::Cache.title($data_system.title_name)'
+
               abort(
-                "FAIRY RUBY SYNTAX ERROR " \
-                "script=#{i} name=#{e[1]}: #{ex.message}"
+                'FAIRY TITLE LOAD MARKER MISSING'
+              ) unless src.include?(old)
+
+              src=src.sub(
+                old,
+                '@sprite.bitmap = RPG::Cache.title("fairy_title")'
               )
+
+              title_changes+=1
+              changed=true
+            end
+
+            if changed
+              e[2]=
+                Zlib::Deflate.deflate(
+                  src
+                )
             end
           end
 
-          puts 'FAIRY_ALL_RUBY_SYNTAX_OK'
+          abort(
+            "FAIRY RANDOM DATA PATH PATCH COUNT=#{path_changes}"
+          ) unless path_changes==16
+
+          abort(
+            "FAIRY TITLE PATCH COUNT=#{title_changes}"
+          ) unless title_changes==1
+
+          File.binwrite(
+            sp,
+            Marshal.dump(
+              scripts
+            )
+          )
+
+          titles=File.join(
+            game,
+            'gameasync',
+            'Graphics',
+            'Titles'
+          )
+
+          title_src=File.join(
+            titles,
+            '일환소프트.png'
+          )
+
+          title_dst=File.join(
+            titles,
+            'fairy_title.png'
+          )
+
+          abort(
+            'FAIRY ORIGINAL TITLE MISSING'
+          ) unless File.size?(title_src)
+
+          FileUtils.cp(
+            title_src,
+            title_dst
+          )
+
+          abort(
+            'FAIRY ASCII TITLE COPY FAILED'
+          ) unless File.size?(title_dst)
+
+          ini_path=File.join(
+            game,
+            'gameasync',
+            'Game.ini'
+          )
+
+          ini=File.binread(
+            ini_path
+          )
+
+          %w[
+            RTP1
+            RTP2
+            RTP3
+          ].each do |key|
+
+            unless ini.match?(
+              /^#{key}=/i
+            )
+              ini << "#{key}=\r\n"
+            end
+          end
+
+          File.binwrite(
+            ini_path,
+            ini
+          )
+
+          puts(
+            "FAIRY_CANONICAL_MAPS=#{map_count}"
+          )
+
+          puts(
+            "FAIRY_RANDOM_PATH_PATCHES=#{path_changes}"
+          )
+
+          puts \
+            'FAIRY_CANONICAL_BOOT_DATA_OK'
           RB
 
-      - name: Build SLFairy mappings after syntax repair
+      - name: Rebuild SLFairy mappings after canonicalization
         run: |
           set -euo pipefail
 
           (
             cd fairy_player/gameasync
-            bash "$GITHUB_WORKSPACE/engine/extra/make_mapping.sh"
+
+            bash \
+              "$GITHUB_WORKSPACE/engine/extra/make_mapping.sh"
           )
 
-          test -s fairy_player/gameasync/mapping.js
-          test -s fairy_player/gameasync/bitmap-map.js
+          test -s \
+            fairy_player/gameasync/mapping.js
 
-          echo FAIRY_MAPPING_AFTER_REPAIR_OK
+          test -s \
+            fairy_player/gameasync/bitmap-map.js
 
-      - name: Finalize SLFairy identity and hotkeys
+          echo \
+            FAIRY_CANONICAL_MAPPING_OK
+
+      - name: Finalize browser boot bridge and cache isolation
         run: |
           set -euo pipefail
 
@@ -243,37 +421,74 @@ jobs:
           from pathlib import Path
           import re
 
-          p=Path('fairy_player/index.html')
+          bad="replace(/\\/g,'/')"
+          good="replace(/\\\\/g,'/')"
+
+          for name in (
+              'player/index.html',
+              'fairy_player/index.html'
+          ):
+
+              p=Path(name)
+              s=p.read_text()
+
+              if s.count(bad)!=1:
+                  raise SystemExit(
+                      f'BROKEN AUDIO BRIDGE MARKER '
+                      f'{name} count={s.count(bad)}'
+                  )
+
+              s=s.replace(
+                  bad,
+                  good,
+                  1
+              )
+
+              p.write_text(s)
+
+          p=Path(
+              'fairy_player/index.html'
+          )
+
           s=p.read_text()
 
-          if 'slknight_v14_engine' not in s:
+          if (
+              'slknight_v14_engine'
+              not in s
+          ):
               raise SystemExit(
                   'Fairy copied Knight namespace marker missing'
               )
 
-          if 'SLKnight V14.3z100' not in s:
+          if (
+              'SLKnight V14.3z100'
+              not in s
+          ):
               raise SystemExit(
                   'Fairy copied Knight title marker missing'
               )
 
-          if 'v143z100' not in s:
+          if (
+              'v143z100'
+              not in s
+          ):
               raise SystemExit(
                   'Fairy copied Knight cache marker missing'
               )
 
           s=s.replace(
               'v143z100',
-              'v143z104elf'
+              'v143z105elf'
           )
 
           s=s.replace(
               'SLKnight V14.3z100',
-              'SLFairy V14.3z10.4'
+              'SLFairy V14.3z10.5'
           )
 
           s=s.replace(
               'slknight_v14_engine',
-              'slfairy_v14_engine'
+              'slfairy_v105_engine'
           )
 
           pat=re.compile(
@@ -292,17 +507,19 @@ jobs:
 
           if n!=1:
               raise SystemExit(
-                  f'Knight monster preload block removal count={n}'
+                  'Knight monster preload block '
+                  f'removal count={n}'
               )
 
           for marker in (
-              'slfairy_v14_engine',
-              'SLFairy V14.3z10.4',
-              'v143z104elf'
+              'slfairy_v105_engine',
+              'SLFairy V14.3z10.5',
+              'v143z105elf'
           ):
               if marker not in s:
                   raise SystemExit(
-                      'Fairy final marker missing: '+marker
+                      'Fairy marker missing: '+
+                      marker
                   )
 
           if (
@@ -341,7 +558,8 @@ jobs:
 
           if t.count(old)!=1:
               raise SystemExit(
-                  f'Fairy dpad hotbar marker count={t.count(old)}'
+                  'Fairy dpad hotbar marker '
+                  f'count={t.count(old)}'
               )
 
           d.write_text(
@@ -353,19 +571,25 @@ jobs:
           )
 
           print(
-              'FAIRY_FINALIZE_Z104_OK'
+              'FAIRY_BROWSER_Z105_OK'
           )
           PY
 
-          touch fairy_player/.nojekyll
+          touch \
+            fairy_player/.nojekyll
 
-      - name: Verify SLFairy bootable web build
+      - name: Verify SLFairy canonical boot package
         run: |
           set -euo pipefail
 
-          test -s fairy_player/index.html
-          test -s fairy_player/mkxp.js
-          test -s fairy_player/mkxp.wasm
+          test -s \
+            fairy_player/index.html
+
+          test -s \
+            fairy_player/mkxp.js
+
+          test -s \
+            fairy_player/mkxp.wasm
 
           test -s \
             fairy_player/gameasync/Game.ini
@@ -379,28 +603,56 @@ jobs:
           test -s \
             fairy_player/gameasync/bitmap-map.js
 
+          test -s \
+            fairy_player/gameasync/Graphics/Titles/fairy_title.png
+
           ! test -e \
             fairy_player/gameasync/Game.rgssad
 
-          grep -Fq \
-            'slfairy_v14_engine' \
-            fairy_player/index.html
+          for f in \
+            Actors \
+            Classes \
+            Skills \
+            Items \
+            Weapons \
+            Armors \
+            Enemies \
+            Troops \
+            States \
+            Animations \
+            Tilesets \
+            CommonEvents \
+            System \
+            MapInfos
+          do
+            test \
+              "$(stat -c %s "fairy_player/gameasync/Data/$f.rxdata")" \
+              -gt 4
+          done
+
+          test \
+            "$(stat -c %s fairy_player/gameasync/Data/Map007.rxdata)" \
+            -gt 4
 
           grep -Fq \
-            'SLFairy V14.3z10.4' \
+            'slfairy_v105_engine' \
             fairy_player/index.html
 
           grep -Fq \
-            'v143z104elf' \
+            'SLFairy V14.3z10.5' \
             fairy_player/index.html
 
-          ! grep -Fq \
-            'slAttackSheets' \
+          grep -Fq \
+            'v143z105elf' \
             fairy_player/index.html
 
-          ! grep -Fq \
-            'slAttackCoords' \
+          grep -Fq \
+            "replace(/\\\\/g,'/')" \
             fairy_player/index.html
+
+          grep -Fq \
+            "replace(/\\\\/g,'/')" \
+            player/index.html
 
           grep -Fq \
             "hotButton(hot,0,'A',117)" \
@@ -432,6 +684,96 @@ jobs:
           node --check \
             fairy_player/js/drive.js
 
+          node --check \
+            player/js/dpad.js
+
+          node --check \
+            player/js/drive.js
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          for html in (
+              'player/index.html',
+              'fairy_player/index.html'
+          ):
+
+              s=Path(
+                  html
+              ).read_text()
+
+              blocks=[]
+
+              for m in re.finditer(
+                  r'<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>',
+                  s,
+                  re.S|re.I
+              ):
+
+                  if (
+                      'src='
+                      in
+                      m.group(
+                          'attrs'
+                      ).lower()
+                  ):
+                      continue
+
+                  body=m.group(
+                      'body'
+                  )
+
+                  if body.strip():
+                      blocks.append(
+                          body
+                      )
+
+              if not blocks:
+                  raise SystemExit(
+                      'NO INLINE JS BLOCKS: '+
+                      html
+                  )
+
+              for i,body in enumerate(
+                  blocks
+              ):
+
+                  tmp=Path(
+                      f'/tmp/'
+                      f'{Path(html).parent.name}'
+                      f'_inline_{i}.js'
+                  )
+
+                  tmp.write_text(
+                      body
+                  )
+
+                  r=subprocess.run(
+                      [
+                          'node',
+                          '--check',
+                          str(tmp)
+                      ],
+                      capture_output=True,
+                      text=True
+                  )
+
+                  if r.returncode:
+                      raise SystemExit(
+                          'INLINE JS SYNTAX ERROR '
+                          f'{html} block={i}\n'
+                          f'{r.stderr}'
+                      )
+
+              print(
+                  'INLINE_JS_OK',
+                  html,
+                  len(blocks)
+              )
+          PY
+
           ruby \
             -EUTF-8:UTF-8 \
             -rzlib \
@@ -460,13 +802,17 @@ jobs:
             'Mobile Diablo Assist',
             'Web Resolution 800x600',
             'Main',
-            'Scene_Title'
+            'Scene_Title',
+            'Game_Map'
           ].each do |name|
 
             abort(
               "FAIRY SCRIPT MISSING: #{name}"
             ) unless names.include?(name)
           end
+
+          random_refs=[]
+          title_ok=false
 
           scripts.each_with_index do |e,i|
 
@@ -477,37 +823,67 @@ jobs:
 
             begin
               code=
-                Zlib::Inflate.inflate(
+                Zlib::Inflate
+                .inflate(
                   e[2]
+                )
+                .force_encoding(
+                  Encoding::UTF_8
                 )
             rescue Zlib::DataError
               next
             end
 
+            if code.match?(
+              /Data\/[A-Z]{20,}/
+            )
+              random_refs << [
+                i,
+                e[1].to_s
+              ]
+            end
+
+            if e[1].to_s=='Scene_Title'
+              title_ok=
+                code.include?(
+                  'RPG::Cache.title("fairy_title")'
+                )
+            end
+
             begin
               RubyVM::InstructionSequence.compile(
                 code,
-                "fairy_verify_#{i}_#{e[1]}"
+                "fairy_verify_#{i}"
               )
             rescue SyntaxError=>ex
               abort(
-                "FAIRY RUBY SYNTAX ERROR " \
-                "script=#{i} name=#{e[1]}: " \
+                'FAIRY RUBY SYNTAX ERROR '
+                "script=#{i}: "
                 "#{ex.message}"
               )
             end
           end
 
+          abort(
+            'FAIRY RANDOM DATA PATHS REMAIN: '+
+            random_refs.inspect
+          ) unless random_refs.empty?
+
+          abort(
+            'FAIRY ASCII TITLE PATCH MISSING'
+          ) unless title_ok
+
           puts \
-            'FAIRY_BOOT_SCRIPT_VERIFY_OK'
+            'FAIRY_CANONICAL_RUBY_VERIFY_OK'
           RB
 
           echo \
             "FAIRY_FILES=$(find fairy_player/gameasync -type f | wc -l)"
 
-          du -sh fairy_player
+          du -sh \
+            fairy_player
 
-      - name: Build Knight + Fairy class launcher
+      - name: Build Knight + Fairy launcher with cache-busted entry
         run: |
           set -euo pipefail
 
@@ -531,11 +907,31 @@ jobs:
           <html lang="ko">
           <head>
             <meta charset="utf-8">
+
+            <meta
+              http-equiv="Cache-Control"
+              content="no-cache, no-store, must-revalidate"
+            >
+
+            <meta
+              http-equiv="Pragma"
+              content="no-cache"
+            >
+
+            <meta
+              http-equiv="Expires"
+              content="0"
+            >
+
             <meta
               name="viewport"
               content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"
             >
-            <title>SLKnight + SLFairy Mobile</title>
+
+            <title>
+              SLKnight + SLFairy Mobile
+            </title>
+
             <style>
               html,body{
                 margin:0;
@@ -592,27 +988,33 @@ jobs:
 
           <body>
             <div class="wrap">
-              <h1>캐릭터 선택</h1>
+
+              <h1>
+                캐릭터 선택
+              </h1>
 
               <div class="choices">
+
                 <button
                   class="card"
-                  onclick="location.href='knight/'"
+                  onclick="location.href='knight/?v='+Date.now()"
                 >
                   기사
                 </button>
 
                 <button
                   class="card"
-                  onclick="location.href='elf/'"
+                  onclick="location.href='elf/?v='+Date.now()"
                 >
                   요정
                 </button>
+
               </div>
 
               <div class="sub">
                 기사와 요정은 원본 게임 파일과 저장 데이터가 서로 분리되어 실행됩니다.
               </div>
+
             </div>
           </body>
           </html>
@@ -635,8 +1037,12 @@ jobs:
             /tmp/sl_dual_site/knight/index.html
 
           grep -Fq \
-            'slfairy_v14_engine' \
+            'slfairy_v105_engine' \
             /tmp/sl_dual_site/elf/index.html
+
+          grep -Fq \
+            "elf/?v='+Date.now()" \
+            /tmp/sl_dual_site/index.html
 
           rm -rf \
             player \
@@ -647,7 +1053,7 @@ jobs:
             player
 
           echo \
-            DUAL_INDEPENDENT_BUILD_OK
+            DUAL_Z105_CANONICAL_BUILD_OK
 
           du -sh \
             player
