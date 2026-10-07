@@ -1,4 +1,4 @@
-name: Deploy SLKnight V14.3z10.6b + SLFairy 640 BOOT TRACE
+name: Deploy SLKnight V14.3z10.6d + SLFairy TRANSFORM PRELOAD
 
 on:
   push:
@@ -116,6 +116,7 @@ jobs:
       - name: Extract stable preparation scripts
         run: |
           set -euo pipefail
+
           ruby -ryaml - <<'RB'
           doc=YAML.load_file('z105src/.github/workflows/build-slknight-web.yml')
           steps=doc.fetch('jobs').fetch('build').fetch('steps')
@@ -140,9 +141,11 @@ jobs:
       - name: Build Knight and prepare Fairy
         run: |
           set -euo pipefail
+
           for i in 0 1 2 3 4; do
             bash -e "$(printf '/tmp/prep_%02d.sh' "$i")"
           done
+
           echo PREP_BUILD_OK
 
       - name: Patch Fairy boot once
@@ -196,8 +199,10 @@ jobs:
 
           output_entry=scripts.find do |e|
             next false unless e.is_a?(Array)&&e.length>=3
+
             begin
               s=inflate(e)
+
               s.include?('class Game_Event < Game_Event') &&
                 s.include?('class Game_Player < Game_Player')
             rescue
@@ -211,6 +216,7 @@ jobs:
           id_sprite=%q~class Game_Character
             attr_accessor :sprite_id
           end
+
           class Sprite_Character
             alias sl_id_original_update update
 
@@ -226,6 +232,7 @@ jobs:
               bitmap.draw_text(1,0,160,16,text,1)
               bitmap.font.color.set(255,255,255)
               bitmap.draw_text(0,0,160,16,text,1)
+
               @_id_sprite=Sprite.new(self.viewport)
               @_id_sprite.bitmap=bitmap
               @_id_sprite.opacity=255
@@ -239,10 +246,14 @@ jobs:
 
             def dispose_id_sprite
               if @_id_sprite!=nil
-                @_id_sprite.bitmap.dispose if @_id_sprite.bitmap!=nil&&!@_id_sprite.bitmap.disposed?
+                if @_id_sprite.bitmap!=nil&&!@_id_sprite.bitmap.disposed?
+                  @_id_sprite.bitmap.dispose
+                end
+
                 @_id_sprite.dispose
                 @_id_sprite=nil
               end
+
               @_id_sprite_visible=false
             end
 
@@ -312,20 +323,136 @@ jobs:
 
           scripts.each_with_index do |e,i|
             next unless e.is_a?(Array)&&e.length>=3
+
             begin
               code=inflate(e)
             rescue
               next
             end
-            RubyVM::InstructionSequence.compile(code,"fairy_#{i}_#{e[1]}")
+
+            RubyVM::InstructionSequence.compile(
+              code,
+              "fairy_#{i}_#{e[1]}"
+            )
           end
 
           puts 'FAIRY_BOOT_640_PATCH_OK'
           RB
 
-      - name: Rebuild mapping and clean browser boot
+      - name: Rebuild mapping and preload transforms
         run: |
           set -euo pipefail
+
+          ruby -EUTF-8:UTF-8 -rjson - player/gameasync fairy_player/gameasync <<'RB'
+          class RawMarshalObject
+            def self._load(data)
+              o=allocate
+              o.instance_variable_set(:@raw,data)
+              o
+            end
+
+            def _dump(_depth)
+              @raw
+            end
+          end
+
+          class Tone < RawMarshalObject; end
+          class Color < RawMarshalObject; end
+          class Rect < RawMarshalObject; end
+          class Table < RawMarshalObject; end
+
+          module RPG
+            class AudioFile; end
+
+            class Animation
+              class Frame; end
+              class Timing; end
+            end
+
+            class Map; end
+            class CommonEvent; end
+
+            class Event
+              class Page
+                class Condition; end
+                class Graphic; end
+              end
+            end
+
+            class EventCommand; end
+            class MoveRoute; end
+            class MoveCommand; end
+          end
+
+          def iv(o,n)
+            o.instance_variable_get("@#{n}")
+          end
+
+          def transform_names(game)
+            cp=Dir.glob(
+              File.join(game,'Data','*CommonEvents.rxdata')
+            ).max_by{|p|File.size(p)}
+
+            abort "CommonEvents missing: #{game}" unless cp&&File.size(cp)>1000
+
+            ce=Marshal.load(File.binread(cp))
+            names=[]
+
+            [6,17,34].each do |id|
+              event=ce[id]
+              next unless event
+
+              (iv(event,:list)||[]).each do |cmd|
+                next unless iv(cmd,:code)==209
+
+                params=iv(cmd,:parameters)||[]
+                route=params[1]
+                next unless route
+
+                (iv(route,:list)||[]).each do |move|
+                  next unless iv(move,:code)==41
+
+                  p=iv(move,:parameters)||[]
+                  name=p[0].to_s
+                  names << name unless name.empty?
+                end
+              end
+            end
+
+            names=names.uniq.sort
+
+            abort "No transform graphics found: #{game}" if names.empty?
+
+            names.each do |name|
+              file=File.join(
+                game,
+                'Graphics',
+                'Characters',
+                "#{name}.png"
+              )
+
+              abort "Missing transform graphic: #{file}" unless File.size?(file)
+            end
+
+            names
+          end
+
+          knight=transform_names(ARGV.fetch(0))
+          fairy=transform_names(ARGV.fetch(1))
+
+          File.write(
+            '/tmp/knight_transform.json',
+            JSON.generate(knight)
+          )
+
+          File.write(
+            '/tmp/fairy_transform.json',
+            JSON.generate(fairy)
+          )
+
+          puts "KNIGHT_TRANSFORMS=#{knight.join(',')}"
+          puts "FAIRY_TRANSFORMS=#{fairy.join(',')}"
+          RB
 
           (
             cd fairy_player/gameasync
@@ -334,11 +461,30 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import json
 
-          for name in ('player/index.html','fairy_player/index.html'):
-              p=Path(name)
-              s=p.read_text()
+          configs=[
+              (
+                  Path('player/index.html'),
+                  json.loads(
+                      Path('/tmp/knight_transform.json').read_text()
+                  ),
+                  'v143z106dknight',
+                  'slknight_v106d_engine',
+                  'SLKnight V14.3z10.6d'
+              ),
+              (
+                  Path('fairy_player/index.html'),
+                  json.loads(
+                      Path('/tmp/fairy_transform.json').read_text()
+                  ),
+                  'v143z106delf',
+                  'slfairy_v106d_engine',
+                  'SLFairy V14.3z10.6d'
+              )
+          ]
 
+          def remove_legacy_touch(s,name):
               start="        if (!is_touch_device()) {"
               end="        resize();"
 
@@ -351,13 +497,6 @@ jobs:
               b=s.index(end,a)+len(end)
               s=s[:a]+s[b:]
 
-              s=s.replace(
-                  'position:fixed;left:8px;top:8px;',
-                  'position:fixed;left:8px;bottom:8px;'
-              )
-
-              p.write_text(s)
-
               if 'is_touch_device()' in s:
                   raise SystemExit(
                       f'is_touch_device remains in {name}'
@@ -367,6 +506,111 @@ jobs:
                   raise SystemExit(
                       f'legacy bindKey remains in {name}'
                   )
+
+              return s
+
+          def inject_transform_preload(s,names,cache_tag,name):
+              marker="}],\n            postRun:"
+
+              if s.count(marker)!=1:
+                  raise SystemExit(
+                      f'PRE-RUN END {name} count={s.count(marker)}'
+                  )
+
+              js_names=json.dumps(
+                  names,
+                  ensure_ascii=False,
+                  separators=(',',':')
+              )
+
+              block=f"""
+  var slTransformSheets={js_names};
+  slTransformSheets.forEach(function(name){{
+    var file=name+'.png';
+    var p='/game/Graphics/Characters/'+file;
+
+    try{{
+      if(FS.analyzePath(p).exists)FS.unlink(p);
+    }}catch(e){{}}
+
+    FS.createPreloadedFile(
+      '/game/Graphics/Characters',
+      file,
+      encodeURI(
+        'gameasync/Graphics/Characters/'+
+        file+
+        '?v={cache_tag}'
+      ),
+      true,
+      true,
+      function(){{}},
+      function(){{
+        console.error(
+          'SLTRANSFORMERR|'+file
+        );
+      }}
+    );
+  }});
+"""
+
+              return s.replace(
+                  marker,
+                  block+marker,
+                  1
+              )
+
+          for path,names,cache_tag,namespace,title in configs:
+              s=path.read_text()
+              s=remove_legacy_touch(
+                  s,
+                  str(path)
+              )
+
+              s=s.replace(
+                  'position:fixed;left:8px;top:8px;',
+                  'position:fixed;left:8px;bottom:8px;'
+              )
+
+              if path.as_posix().startswith('player/'):
+                  s=s.replace(
+                      'slknight_v14_engine',
+                      namespace
+                  )
+
+                  s=s.replace(
+                      'SLKnight V14.3z100',
+                      title
+                  )
+
+                  s=s.replace(
+                      'v143z100',
+                      cache_tag
+                  )
+
+              else:
+                  s=s.replace(
+                      'slfairy_v105_engine',
+                      namespace
+                  )
+
+                  s=s.replace(
+                      'SLFairy V14.3z10.5',
+                      title
+                  )
+
+                  s=s.replace(
+                      'v143z105elf',
+                      cache_tag
+                  )
+
+              s=inject_transform_preload(
+                  s,
+                  names,
+                  cache_tag,
+                  str(path)
+              )
+
+              path.write_text(s)
 
           p=Path('fairy_player/index.html')
           s=p.read_text()
@@ -383,7 +627,7 @@ jobs:
 
           new_bridge="""  function report(t){
             t=String(t||'');
-            if(/SLRUNTIMEERR|SLSCRIPTERR|Message:|NO SUCH FILE|PHYSFS ERROR|Skipping loading| - err(?:$|\\s)|SLFONTERR|SLAUDIOJSERR/i.test(t))err(t);
+            if(/SLRUNTIMEERR|SLSCRIPTERR|Message:|NO SUCH FILE|PHYSFS ERROR|Skipping loading| - err(?:$|\\s)|SLFONTERR|SLAUDIOJSERR|SLTRANSFORMERR/i.test(t))err(t);
           }
           var log=console.log.bind(console),elog=console.error.bind(console);
           console.log=function(){
@@ -407,7 +651,10 @@ jobs:
           });
           window.addEventListener('unhandledrejection',function(e){
             var r=e&&e.reason;
-            err('PROMISE ERROR | '+(r&&r.message?r.message:String(r)));
+            err(
+              'PROMISE ERROR | '+
+              (r&&r.message?r.message:String(r))
+            );
           });"""
           new_bridge=new_bridge.replace('          ','')
 
@@ -416,25 +663,28 @@ jobs:
                   f'FAIRY ERROR BRIDGE count={s.count(old_bridge)}'
               )
 
-          s=s.replace(old_bridge,new_bridge,1)
-
-          s=s.replace(
-              'slfairy_v105_engine',
-              'slfairy_v106b_engine'
-          )
-          s=s.replace(
-              'SLFairy V14.3z10.5',
-              'SLFairy V14.3z10.6b'
-          )
-          s=s.replace(
-              'v143z105elf',
-              'v143z106belf'
+          p.write_text(
+              s.replace(
+                  old_bridge,
+                  new_bridge,
+                  1
+              )
           )
 
-          p.write_text(s)
-
-          print('FAIRY_BROWSER_TRACE_OK')
+          print('TRANSFORM_PRELOAD_BROWSER_OK')
           PY
+
+          grep -Fq 'slknight_v106d_engine' player/index.html
+          grep -Fq 'SLKnight V14.3z10.6d' player/index.html
+          grep -Fq 'v143z106dknight' player/index.html
+          grep -Fq 'var slTransformSheets=' player/index.html
+          grep -Fq 'SLTRANSFORMERR' player/index.html
+
+          grep -Fq 'slfairy_v106d_engine' fairy_player/index.html
+          grep -Fq 'SLFairy V14.3z10.6d' fairy_player/index.html
+          grep -Fq 'v143z106delf' fairy_player/index.html
+          grep -Fq 'var slTransformSheets=' fairy_player/index.html
+          grep -Fq 'SLTRANSFORMERR' fairy_player/index.html
 
       - name: Build dual site
         run: |
@@ -464,6 +714,7 @@ jobs:
           <body>
             <div class="wrap">
               <h1>캐릭터 선택</h1>
+
               <div class="choices">
                 <button onclick="location.href='knight/?v='+Date.now()">기사</button>
                 <button onclick="location.href='elf/?v='+Date.now()">요정</button>
@@ -474,6 +725,7 @@ jobs:
           HTML
 
           touch site/.nojekyll
+
           rm -rf player
           mv site player
 
@@ -482,21 +734,34 @@ jobs:
           set -euo pipefail
 
           test -s player/knight/index.html
+          test -s player/knight/mkxp.js
+          test -s player/knight/mkxp.wasm
+          test -s player/knight/gameasync/Data/Scripts.rxdata
+          test -s player/knight/gameasync/mapping.js
+
           test -s player/elf/index.html
           test -s player/elf/mkxp.js
           test -s player/elf/mkxp.wasm
           test -s player/elf/gameasync/Data/Scripts.rxdata
           test -s player/elf/gameasync/mapping.js
 
-          grep -Fq 'slfairy_v106b_engine' player/elf/index.html
-          grep -Fq 'SLFairy V14.3z10.6b' player/elf/index.html
-          grep -Fq 'v143z106belf' player/elf/index.html
+          grep -Fq 'slknight_v106d_engine' player/knight/index.html
+          grep -Fq 'SLKnight V14.3z10.6d' player/knight/index.html
+          grep -Fq 'v143z106dknight' player/knight/index.html
+          grep -Fq 'var slTransformSheets=' player/knight/index.html
+          grep -Fq 'SLTRANSFORMERR' player/knight/index.html
+
+          grep -Fq 'slfairy_v106d_engine' player/elf/index.html
+          grep -Fq 'SLFairy V14.3z10.6d' player/elf/index.html
+          grep -Fq 'v143z106delf' player/elf/index.html
+          grep -Fq 'var slTransformSheets=' player/elf/index.html
+          grep -Fq 'SLTRANSFORMERR' player/elf/index.html
           grep -Fq 'position:fixed;left:8px;bottom:8px;' player/elf/index.html
 
           grep -Fq 'function report(t)' player/elf/index.html
           grep -Fq 'NO SUCH FILE' player/elf/index.html
           grep -Fq 'PHYSFS ERROR' player/elf/index.html
-          grep -Fq 'Skipping loading' player/elf/index.html
+          grep -Fq 'SLTRANSFORMERR' player/elf/index.html
           grep -Fq 'console.error=function()' player/elf/index.html
           grep -Fq 'unhandledrejection' player/elf/index.html
 
@@ -506,6 +771,8 @@ jobs:
 
           ! grep -Fq 'is_touch_device()' player/elf/index.html
           ! grep -Fq "bindKey('d-up'" player/elf/index.html
+          ! grep -Fq 'is_touch_device()' player/knight/index.html
+          ! grep -Fq "bindKey('d-up'" player/knight/index.html
 
           ruby -rzlib - player/elf/gameasync/Data/Scripts.rxdata <<'RB'
           scripts=Marshal.load(File.binread(ARGV[0]))
@@ -529,7 +796,7 @@ jobs:
           puts 'FAIRY_640_VERIFY_OK'
           RB
 
-          echo FAIRY_640_TRACE_BUILD_OK
+          echo TRANSFORM_PRELOAD_DUAL_BUILD_OK
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
