@@ -1,5 +1,5 @@
 
-name: V193 | Deploy SLKnight POTION ASSASSIN + SLFairy INVENTORY ICON FIX
+name: V194 | Deploy SLKnight POTION ASSASSIN + SLFairy LINE AUTO TARGET
 on:
   push:
     branches: [main]
@@ -235,6 +235,115 @@ jobs:
           puts 'KNIGHT_POTION_TRANSFORM_ASSASSIN_PATCH_OK'
           RB
           (cd player/gameasync && bash "$GITHUB_WORKSPACE/engine/extra/make_mapping.sh")
+      - name: V194 Fairy directional straight-line targeting
+        run: |
+          set -euo pipefail
+          ruby -EUTF-8:UTF-8 -rzlib - fairy_player/gameasync/Data/Scripts.rxdata <<'RB'
+          path=ARGV.fetch(0)
+          scripts=Marshal.load(File.binread(path))
+          title='SLFairy Line Target V194'
+          abort 'Duplicate V194 target script' if scripts.any?{|e|e.is_a?(Array)&&e[1].to_s==title}
+          main_index=scripts.index{|e|e.is_a?(Array)&&e[1].to_s=='Main'}
+          abort 'Fairy Main script missing' unless main_index
+          target_code=<<'SRC'
+          # SL_FAIRY_LINE_TARGET_V194
+          # Preserve original combat damage, hit rate and attack animations.
+          module SLFairyLineTargetV194
+            BOW_RANGE = 8
+
+            def self.weapon_range
+              party = $game_party
+              actor = party && party.actors && party.actors[0]
+              return 1 unless actor && $data_weapons
+              ids = actor.respond_to?(:weapon_ids) ? actor.weapon_ids : [actor.weapon_id]
+              ids = [ids] unless ids.is_a?(Array)
+              bow = ids.compact.any? do |id|
+                weapon = $data_weapons[id.to_i]
+                weapon && (weapon.name.to_s =~ /(활|보우|bow|crossbow)/i)
+              end
+              return 1 unless bow
+              return 1 if $game_map.map_id == 1
+              BOW_RANGE
+            end
+
+            def self.monster_event?(ev)
+              source = ev.instance_variable_get(:@event)
+              return false unless source && source.name.to_s.start_with?('[ID')
+              return false if ev.instance_variable_get(:@erased)
+              return false unless ev.list && ev.list.size > 1
+              return false if ev.jumping?
+              return false if ev.character_name && ev.character_name.to_s.empty?
+              names = $data_system && $data_system.variables
+              return false unless names
+              source.pages.any? do |page|
+                condition = page.condition
+                condition && condition.variable_valid &&
+                  names[condition.variable_id].to_s.include?('체력')
+              end
+            end
+
+            def self.find(player, triggers)
+              map = $game_map
+              return nil unless map && map.events
+              direction = player.direction
+              dx = (direction == 6 ? 1 : direction == 4 ? -1 : 0)
+              dy = (direction == 2 ? 1 : direction == 8 ? -1 : 0)
+              return nil if dx == 0 && dy == 0
+              px = player.x
+              py = player.y
+              limit = weapon_range
+              distance = 1
+
+              while distance <= limit
+                nx = px + dx
+                ny = py + dy
+                break unless map.valid?(nx, ny)
+                break unless map.passable?(px, py, direction) &&
+                             map.passable?(nx, ny, 10-direction)
+
+                found = nil
+                blocked = false
+                map.events.values.each do |event|
+                  next unless event.x == nx && event.y == ny
+                  if monster_event?(event) && triggers.include?(event.trigger)
+                    found = event unless event.over_trigger?
+                  elsif !event.through && event.character_name.to_s != ''
+                    blocked = true
+                  end
+                end
+                return found if found
+                break if blocked
+                px = nx
+                py = ny
+                distance += 1
+              end
+              nil
+            end
+          end
+
+          class Game_Player
+            alias sl_fairy_v194_event_trigger_there check_event_trigger_there
+            def check_event_trigger_there(triggers)
+              if triggers.include?(0) && triggers.include?(1) &&
+                 $game_system && !$game_system.map_interpreter.running? &&
+                 $game_temp && !$game_temp.message_window_showing
+                target = SLFairyLineTargetV194.find(self, triggers)
+                if target
+                  target.start
+                  puts('SLTARGET|'+target.id.to_s+'|'+target.x.to_s+'|'+target.y.to_s)
+                  return true
+                end
+              end
+              sl_fairy_v194_event_trigger_there(triggers)
+            end
+          end
+          SRC
+          target_code.gsub!(/^          /,'')
+          RubyVM::InstructionSequence.compile(target_code,'SLFairy Line Target V194')
+          scripts.insert(main_index,[99999989,title,Zlib::Deflate.deflate(target_code)])
+          File.binwrite(path,Marshal.dump(scripts))
+          puts 'FAIRY_STRAIGHT_TARGET_V194_OK'
+          RB
       - name: Fix Fairy compatibility title and new game flow
         run: |
           set -euo pipefail
@@ -245,7 +354,7 @@ jobs:
           def store(e,s);e[2]=Zlib::Deflate.deflate(s);end
           replacements={
             'weapon_array = Array.new(self.weapon_ids) #save weapons'=>'weapon_array = self.weapon_ids.dup #save weapons',
-            '@weapon_slots = Array.new(array) #new slots'=>'@weapon_slots = array.dup #save weapons',
+            '@weapon_slots = Array.new(array) #new slots'=>'@weapon_slots = array.dup #new slots',
             'temp_array = Array.new(@armor_slot_names)'=>'temp_array = @armor_slot_names.dup',
             'temp_array = Array.new(@weapon_slot_names) #use the custom values'=>'temp_array = @weapon_slot_names.dup',
             'return Array.new(attacks)'=>'return attacks.dup',
