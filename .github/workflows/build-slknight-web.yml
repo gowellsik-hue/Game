@@ -1,5 +1,5 @@
 
-name: V196 | SLFairy Safe Auto Attack + Native 640x480 Portrait
+name: V197 | SLFairy Event-Gated Auto Attack + Runtime Diagnostics
 
 on:
   push:
@@ -119,45 +119,44 @@ jobs:
           done
           echo V194_BASE_READY_WITHOUT_LINE_HOOK
 
-      - name: V196 restore native Fairy resolution and safe held-ATK targeting
+      - name: V197 restore native resolution and event-gated target search
         run: |
           set -euo pipefail
           ruby -EUTF-8:UTF-8 -rzlib - fairy_player/gameasync/Data/Scripts.rxdata <<'RB'
           path = ARGV.fetch(0)
           scripts = Marshal.load(File.binread(path))
-          title = 'SLFairy Auto Target V196'
-          abort 'V194 target unexpectedly present' if scripts.any? { |e| e.is_a?(Array) && e[1].to_s == 'SLFairy Line Target V194' }
-          abort 'Duplicate target' if scripts.any? { |e| e.is_a?(Array) && e[1].to_s == title }
-          resolution_name = '해상도'
-          fixed_resolution = 0
+          name = 'SLFairy Event Target V197'
+          abort 'Previous V194 targeting script found' if scripts.any? { |e| e.is_a?(Array) && e[1].to_s == 'SLFairy Line Target V194' }
+          abort 'V197 target already inserted' if scripts.any? { |e| e.is_a?(Array) && e[1].to_s == name }
+          changed = 0
           scripts.each do |entry|
             next unless entry.is_a?(Array) && entry.length >= 3
-            next unless [resolution_name, 'Web Resolution 800x600'].include?(entry[1].to_s)
-            source = Zlib::Inflate.inflate(entry[2]).force_encoding('UTF-8')
-            source.gsub!('$WINDOW_WIDTH = 800', '$WINDOW_WIDTH = 640')
-            source.gsub!('$WINDOW_HEIGHT = 600', '$WINDOW_HEIGHT = 480')
-            source.gsub!(/Graphics\.resize_screen\(\s*800\s*,\s*600\s*\)/m, 'Graphics.resize_screen(640, 480)')
-            source.gsub!(/\b800\s*,\s*600\b/, '640, 480')
-            abort 'Unconverted resolution' if source.include?('$WINDOW_WIDTH = 800') || source.include?('$WINDOW_HEIGHT = 600')
-            entry[2] = Zlib::Deflate.deflate(source)
-            fixed_resolution += 1
+            next unless ['해상도', 'Web Resolution 800x600'].include?(entry[1].to_s)
+            code = Zlib::Inflate.inflate(entry[2]).force_encoding('UTF-8')
+            code.gsub!('$WINDOW_WIDTH = 800', '$WINDOW_WIDTH = 640')
+            code.gsub!('$WINDOW_HEIGHT = 600', '$WINDOW_HEIGHT = 480')
+            code.gsub!(/Graphics\.resize_screen\(\s*800\s*,\s*600\s*\)/m, 'Graphics.resize_screen(640, 480)')
+            code.gsub!(/\b800\s*,\s*600\b/, '640, 480')
+            abort 'Resolution left at 800x600' if code.include?('$WINDOW_WIDTH = 800') || code.include?('$WINDOW_HEIGHT = 600')
+            entry[2] = Zlib::Deflate.deflate(code)
+            changed += 1
           end
-          # V194 reconstructs a single active resolution shim; the legacy named entry is optional.
-          abort 'No Fairy resolution script found' unless fixed_resolution >= 1
-          shim = scripts.find { |e| e.is_a?(Array) && e[1].to_s == 'Web Resolution 800x600' }
-          abort 'Active Fairy resolution shim missing' unless shim
-          shim_code = Zlib::Inflate.inflate(shim[2])
-          abort 'Fairy resolution conversion missing' unless shim_code.include?('Graphics.resize_screen(640, 480)')
-          code = <<'SRC'
-          # SL_FAIRY_HELD_AUTO_V196
-          # Keep native monster event combat and native attack animation.
-          module SLFairyAutoV196
+          abort 'No Fairy resolution script' if changed == 0
+          active = scripts.find { |e| e.is_a?(Array) && e[1].to_s == 'Web Resolution 800x600' }
+          abort 'Active resolution shim missing' unless active
+          abort 'Active resolution not 640x480' unless Zlib::Inflate.inflate(active[2]).include?('Graphics.resize_screen(640, 480)')
+          target_code = <<'SRC'
+          # SL_FAIRY_EVENT_TARGET_V197
+          # Normal confirm events remain native. Only adjacent/front-line monster
+          # events receive a scoped selection when the ATK key pulses.
+          module SLFairyTargetV197
             BOW_RANGE = 8
-            @last_frame = -1000
+            MIN_FRAMES = 12
+            @previous_event = nil
+            @previous_frame = -99999
 
             def self.weapon_range
-              party = $game_party
-              actor = party && party.actors && party.actors[0]
+              actor = $game_party && $game_party.actors && $game_party.actors[0]
               return 1 unless actor && $data_weapons
               ids = actor.respond_to?(:weapon_ids) ? actor.weapon_ids : [actor.weapon_id]
               ids = [ids] unless ids.is_a?(Array)
@@ -173,85 +172,121 @@ jobs:
               page = event.instance_variable_get(:@page)
               return false unless data && page && data.name.to_s.start_with?('[ID')
               return false if event.instance_variable_get(:@erased)
-              return false if event.through || event.trigger != 2 || event.jumping?
-              return false unless event.list && event.list.size > 1
-              true
+              return false if event.instance_variable_get(:@starting)
+              return false if event.through || event.jumping?
+              return false if event.character_name.to_s.empty?
+              [0, 1, 2].include?(event.trigger)
             end
 
-            def self.target(player)
+            def self.find(player, triggers)
+              return nil unless triggers.include?(0) && triggers.include?(1)
+              return nil unless $game_map && $game_system && $game_temp
+              return nil if $game_temp.message_window_showing
+              i = $game_system.map_interpreter
+              return nil if i && i.running?
               map = $game_map
-              return nil unless map && map.events
               dir = player.direction
               dx = (dir == 6 ? 1 : dir == 4 ? -1 : 0)
               dy = (dir == 2 ? 1 : dir == 8 ? -1 : 0)
               return nil if dx == 0 && dy == 0
+              # Index occupied tiles once per key pulse, not once per pixel or frame.
+              occupied = {}
+              map.events.each_value do |ev|
+                key = [ev.x, ev.y]
+                occupied[key] ||= []
+                occupied[key] << ev
+              end
               x = player.x
               y = player.y
-              distance = 0
-              limit = weapon_range
-              events = map.events.values
-              while distance < limit
+              step = 0
+              while step < weapon_range
                 nx = x + dx
                 ny = y + dy
                 break unless map.valid?(nx, ny)
                 blocked = false
-                found = nil
-                events.each do |event|
-                  next unless event.x == nx && event.y == ny
-                  if enemy?(event)
-                    found = event
-                    break
-                  elsif !event.through && event.character_name.to_s != ''
-                    blocked = true
-                  end
+                (occupied[[nx, ny]] || []).each do |ev|
+                  return ev if enemy?(ev)
+                  blocked = true if !ev.through && ev.character_name.to_s != ''
                 end
-                return found if found
                 break if blocked
                 break unless map.passable?(x, y, dir)
                 x = nx
                 y = ny
-                distance += 1
+                step += 1
               end
               nil
             end
 
-            def self.fire(player)
-              return unless Input.press?(Input::C)
-              return unless $game_system && $game_temp && $game_switches
-              return if $game_switches[743]
-              return if player.moving? || player.instance_variable_get(:@move_route_forcing)
-              return if $game_temp.message_window_showing
-              interpreter = $game_system.map_interpreter
-              return if interpreter && interpreter.running?
-              frame = Graphics.frame_count
-              return if frame >= @last_frame && frame - @last_frame < 2
-              enemy = target(player)
-              return unless enemy
-              return if enemy.instance_variable_get(:@starting)
-              @last_frame = frame
-              puts('SLAUTO|START|'+enemy.id.to_s+'|'+enemy.x.to_s+'|'+enemy.y.to_s+'|'+frame.to_s)
-              enemy.start
-              puts('SLAUTO|QUEUED|'+enemy.id.to_s+'|'+frame.to_s)
+            def self.ready?(enemy)
+              f = Graphics.frame_count
+              return false if enemy.id == @previous_event && f >= @previous_frame && f - @previous_frame < MIN_FRAMES
+              @previous_event = enemy.id
+              @previous_frame = f
+              true
             end
           end
 
           class Game_Player
-            alias sl_fairy_v196_original_update update
+            alias sl_fairy_v197_original_check_event_trigger_there check_event_trigger_there
+            def check_event_trigger_there(triggers)
+              if Input.trigger?(Input::C)
+                enemy = SLFairyTargetV197.find(self, triggers)
+                if enemy
+                  if SLFairyTargetV197.ready?(enemy)
+                    puts('SLTARGET|START|'+enemy.id.to_s+'|'+Graphics.frame_count.to_s)
+                    enemy.start
+                    puts('SLTARGET|QUEUED|'+enemy.id.to_s+'|'+Graphics.frame_count.to_s)
+                  end
+                  return true
+                end
+              end
+              sl_fairy_v197_original_check_event_trigger_there(triggers)
+            end
+          end
+
+          class Scene_Map
+            alias sl_fairy_v197_original_update update
             def update
-              sl_fairy_v196_original_update
-              SLFairyAutoV196.fire(self)
+              before = Graphics.frame_count
+              if before % 120 == 0 && @sl_v197_last_tick != before
+                @sl_v197_last_tick = before
+                puts('SLBEAT|'+before.to_s+'|ENTER')
+              end
+              sl_fairy_v197_original_update
+              if before % 120 == 0 && @sl_v197_last_exit != before
+                @sl_v197_last_exit = before
+                puts('SLBEAT|'+before.to_s+'|EXIT')
+              end
             end
           end
           SRC
-          RubyVM::InstructionSequence.compile(code, title)
+          RubyVM::InstructionSequence.compile(target_code, name)
           main_index = scripts.index { |e| e.is_a?(Array) && e[1].to_s == 'Main' }
-          abort 'Fairy Main missing' unless main_index
-          scripts.insert(main_index, [99999989, title, Zlib::Deflate.deflate(code)])
+          abort 'Fairy Main script missing' unless main_index
+          scripts.insert(main_index, [99999989, name, Zlib::Deflate.deflate(target_code)])
           File.binwrite(path, Marshal.dump(scripts))
-          puts 'V196_FAIRY_NATIVE_640_SAFE_AUTO_OK'
+          puts 'V197_NATIVE_EVENT_TARGET_OK'
           RB
 
-      - name: V196 repair Fairy canvas and portrait controls
+      - name: Refresh Fairy Scripts mapping hash after Ruby patch
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, hashlib
+          data = Path('fairy_player/gameasync/Data/Scripts.rxdata')
+          mapping = Path('fairy_player/gameasync/mapping.js')
+          md5 = hashlib.md5(data.read_bytes()).hexdigest()
+          content = mapping.read_text(encoding='utf-8')
+          pat = r'(\["data/scripts",\s*"Data/Scripts\.rxdata\?h=)[0-9a-f]{32}("\],)'
+          changed, count = re.subn(pat, lambda m: m.group(1) + md5 + m.group(2), content)
+          if count != 1:
+              raise SystemExit('Fairy Data/Scripts.rxdata mapping anchor mismatch: ' + str(count))
+          mapping.write_text(changed, encoding='utf-8')
+          print('V197_FAIRY_MAPPING_MD5=' + md5)
+          PY
+
+      - name: V197 repair Fairy canvas, ATK repeat and status display
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -265,43 +300,76 @@ jobs:
               raise SystemExit('Fairy 800x600 canvas anchor missing')
           html = html.replace(old_canvas, 'width="640" height="480"', 1)
           html = html.replace('SLFairy 800', 'SLFairy 640')
+          # A new HTML query is insufficient if the linked scripts reuse old URLs.
+          cache_urls = {
+              'gameasync/mapping.js?v=fairy192': 'gameasync/mapping.js?v=fairy197',
+              'js/dpad.js?v=fairy800': 'js/dpad.js?v=fairy197'
+          }
+          for old, new in cache_urls.items():
+              if html.count(old) != 1:
+                  raise SystemExit('Fairy cache-bust anchor missing: ' + old)
+              html = html.replace(old, new, 1)
 
-          diagnostic = '''<script id="sl-v196-diagnostic">
+          # SLNEW/SLTITLE are progress markers, never red errors.
+          noisy = '/SLRUNTIMEERR|SLSCRIPTERR|SLTITLE|SLNEW| - err/.test(t)'
+          quiet = '/SLRUNTIMEERR|SLSCRIPTERR| - err/.test(t)'
+          if html.count(noisy) != 1:
+              raise SystemExit('V194 misleading SLNEW error banner anchor missing')
+          html = html.replace(noisy, quiet, 1)
+
+          diagnostic = r'''<script id="sl-v197-diagnostic">
           (function(){
-            window.slV196LastAttack='none';
-            var previous=console.log.bind(console);
+            var lastFrame=0,seenAt=0,phase='WAIT',lastTarget='none',lastScene='-';
+            var prior=console.log.bind(console), box;
+            function ensure(){
+              if(box || !document.body)return;
+              box=document.createElement('div');box.id='sl-v197-status';
+              box.style='position:fixed;left:8px;bottom:8px;z-index:90000;'+
+                'pointer-events:none;max-width:55vw;padding:3px 6px;'+
+                'border:1px solid #555;background:#111c;color:#ddd;'+
+                'font:10px/14px monospace;white-space:normal';
+              document.body.appendChild(box);
+            }
             console.log=function(){
               var s=Array.prototype.join.call(arguments,' ');
-              var i=s.indexOf('SLAUTO|');
-              if(i>=0)window.slV196LastAttack=s.slice(i,i+120);
-              if(s.indexOf('SLFRAME|Scene_Map')>=0){
-                var spinner=document.getElementById('spinner');
-                var progress=document.getElementById('progress');
-                if(spinner)spinner.style.display='none';
-                if(progress)progress.style.display='none';
+              var pos=s.indexOf('SLBEAT|');
+              if(pos>=0){
+                var p=s.slice(pos).split('|');
+                lastFrame=Number(p[1])||lastFrame; phase=p[2]||'-';
+                seenAt=Date.now();
               }
-              previous.apply(console,arguments);
+              pos=s.indexOf('SLTARGET|');
+              if(pos>=0)lastTarget=s.slice(pos,pos+75);
+              pos=s.indexOf('SLFRAME|');
+              if(pos>=0){lastScene=s.slice(pos+8).split(/\s/)[0];
+                if(lastScene==='Scene_Map'){
+                  ['spinner','progress'].forEach(function(id){
+                    var el=document.getElementById(id);if(el)el.style.display='none';
+                  });
+                }
+              }
+              prior.apply(console,arguments);
             };
-            function report(message){
-              var p=document.getElementById('slerr');
-              if(!p)return;
-              p.style.top='6px';p.style.bottom='auto';p.style.height='auto';
-              p.style.maxHeight='75px';p.style.whiteSpace='normal';
-              p.style.fontSize='11px';
-              p.textContent=String(message)+' | '+window.slV196LastAttack;
-            }
             window.addEventListener('error',function(e){
-              var m=String(e && e.message || '');
-              if(/memory access out of bounds|RuntimeError|unreachable/i.test(m))report('WASM ERROR | '+m);
+              var text=String(e && e.message || 'unknown');
+              lastTarget='JS ERROR: '+text.slice(0,90);
             });
             window.addEventListener('unhandledrejection',function(e){
               var r=e && e.reason;
-              var m=String(r && r.message || r || 'unknown');
-              report('PROMISE ERROR | '+m);
+              lastTarget='PROMISE ERROR: '+String(r && r.message || r || '').slice(0,90);
             });
+            if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',ensure);
+            else ensure();
+            setInterval(function(){
+              ensure();if(!box)return;
+              var lag=seenAt?Math.round((Date.now()-seenAt)/1000):-1;
+              var state=(seenAt && lag>7)?'STALL':'RUN';
+              box.textContent='V197 '+state+' F:'+lastFrame+' '+phase+' '+
+                'age:'+lag+'s '+lastScene+' / '+lastTarget;
+            },1200);
           })();
           </script>'''
-          if html.count('</head>') != 1 or 'sl-v196-diagnostic' in html:
+          if html.count('</head>') != 1 or 'sl-v197-diagnostic' in html:
               raise SystemExit('Fairy diagnostic head anchor mismatch')
           html = html.replace('</head>', diagnostic + '</head>', 1)
           html_path.write_text(html, encoding='utf-8')
@@ -323,11 +391,50 @@ jobs:
           if pad.count(target_css) != 1:
               raise SystemExit('Fairy landscape pad anchor missing')
           pad = pad.replace(target_css, target_css + '\n#sl-pad[data-mode="side"] #sl-joy-zone{display:none!important}', 1)
+          button_mark = "button(pad,'sl-atk','ATK',67,'sl-btn');button(pad,'sl-cancel','X',88,'sl-btn');"
+          if pad.count(button_mark) != 1:
+              raise SystemExit('Fairy ATK button constructor anchor missing')
+          revised = "const fairyAtk=document.createElement('div');fairyAtk.id='sl-atk';fairyAtk.className='sl-btn';fairyAtk.textContent='ATK';pad.appendChild(fairyAtk);bindFairyAutoAtk(fairyAtk);button(pad,'sl-cancel','X',88,'sl-btn');"
+          pad = pad.replace(button_mark, revised, 1)
+          hook = 'function initSLTouchControls(){'
+          if pad.count(hook) != 1:
+              raise SystemExit('Fairy touch initialization anchor missing')
+          auto = r'''function bindFairyAutoAtk(b){
+            let active=false,handle=null;
+            function pulse(){if(active)pulseKey(67,90);}
+            function stop(e){
+              if(e){e.preventDefault();e.stopPropagation();}
+              active=false;
+              if(handle!==null){clearInterval(handle);handle=null;}
+              b.classList.remove('pressed');
+              const old=pulseTimers.get(67);
+              if(old)clearTimeout(old);
+              pulseTimers.delete(67);
+              sendKey(67,false);
+            }
+            b.addEventListener('pointerdown',e=>{
+              e.preventDefault();e.stopPropagation();
+              if(active)return;
+              try{b.setPointerCapture(e.pointerId);}catch(_){}
+              active=true;b.classList.add('pressed');
+              pulse();handle=setInterval(pulse,260);
+            });
+            b.addEventListener('pointermove',e=>{
+              if(!active)return;
+              const r=b.getBoundingClientRect();
+              if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)stop(e);
+            });
+            ['pointerup','pointercancel','lostpointercapture'].forEach(n=>b.addEventListener(n,stop));
+            window.addEventListener('blur',()=>stop());
+            document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
+          }
+          '''
+          pad = pad.replace(hook, auto + hook, 1)
           pad_path.write_text(pad,encoding='utf-8')
           PY
           node --check fairy_player/js/dpad.js
           sha256sum -c /tmp/knight_dpad_178.sha
-          echo FAIRY_CANVAS_AND_PAD_V196_OK
+          echo FAIRY_CANVAS_AND_PAD_V197_OK
 
       - name: Assemble unchanged Knight and repaired Fairy
         run: |
@@ -341,8 +448,21 @@ jobs:
           test -s player/knight/gameasync/Data/Scripts.rxdata
           test -s player/elf/gameasync/Data/Scripts.rxdata
           grep -Fq 'width="640" height="480"' player/elf/index.html
-          grep -Fq 'sl-v196-diagnostic' player/elf/index.html
+          grep -Fq 'sl-v197-diagnostic' player/elf/index.html
           grep -Fq 'panelH=' player/elf/js/dpad.js
+          grep -Fq 'bindFairyAutoAtk' player/elf/js/dpad.js
+          grep -Fq 'gameasync/mapping.js?v=fairy197' player/elf/index.html
+          grep -Fq 'js/dpad.js?v=fairy197' player/elf/index.html
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          md5 = hashlib.md5(Path('player/elf/gameasync/Data/Scripts.rxdata').read_bytes()).hexdigest()
+          txt = Path('player/elf/gameasync/mapping.js').read_text(encoding='utf-8')
+          if 'Data/Scripts.rxdata?h=' + md5 not in txt:
+              raise SystemExit('Deployed Fairy Scripts hash is stale')
+          print('V197_DEPLOY_MAPPING_HASH_OK')
+          PY
+
           ! grep -Fq 'SLFairy Line Target V194' player/elf/index.html
           node --check player/elf/js/dpad.js
           expected=$(cut -d' ' -f1 /tmp/knight_dpad_178.sha)
@@ -353,13 +473,13 @@ jobs:
           ruby -rzlib - player/elf/gameasync/Data/Scripts.rxdata <<'RB'
           scripts = Marshal.load(File.binread(ARGV.fetch(0)))
           titles = scripts.map { |entry| entry.is_a?(Array) ? entry[1].to_s : '' }
-          abort 'V196 auto missing' unless titles.count('SLFairy Auto Target V196') == 1
+          abort 'V197 auto missing' unless titles.count('SLFairy Event Target V197') == 1
           abort 'V194 auto remains' if titles.include?('SLFairy Line Target V194')
           shim = scripts.find { |entry| entry.is_a?(Array) && entry[1].to_s == 'Web Resolution 800x600' }
           abort 'Fairy resolution shim missing' unless shim
           body = Zlib::Inflate.inflate(shim[2])
           abort 'Fairy still 800x600' unless body.include?('Graphics.resize_screen(640, 480)')
-          puts 'V196_RUNTIME_VALIDATED'
+          puts 'V197_RUNTIME_VALIDATED'
           RB
 
       - name: Upload GitHub Pages artifact
