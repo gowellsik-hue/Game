@@ -1,5 +1,5 @@
 
-name: V199 | Repair Fairy HUD Lifetime Without Rebuilding Game
+name: V200 | Fairy Isolated Bow Targeting - Knight Untouched
 
 on:
   push:
@@ -20,156 +20,225 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
-      - name: Download exact successful V198 deployment
+      - name: Restore last intact-screen V196 site
         uses: actions/download-artifact@v4
         with:
           name: github-pages
-          run-id: 38113124901
+          run-id: 38055151567
           github-token: ${{ github.token }}
           path: prior
 
-      - name: Restore V198 site byte-for-byte
+      - name: Verify V196 and freeze untouched files
         shell: bash
         run: |
           set -euo pipefail
           test -s prior/artifact.tar
           mkdir -p site
           tar -xf prior/artifact.tar -C site
-          test -s site/index.html
-          test -s site/knight/index.html
-          test -s site/elf/index.html
-          test -s site/elf/gameasync/Data/Scripts.rxdata
-          test -s site/elf/gameasync/mapping.js
-          test -s site/elf/js/dpad.js
-          test -s site/knight/mkxp.wasm
-          test -s site/elf/mkxp.wasm
-          sha256sum site/knight/index.html site/knight/js/dpad.js site/knight/gameasync/Data/Scripts.rxdata site/elf/js/dpad.js > /tmp/v199_unchanged.sha
-          echo V198_ARTIFACT_RESTORED
+          for f in site/knight/index.html site/knight/js/dpad.js site/knight/gameasync/Data/Scripts.rxdata site/elf/index.html site/elf/js/dpad.js site/elf/gameasync/Data/Scripts.rxdata site/elf/gameasync/mapping.js site/elf/mkxp.wasm; do
+            test -s "$f"
+          done
+          sha256sum site/knight/index.html site/knight/js/dpad.js site/knight/gameasync/Data/Scripts.rxdata site/elf/js/drive.js site/elf/mkxp.js site/elf/mkxp.wasm > /tmp/v200_unchanged.sha
+          cp site/elf/js/dpad.js /tmp/v200_original_dpad.js
+          cp site/elf/gameasync/Data/Scripts.rxdata /tmp/v200_original_scripts.rxdata
+          echo V200_V196_BASE_VERIFIED
 
-      - name: V199 move Fairy HUD cleanup to scene disposal
+      - name: Replace only Fairy attack script
         shell: bash
         run: |
           set -euo pipefail
           ruby -rzlib - site/elf/gameasync/Data/Scripts.rxdata <<'RB'
           path = ARGV.fetch(0)
           scripts = Marshal.load(File.binread(path))
-          hud = scripts.select { |e| e.is_a?(Array) && e[1].to_s == 'MOG - S HUD' }
-          abort "MOG HUD count=#{hud.length}" unless hud.length == 1
-          source = Zlib::Inflate.inflate(hud[0][2]).force_encoding('UTF-8').gsub("\r\n", "\n")
+          old_name = 'SLFairy Auto Target V196'
+          new_name = 'SLFairy Attack Only V200'
+          index = scripts.index { |e| e.is_a?(Array) && e[1].to_s == old_name }
+          abort 'Exactly one V196 attack script required' unless index && scripts.count { |e| e.is_a?(Array) && e[1].to_s == old_name } == 1
+          code = <<'SRC'
+          # V200: ATK = F8. C remains the untouched NPC/action key.
+          module SLFairyAttackV200
+            BOW_RANGE = 8
 
-          old_cleanup = <<'OLD'
-                shud_main    
-                @shud.dispose
-                @shud = nil
-                @s_viewport.dispose
-                @s_viewport = nil
-          OLD
-          abort 'HUD early cleanup marker mismatch' unless source.scan(old_cleanup).length == 1
-          source.sub!(old_cleanup, "      shud_main\n")
-
-          old_update = <<'OLD'
-            def update
-              shud_update
-              @shud.update
-            end  
-          end
-          OLD
-          new_update = <<'NEW'
-            def update
-              shud_update
-              @shud.update
+            def self.range
+              actor = $game_party && $game_party.actors && $game_party.actors[0]
+              return 1 unless actor && $data_weapons
+              ids = actor.respond_to?(:weapon_ids) ? actor.weapon_ids : [actor.weapon_id]
+              ids = [ids] unless ids.is_a?(Array)
+              ids.compact.each do |id|
+                weapon = $data_weapons[id.to_i]
+                next unless weapon
+                name = weapon.name.to_s
+                low = name.downcase
+                return BOW_RANGE if name.include?('활') || name.include?('궁') || low.include?('bow')
+              end
+              1
             end
 
-            # Keep HUD alive after nonblocking main; release it only on scene exit.
-            alias sl_v199_original_dispose dispose
-            def dispose
-              if @shud
-                @shud.dispose
-                @shud = nil
+            def self.monster?(event)
+              data = event.instance_variable_get(:@event)
+              page = event.instance_variable_get(:@page)
+              return false unless data && page && data.name.to_s.start_with?('[ID')
+              return false if event.instance_variable_get(:@erased)
+              return false if event.instance_variable_get(:@starting)
+              return false unless event.list && event.list.size > 1
+              return false if event.jumping? || event.through
+              return false if event.character_name.to_s.empty?
+              [0, 1, 2].include?(event.trigger)
+            end
+
+            def self.find(player)
+              map = $game_map
+              return nil unless map && map.events
+              dir = player.direction
+              dx = (dir == 6 ? 1 : dir == 4 ? -1 : 0)
+              dy = (dir == 2 ? 1 : dir == 8 ? -1 : 0)
+              return nil if dx == 0 && dy == 0
+              x = player.x
+              y = player.y
+              events = map.events.values
+              1.upto(range) do
+                nx = x + dx
+                ny = y + dy
+                break unless map.valid?(nx, ny)
+                break unless map.passable?(x, y, dir)
+                break unless map.passable?(nx, ny, 10 - dir)
+                occupied = events.select { |e| e.x == nx && e.y == ny }
+                occupied.each { |e| return e if monster?(e) }
+                break if occupied.any? { |e| !e.through && e.character_name.to_s != '' }
+                x = nx
+                y = ny
               end
-              if @s_viewport
-                @s_viewport.dispose
-                @s_viewport = nil
-              end
-              sl_v199_original_dispose
+              nil
+            end
+
+            def self.fire(player)
+              return unless Input.trigger?(Input::F8)
+              return unless $game_temp && $game_system && $game_switches
+              return if player.moving? || player.instance_variable_get(:@move_route_forcing)
+              return if $game_temp.message_window_showing
+              return if $game_switches[743]
+              interpreter = $game_system.map_interpreter
+              return if interpreter && interpreter.running?
+              enemy = find(player)
+              enemy.start if enemy
             end
           end
-          NEW
-          abort 'HUD update marker mismatch' unless source.scan(old_update).length == 1
-          source.sub!(old_update, new_update)
-          RubyVM::InstructionSequence.compile(source, 'MOG - S HUD V199')
-          hud[0][2] = Zlib::Deflate.deflate(source)
+
+          class Game_Player
+            alias sl_fairy_v200_native_update update
+            def update
+              sl_fairy_v200_native_update
+              SLFairyAttackV200.fire(self)
+            end
+          end
+          SRC
+          RubyVM::InstructionSequence.compile(code, new_name)
+          scripts[index][1] = new_name
+          scripts[index][2] = Zlib::Deflate.deflate(code)
           File.binwrite(path, Marshal.dump(scripts))
-          puts 'V199_HUD_LIFETIME_FIXED'
+          puts 'V200_FAIRY_ATTACK_SCRIPT_OK'
           RB
 
-      - name: Refresh only Fairy script hash and version
+      - name: Separate ATK F8 from NPC C without replacing button
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
           import re
+          path = Path('site/elf/js/dpad.js')
+          js = path.read_text(encoding='utf-8')
+          begin = js.find('function attackButton(parent){')
+          end = js.find('function button(', begin)
+          if begin < 0 or end < 0:
+              raise SystemExit('Original V196 attackButton anchors missing')
+          old = js[begin:end]
+          new, count = re.subn(r'\b67\b', '119', old)
+          if count != 5:
+              raise SystemExit('Expected exactly five attack-only key references, got ' + str(count))
+          if 'AUTO_ATTACK_INTERVAL_MS=80' not in new or 'window.slAttackAutoCancel=cancelAuto' not in new:
+              raise SystemExit('Existing auto toggle/attack speed unexpectedly changed')
+          if js.count("attackButton(pad);") != 1:
+              raise SystemExit('Existing ATK button constructor missing')
+          path.write_text(js[:begin] + new + js[end:], encoding='utf-8')
+          print('V200_ATK_F8_NPC_C_UNCHANGED')
+          PY
+          node --check site/elf/js/dpad.js
 
+      - name: Refresh Fairy script hash and cache versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,hashlib
           data = Path('site/elf/gameasync/Data/Scripts.rxdata')
           mapping = Path('site/elf/gameasync/mapping.js')
           html = Path('site/elf/index.html')
-          md5 = hashlib.md5(data.read_bytes()).hexdigest()
-          contents = mapping.read_text(encoding='utf-8')
-          regex = r'(\["data/scripts",\s*"Data/Scripts\.rxdata\?h=)[0-9a-f]{32}("\],)'
-          result, count = re.subn(regex, lambda m: m.group(1) + md5 + m.group(2), contents)
+          digest = hashlib.md5(data.read_bytes()).hexdigest()
+          s = mapping.read_text(encoding='utf-8')
+          pattern = r'(\["data/scripts",\s*"Data/Scripts\.rxdata\?h=)[0-9a-f]{32}("\],)'
+          updated, count = re.subn(pattern, lambda m: m.group(1) + digest + m.group(2), s)
           if count != 1:
-              raise SystemExit('Scripts mapping hash marker mismatch')
-          mapping.write_text(result, encoding='utf-8')
-
-          content = html.read_text(encoding='utf-8')
+              raise SystemExit('Fairy script mapping hash marker mismatch')
+          mapping.write_text(updated, encoding='utf-8')
+          s = html.read_text(encoding='utf-8')
           for old, new in (
-              ('gameasync/mapping.js?v=fairy198', 'gameasync/mapping.js?v=fairy199'),
-              ("box.textContent='V198 '+state", "box.textContent='V199 '+state"),
+              ('js/dpad.js?v=fairy800', 'js/dpad.js?v=fairy200'),
+              ('gameasync/mapping.js?v=fairy192', 'gameasync/mapping.js?v=fairy200'),
           ):
-              if content.count(old) != 1:
-                  raise SystemExit('Fairy index marker mismatch: ' + old)
-              content = content.replace(old, new, 1)
-          html.write_text(content, encoding='utf-8')
-          print('V199_FAIRY_MAPPING_REFRESHED')
+              if s.count(old) != 1:
+                  raise SystemExit('Fairy HTML cache marker mismatch: ' + old)
+              s = s.replace(old, new, 1)
+          html.write_text(s, encoding='utf-8')
+          print('V200_MAPPING_AND_CACHE_OK')
           PY
 
-      - name: Verify restored HUD and unchanged Knight
+      - name: Check single-script change and preserve Knight
         shell: bash
         run: |
           set -euo pipefail
-          sha256sum -c /tmp/v199_unchanged.sha
-          grep -Fq 'gameasync/mapping.js?v=fairy199' site/elf/index.html
-          grep -Fq "box.textContent='V199 '+state" site/elf/index.html
+          sha256sum -c /tmp/v200_unchanged.sha
           node --check site/elf/js/dpad.js
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
-          data = Path('site/elf/gameasync/Data/Scripts.rxdata')
+          import re,hashlib
+          old = Path('/tmp/v200_original_dpad.js').read_text(encoding='utf-8')
+          new = Path('site/elf/js/dpad.js').read_text(encoding='utf-8')
+          a = old.index('function attackButton(parent){')
+          b = old.index('function button(', a)
+          expected = old[:a] + re.sub(r'\b67\b', '119', old[a:b]) + old[b:]
+          if new != expected:
+              raise SystemExit('Fairy dpad changed outside attackButton')
+          data = Path('site/elf/gameasync/Data/Scripts.rxdata').read_bytes()
           mapping = Path('site/elf/gameasync/mapping.js').read_text(encoding='utf-8')
-          expected = 'Data/Scripts.rxdata?h=' + hashlib.md5(data.read_bytes()).hexdigest()
-          if expected not in mapping:
-              raise SystemExit('V199 script hash stale')
-          print('V199_HASH_OK')
+          if 'Data/Scripts.rxdata?h='+hashlib.md5(data).hexdigest() not in mapping:
+              raise SystemExit('Fairy Scripts mapping hash stale')
+          html = Path('site/elf/index.html').read_text(encoding='utf-8')
+          for token in ('js/dpad.js?v=fairy200','gameasync/mapping.js?v=fairy200'):
+              if token not in html:
+                  raise SystemExit('Cache token missing: ' + token)
+          print('V200_JS_ISOLATION_AND_MAPPING_OK')
           PY
-          ruby -rzlib - site/elf/gameasync/Data/Scripts.rxdata <<'RB'
-          scripts = Marshal.load(File.binread(ARGV.fetch(0)))
-          hud = scripts.find { |e| e.is_a?(Array) && e[1].to_s == 'MOG - S HUD' }
-          scene = scripts.find { |e| e.is_a?(Array) && e[1].to_s == 'Scene_Map' }
-          abort 'Fairy HUD or map missing' unless hud && scene
-          hs = Zlib::Inflate.inflate(hud[2])
-          ms = Zlib::Inflate.inflate(scene[2])
-          abort 'V198 scene initialization changed' unless ms.include?('def sl_v198_inputs')
-          abort 'Early HUD dispose still present' if hs.match?(/shud_main\s*\n\s*@shud\.dispose/)
-          abort 'HUD disposal not deferred' unless hs.include?('alias sl_v199_original_dispose dispose')
-          abort 'HUD update removed' unless hs.include?('@shud.update')
-          RubyVM::InstructionSequence.compile(hs, 'MOG HUD V199')
-          puts 'V199_HUD_LIFECYCLE_VERIFIED'
+          ruby -rzlib - /tmp/v200_original_scripts.rxdata site/elf/gameasync/Data/Scripts.rxdata <<'RB'
+          before = Marshal.load(File.binread(ARGV[0]))
+          after = Marshal.load(File.binread(ARGV[1]))
+          abort 'Script array size changed' unless before.length == after.length
+          diff = (0...before.length).select { |i| before[i] != after[i] }
+          abort "More than Fairy targeting changed: #{diff.inspect}" unless diff.length == 1
+          old = before[diff[0]]
+          newe = after[diff[0]]
+          abort 'Wrong old script' unless old[1] == 'SLFairy Auto Target V196'
+          abort 'Wrong new script' unless newe[1] == 'SLFairy Attack Only V200'
+          source = Zlib::Inflate.inflate(newe[2])
+          abort 'C/NPC interception introduced' if source.include?('check_event_trigger_there') || source.include?('Input::C')
+          abort 'F8-only attack missing' unless source.include?('Input.trigger?(Input::F8)')
+          RubyVM::InstructionSequence.compile(source, 'SLFairy Attack V200')
+          puts 'V200_ONLY_ONE_RUBY_SCRIPT_CHANGED'
           RB
-          echo V199_STATIC_CHECKS_OK
+          echo V200_STATIC_CHECKS_OK
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
