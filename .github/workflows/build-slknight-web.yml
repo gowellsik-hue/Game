@@ -1,5 +1,5 @@
 
-name: V201 | Restore New Game and NPC-Safe Bow Targeting
+name: V202 | Restore Missing Fairy Combat Sounds Only
 
 on:
   push:
@@ -22,219 +22,141 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - name: Restore V199 with working New Game and HUD
+      - name: Restore exact deployed V201 site
         uses: actions/download-artifact@v4
         with:
           name: github-pages
-          run-id: 38119087965
+          run-id: 38125379547
           github-token: ${{ github.token }}
-          path: prior
+          path: previous
 
-      - name: Extract and freeze intact game
+      - name: Extract and protect game scripts and controls
         shell: bash
         run: |
           set -euo pipefail
-          test -s prior/artifact.tar
+          test -s previous/artifact.tar
           mkdir -p site
-          tar -xf prior/artifact.tar -C site
-          for path in site/index.html site/knight/index.html site/knight/js/dpad.js site/knight/gameasync/Data/Scripts.rxdata site/elf/index.html site/elf/js/dpad.js site/elf/gameasync/Data/Scripts.rxdata site/elf/gameasync/mapping.js site/elf/mkxp.wasm; do
-            test -s "$path"
+          tar -xf previous/artifact.tar -C site
+          for f in \
+            site/knight/index.html \
+            site/knight/js/dpad.js \
+            site/knight/gameasync/Data/Scripts.rxdata \
+            site/elf/index.html \
+            site/elf/js/dpad.js \
+            site/elf/gameasync/Data/Scripts.rxdata \
+            site/elf/gameasync/mapping.js \
+            site/elf/gameasync/Audio/SE/attack1.ogg \
+            site/elf/gameasync/Audio/SE/attack2.ogg \
+            site/elf/gameasync/Audio/SE/missile1.ogg \
+            site/elf/mkxp.wasm; do
+            test -s "$f"
           done
-          sha256sum site/knight/index.html site/knight/js/dpad.js site/knight/gameasync/Data/Scripts.rxdata site/elf/js/dpad.js site/elf/mkxp.wasm site/elf/mkxp.js > /tmp/v201_unchanged.sha
-          cp site/elf/gameasync/Data/Scripts.rxdata /tmp/v201_original_scripts.rxdata
-          echo V201_GOOD_NEW_GAME_BASE_RESTORED
+          sha256sum \
+            site/knight/index.html \
+            site/knight/js/dpad.js \
+            site/knight/gameasync/Data/Scripts.rxdata \
+            site/elf/js/dpad.js \
+            site/elf/gameasync/Data/Scripts.rxdata \
+            site/elf/mkxp.js \
+            site/elf/mkxp.wasm > /tmp/v202_untouched.sha
+          echo V202_EXACT_V201_GAME_RESTORED
 
-      - name: Restore shared C key and isolate only monster search
+      - name: Repair nine missing Fairy event sound resources
         shell: bash
         run: |
           set -euo pipefail
-          ruby -EUTF-8:UTF-8 -rzlib - site/elf/gameasync/Data/Scripts.rxdata <<'RB'
-          path = ARGV.fetch(0)
-          scripts = Marshal.load(File.binread(path))
-          candidates = scripts.each_index.select { |i| scripts[i].is_a?(Array) && scripts[i][1].to_s == 'SLFairy Event Target V197' }
-          abort "Expected one V199 target; got #{candidates.size}" unless candidates.size == 1
-          entry = scripts[candidates.first]
-          old_source = Zlib::Inflate.inflate(entry[2]).force_encoding('UTF-8')
-          diagnostic_start = old_source.index("\nclass Scene_Map\n  alias sl_fairy_v197_original_update update")
-          abort 'V199 map diagnostics marker absent' unless diagnostic_start
-          diagnostics = old_source[diagnostic_start..-1]
-          targeting = <<'SRC'
-          # V201: C is still the shared confirm button; only [ID] monster
-          # events gain a longer reach. NPC interaction uses native logic.
-          module SLFairyTargetV201
-            BOW_RANGE = 8
-            @last_event = nil
-            @last_frame = -1000
-
-            def self.range
-              actor = $game_party && $game_party.actors && $game_party.actors[0]
-              return 1 unless actor && $data_weapons
-              ids = actor.respond_to?(:weapon_ids) ? actor.weapon_ids : [actor.weapon_id]
-              ids = [ids] unless ids.is_a?(Array)
-              ids.compact.each do |id|
-                weapon = $data_weapons[id.to_i]
-                next unless weapon
-                name = weapon.name.to_s
-                return BOW_RANGE if name =~ /(활|궁|보우|bow|crossbow)/i
-              end
-              1
-            end
-
-            def self.monster?(ev)
-              source = ev.instance_variable_get(:@event)
-              page = ev.instance_variable_get(:@page)
-              return false unless source && page && source.name.to_s.start_with?('[ID')
-              return false if ev.instance_variable_get(:@erased)
-              return false if ev.instance_variable_get(:@starting)
-              return false if ev.through || ev.jumping?
-              return false if ev.character_name.to_s.empty?
-              return false unless ev.list && ev.list.size > 1
-              [0, 1, 2].include?(ev.trigger)
-            end
-
-            def self.find(player, triggers)
-              return nil unless triggers.include?(0) && triggers.include?(1)
-              return nil unless $game_map && $game_system && $game_temp
-              return nil if $game_temp.message_window_showing
-              runner = $game_system.map_interpreter
-              return nil if runner && runner.running?
-              map = $game_map
-              dir = player.direction
-              dx = dir == 6 ? 1 : dir == 4 ? -1 : 0
-              dy = dir == 2 ? 1 : dir == 8 ? -1 : 0
-              return nil if dx == 0 && dy == 0
-              x = player.x
-              y = player.y
-              events = map.events.values
-              1.upto(range) do
-                nx = x + dx
-                ny = y + dy
-                break unless map.valid?(nx, ny)
-                tile = events.select { |ev| ev.x == nx && ev.y == ny }
-                # Keep solid NPCs as blockers; never use them as long-range targets.
-                obstruction = tile.any? do |ev|
-                  !ev.through && ev.character_name.to_s != '' && !monster?(ev)
-                end
-                break if obstruction
-                enemy = tile.find { |ev| monster?(ev) }
-                break unless map.passable?(x, y, dir)
-                # Skip the target's own collision tile while checking the wall.
-                break unless map.passable?(nx, ny, 10 - dir, enemy)
-                return enemy if enemy
-                x = nx
-                y = ny
-              end
-              nil
-            end
-
-            def self.ready?(enemy)
-              frame = Graphics.frame_count
-              return false if enemy.id == @last_event && frame >= @last_frame && frame - @last_frame < 4
-              @last_event = enemy.id
-              @last_frame = frame
-              true
-            end
-          end
-
-          class Game_Player
-            alias sl_fairy_v201_native_there check_event_trigger_there
-            def check_event_trigger_there(triggers)
-              if Input.trigger?(Input::C)
-                enemy = SLFairyTargetV201.find(self, triggers)
-                if enemy
-                  if SLFairyTargetV201.ready?(enemy)
-                    enemy.start
-                    puts('SLTARGET|V201|'+enemy.id.to_s)
-                  end
-                  return true
-                end
-              end
-              # NPC, character selection, counters and doors remain native.
-              sl_fairy_v201_native_there(triggers)
-            end
-          end
-          SRC
-          source = targeting.force_encoding('UTF-8') + diagnostics
-          RubyVM::InstructionSequence.compile(source, 'SLFairy Target V201')
-          entry[1] = 'SLFairy NPC Safe Target V201'
-          entry[2] = Zlib::Deflate.deflate(source)
-          File.binwrite(path, Marshal.dump(scripts))
-          puts 'V201_C_MENU_AND_NPC_NATIVE_BOW_TARGET_UPDATED'
-          RB
-
-      - name: Refresh only edited Fairy scripts mapping
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib,re
-          data = Path('site/elf/gameasync/Data/Scripts.rxdata')
-          mapping = Path('site/elf/gameasync/mapping.js')
-          html = Path('site/elf/index.html')
-          digest = hashlib.md5(data.read_bytes()).hexdigest()
-          original = mapping.read_text(encoding='utf-8')
-          expression = r'(\["data/scripts",\s*"Data/Scripts\.rxdata\?h=)[0-9a-f]{32}("\],)'
-          result, count = re.subn(expression, lambda m:m.group(1)+digest+m.group(2), original)
-          if count != 1: raise SystemExit('V199 scripts mapping mismatch')
-          mapping.write_text(result, encoding='utf-8')
-          content = html.read_text(encoding='utf-8')
-          replacements = (
-            ('gameasync/mapping.js?v=fairy199', 'gameasync/mapping.js?v=fairy201'),
-            ("box.textContent='V199 '+state", "box.textContent='V201 '+state"),
-          )
-          for old,new in replacements:
-            if content.count(old) != 1: raise SystemExit('V199 HTML anchor mismatch: '+old)
-            content = content.replace(old,new,1)
-          html.write_text(content,encoding='utf-8')
-          print('V201_MAPPING_REFRESHED')
-          PY
-
-      - name: Guard against New Game and HUD regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          sha256sum -c /tmp/v201_unchanged.sha
-          node --check site/elf/js/dpad.js
-          grep -Fq 'gameasync/mapping.js?v=fairy201' site/elf/index.html
-          grep -Fq "box.textContent='V201 '+state" site/elf/index.html
-          grep -Fq 'sendKey(67,true)' site/elf/js/dpad.js
-          grep -Fq 'pulseKey(67,AUTO_ATTACK_DOWN_MS)' site/elf/js/dpad.js
-          ! grep -Fq 'pulseKey(119,AUTO_ATTACK_DOWN_MS)' site/elf/js/dpad.js
-          ruby -rzlib - /tmp/v201_original_scripts.rxdata site/elf/gameasync/Data/Scripts.rxdata <<'RB'
-          before = Marshal.load(File.binread(ARGV[0]))
-          after = Marshal.load(File.binread(ARGV[1]))
-          abort 'Script count changed' unless before.length == after.length
-          diff = (0...before.size).select { |i| before[i] != after[i] }
-          abort "Unexpected Fairy script changes: #{diff.inspect}" unless diff.size == 1
-          old = before[diff.first]
-          now = after[diff.first]
-          abort 'Wrong script altered' unless old[1] == 'SLFairy Event Target V197' && now[1] == 'SLFairy NPC Safe Target V201'
-          code = Zlib::Inflate.inflate(now[2])
-          oldcode = Zlib::Inflate.inflate(old[2])
-          marker = "\nclass Scene_Map\n  alias sl_fairy_v197_original_update update"
-          abort 'Scene_Map diagnostics changed' unless code[code.index(marker)..-1] == oldcode[oldcode.index(marker)..-1]
-          RubyVM::InstructionSequence.compile(code, 'V201 Target')
-          title = after.find { |e| e.is_a?(Array) && e[1].to_s == 'Scene_Title' }
-          map = after.find { |e| e.is_a?(Array) && e[1].to_s == 'Scene_Map' }
-          hud = after.find { |e| e.is_a?(Array) && e[1].to_s == 'MOG - S HUD' }
-          abort 'Core classes missing' unless title && map && hud
-          abort 'New game C confirmation missing' unless Zlib::Inflate.inflate(title[2]).include?('Input.trigger?(Input::C)')
-          abort 'Nonblocking map main lost' unless Zlib::Inflate.inflate(map[2]).include?('def sl_v198_inputs')
-          abort 'HUD lifecycle lost' unless Zlib::Inflate.inflate(hud[2]).include?('alias sl_v199_original_dispose dispose')
-          puts 'V201_NEW_GAME_NPC_MAP_HUD_PRESERVED'
-          RB
           python3 - <<'PY'
           from pathlib import Path
           import hashlib
-          p = Path('site/elf/gameasync/Data/Scripts.rxdata')
-          m = Path('site/elf/gameasync/mapping.js').read_text(encoding='utf-8')
-          if 'Data/Scripts.rxdata?h='+hashlib.md5(p.read_bytes()).hexdigest() not in m:
-            raise SystemExit('Bad Fairy mapping cache')
-          print('V201_CACHE_CHECK_OK')
+          import json
+          import re
+          import shutil
+
+          root = Path('site/elf/gameasync')
+          effects = root / 'Audio' / 'SE'
+          mapping_file = root / 'mapping.js'
+          mapping = mapping_file.read_text(encoding='utf-8')
+
+          # Every name below is referenced by an existing Fairy map event.
+          # Existing, decodable sounds are temporary replacements; no combat
+          # calculation, event script or key binding is changed.
+          missing = {
+              '여요정주먹': 'attack1',
+              '펑거스 맞음': 'attack2',
+              '펑거스 죽음': 'attack2',
+              '엔트 맞음': 'attack2',
+              '판 맞음': 'attack2',
+              '아라크네 맞음': 'attack2',
+              '활': 'missile1',
+              '다크레인저 활': 'missile1',
+              '다크엘프 활': 'missile1',
+          }
+          lines = []
+          for target, replacement in missing.items():
+              src = effects / (replacement + '.ogg')
+              dst = effects / (target + '.ogg')
+              key = 'audio/se/' + target.lower()
+              if not src.is_file() or src.read_bytes()[:4] != b'OggS':
+                  raise SystemExit('Missing or invalid fallback OGG: ' + str(src))
+              if dst.exists() or ('["' + key + '",') in mapping:
+                  raise SystemExit('Existing asset would be overwritten: ' + target)
+              shutil.copyfile(src, dst)
+              digest = hashlib.md5(dst.read_bytes()).hexdigest()
+              address = 'Audio/SE/' + target + '.ogg?h=' + digest
+              lines.append('[' + json.dumps(key, ensure_ascii=False) + ', ' +
+                           json.dumps(address, ensure_ascii=False) + '],')
+
+          updated, count = re.subn(r'^\];\s*$',
+                                   lambda m: '\n'.join(lines) + '\n];',
+                                   mapping, count=1, flags=re.M)
+          if count != 1:
+              raise SystemExit('Fairy mapping array closing marker mismatch')
+          mapping_file.write_text(updated, encoding='utf-8')
+
+          html_file = Path('site/elf/index.html')
+          html = html_file.read_text(encoding='utf-8')
+          changes = {
+              'gameasync/mapping.js?v=fairy201':
+                  'gameasync/mapping.js?v=fairy202',
+              "box.textContent='V201 '+state":
+                  "box.textContent='V202 '+state",
+          }
+          for old, new in changes.items():
+              if html.count(old) != 1:
+                  raise SystemExit('Unexpected Fairy HTML marker: ' + old)
+              html = html.replace(old, new, 1)
+          html_file.write_text(html, encoding='utf-8')
+          print('V202_NINE_MISSING_SFX_MAPPED')
           PY
 
-      - name: Upload GitHub Pages artifact
+      - name: Verify resources and unchanged game behavior code
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c /tmp/v202_untouched.sha
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import re
+          root = Path('site/elf/gameasync')
+          mapping = (root / 'mapping.js').read_text(encoding='utf-8')
+          names = ('여요정주먹', '펑거스 맞음', '펑거스 죽음',
+                   '엔트 맞음', '판 맞음', '아라크네 맞음',
+                   '활', '다크레인저 활', '다크엘프 활')
+          for name in names:
+              f = root / 'Audio' / 'SE' / (name + '.ogg')
+              assert f.is_file() and f.read_bytes()[:4] == b'OggS', name
+              tag = 'Audio/SE/' + name + '.ogg?h=' + hashlib.md5(f.read_bytes()).hexdigest()
+              assert tag in mapping, 'Mapping missing: ' + name
+              assert len(re.findall(r'\["audio/se/' + re.escape(name.lower()) + r'",', mapping)) == 1
+          html = Path('site/elf/index.html').read_text(encoding='utf-8')
+          assert 'gameasync/mapping.js?v=fairy202' in html
+          assert "box.textContent='V202 '+state" in html
+          assert 'js/dpad.js?v=fairy198' in html
+          print('V202_NINE_SFX_VALIDATED; CODE_UNCHANGED')
+          PY
+
+      - name: Upload verified Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
