@@ -1,5 +1,5 @@
 
-name: V206 | General Fairy Monster Attacks and Visible Motion
+name: V208 | Knight Ettin Accuracy Fix - Fairy and Saves Untouched
 
 on:
   push:
@@ -22,409 +22,153 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - name: Restore successful V205 site and working V204 save
+      - name: Restore deployed V206 dual game
         uses: actions/download-artifact@v4
         with:
           name: github-pages
-          run-id: 38197514702
+          run-id: 38210263442
           github-token: ${{ github.token }}
           path: prior
 
-      - name: Extract and fingerprint unchanged game files
+      - name: Extract and protect all original files
         shell: bash
         run: |
           set -euo pipefail
           test -s prior/artifact.tar
           mkdir -p site
           tar -xf prior/artifact.tar -C site
-          for f in site/elf/index.html site/elf/js/dpad.js site/elf/mkxp.wasm site/elf/gameasync/Data/Scripts.rxdata site/elf/gameasync/mapping.js site/elf/gameasync/Graphics/Pictures/SL_V205_Attack.png site/knight/index.html site/knight/gameasync/Data/Scripts.rxdata; do
-            test -s "$f"
-          done
-          find site -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/v206_original.sha
-          cp site/elf/gameasync/Data/Scripts.rxdata /tmp/v206_original_scripts.rxdata
-          echo V206_ORIGINAL_SAVE_AND_KNIGHT_PROTECTED
+          test -s site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata
+          test -s site/knight/gameasync/mapping.js
+          test -s site/knight/gameasync/Data/Scripts.rxdata
+          test -s site/elf/gameasync/Data/Scripts.rxdata
+          find site -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/v208_before.sha
+          cp site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata /tmp/v208_knight_before.rxdata
+          echo V208_V206_BASE_PROTECTED
 
-      - name: Write general Fairy combat and visible animation code
+      - name: Remove only invalid Knight Ettin hit multiplier
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/v206_combat.rb <<'RUBY_COMBAT'
+          ruby -EUTF-8:UTF-8 -rdigest - site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata <<'RB'
           # encoding: utf-8
-          # V206 - data-driven general combat with visible, independent player motion.
-          # Native C-key menus, NPC events, shop and save are not overridden.
-          module SLFairyTargetV206
-            BOW_RANGE = 8
-            @last_key = nil
-            @last_frame = -99999
-            @spec_cache = {}
-            @map_key = nil
-            @shot_id = 0
-            @shot_dir = 2
-            @shot_actor = 0
-            @shot_x = 0
-            @shot_y = 0
-            @shot_result = 'ATK'
-
-            def self.weapon_range
-              actor = $game_party && $game_party.actors && $game_party.actors[0]
-              return 1 unless actor && $data_weapons
-              ids = actor.respond_to?(:weapon_ids) ? actor.weapon_ids : [actor.weapon_id]
-              ids = [ids] unless ids.is_a?(Array)
-              ids.compact.each do |id|
-                w = $data_weapons[id.to_i]
-                next unless w
-                return BOW_RANGE if w.name.to_s =~ /(\xED\x99\x9C|\xEA\xB6\x81|\xEB\xB3\xB4\xEC\x9A\xB0|bow|crossbow)/i
-              end
-              1
-            end
-
-            # Build one validated damage spec per event from its original pages.
-            # Works for touch events and switch-controlled auto combat events.
-            def self.damage_spec(enemy)
-              data = enemy.instance_variable_get(:@event)
-              page = enemy.instance_variable_get(:@page)
-              return nil unless data && page
-              return nil unless data.name.to_s.start_with?('[ID')
-              return nil if enemy.instance_variable_get(:@erased) || enemy.instance_variable_get(:@starting)
-              return nil if enemy.through || enemy.jumping? || enemy.character_name.to_s.empty?
-              map_id = $game_map.map_id
-              if @map_key != map_id
-                @map_key = map_id
-                @spec_cache = {}
-              end
-              key = enemy.id
-              unless @spec_cache.has_key?(key)
-                result = nil
-                data.pages.each do |pg|
-                  list = pg.list
-                  next unless list
-                  list.each_with_index do |cmd, i|
-                    next unless cmd.code == 122
-                    a = cmd.parameters
-                    next unless a.size >= 6 && a[0] == a[1] && a[2] == 1 && a[3] == 4 && a[4] == 1 && a[5] == 10
-                    bcmd = list[i + 1]
-                    next unless bcmd && bcmd.code == 122
-                    b = bcmd.parameters
-                    next unless b.size >= 5 && b[0] == a[0] && b[1] == a[0] && b[2] == 1
-                    next unless (b[3] == 1 && b[4] == 619) || (b.size >= 6 && b[3] == 4 && b[4] == 1 && b[5] == 6)
-                    result = [a[0], b[3], b[4], b.size >= 6 ? b[5] : 0]
-                    break
-                  end
-                  break if result
-                end
-                @spec_cache[key] = result
-              end
-              spec = @spec_cache[key]
-              return nil unless spec
-              # Death pages use a variable threshold on the HP/damage accumulator.
-              c = page.condition
-              if c && c.variable_valid && c.variable_id == spec[0]
-                return nil if $game_variables[spec[0]] >= c.variable_value
-              end
-              spec
-            end
-
-            def self.find(player, triggers)
-              return nil unless triggers.include?(0) && triggers.include?(1)
-              return nil unless $game_map && $game_system && $game_temp
-              return nil if $game_temp.message_window_showing
-              runner = $game_system.map_interpreter
-              return nil if runner && runner.running?
-              dir = player.direction
-              dx = (dir == 6 ? 1 : dir == 4 ? -1 : 0)
-              dy = (dir == 2 ? 1 : dir == 8 ? -1 : 0)
-              return nil if dx == 0 && dy == 0
-              x = player.x
-              y = player.y
-              events = $game_map.events.values
-              1.upto(weapon_range) do |distance|
-                nx = x + dx
-                ny = y + dy
-                break unless $game_map.valid?(nx, ny)
-                tile = events.select { |ev| ev.x == nx && ev.y == ny }
-                selected = nil
-                tile.each do |ev|
-                  spec = damage_spec(ev)
-                  selected = [ev, distance, spec] if spec && selected.nil?
-                end
-                # Solid ordinary NPCs or objects block both target selection and arrows.
-                break if tile.any? { |ev| !ev.through && !damage_spec(ev) && ev.character_name.to_s != '' }
-                break unless $game_map.passable?(x, y, dir)
-                break unless $game_map.passable?(nx, ny, 10 - dir, selected && selected[0])
-                return selected if selected
-                x = nx
-                y = ny
-              end
-              nil
-            end
-
-            def self.attack(player, enemy, spec, distance)
-              frame = Graphics.frame_count
-              key = [$game_map.map_id, enemy.id]
-              return true if @last_key == key && frame >= @last_frame && frame - @last_frame < 4
-              @last_key = key
-              @last_frame = frame
-              hit = (rand(8) + 1) >= (rand(3) + 1)
-              if hit
-                second = spec[1] == 1 ? $game_variables[spec[2]].to_i : (rand(spec[3] - spec[2] + 1) + spec[2])
-                total = (rand(10) + 1) + second
-                $game_variables[spec[0]] = $game_variables[spec[0]] - total
-                # The original event interpreter sets this after control-variable commands.
-                # Without it monster death, loot and respawn pages do not refresh.
-                $game_map.need_refresh = true
-              end
-              @shot_id += 1
-              @shot_dir = player.direction
-              @shot_actor = player.character_name.to_s.include?("\xEB\x8B\xA4\xED\x81\xAC\xEC\x97\x98\xED\x94\x84") ? 4 : 0
-              @shot_x = enemy.screen_x
-              @shot_y = enemy.screen_y
-              @shot_result = hit ? 'HIT' : 'MISS'
-              puts('SLV206|SHOT|'+enemy.id.to_s+'|'+distance.to_s+'|'+@shot_result)
-              true
-            end
-
-            def self.shot_id; @shot_id; end
-            def self.shot_dir; @shot_dir; end
-            def self.shot_actor; @shot_actor; end
-            def self.shot_x; @shot_x; end
-            def self.shot_y; @shot_y; end
-            def self.shot_result; @shot_result; end
+          module RPG
+            class CommonEvent; end
+            class EventCommand; end
+            class MoveRoute; end
+            class MoveCommand; end
+            class AudioFile; end
           end
-
-          class Game_Player
-            alias sl_fairy_v201_native_there check_event_trigger_there
-            def check_event_trigger_there(triggers)
-              if Input.trigger?(Input::C)
-                candidate = SLFairyTargetV206.find(self, triggers)
-                if candidate
-                  enemy, distance, spec = candidate
-                  return true if SLFairyTargetV206.attack(self, enemy, spec, distance)
-                end
-              end
-              # Keep all ordinary event and NPC interactions one tile ahead.
-              sl_fairy_v201_native_there(triggers)
-            end
+          class V208RawRGSS
+            def initialize(bytes); @bytes = bytes; end
+            def self._load(bytes); new(bytes); end
+            def _dump(level); @bytes; end
           end
+          class Tone < V208RawRGSS; end
+          class Color < V208RawRGSS; end
+          class Table < V208RawRGSS; end
 
-          class Scene_Map
-            alias sl_v206_native_update update
-            alias sl_v206_native_dispose dispose
-
-            def sl_v206_clear_visual
-              if @sl_v206_player_sprite
-                @sl_v206_player_sprite.visible = true unless @sl_v206_player_sprite.disposed?
-                @sl_v206_player_sprite = nil
-              end
-              if @sl_v206_attack_sprite
-                @sl_v206_attack_sprite.dispose unless @sl_v206_attack_sprite.disposed?
-                @sl_v206_attack_sprite = nil
-              end
-              if @sl_v206_hit_sprite
-                unless @sl_v206_hit_sprite.disposed?
-                  image = @sl_v206_hit_sprite.bitmap
-                  image.dispose if image && !image.disposed?
-                  @sl_v206_hit_sprite.dispose
-                end
-                @sl_v206_hit_sprite = nil
-              end
-              @sl_v206_started = nil
-            end
-
-            def sl_v206_attack_visual
-              return unless @spriteset
-              if @sl_v206_spriteset != @spriteset
-                sl_v206_clear_visual
-                @sl_v206_spriteset = @spriteset
-              end
-              @sl_v206_seen = 0 if @sl_v206_seen.nil?
-              token = SLFairyTargetV206.shot_id
-              if token != @sl_v206_seen
-                @sl_v206_seen = token
-                if @sl_v206_started.nil?
-                  @sl_v206_started = Graphics.frame_count
-                  @sl_v206_dir = SLFairyTargetV206.shot_dir
-                  @sl_v206_actor = SLFairyTargetV206.shot_actor
-                  @sl_v206_text = SLFairyTargetV206.shot_result
-                  @sl_v206_hit_x = SLFairyTargetV206.shot_x
-                  @sl_v206_hit_y = SLFairyTargetV206.shot_y
-                end
-              end
-              return unless @sl_v206_started
-              elapsed = Graphics.frame_count - @sl_v206_started
-              if elapsed >= 16
-                @sl_v206_attack_sprite.visible = false if @sl_v206_attack_sprite
-                @sl_v206_hit_sprite.visible = false if @sl_v206_hit_sprite
-                @sl_v206_player_sprite.visible = true if @sl_v206_player_sprite && !@sl_v206_player_sprite.disposed?
-                @sl_v206_player_sprite = nil
-                @sl_v206_started = nil
-                return
-              end
-              # The original game draws its attack frames as Pictures on viewport2.
-              # viewport1 sprites were rendered below those Pictures and could be hidden.
-              viewport = @spriteset.instance_variable_get(:@viewport2)
-              unless @sl_v206_attack_sprite
-                @sl_v206_attack_sprite = Sprite.new(viewport)
-                @sl_v206_attack_sprite.bitmap = RPG::Cache.picture('SL_V205_Attack')
-                @sl_v206_attack_sprite.ox = 40
-                @sl_v206_attack_sprite.oy = 80
-                @sl_v206_attack_sprite.z = 1000
-              end
-              dirs = {2 => 0, 4 => 1, 6 => 2, 8 => 3}
-              row = @sl_v206_actor + (dirs[@sl_v206_dir] || 0)
-              frame = [elapsed / 2, 7].min
-              @sl_v206_attack_sprite.src_rect.set(frame * 80, row * 96, 80, 96)
-              @sl_v206_attack_sprite.x = $game_player.screen_x
-              @sl_v206_attack_sprite.y = $game_player.screen_y
-              @sl_v206_attack_sprite.visible = true
-              chars = @spriteset.instance_variable_get(:@character_sprites)
-              @sl_v206_player_sprite = chars.last if chars && chars.last
-              @sl_v206_player_sprite.visible = false if @sl_v206_player_sprite
-              # A brief HIT/MISS text confirms that an attack event really fired.
-              unless @sl_v206_hit_sprite
-                @sl_v206_hit_sprite = Sprite.new(viewport)
-                @sl_v206_hit_sprite.bitmap = Bitmap.new(90, 28)
-                @sl_v206_hit_sprite.bitmap.font.size = 20
-                @sl_v206_hit_sprite.z = 1050
-              end
-              if elapsed == 0 || elapsed == 1
-                @sl_v206_hit_sprite.bitmap.clear
-                @sl_v206_hit_sprite.bitmap.draw_text(0, 0, 90, 28, @sl_v206_text, 1)
-              end
-              @sl_v206_hit_sprite.x = @sl_v206_hit_x - 45
-              @sl_v206_hit_sprite.y = @sl_v206_hit_y - 74 - elapsed
-              @sl_v206_hit_sprite.visible = true
-            end
-
-            def update
-              sl_v206_native_update
-              sl_v206_attack_visual if $scene == self && @spriteset
-            end
-
-            def dispose
-              sl_v206_clear_visual
-              sl_v206_native_dispose
-            end
+          file = ARGV.fetch(0)
+          original = File.binread(file)
+          data = Marshal.load(original)
+          abort 'RGSS Marshal data would not round-trip unchanged' unless Marshal.dump(data) == original
+          abort 'Invalid CommonEvents length' unless data.is_a?(Array) && data.length > 919
+          event = data.fetch(882)
+          name = event.instance_variable_get(:@name).dup.force_encoding('UTF-8')
+          abort "Wrong common event: #{name}" unless name == '[공격]에틴'
+          list = event.instance_variable_get(:@list)
+          invalid = [336, 336, 3, 1, 770]
+          indexes = list.each_index.select do |i|
+            cmd = list[i]
+            cmd.instance_variable_get(:@code) == 122 && cmd.instance_variable_get(:@parameters) == invalid
           end
-          RUBY_COMBAT
-          ruby -c /tmp/v206_combat.rb
+          abort "Expected one invalid multiplier, found #{indexes.length}" unless indexes.length == 1
+          at = indexes.first
+          before = list.fetch(at - 1)
+          after = list.fetch(at + 1)
+          abort 'Ettin random accuracy initializer differs' unless before.instance_variable_get(:@code) == 122 && before.instance_variable_get(:@parameters) == [336, 336, 0, 2, 40, 70]
+          abort 'Ettin accuracy conditional differs' unless after.instance_variable_get(:@code) == 111 && after.instance_variable_get(:@parameters) == [1, 336, 1, 337, 1]
 
-      - name: Replace only the V205 Fairy combat script
+          untouched = data.each_with_index.to_h do |item, i|
+            [i, item.nil? ? nil : Digest::SHA256.hexdigest(Marshal.dump(item))]
+          end
+          list.delete_at(at)
+          changed = data.each_with_index.filter_map do |item, i|
+            digest = item.nil? ? nil : Digest::SHA256.hexdigest(Marshal.dump(item))
+            i unless digest == untouched[i]
+          end
+          abort "Unexpected common events modified: #{changed.inspect}" unless changed == [882]
+          File.binwrite(file, Marshal.dump(data))
+          puts 'V208_ONLY_KNIGHT_COMMON_EVENT_882_MODIFIED'
+          RB
+
+      - name: Refresh Knight CommonEvents mapping and cache
         shell: bash
         run: |
           set -euo pipefail
-          ruby -rzlib - site/elf/gameasync/Data/Scripts.rxdata <<'RUBY_PATCH'
-          path = ARGV.fetch(0)
-          scripts = Marshal.load(File.binread(path))
-          entries = scripts.select { |e| e.is_a?(Array) && e[1].to_s == 'SLFairy Native Range Bow and Motion V205' }
-          abort 'Expected exactly one V205 combat hook' unless entries.length == 1
-          entry = entries.first
-          old = Zlib::Inflate.inflate(entry[2]).force_encoding('UTF-8')
-          diagnostic_start = old.index("\nclass Scene_Map\n  alias sl_fairy_v197_original_update update")
-          old_visual_start = old.index("\nclass Scene_Map\n  alias sl_v205_base_update update")
-          abort 'Cannot preserve V205 diagnostic code' unless diagnostic_start && old_visual_start && diagnostic_start < old_visual_start
-          diagnostic = old[diagnostic_start...old_visual_start]
-          source = File.binread('/tmp/v206_combat.rb').force_encoding('UTF-8')
-          new_visual_start = source.index("\nclass Scene_Map\n  alias sl_v206_native_update update")
-          abort 'Cannot place V206 visual code' unless new_visual_start
-          result = source[0...new_visual_start] + diagnostic + source[new_visual_start..-1]
-          RubyVM::InstructionSequence.compile(result, 'V206 combat')
-          entry[1] = 'SLFairy All Monster Attack and Motion V206'
-          entry[2] = Zlib::Deflate.deflate(result)
-          File.binwrite(path, Marshal.dump(scripts))
-          puts 'V206_GENERAL_ATTACK_AND_PICTURE_LAYER_READY'
-          RUBY_PATCH
-
-      - name: Refresh changed Fairy script hash and page version
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_CACHE'
+          python3 - <<'PY'
           from pathlib import Path
           import hashlib, re
-          base = Path('site/elf')
-          scripts = base / 'gameasync/Data/Scripts.rxdata'
-          mapping = base / 'gameasync/mapping.js'
-          html = base / 'index.html'
-          digest = hashlib.md5(scripts.read_bytes()).hexdigest()
-          original = mapping.read_text(encoding='utf-8')
-          regex = r'(\["data/scripts",\s*"Data/Scripts\.rxdata\?h=)[0-9a-f]{32}("\],)'
-          result, count = re.subn(regex, lambda m: m.group(1) + digest + m.group(2), original)
+          root = Path('site/knight')
+          filename = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata'
+          current = root / 'gameasync/Data' / filename
+          old = Path('/tmp/v208_knight_before.rxdata')
+          mapping = root / 'gameasync/mapping.js'
+          page = root / 'index.html'
+          before = mapping.read_text(encoding='utf-8')
+          key = 'data/' + filename.removesuffix('.rxdata').lower()
+          regex = r'(\["' + re.escape(key) + r'",\s*"Data/' + re.escape(filename) + r'\?h=)([0-9a-f]{32})("\],)'
+          found = list(re.finditer(regex, before))
+          if len(found) != 1:
+              raise SystemExit('Expected exactly one Knight real CommonEvents mapping')
+          if found[0].group(2) != hashlib.md5(old.read_bytes()).hexdigest():
+              raise SystemExit('Old CommonEvents mapping hash does not match artifact')
+          digest = hashlib.md5(current.read_bytes()).hexdigest()
+          updated, count = re.subn(regex, lambda m: m.group(1) + digest + m.group(3), before)
           if count != 1:
-              raise SystemExit('V205 Scripts hash anchor missing')
-          mapping.write_text(result, encoding='utf-8')
-          page = html.read_text(encoding='utf-8')
-          for before, after in (
-              ('gameasync/mapping.js?v=fairy205', 'gameasync/mapping.js?v=fairy206'),
-              ("box.textContent='V205 '+state", "box.textContent='V206 '+state"),
-          ):
-              if page.count(before) != 1:
-                  raise SystemExit('V205 page version anchor missing: ' + before)
-              page = page.replace(before, after, 1)
-          html.write_text(page, encoding='utf-8')
-          print('V206_SCRIPTS_HASH_AND_CACHE_OK')
-          PY_CACHE
+              raise SystemExit('Cannot refresh Knight CommonEvents hash')
+          mapping.write_text(updated, encoding='utf-8')
+          html = page.read_text(encoding='utf-8')
+          existing = 'gameasync/mapping.js?v=v143z100'
+          if html.count(existing) != 1:
+              raise SystemExit('Knight mapping cache version marker mismatch')
+          page.write_text(html.replace(existing, 'gameasync/mapping.js?v=v208', 1), encoding='utf-8')
+          print('V208_KNIGHT_ETTIN_CACHE_REFRESHED')
+          PY
 
-      - name: Verify no save, control, Knight or asset regressions
+      - name: Verify only Knight Ettin event changed
         shell: bash
         run: |
           set -euo pipefail
-          ruby -rzlib - /tmp/v206_original_scripts.rxdata site/elf/gameasync/Data/Scripts.rxdata <<'RUBY_VERIFY'
-          before = Marshal.load(File.binread(ARGV[0]))
-          after = Marshal.load(File.binread(ARGV[1]))
-          abort 'Script count changed' unless before.length == after.length
-          changed = (0...before.length).select { |i| before[i] != after[i] }
-          abort "Unexpected Ruby modifications: #{changed.inspect}" unless changed.length == 1
-          a, b = before[changed[0]], after[changed[0]]
-          abort 'Wrong script replaced' unless a[1] == 'SLFairy Native Range Bow and Motion V205' && b[1] == 'SLFairy All Monster Attack and Motion V206'
-          source = Zlib::Inflate.inflate(b[2])
-          abort 'Remote touch event invocation not removed' if source.include?('enemy.start')
-          abort 'NPC native interaction removed' unless source.include?('sl_fairy_v201_native_there(triggers)')
-          abort 'Monster variable refresh absent' unless source.include?('$game_map.need_refresh = true')
-          abort 'Visible Picture viewport missing' unless source.include?('instance_variable_get(:@viewport2)')
-          abort 'Animation frame restore missing' unless source.include?('@sl_v206_player_sprite.visible = true')
-          abort 'No player attack visual' unless source.include?("RPG::Cache.picture('SL_V205_Attack')")
-          abort 'Input C menu behavior changed' unless source.include?('Input.trigger?(Input::C)')
-          RubyVM::InstructionSequence.compile(source, 'V206 combat verify')
-          ['Scene_Menu','Scene_Save','Scene_Load','Scene_Title','MOG - S HUD'].each do |name|
-            old = before.find { |e| e.is_a?(Array) && e[1].to_s == name }
-            new = after.find { |e| e.is_a?(Array) && e[1].to_s == name }
-            abort "Essential script changed: #{name}" unless old && new && old == new
-          end
-          puts 'V206_SAVE_LOAD_HUD_AND_TITLE_UNCHANGED'
-          RUBY_VERIFY
-          python3 - <<'PY_VERIFY'
+          python3 - <<'PY'
           from pathlib import Path
           import hashlib
-          original = {}
-          for line in Path('/tmp/v206_original.sha').read_text().splitlines():
-              digest, filename = line.split('  ', 1)
-              original[filename] = digest
-          allowed = {'site/elf/gameasync/Data/Scripts.rxdata', 'site/elf/gameasync/mapping.js', 'site/elf/index.html'}
-          current = {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('site').rglob('*') if p.is_file()}
-          if current.keys() != original.keys():
-              raise SystemExit('Site files added or removed')
-          unexpected = [p for p in original if original[p] != current[p] and p not in allowed]
-          if unexpected:
-              raise SystemExit('Protected files modified: ' + repr(unexpected[:15]))
-          changed = {p for p in original if original[p] != current[p]}
+          before = {}
+          for line in Path('/tmp/v208_before.sha').read_text().splitlines():
+              digest, path = line.split('  ', 1)
+              before[path] = digest
+          after = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in Path('site').rglob('*') if p.is_file()}
+          if after.keys() != before.keys():
+              raise SystemExit('Files added or removed during patch')
+          allowed = {
+              'site/knight/index.html',
+              'site/knight/gameasync/mapping.js',
+              'site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata'
+          }
+          changed = {path for path in before if before[path] != after[path]}
           if changed != allowed:
-              raise SystemExit('Unexpected changed files: ' + repr(changed))
-          base = Path('site/elf')
-          mapping = (base / 'gameasync/mapping.js').read_text(encoding='utf-8')
-          scripts = (base / 'gameasync/Data/Scripts.rxdata').read_bytes()
-          if 'Data/Scripts.rxdata?h=' + hashlib.md5(scripts).hexdigest() not in mapping:
-              raise SystemExit('Stale script hash')
-          if 'Graphics/Pictures/SL_V205_Attack.png?h=' not in mapping:
-              raise SystemExit('Original animation atlas lost')
-          html = (base / 'index.html').read_text(encoding='utf-8')
-          if 'gameasync/mapping.js?v=fairy206' not in html:
-              raise SystemExit('Cache version not updated')
-          print('V206_ONLY_THREE_EXISTING_FAIRY_FILES_CHANGED')
-          PY_VERIFY
-          node --check site/elf/js/dpad.js
-          echo V206_VALIDATION_COMPLETE
+              raise SystemExit('Unexpected game file changes: ' + repr(changed))
+          mapping = Path('site/knight/gameasync/mapping.js').read_text(encoding='utf-8')
+          filename = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata'
+          data = Path('site/knight/gameasync/Data') / filename
+          assert 'Data/' + filename + '?h=' + hashlib.md5(data.read_bytes()).hexdigest() in mapping
+          assert 'gameasync/mapping.js?v=v208' in Path('site/knight/index.html').read_text(encoding='utf-8')
+          assert 'slknight_v14_engine' in Path('site/knight/index.html').read_text(encoding='utf-8')
+          print('V208_ALL_ELF_FILES_AND_BOTH_SAVE_SYSTEMS_UNCHANGED')
+          PY
+          echo V208_STATIC_VALIDATION_PASSED
 
-      - name: Upload GitHub Pages artifact
+      - name: Upload verified GitHub Pages site
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
