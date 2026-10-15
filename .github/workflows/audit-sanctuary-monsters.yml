@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Sprite Extraction V2
+name: Sanctuary of Aden Animation Mapping V3
 
 on:
   workflow_dispatch:
@@ -12,11 +12,11 @@ permissions:
   actions: read
 
 concurrency:
-  group: sanctuary-sprite-v2
+  group: sanctuary-monster-audit
   cancel-in-progress: false
 
 jobs:
-  extract:
+  discover:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -34,11 +34,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full
 
-          mkdir -p downloads client previous reports sprite_chunks
+          mkdir -p downloads client previous/v1 previous/v2 reports
 
           df -h .
 
-      - name: Download successful V1 inventory
+      - name: Restore V1 and V2 analysis reports
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,13 +48,19 @@ jobs:
           gh run download 38782357687 \
             --repo "$GITHUB_REPOSITORY" \
             --name Sanctuary-Monster-Audit \
-            --dir previous
+            --dir previous/v1
 
-          test -n "$(find previous -name '02_pak_records.csv' -print -quit)"
+          gh run download 38784834277 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Sanctuary-V2-Reports \
+            --dir previous/v2
 
-          echo "V1 INDEX REPORT RESTORED"
+          test -n "$(find previous/v1 -name '02_pak_records.csv' -print -quit)"
+          test -n "$(find previous/v2 -name 'sprite_id_groups.csv' -print -quit)"
 
-      - name: Download original client
+          echo "V1 AND V2 INVENTORIES RESTORED"
+
+      - name: Download original 46 archive parts
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -75,8 +81,7 @@ jobs:
           expected = [
               f"{base}.z{i:02d}"
               for i in range(1, 46)
-          ]
-          expected.append(f"{base}.zip")
+          ] + [f"{base}.zip"]
 
           missing = [
               x for x in expected
@@ -84,16 +89,12 @@ jobs:
           ]
 
           if missing:
-              raise SystemExit(f"Missing: {missing}")
+              raise SystemExit(f"Missing archive parts: {missing}")
 
-          print("ALL 46 PARTS PRESENT")
-          print("TOTAL BYTES:", sum(
-              (root / x).stat().st_size
-              for x in expected
-          ))
+          print("VERIFIED PARTS:", len(expected))
           PY
 
-      - name: Restore original client
+      - name: Extract original client
         shell: bash
         run: |
           set -euo pipefail
@@ -105,13 +106,12 @@ jobs:
 
           rm -rf downloads
 
-          echo "CLIENT EXTRACTED"
-
+          echo "CLIENT FILES:"
           find client -type f | wc -l
 
           df -h .
 
-      - name: Export every indexed sprite
+      - name: Analyze animation metadata and ID references
         shell: bash
         run: |
           set -euo pipefail
@@ -120,333 +120,583 @@ jobs:
           import csv
           import hashlib
           import json
+          import os
           import re
-          import zipfile
+          import xml.etree.ElementTree as ET
 
+          from collections import Counter
           from pathlib import Path
-          from collections import Counter, defaultdict
 
           ROOT = Path.cwd()
           CLIENT = ROOT / "client"
           REPORT = ROOT / "reports"
-          OUT = ROOT / "sprite_chunks"
+          EXTRACTED = REPORT / "extracted_metadata"
 
           REPORT.mkdir(exist_ok=True)
-          OUT.mkdir(exist_ok=True)
+          EXTRACTED.mkdir(exist_ok=True)
 
-          indexes = list(
-              (ROOT / "previous").rglob("02_pak_records.csv")
-          )
-
-          if len(indexes) != 1:
-              raise SystemExit(
-                  "V1 index report not uniquely found"
-              )
-
-          with indexes[0].open(
-              encoding="utf-8-sig", newline=""
-          ) as f:
-              records = list(csv.DictReader(f))
+          def load_csv(path):
+              with path.open(
+                  "r", encoding="utf-8-sig", newline=""
+              ) as f:
+                  return list(csv.DictReader(f))
 
           def save_csv(name, rows, fields):
               with (REPORT / name).open(
-                  "w",
-                  encoding="utf-8-sig",
-                  newline=""
+                  "w", encoding="utf-8-sig", newline=""
               ) as f:
                   writer = csv.DictWriter(
-                      f,
-                      fieldnames=fields,
+                      f, fieldnames=fields,
                       extrasaction="ignore"
                   )
                   writer.writeheader()
                   writer.writerows(rows)
 
-          def resolve_pak(record):
-              old = Path(record["pak"])
-              parts = old.parts
+          v1 = list(
+              (ROOT / "previous/v1").rglob("02_pak_records.csv")
+          )
+          v2 = list(
+              (ROOT / "previous/v2").rglob("sprite_id_groups.csv")
+          )
 
-              if not parts or parts[0] != "outer":
-                  return None
+          if len(v1) != 1 or len(v2) != 1:
+              raise SystemExit("Previous reports not found uniquely")
 
-              return CLIENT.joinpath(*parts[1:])
+          records = load_csv(v1[0])
+          groups = load_csv(v2[0])
 
-          def safe_name(value):
-              return re.sub(
-                  r"[^A-Za-z0-9_.-]+",
-                  "_",
-                  value
-              )
+          known_sprite_ids = {
+              int(row["sprite_id"])
+              for row in groups
+          }
 
-          sprite_ext = (".spr", ".spx", ".sp2", ".fspr")
+          print("INDEXED PAK RECORDS:", len(records))
+          print("SPRITE ID GROUPS:", len(known_sprite_ids))
 
-          candidates = []
-          metadata = []
+          # --------------------------------------------------
+          # Inventory all indexed files, not just known sprites.
+          # --------------------------------------------------
+
+          extensions = Counter()
+          package_counts = Counter()
 
           for row in records:
-              name = row["file"].replace("\\", "/")
-              low = name.lower()
-              pak = resolve_pak(row)
+              filename = row["file"].replace("\\", "/")
+              extension = Path(filename).suffix.lower()
 
-              if not pak:
-                  continue
+              extensions[extension or "(none)"] += 1
+              package_counts[row["pak"]] += 1
 
-              if any(x in low for x in (
-                  "list.spr",
-                  "wlist.spr",
-                  "sprite",
-                  "action",
-                  "motion",
-                  "animation",
-                  "monster",
-                  "npc",
-                  "desc.tbl"
-              )):
-                  metadata.append({
-                      "pak": row["pak"],
-                      "file": name,
-                      "offset": row["offset"],
-                      "bytes": row["bytes"]
-                  })
+          save_csv(
+              "01_extension_inventory.csv",
+              [
+                  {"extension": ext, "records": count}
+                  for ext, count in extensions.most_common()
+              ],
+              ["extension", "records"]
+          )
 
-              if not low.endswith(sprite_ext):
-                  continue
+          save_csv(
+              "02_package_inventory.csv",
+              [
+                  {"package": name, "records": count}
+                  for name, count in package_counts.most_common()
+              ],
+              ["package", "records"]
+          )
 
+          # --------------------------------------------------
+          # Discover possible animation and actor definitions.
+          # --------------------------------------------------
+
+          CONFIG_EXT = {
+              ".xml", ".txt", ".ini", ".cfg",
+              ".json", ".csv", ".tbl", ".lst",
+              ".dat", ".bin", ".def", ".str",
+              ".lua"
+          }
+
+          IMPORTANT_NAMES = {
+              "list.spr",
+              "wlist.spr",
+              "actions.xml",
+              "qmotioninfo.xml"
+          }
+
+          NAME_HINT = re.compile(
+              r"action|motion|anim|sprite|monster|"
+              r"npc|actor|character|mob|shape|"
+              r"graphic|object|desc",
+              re.I
+          )
+
+          MAX_SCAN_SIZE = 8 * 1024 * 1024
+          MAX_EXPORT_TOTAL = 64 * 1024 * 1024
+
+          candidates = []
+          all_packages_missing = set()
+
+          for row in records:
               if row["valid"].lower() != "true":
                   continue
 
+              filename = row["file"].replace("\\", "/")
+              basename = filename.split("/")[-1]
+              extension = Path(basename).suffix.lower()
+
+              is_important = (
+                  basename.lower() in IMPORTANT_NAMES
+                  or bool(NAME_HINT.search(basename))
+              )
+
+              if (
+                  extension not in CONFIG_EXT
+                  and not is_important
+              ):
+                  continue
+
+              if extension in (".spr", ".spx", ".sp2"):
+                  if basename.lower() not in IMPORTANT_NAMES:
+                      continue
+
+              old_pak = Path(row["pak"])
+
+              if not old_pak.parts or old_pak.parts[0] != "outer":
+                  continue
+
+              pak = CLIENT.joinpath(*old_pak.parts[1:])
+
+              if not pak.is_file():
+                  all_packages_missing.add(str(pak))
+                  continue
+
               candidates.append({
+                  "source": row["pak"],
                   "pak": pak,
-                  "pak_original": row["pak"],
-                  "name": name,
+                  "filename": filename,
+                  "basename": basename,
                   "offset": int(row["offset"]),
-                  "size": int(row["bytes"])
+                  "size": int(row["bytes"]),
+                  "important": is_important,
+                  "priority": (
+                      0 if basename.lower() in IMPORTANT_NAMES
+                      else 1 if is_important
+                      else 2 if extension == ".xml"
+                      else 3
+                  )
               })
 
-          save_csv(
-              "metadata_candidates.csv",
-              metadata,
-              ["pak", "file", "offset", "bytes"]
-          )
+          # Also inspect unpacked configuration files.
+          for p in CLIENT.rglob("*"):
+              if not p.is_file() or p.is_symlink():
+                  continue
 
-          # Never assume numeric sprite IDs are monsters.
-          # All sprite actors are retained for later identification.
+              extension = p.suffix.lower()
+              basename = p.name
 
-          candidate_rows = []
-          for c in candidates:
-              candidate_rows.append({
-                  "pak": c["pak_original"],
-                  "file": c["name"],
-                  "offset": c["offset"],
-                  "bytes": c["size"]
+              if extension not in CONFIG_EXT and \
+                 basename.lower() not in IMPORTANT_NAMES:
+                  continue
+
+              candidates.append({
+                  "source": str(p.relative_to(ROOT)),
+                  "pak": p,
+                  "filename": str(p.relative_to(CLIENT)),
+                  "basename": basename,
+                  "offset": 0,
+                  "size": p.stat().st_size,
+                  "important": bool(NAME_HINT.search(basename)),
+                  "priority": 1
               })
 
-          save_csv(
-              "all_sprite_candidates.csv",
-              candidate_rows,
-              ["pak", "file", "offset", "bytes"]
+          candidates.sort(
+              key=lambda c: (
+                  c["priority"],
+                  c["source"].lower(),
+                  c["offset"]
+              )
           )
 
-          # Group sprite files by the numeric ID before the
-          # first hyphen, without merging different IDs.
+          print("CONFIGURATION CANDIDATES:", len(candidates))
 
-          groups = defaultdict(list)
-          ungrouped = []
+          # --------------------------------------------------
+          # Decode safely, without executing client programs.
+          # --------------------------------------------------
 
-          pattern = re.compile(
-              r"^(\d+)-(\d+)\.(spr|spx|sp2|fspr)$",
-              re.IGNORECASE
-          )
+          def decode_text(raw):
+              if not raw:
+                  return None, None
 
-          for c in candidates:
-              filename = c["name"].split("/")[-1]
-              match = pattern.match(filename)
+              nul_ratio = raw.count(b"\x00") / len(raw)
 
-              if match:
-                  actor_id = int(match.group(1))
-                  groups[actor_id].append(c)
+              if nul_ratio > 0.10:
+                  encodings = (
+                      "utf-16", "utf-16-le", "utf-16-be"
+                  )
               else:
-                  ungrouped.append(c)
-
-          group_rows = []
-
-          for actor_id in sorted(groups):
-              items = groups[actor_id]
-
-              group_rows.append({
-                  "sprite_id": actor_id,
-                  "files": len(items),
-                  "total_bytes": sum(
-                      x["size"] for x in items
-                  ),
-                  "status": "ACTOR_TYPE_NOT_YET_IDENTIFIED"
-              })
-
-          save_csv(
-              "sprite_id_groups.csv",
-              group_rows,
-              [
-                  "sprite_id",
-                  "files",
-                  "total_bytes",
-                  "status"
-              ]
-          )
-
-          # Export raw SPR/SPX assets in bounded ZIP chunks.
-          # This avoids collecting all sprites uncompressed
-          # in the runner's working directory.
-
-          MAX_CHUNK = 350 * 1024 * 1024
-          MAX_ENTRY = 256 * 1024 * 1024
-
-          chunk_no = 0
-          chunk_bytes = 0
-          archive = None
-
-          exported = []
-          rejected = []
-          total_exported_bytes = 0
-
-          def new_chunk():
-              global chunk_no, chunk_bytes, archive
-
-              if archive is not None:
-                  archive.close()
-
-              chunk_no += 1
-              chunk_bytes = 0
-
-              path = OUT / f"sprites-{chunk_no:03d}.zip"
-
-              archive = zipfile.ZipFile(
-                  path,
-                  mode="w",
-                  compression=zipfile.ZIP_STORED,
-                  allowZip64=True
-              )
-
-          ordered = sorted(
-              candidates,
-              key=lambda x: (
-                  x["name"].split("/")[-1].lower(),
-                  x["pak_original"],
-                  x["offset"]
-              )
-          )
-
-          for c in ordered:
-              src = c["pak"]
-              size = c["size"]
-
-              if size <= 0 or size > MAX_ENTRY:
-                  rejected.append({
-                      "file": c["name"],
-                      "reason": "INVALID_OR_OVERSIZED_ENTRY"
-                  })
-                  continue
-
-              if not src.is_file():
-                  rejected.append({
-                      "file": c["name"],
-                      "reason": "SOURCE_PAK_MISSING"
-                  })
-                  continue
-
-              if chunk_bytes + size > MAX_CHUNK:
-                  new_chunk()
-
-              if archive is None:
-                  new_chunk()
-
-              try:
-                  with src.open("rb") as f:
-                      f.seek(c["offset"])
-                      data = f.read(size)
-
-                  if len(data) != size:
-                      raise ValueError("Incomplete PAK entry")
-
-                  filename = c["name"].split("/")[-1]
-                  match = pattern.match(filename)
-
-                  if match:
-                      directory = "sprite_id_" + match.group(1)
-                  else:
-                      directory = "unidentified"
-
-                  package_name = safe_name(
-                      Path(c["pak_original"]).stem
+                  encodings = (
+                      "utf-8-sig", "cp949", "big5"
                   )
 
-                  entry_name = (
-                      package_name + "/" +
-                      directory + "/" +
-                      safe_name(filename)
-                  )
+              for encoding in encodings:
+                  try:
+                      text = raw.decode(encoding)
+                  except (UnicodeError, LookupError):
+                      continue
 
-                  # Prevent overwriting archive entries
-                  # with identical sprite filenames.
-                  entry_name = (
-                      f"{len(exported):07d}_" +
-                      entry_name
-                  )
+                  sample = text[:4000]
 
-                  archive.writestr(entry_name, data)
+                  if not sample:
+                      continue
 
-                  exported.append({
-                      "sprite_file": c["name"],
-                      "pak": c["pak_original"],
-                      "archive": f"sprites-{chunk_no:03d}.zip",
-                      "entry": entry_name,
-                      "bytes": size,
-                      "sha256": hashlib.sha256(data).hexdigest()
-                  })
+                  printable = sum(
+                      ch.isprintable() or ch in "\r\n\t"
+                      for ch in sample
+                  ) / len(sample)
 
-                  chunk_bytes += size
-                  total_exported_bytes += size
+                  if printable >= 0.85:
+                      return text, encoding
 
-              except Exception as ex:
-                  rejected.append({
-                      "file": c["name"],
-                      "reason": str(ex)
-                  })
+              return None, None
 
-          if archive is not None:
-              archive.close()
-
-          save_csv(
-              "exported_sprite_manifest.csv",
-              exported,
-              [
-                  "sprite_file",
-                  "pak",
-                  "archive",
-                  "entry",
-                  "bytes",
-                  "sha256"
-              ]
+          ACTION_WORDS = (
+              "move", "walk", "wait", "idle",
+              "breath", "attack", "damage",
+              "hit", "death", "die", "cast",
+              "motion", "animation", "frame",
+              "direction", "sprite"
           )
 
-          save_csv(
-              "unresolved_sprite_entries.csv",
-              rejected,
-              ["file", "reason"]
+          SPRITE_FIELD = re.compile(
+              r"sprite|sprid|sprno|graphic|gfx|"
+              r"shape|polyid",
+              re.I
           )
 
-          summary = {
-              "indexed_pak_records": len(records),
-              "sprite_candidates": len(candidates),
-              "sprite_id_groups": len(groups),
-              "ungrouped_sprites": len(ungrouped),
-              "exported_files": len(exported),
-              "exported_bytes": total_exported_bytes,
-              "failed_exports": len(rejected),
-              "zip_chunks": chunk_no,
-              "action_classification": "NOT_YET_VERIFIED"
+          LABEL_FIELDS = {
+              "name", "displayname", "monstername",
+              "npcname", "mobname", "title"
           }
 
-          (REPORT / "summary_v2.json").write_text(
+          ACTION_FIELDS = {
+              "action", "actionid", "actionno",
+              "motion", "motionid", "motionno",
+              "animation", "animationid"
+          }
+
+          inventory = []
+          sprite_links = []
+          motion_sources = []
+          total_exported = 0
+          decoded_count = 0
+          xml_count = 0
+          xml_parse_success = 0
+
+          for index, item in enumerate(candidates):
+              filename = item["filename"]
+              basename = item["basename"]
+              size = item["size"]
+              source = item["source"]
+
+              result = {
+                  "source": source,
+                  "file": filename,
+                  "bytes": size,
+                  "status": "",
+                  "encoding": "",
+                  "sha256": "",
+                  "action_keywords": "",
+                  "export_file": ""
+              }
+
+              if size <= 0:
+                  result["status"] = "EMPTY"
+                  inventory.append(result)
+                  continue
+
+              if size > MAX_SCAN_SIZE:
+                  result["status"] = "TOO_LARGE"
+                  inventory.append(result)
+                  continue
+
+              try:
+                  with item["pak"].open("rb") as f:
+                      f.seek(item["offset"])
+                      raw = f.read(size)
+
+                  if len(raw) != size:
+                      raise IOError("Incomplete PAK read")
+
+                  result["sha256"] = hashlib.sha256(
+                      raw
+                  ).hexdigest()
+
+                  content, encoding = decode_text(raw)
+
+                  if content is None:
+                      result["status"] = "BINARY_OR_UNKNOWN"
+                      inventory.append(result)
+                      continue
+
+                  decoded_count += 1
+                  result["encoding"] = encoding
+                  result["status"] = "TEXT_DECODED"
+
+                  lowered = content.lower()
+
+                  matched_words = [
+                      word for word in ACTION_WORDS
+                      if word in lowered
+                  ]
+
+                  result["action_keywords"] = ",".join(
+                      matched_words
+                  )
+
+                  if matched_words:
+                      motion_sources.append({
+                          "source": source,
+                          "file": filename,
+                          "keywords": ",".join(matched_words),
+                          "bytes": size
+                      })
+
+                  # Preserve real metadata bytes for inspection.
+                  if (
+                      total_exported + size <= MAX_EXPORT_TOTAL
+                      and (
+                          item["important"]
+                          or Path(basename).suffix.lower()
+                          in (".xml", ".tbl", ".ini", ".json")
+                      )
+                  ):
+                      safe = re.sub(
+                          r"[^A-Za-z0-9_.-]",
+                          "_",
+                          basename
+                      )[:100]
+
+                      output = EXTRACTED / (
+                          f"{index:06d}_{safe}"
+                      )
+
+                      output.write_bytes(raw)
+
+                      result["export_file"] = str(
+                          output.relative_to(REPORT)
+                      )
+
+                      total_exported += size
+
+                  # Parse actual XML attributes.
+                  if (
+                      Path(basename).suffix.lower() == ".xml"
+                      or content.lstrip().startswith("<")
+                  ):
+                      xml_count += 1
+
+                      try:
+                          root = ET.fromstring(
+                              content.lstrip("\ufeff")
+                          )
+                      except ET.ParseError:
+                          result["status"] = "TEXT_NOT_VALID_XML"
+                          inventory.append(result)
+                          continue
+
+                      xml_parse_success += 1
+                      result["status"] = "XML_PARSED"
+
+                      for element in root.iter():
+                          tag = element.tag
+
+                          if not isinstance(tag, str):
+                              continue
+
+                          tag = tag.split("}")[-1]
+
+                          attributes = {
+                              k.split("}")[-1]: v
+                              for k, v in element.attrib.items()
+                          }
+
+                          lowered_attrs = {
+                              k.lower(): v
+                              for k, v in attributes.items()
+                          }
+
+                          label = next(
+                              (
+                                  value
+                                  for key, value
+                                  in lowered_attrs.items()
+                                  if key in LABEL_FIELDS
+                              ),
+                              ""
+                          )
+
+                          action_hint = next(
+                              (
+                                  value
+                                  for key, value
+                                  in lowered_attrs.items()
+                                  if key in ACTION_FIELDS
+                              ),
+                              ""
+                          )
+
+                          # Only explicit sprite-like fields
+                          # can become candidate ID links.
+                          pairs = list(attributes.items())
+
+                          if element.text and element.text.strip():
+                              pairs.append(
+                                  (tag, element.text.strip())
+                              )
+
+                          for key, value in pairs:
+                              if not SPRITE_FIELD.search(key):
+                                  continue
+
+                              value = value.strip()
+
+                              if not re.fullmatch(
+                                  r"\d{1,8}", value
+                              ):
+                                  continue
+
+                              sprite_id = int(value)
+
+                              sprite_links.append({
+                                  "source": source,
+                                  "file": filename,
+                                  "xml_tag": tag,
+                                  "field": key,
+                                  "sprite_id": sprite_id,
+                                  "in_v2_sprite_groups": (
+                                      sprite_id in known_sprite_ids
+                                  ),
+                                  "label_hint": label,
+                                  "action_hint": action_hint,
+                                  "attributes": json.dumps(
+                                      attributes,
+                                      ensure_ascii=False
+                                  )[:1000],
+                                  "verification": (
+                                      "EXPLICIT_FIELD_ONLY_"
+                                      "ACTOR_TYPE_UNVERIFIED"
+                                  )
+                              })
+
+                  inventory.append(result)
+
+              except Exception as ex:
+                  result["status"] = (
+                      "READ_ERROR: " + str(ex)
+                  )
+                  inventory.append(result)
+
+          # --------------------------------------------------
+          # Save detailed evidence and linkage candidates.
+          # --------------------------------------------------
+
+          save_csv(
+              "03_all_configuration_files.csv",
+              inventory,
+              [
+                  "source", "file", "bytes",
+                  "status", "encoding", "sha256",
+                  "action_keywords", "export_file"
+              ]
+          )
+
+          save_csv(
+              "04_motion_keyword_sources.csv",
+              motion_sources,
+              [
+                  "source", "file",
+                  "keywords", "bytes"
+              ]
+          )
+
+          save_csv(
+              "05_explicit_sprite_references.csv",
+              sprite_links,
+              [
+                  "source", "file", "xml_tag",
+                  "field", "sprite_id",
+                  "in_v2_sprite_groups",
+                  "label_hint", "action_hint",
+                  "attributes", "verification"
+              ]
+          )
+
+          matched_links = [
+              row for row in sprite_links
+              if row["in_v2_sprite_groups"]
+          ]
+
+          save_csv(
+              "06_references_matching_V2.csv",
+              matched_links,
+              [
+                  "source", "file", "xml_tag",
+                  "field", "sprite_id",
+                  "in_v2_sprite_groups",
+                  "label_hint", "action_hint",
+                  "attributes", "verification"
+              ]
+          )
+
+          direct_animation_names = {
+              "actions.xml",
+              "qmotioninfo.xml",
+              "list.spr",
+              "wlist.spr"
+          }
+
+          important_results = [
+              row for row in inventory
+              if Path(row["file"]).name.lower()
+              in direct_animation_names
+          ]
+
+          save_csv(
+              "07_known_animation_filename_results.csv",
+              important_results,
+              [
+                  "source", "file", "bytes",
+                  "status", "encoding", "sha256",
+                  "action_keywords", "export_file"
+              ]
+          )
+
+          matched_ids = {
+              row["sprite_id"]
+              for row in matched_links
+          }
+
+          summary = {
+              "phase": "ANIMATION_METADATA_DISCOVERY",
+              "v1_pak_records": len(records),
+              "v2_sprite_groups": len(known_sprite_ids),
+              "config_candidates": len(candidates),
+              "decoded_text_files": decoded_count,
+              "xml_candidates": xml_count,
+              "xml_parsed": xml_parse_success,
+              "files_with_motion_keywords": len(motion_sources),
+              "explicit_sprite_field_references": len(sprite_links),
+              "references_matching_v2": len(matched_links),
+              "unique_v2_ids_referenced": len(matched_ids),
+              "metadata_bytes_exported": total_exported,
+              "missing_pak_paths": sorted(
+                  all_packages_missing
+              )[:100],
+              "monster_identity_verified": False,
+              "animation_sequences_verified": False
+          }
+
+          (REPORT / "08_summary_v3.json").write_text(
               json.dumps(
                   summary,
                   ensure_ascii=False,
@@ -455,43 +705,74 @@ jobs:
               encoding="utf-8"
           )
 
-          print("=== SANCTUARY V2 RESULT ===")
+          report_lines = [
+              "# Sanctuary of Aden Animation Mapping V3",
+              "",
+              "## Inventory",
+              "",
+              f"- PAK records: {len(records)}",
+              f"- V2 sprite ID groups: {len(known_sprite_ids)}",
+              f"- Configuration candidates: {len(candidates)}",
+              f"- Readable text files: {decoded_count}",
+              f"- Parsed XML files: {xml_parse_success}",
+              f"- Explicit sprite references: {len(sprite_links)}",
+              f"- Matching references: {len(matched_links)}",
+              f"- Unique matched sprite IDs: {len(matched_ids)}",
+              "",
+              "## Important limitations",
+              "",
+              "A numeric sprite field is not proof of a monster.",
+              "Matching IDs are candidates, not verified actions.",
+              "Action words alone do not establish frame order.",
+              "No executable client code was run.",
+              "",
+              "## Next validation",
+              "",
+              "Inspect exported XML and reference CSV files.",
+              "Confirm object names and action data structures.",
+              "Derive direction and frame sequence only from evidence."
+          ]
+
+          (REPORT / "REPORT.md").write_text(
+              "\n".join(report_lines),
+              encoding="utf-8"
+          )
+
+          print("=== V3 METADATA RESULTS ===")
           print(json.dumps(
               summary,
               ensure_ascii=False,
               indent=2
           ))
 
-          print("=== FIRST 40 SPRITE GROUPS ===")
-          for row in group_rows[:40]:
+          print("=== IMPORTANT FILES ===")
+          for row in important_results:
               print(row)
 
-          print("=== METADATA CANDIDATE SAMPLE ===")
-          for row in metadata[:100]:
+          print("=== FIRST 50 EXPLICIT MATCHES ===")
+          for row in matched_links[:50]:
               print(row)
 
-          if not exported:
+          if "GITHUB_STEP_SUMMARY" in os.environ:
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"],
+                  "a", encoding="utf-8"
+              ) as f:
+                  f.write("\n".join(report_lines))
+
+          if not decoded_count:
               raise SystemExit(
-                  "No raw sprites exported. Check report."
+                  "No readable metadata. Review raw files."
               )
 
           PY
 
-      - name: Upload V2 investigation reports
+      - name: Upload V3 metadata analysis
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V2-Reports
+          name: Sanctuary-V3-Animation-Mapping
           path: reports/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload complete raw sprite archive chunks
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sanctuary-V2-Raw-Sprites
-          path: sprite_chunks/*.zip
           if-no-files-found: error
           retention-days: 30
-          compression-level: 0
+          compression-level: 6
