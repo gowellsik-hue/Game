@@ -1,0 +1,1005 @@
+
+name: Sanctuary of Aden Monster Asset Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/audit-sanctuary-monsters.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanctuary-monster-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Prepare environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full zip unzip
+
+          mkdir -p downloads outer reports raw_monster_sprites
+
+          echo "=== DISK SPACE ==="
+          df -h .
+
+      - name: Download all 46 release parts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh release download v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "Sanctuary.of.Aden.-.Copy.*" \
+            --dir downloads
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("downloads")
+          base = "Sanctuary.of.Aden.-.Copy"
+
+          expected = [
+              f"{base}.z{i:02d}"
+              for i in range(1, 46)
+          ]
+          expected.append(f"{base}.zip")
+
+          missing = [
+              name for name in expected
+              if not (root / name).is_file()
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing release parts: " + repr(missing)
+              )
+
+          total = 0
+
+          for name in expected:
+              size = (root / name).stat().st_size
+
+              if size <= 0:
+                  raise SystemExit("Empty file: " + name)
+
+              if name.endswith(".zip") is False:
+                  if size != 100000000:
+                      raise SystemExit(
+                          f"Unexpected part size: {name} {size}"
+                      )
+
+              total += size
+
+          print("PARTS VERIFIED:", len(expected))
+          print("TOTAL BYTES:", total)
+          print("DOWNLOAD CHECK COMPLETE")
+          PY
+
+      - name: Extract split ZIP and inner archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="downloads/Sanctuary.of.Aden.-.Copy.zip"
+
+          echo "=== FIRST EXTRACTION ==="
+
+          if 7z x "$ARCHIVE" \
+            "-o${PWD}/outer" -y \
+            > reports/outer_extract.log 2>&1
+          then
+            echo "First extraction succeeded"
+            rm -rf downloads
+          else
+            echo "Direct extraction failed"
+            echo "Trying split ZIP conversion"
+
+            rm -rf outer
+            mkdir -p outer
+
+            zip -s 0 "$ARCHIVE" \
+              --out reconstructed.zip \
+              > reports/reconstruct.log 2>&1
+
+            rm -rf downloads
+
+            7z x reconstructed.zip \
+              "-o${PWD}/outer" -y \
+              >> reports/outer_extract.log 2>&1
+
+            rm -f reconstructed.zip
+          fi
+
+          echo "=== SECOND EXTRACTION ==="
+
+          mapfile -t INNER_ARCHIVES < <(
+            python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("outer")
+          result = []
+
+          for p in root.rglob("*"):
+              if not p.is_file() or p.is_symlink():
+                  continue
+
+              name = p.name.lower()
+
+              supported = (
+                  name.endswith(".zip")
+                  or name.endswith(".7z")
+                  or name.endswith(".rar")
+                  or name.endswith(".7z.001")
+                  or name.endswith(".part1.rar")
+              )
+
+              if supported and p.stat().st_size > 1048576:
+                  result.append(p)
+
+          result.sort(
+              key=lambda p: p.stat().st_size,
+              reverse=True
+          )
+
+          for p in result[:10]:
+              print(p)
+          PY
+          )
+
+          COUNT=0
+
+          for INNER in "${INNER_ARCHIVES[@]}"; do
+            COUNT=$((COUNT + 1))
+            TARGET="${PWD}/inner-${COUNT}"
+
+            mkdir -p "$TARGET"
+
+            echo "Extracting: $INNER"
+
+            if 7z x "$INNER" "-o${TARGET}" -y \
+              > "reports/inner_${COUNT}.log" 2>&1
+            then
+              echo "Inner archive extracted"
+              rm -f "$INNER"
+            else
+              echo "WARNING: Inner archive failed: $INNER"
+              echo "$INNER" >> reports/failed_inner_archives.txt
+            fi
+          done
+
+          echo "=== EXTRACTION COMPLETE ==="
+          df -h .
+
+      - name: Full monster animation inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import struct
+
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          REPORT = ROOT / "reports"
+          EXPORT = ROOT / "raw_monster_sprites"
+
+          REPORT.mkdir(exist_ok=True)
+          EXPORT.mkdir(exist_ok=True)
+
+          SEARCH_ROOTS = [ROOT / "outer"]
+          SEARCH_ROOTS += sorted(ROOT.glob("inner-*"))
+
+          files = []
+
+          for folder in SEARCH_ROOTS:
+              if not folder.is_dir():
+                  continue
+
+              for p in folder.rglob("*"):
+                  if p.is_file() and not p.is_symlink():
+                      files.append(p)
+
+          files.sort(key=lambda p: str(p).lower())
+
+          def rel(p):
+              return str(p.relative_to(ROOT)).replace("\\", "/")
+
+          def csv_save(name, rows, fields):
+              with (REPORT / name).open(
+                  "w", encoding="utf-8-sig", newline=""
+              ) as f:
+                  writer = csv.DictWriter(
+                      f, fieldnames=fields, extrasaction="ignore"
+                  )
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def decode(data):
+              for encoding in (
+                  "utf-8-sig", "cp949", "big5", "latin-1"
+              ):
+                  try:
+                      return data.decode(encoding)
+                  except UnicodeDecodeError:
+                      pass
+              return data.decode("latin-1", errors="replace")
+
+          def basename(name):
+              return name.replace("\\", "/").split("/")[-1]
+
+          def classify(p):
+              name = p.name.lower()
+              ext = p.suffix.lower()
+
+              if name in ("list.spr", "wlist.spr"):
+                  return "animation_definition"
+
+              if ext in (".spr", ".spx", ".sp2"):
+                  return "sprite"
+
+              if "sprite" in name and ext in (".idx", ".pak"):
+                  return "sprite_package"
+
+              if ext in (".pak", ".idx"):
+                  return "other_package"
+
+              if ext in (".wav", ".ogg", ".mp3"):
+                  return "sound"
+
+              if ext in (".png", ".bmp", ".webp", ".gif"):
+                  return "image"
+
+              if ext in (".exe", ".dll", ".sys", ".msi"):
+                  return "executable_excluded"
+
+              if ext in (".zip", ".7z", ".rar"):
+                  return "nested_archive"
+
+              return "other"
+
+          inventory = []
+          categories = Counter()
+
+          for p in files:
+              kind = classify(p)
+              categories[kind] += 1
+
+              inventory.append({
+                  "path": rel(p),
+                  "bytes": p.stat().st_size,
+                  "category": kind
+              })
+
+          csv_save(
+              "01_all_client_files.csv",
+              inventory,
+              ["path", "bytes", "category"]
+          )
+
+          # -----------------------------------------
+          # Read PAK/IDX indexes without running code
+          # -----------------------------------------
+
+          pak_records = []
+          index_status = []
+          sprite_sources = {}
+          list_sources = []
+          seen_lists = set()
+
+          for p in files:
+              if p.suffix.lower() in (".spr", ".spx", ".sp2"):
+                  key = p.stem.lower()
+
+                  sprite_sources.setdefault(
+                      key, ("direct", p, 0, p.stat().st_size)
+                  )
+
+              if p.name.lower() in ("list.spr", "wlist.spr"):
+                  if p.stat().st_size < 100000000:
+                      data = p.read_bytes()
+                      digest = hashlib.sha256(data).hexdigest()
+
+                      if digest not in seen_lists:
+                          seen_lists.add(digest)
+                          list_sources.append((rel(p), decode(data)))
+
+          for idx in files:
+              if idx.suffix.lower() != ".idx":
+                  continue
+
+              try:
+                  data = idx.read_bytes()
+
+                  if len(data) < 4:
+                      raise ValueError("Short index")
+
+                  count = struct.unpack_from("<I", data, 0)[0]
+
+                  if len(data) != 4 + count * 28:
+                      raise ValueError(
+                          "Unknown or protected IDX format"
+                      )
+
+                  pak = None
+
+                  for q in idx.parent.iterdir():
+                      if (
+                          q.stem.lower() == idx.stem.lower()
+                          and q.suffix.lower() == ".pak"
+                      ):
+                          pak = q
+                          break
+
+                  if pak is None:
+                      raise ValueError("Matching PAK not found")
+
+                  pak_size = pak.stat().st_size
+                  valid_count = 0
+
+                  for i in range(count):
+                      pos = 4 + i * 28
+
+                      offset = struct.unpack_from(
+                          "<I", data, pos
+                      )[0]
+
+                      rawname = data[
+                          pos + 4:pos + 24
+                      ].split(b"\x00", 1)[0]
+
+                      filename = decode(rawname)
+
+                      size = struct.unpack_from(
+                          "<I", data, pos + 24
+                      )[0]
+
+                      valid = (
+                          offset <= pak_size
+                          and size <= pak_size - offset
+                      )
+
+                      pak_records.append({
+                          "idx": rel(idx),
+                          "pak": rel(pak),
+                          "file": filename,
+                          "offset": offset,
+                          "bytes": size,
+                          "valid": valid
+                      })
+
+                      if not valid:
+                          continue
+
+                      valid_count += 1
+
+                      clean_name = basename(filename).lower()
+                      stem = Path(clean_name).stem
+
+                      if clean_name.endswith(
+                          (".spr", ".spx", ".sp2")
+                      ):
+                          sprite_sources.setdefault(
+                              stem,
+                              ("pak", pak, offset, size)
+                          )
+
+                      if clean_name in ("list.spr", "wlist.spr"):
+                          if 0 < size < 100000000:
+                              with pak.open("rb") as f:
+                                  f.seek(offset)
+                                  raw = f.read(size)
+
+                              digest = hashlib.sha256(
+                                  raw
+                              ).hexdigest()
+
+                              if digest not in seen_lists:
+                                  seen_lists.add(digest)
+                                  list_sources.append((
+                                      rel(pak) + ":" + filename,
+                                      decode(raw)
+                                  ))
+
+                  index_status.append({
+                      "index": rel(idx),
+                      "status": "parsed",
+                      "records": count,
+                      "valid": valid_count,
+                      "error": ""
+                  })
+
+              except Exception as ex:
+                  index_status.append({
+                      "index": rel(idx),
+                      "status": "unresolved",
+                      "records": 0,
+                      "valid": 0,
+                      "error": str(ex)
+                  })
+
+          csv_save(
+              "02_pak_records.csv",
+              pak_records,
+              ["idx", "pak", "file", "offset", "bytes", "valid"]
+          )
+
+          csv_save(
+              "03_index_status.csv",
+              index_status,
+              ["index", "status", "records", "valid", "error"]
+          )
+
+          # -----------------------------------------
+          # Parse list.spr / wlist.spr
+          # -----------------------------------------
+
+          HEADER = re.compile(
+              r"^\s*#(\d+)\s+(\d+)(?:=(\d+))?"
+              r"(?:\s+([^\r\n]*))?\s*$"
+          )
+
+          ACTION = re.compile(
+              r"(?<![\w.])(\d+)\."
+              r"([a-zA-Z_][a-zA-Z0-9_ -]*)?"
+              r"\(([^)]*)\)",
+              re.S
+          )
+
+          FRAME = re.compile(
+              r"(\d+)\.(\d+):(-?\d+)"
+          )
+
+          ATTACK_IDS = {
+              1, 4, 5, 6, 7,
+              11, 12, 13, 14,
+              16, 17, 18, 19,
+              20, 21, 22, 23,
+              24, 25, 26, 27,
+              40, 41, 42, 43,
+              46, 47, 48, 49
+          }
+
+          GROUPS = (
+              "move", "wait", "attack", "hit", "death"
+          )
+
+          def group_for(aid, name):
+              n = name.lower()
+
+              if aid == 0:
+                  return "move"
+              if aid == 2:
+                  return "hit"
+              if aid == 3:
+                  return "wait"
+              if aid == 8:
+                  return "death"
+
+              if aid in ATTACK_IDS:
+                  return "attack"
+
+              if "attack" in n:
+                  return "attack"
+              if "walk" in n or "move" in n:
+                  return "move"
+              if "breath" in n or "idle" in n:
+                  return "wait"
+              if "damage" in n or "hit" in n:
+                  return "hit"
+              if "death" in n or "die" in n:
+                  return "death"
+
+              return "other"
+
+          actors = []
+          actions = []
+          references = []
+          needed_sprites = set()
+
+          for source, content in list_sources:
+              entries = []
+              current = None
+
+              for line in content.splitlines():
+                  match = HEADER.match(line)
+
+                  if match:
+                      if current is not None:
+                          entries.append(current)
+
+                      actor_id = int(match.group(1))
+                      image_count = int(match.group(2))
+                      sprite_id = int(
+                          match.group(3) or match.group(1)
+                      )
+
+                      name = (
+                          match.group(4) or f"#{actor_id}"
+                      ).strip()
+
+                      current = {
+                          "id": actor_id,
+                          "sprite_id": sprite_id,
+                          "image_count": image_count,
+                          "name": name,
+                          "body": []
+                      }
+
+                  elif current is not None:
+                      current["body"].append(line)
+
+              if current is not None:
+                  entries.append(current)
+
+              for entry in entries:
+                  body = "\n".join(entry["body"])
+
+                  type_match = re.search(
+                      r"(?<!\d)102\.[a-zA-Z_]*"
+                      r"\(\s*(-?\d+)",
+                      body
+                  )
+
+                  object_type = (
+                      int(type_match.group(1))
+                      if type_match else None
+                  )
+
+                  actor = {
+                      "source": source,
+                      "actor_id": entry["id"],
+                      "name": entry["name"],
+                      "sprite_id": entry["sprite_id"],
+                      "object_type": object_type,
+                      "declared_images": entry["image_count"]
+                  }
+
+                  actors.append(actor)
+
+                  for match in ACTION.finditer(body):
+                      action_id = int(match.group(1))
+
+                      if action_id >= 100:
+                          continue
+
+                      action_name = (
+                          match.group(2) or ""
+                      ).strip()
+
+                      raw = match.group(3)
+                      prefix = re.match(
+                          r"\s*(-?\d+)\s+(-?\d+)\s*,",
+                          raw
+                      )
+
+                      directional = (
+                          int(prefix.group(1))
+                          if prefix else -1
+                      )
+
+                      declared_frames = (
+                          int(prefix.group(2))
+                          if prefix else -1
+                      )
+
+                      frames = FRAME.findall(raw)
+                      group = group_for(
+                          action_id, action_name
+                      )
+
+                      image_ids = sorted({
+                          int(x[0]) for x in frames
+                      })
+
+                      expected = set()
+
+                      for image_id in image_ids:
+                          directions = (
+                              range(8)
+                              if directional == 1
+                              else (0,)
+                          )
+
+                          for d in directions:
+                              stem = (
+                                  f"{entry['sprite_id']}"
+                                  f"-{image_id + d}"
+                              )
+                              expected.add(stem)
+
+                      found = 0
+
+                      for stem in sorted(expected):
+                          available = stem.lower() in sprite_sources
+
+                          if available:
+                              found += 1
+
+                          references.append({
+                              "actor_id": entry["id"],
+                              "name": entry["name"],
+                              "object_type": object_type,
+                              "action_id": action_id,
+                              "group": group,
+                              "sprite_key": stem,
+                              "available": available
+                          })
+
+                          if object_type == 10:
+                              needed_sprites.add(stem.lower())
+
+                      durations = [
+                          int(x[2]) for x in frames
+                          if int(x[2]) >= 0
+                      ]
+
+                      sounds = sorted(set(
+                          re.findall(r"\[(\d+)", raw)
+                      ))
+
+                      actions.append({
+                          "source": source,
+                          "actor_id": entry["id"],
+                          "name": entry["name"],
+                          "sprite_id": entry["sprite_id"],
+                          "object_type": object_type,
+                          "action_id": action_id,
+                          "action_name": action_name,
+                          "group": group,
+                          "directional": directional,
+                          "declared_frames": declared_frames,
+                          "frame_references": len(frames),
+                          "duration_units": sum(durations),
+                          "expected_assets": len(expected),
+                          "found_assets": found,
+                          "sound_ids": ",".join(sounds)
+                      })
+
+          csv_save(
+              "04_all_actor_actions.csv",
+              actions,
+              [
+                  "source", "actor_id", "name",
+                  "sprite_id", "object_type",
+                  "action_id", "action_name", "group",
+                  "directional", "declared_frames",
+                  "frame_references", "duration_units",
+                  "expected_assets", "found_assets",
+                  "sound_ids"
+              ]
+          )
+
+          csv_save(
+              "05_sprite_references.csv",
+              references,
+              [
+                  "actor_id", "name", "object_type",
+                  "action_id", "group",
+                  "sprite_key", "available"
+              ]
+          )
+
+          # -----------------------------------------
+          # Make complete action matrix
+          # -----------------------------------------
+
+          by_actor = defaultdict(list)
+
+          for action in actions:
+              key = (
+                  action["source"],
+                  action["actor_id"]
+              )
+              by_actor[key].append(action)
+
+          matrix = []
+
+          for actor in actors:
+              key = (
+                  actor["source"],
+                  actor["actor_id"]
+              )
+
+              actor_actions = by_actor[key]
+              row = dict(actor)
+
+              for group in GROUPS:
+                  selected = [
+                      a for a in actor_actions
+                      if a["group"] == group
+                  ]
+
+                  row[group] = (
+                      "PRESENT" if selected
+                      else "NOT_DEFINED"
+                  )
+
+                  row[group + "_action_ids"] = ",".join(
+                      str(a["action_id"])
+                      for a in selected
+                  )
+
+                  row[group + "_frames"] = sum(
+                      a["frame_references"]
+                      for a in selected
+                  )
+
+              matrix.append(row)
+
+          matrix.sort(
+              key=lambda r: (
+                  r["object_type"] != 10,
+                  r["actor_id"],
+                  r["source"]
+              )
+          )
+
+          matrix_fields = [
+              "source", "actor_id", "name",
+              "sprite_id", "object_type",
+              "declared_images"
+          ]
+
+          for group in GROUPS:
+              matrix_fields += [
+                  group,
+                  group + "_action_ids",
+                  group + "_frames"
+              ]
+
+          csv_save(
+              "06_all_actor_matrix.csv",
+              matrix,
+              matrix_fields
+          )
+
+          monsters = [
+              r for r in matrix
+              if r["object_type"] == 10
+          ]
+
+          csv_save(
+              "07_monster_action_matrix.csv",
+              monsters,
+              matrix_fields
+          )
+
+          csv_save(
+              "08_monster_action_details.csv",
+              [
+                  a for a in actions
+                  if a["object_type"] == 10
+              ],
+              [
+                  "source", "actor_id", "name",
+                  "sprite_id", "object_type",
+                  "action_id", "action_name", "group",
+                  "directional", "declared_frames",
+                  "frame_references", "duration_units",
+                  "expected_assets", "found_assets",
+                  "sound_ids"
+              ]
+          )
+
+          # -----------------------------------------
+          # Export identified raw monster SPR files
+          # -----------------------------------------
+
+          exported = []
+          exported_bytes = 0
+          skipped_space = 0
+
+          for stem in sorted(needed_sprites):
+              src = sprite_sources.get(stem)
+
+              if src is None:
+                  continue
+
+              kind, path, offset, size = src
+
+              if shutil.disk_usage(ROOT).free < size + 1073741824:
+                  skipped_space += 1
+                  continue
+
+              if kind == "direct":
+                  extension = path.suffix.lower()
+              else:
+                  extension = ".spr"
+
+              output = EXPORT / (stem + extension)
+
+              try:
+                  if kind == "direct":
+                      shutil.copyfile(path, output)
+                  else:
+                      with path.open("rb") as f:
+                          f.seek(offset)
+                          with output.open("wb") as target:
+                              remaining = size
+
+                              while remaining > 0:
+                                  chunk = f.read(
+                                      min(1048576, remaining)
+                                  )
+
+                                  if not chunk:
+                                      raise IOError("Unexpected EOF")
+
+                                  target.write(chunk)
+                                  remaining -= len(chunk)
+
+                  exported.append({
+                      "sprite_key": stem,
+                      "file": rel(output),
+                      "bytes": output.stat().st_size,
+                      "source_kind": kind
+                  })
+
+                  exported_bytes += output.stat().st_size
+
+              except Exception as ex:
+                  if output.exists():
+                      output.unlink()
+
+                  print("EXPORT FAILED", stem, str(ex))
+
+          csv_save(
+              "09_exported_sprites.csv",
+              exported,
+              [
+                  "sprite_key", "file",
+                  "bytes", "source_kind"
+              ]
+          )
+
+          # -----------------------------------------
+          # Summary and validation
+          # -----------------------------------------
+
+          unresolved = sum(
+              1 for row in index_status
+              if row["status"] != "parsed"
+          )
+
+          if not list_sources or not actors:
+              status = "INCOMPLETE_NO_PARSEABLE_LIST_SPR"
+          elif unresolved:
+              status = "PARTIAL_UNRESOLVED_INDEXES"
+          else:
+              status = "PARSED_AVAILABLE_DEFINITIONS"
+
+          summary = {
+              "status": status,
+              "total_files": len(files),
+              "file_categories": dict(categories),
+              "pak_records": len(pak_records),
+              "unresolved_indexes": unresolved,
+              "list_spr_sources": [
+                  source for source, _ in list_sources
+              ],
+              "actors": len(actors),
+              "confirmed_monster_entries": len(monsters),
+              "monster_actions": sum(
+                  a["object_type"] == 10
+                  for a in actions
+              ),
+              "missing_action_definitions": {
+                  group: sum(
+                      r[group] == "NOT_DEFINED"
+                      for r in monsters
+                  )
+                  for group in GROUPS
+              },
+              "identified_monster_sprite_keys": len(
+                  needed_sprites
+              ),
+              "exported_sprites": len(exported),
+              "exported_bytes": exported_bytes,
+              "skipped_due_to_disk_space": skipped_space
+          }
+
+          (REPORT / "summary.json").write_text(
+              json.dumps(
+                  summary,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          report_lines = [
+              "# Sanctuary of Aden Monster Audit",
+              "",
+              f"Status: {status}",
+              "",
+              f"Total client files: {len(files)}",
+              f"All actors: {len(actors)}",
+              f"Confirmed monsters: {len(monsters)}",
+              f"Monster actions: {summary['monster_actions']}",
+              f"Raw sprite exports: {len(exported)}",
+              f"Unresolved indexes: {unresolved}",
+              "",
+              "## Missing action definitions",
+              ""
+          ]
+
+          for group in GROUPS:
+              count = summary[
+                  "missing_action_definitions"
+              ][group]
+              report_lines.append(f"- {group}: {count}")
+
+          report_lines += [
+              "",
+              "## Interpretation",
+              "",
+              "NOT_DEFINED means absent from parsed action definitions.",
+              "It does not prove the client lacks animation graphics.",
+              "PAK contents may be protected or encoded.",
+              "Raw SPR exports are not converted PNG images.",
+              "No client executable was run.",
+              ""
+          ]
+
+          (REPORT / "REPORT.md").write_text(
+              "\n".join(report_lines),
+              encoding="utf-8"
+          )
+
+          print("=== FINAL AUDIT ===")
+          print(json.dumps(
+              summary,
+              ensure_ascii=False,
+              indent=2
+          ))
+
+          with Path(
+              __import__("os").environ["GITHUB_STEP_SUMMARY"]
+          ).open("a", encoding="utf-8") as f:
+              f.write("\n".join(report_lines))
+
+          PY
+
+      - name: Upload complete audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sanctuary-Monster-Audit
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload extracted monster sprites
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sanctuary-Monster-Raw-Sprites
+          path: raw_monster_sprites/
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 1
