@@ -1,6 +1,7 @@
 
-name: Sanctuary of Aden Mobile Web V1
+name: Sanctuary of Aden Mobile Web V2
 
+# Replace .github/workflows/build-web.yml only. No GitHub Pages overwrite.
 on:
   push:
     branches: [main]
@@ -12,12 +13,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: sanctuary-build-web-v1
+  group: sanctuary-build-web-v2
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build Sanctuary Mobile Prototype
+    name: Build independent playable prototype
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -32,7 +33,7 @@ jobs:
           mkdir -p downloads client src reports dist/sanctuary-mobile
           df -h .
 
-      - name: Download all 46 original archive parts
+      - name: Download the original 46 split archive pieces
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,205 +43,181 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'Sanctuary.of.Aden.-.Copy.*' \
             --dir downloads
-
           python3 - <<'PY_VALIDATE'
           from pathlib import Path
-
           root = Path('downloads')
           prefix = 'Sanctuary.of.Aden.-.Copy'
-          pieces = [
-              root / (prefix + f'.z{i:02d}')
-              for i in range(1, 46)
-          ]
+          pieces = [root / (prefix + f'.z{i:02d}') for i in range(1, 46)]
           pieces.append(root / (prefix + '.zip'))
-
           missing = [str(p) for p in pieces if not p.is_file()]
           if missing:
-              raise SystemExit('Missing archive parts: ' + repr(missing))
-
+              raise SystemExit('Missing original archive parts: ' + repr(missing))
           for p in pieces[:-1]:
               if p.stat().st_size != 100000000:
-                  raise SystemExit(
-                      f'Unexpected size: {p.name} {p.stat().st_size}'
-                  )
-
+                  raise SystemExit(f'Unexpected part size: {p.name} {p.stat().st_size}')
           if pieces[-1].stat().st_size <= 0:
-              raise SystemExit('Final ZIP part is empty')
-
-          print('VERIFIED PARTS:', len(pieces))
-          print('TOTAL BYTES:', sum(p.stat().st_size for p in pieces))
+              raise SystemExit('ZIP final segment is empty')
+          print('46 original pieces validated; bytes =', sum(p.stat().st_size for p in pieces))
           PY_VALIDATE
 
-      - name: Reconstruct ZIP and extract SPR package
+      - name: Reconstruct split ZIP and extract only required SPR package
         shell: bash
         run: |
           set -euo pipefail
-
           zip -s 0 downloads/Sanctuary.of.Aden.-.Copy.zip \
-            --out sanctuary-rejoined.zip \
-            > reports/zip_reconstruction.log 2>&1
-
+            --out sanctuary-rejoined.zip > reports/zip_reconstruction.log 2>&1
           test -s sanctuary-rejoined.zip
           rm -rf downloads
-
-          7z x sanctuary-rejoined.zip -oclient -y \
+          # The split ZIP contains the top-level folder:
+          # Sanctuary of Aden - Copy/Sprite.idx and Sprite.pak
+          # 7z keeps that directory when using -ir selection.
+          if ! 7z x sanctuary-rejoined.zip -oclient -y \
             '-ir!Sprite.idx' '-ir!Sprite.pak' \
-            > reports/sprite_extraction.log 2>&1
-
-          test -s client/Sprite.idx
-          test -s client/Sprite.pak
-
+            > reports/sprite_extraction.log 2>&1; then
+            tail -n 70 reports/sprite_extraction.log
+            exit 1
+          fi
           rm -f sanctuary-rejoined.zip
 
-          echo 'SPR package extraction successful'
-          ls -lh client/Sprite.idx client/Sprite.pak
+          python3 - <<'PY_LOCATE'
+          import os
+          from pathlib import Path
+
+          matches = sorted(Path('client').rglob('Sprite.idx'))
+          if len(matches) != 1:
+              raise SystemExit(
+                  f'Expected 1 Sprite.idx, found {len(matches)}: {matches}'
+              )
+          idx = matches[0]
+          pak = idx.with_suffix('.pak')
+          if not idx.is_file() or idx.stat().st_size == 0:
+              raise SystemExit('Sprite.idx missing or empty')
+          if not pak.is_file() or pak.stat().st_size == 0:
+              raise SystemExit(f'Sprite.pak missing or empty: {pak}')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as out:
+              out.write(f'SPR_IDX={idx.resolve()}\n')
+              out.write(f'SPR_PAK={pak.resolve()}\n')
+          print(f'SPR idx: {idx} ({idx.stat().st_size:,} bytes)')
+          print(f'SPR pak: {pak} ({pak.stat().st_size:,} bytes)')
+          PY_LOCATE
+          echo 'SPR package extraction and path validation passed'
           df -h .
 
-      - name: Set up Python
+      - name: Set up isolated Python runtime
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install image decoder
+      - name: Install PNG decoder dependency
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check 'Pillow==11.3.0'
 
-      - name: Convert original SPR and build HTML5 game
+      - name: Build independent mobile game and convert real SPR frames
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src dist/sanctuary-mobile
-
           cat > src/builder.py <<'PY_BUILDER'
           #!/usr/bin/env python3
+          """Sanctuary of Aden independent, research-stage mobile sprite demo builder.
+          
+          The numeric Sprite IDs and 0-7 action keys below are prototype-only choices.
+          This script does not claim that a key equals a verified direction or action.
+          """
           import argparse
           import json
+          import re
           import struct
+          import zipfile
           from pathlib import Path
           from PIL import Image
-
-          # Prototype sprite selections.
-          # These IDs are confirmed assets, not verified actor identities.
-          PAIRS = {
-              'hero': (2786, range(8)),
-              'enemy': (3215, range(8))
-          }
-
+          
+          
+          PAIRS = {'hero': (2786, range(8)), 'enemy': (3215, range(8))}
+          
+          
           def u16(blob, offset):
               return struct.unpack_from('<H', blob, offset)[0]
-
+          
+          
+          def i16(blob, offset):
+              return struct.unpack_from('<h', blob, offset)[0]
+          
+          
           def u32(blob, offset):
               return struct.unpack_from('<I', blob, offset)[0]
-
+          
+          
           def to_color(c):
-              return (
-                  ((c >> 10) & 31) * 255 // 31,
-                  ((c >> 5) & 31) * 255 // 31,
-                  (c & 31) * 255 // 31,
-                  255
-              )
-
-          def decode_spr(blob, max_frames=4):
+              return ((c >> 10 & 31) * 255 // 31,
+                      (c >> 5 & 31) * 255 // 31,
+                      (c & 31) * 255 // 31, 255)
+          
+          
+          def decode_spr(blob, max_frames=5):
               if len(blob) < 16:
                   raise ValueError('SPR too short')
-
               pos = 0
               frame_count = blob[pos]
               pos += 1
               palette = None
-
               if frame_count == 255:
                   count = blob[pos] or 256
                   pos += 1
-                  palette = [
-                      to_color(c) for c in struct.unpack_from(
-                          '<' + str(count) + 'H', blob, pos
-                      )
-                  ]
+                  palette = [to_color(c) for c in struct.unpack_from('<' + str(count) + 'H', blob, pos)]
                   pos += count * 2
                   frame_count = blob[pos]
                   pos += 1
-
               if not 1 <= frame_count <= 200:
-                  raise ValueError('Invalid frame count')
-
+                  raise ValueError(f'Bad SPR frame count: {frame_count}')
               frames = []
-
               for _ in range(frame_count):
+                  bounds = struct.unpack_from('<hhhh', blob, pos)
                   pos += 8
-                  pos += 4
-                  count = u16(blob, pos)
+                  pos += 4  # two metadata words
+                  n = u16(blob, pos)
                   pos += 2
-
-                  if count > 1000:
-                      raise ValueError('Too many tile references')
-
+                  if n > 1000:
+                      raise ValueError('Unexpected tile reference count')
                   refs = []
-
-                  for _ in range(count):
-                      a, b, frame_type, index = struct.unpack_from(
-                          '<bbBH', blob, pos
-                      )
+                  for _ in range(n):
+                      a, b, frame_type, index = struct.unpack_from('<bbBH', blob, pos)
                       pos += 5
                       refs.append((a, b, index))
-
                   frames.append(refs)
-
               tile_count = u32(blob, pos)
               pos += 4
-
               if tile_count > 100000:
-                  raise ValueError('Too many SPR tiles')
-
-              offsets = struct.unpack_from(
-                  '<' + str(tile_count) + 'I',
-                  blob, pos
-              )
+                  raise ValueError('Excessive tile count')
+              offsets = struct.unpack_from('<' + str(tile_count) + 'I', blob, pos)
               pos += tile_count * 4
               pos += 4
-              data_start = pos
-
-              needed = {
-                  idx
-                  for refs in frames[:max_frames]
-                  for _, _, idx in refs
-              }
-
-              if any(idx >= tile_count for idx in needed):
-                  raise ValueError('Tile reference outside table')
-
+              base = pos
+              needed = {ix for refs in frames[:max_frames] for _, _, ix in refs}
+              if any(ix >= tile_count for ix in needed):
+                  raise ValueError('Tile reference out of range')
               blocks = {}
-
               for idx in needed:
-                  p = data_start + offsets[idx]
+                  p = base + offsets[idx]
                   if p + 4 > len(blob):
                       raise ValueError('Tile offset outside SPR')
-
-                  start_x, start_y, unknown, rows = (
-                      struct.unpack_from('<BBBB', blob, p)
-                  )
+                  start_x, start_y, unknown, rows = struct.unpack_from('<BBBB', blob, p)
                   p += 4
-
                   if start_x > 24 or start_y > 24 or start_y + rows > 24:
-                      raise ValueError('Invalid tile bounds')
-
+                      raise ValueError('Invalid tile dimensions')
                   pixels = []
-
                   for y in range(start_y, start_y + rows):
                       x = start_x
                       segment_count = blob[p]
                       p += 1
-
                       for _ in range(segment_count):
                           x += blob[p] // 2
                           count = blob[p + 1]
                           p += 2
-
                           if x + count > 24:
-                              raise ValueError('Tile row exceeds width')
-
+                              raise ValueError('Tile scanline exceeded width')
                           for _ in range(count):
                               if palette is not None:
                                   color = palette[blob[p]]
@@ -248,248 +225,190 @@ jobs:
                               else:
                                   color = to_color(u16(blob, p))
                                   p += 2
-
                               pixels.append((x, y, color))
                               x += 1
-
                   blocks[idx] = pixels
-
               results = []
-
               for refs in frames[:max_frames]:
                   if not refs:
                       continue
-
                   placements = []
-
-                  for a, b, idx in refs:
+                  for a, b, ix in refs:
+                      # Matches SPR block-isometric placement, including negative a rounding.
                       adjusted = a - 1 if a < 0 else a
                       half = int(adjusted / 2)
-
                       px = 24 * (b + a - half)
                       py = 12 * (b - half)
-
-                      placements.append((px, py, idx))
-
+                      placements.append((px, py, ix))
                   left = min(x for x, _, _ in placements)
                   top = min(y for _, y, _ in placements)
                   right = max(x + 24 for x, _, _ in placements)
                   bottom = max(y + 24 for _, y, _ in placements)
-
-                  width = right - left
-                  height = bottom - top
-
-                  if not (1 <= width <= 512 and 1 <= height <= 512):
+                  w, h = right - left, bottom - top
+                  if not (1 <= w <= 512 and 1 <= h <= 512):
                       raise ValueError('SPR frame exceeds safety bounds')
-
-                  image = Image.new(
-                      'RGBA', (width, height), (0, 0, 0, 0)
-                  )
+                  image = Image.new('RGBA', (w, h), (0, 0, 0, 0))
                   pix = image.load()
-
                   for bx, by, idx in placements:
                       for tx, ty, color in blocks[idx]:
                           pix[bx - left + tx, by - top + ty] = color
-
                   results.append(image)
-
               if not results:
                   raise ValueError('No visible SPR frames')
-
               return results
-
-          def read_index(blob):
+          
+          
+          def index_pak(blob):
               count = u32(blob, 0)
-
               if len(blob) != 4 + count * 28:
-                  raise ValueError('Unexpected IDX format')
-
-              wanted = {
-                  f'{sprite_id}-{key}.spr'
-                  for sprite_id, keys in PAIRS.values()
-                  for key in keys
-              }
-
+                  raise ValueError('Unexpected IDX layout: count*28 mismatch')
+              wanted = {f'{sprite_id}-{key}.spr' for sprite_id, keys in PAIRS.values() for key in keys}
               records = {}
-
               for j in range(count):
-                  pos = 4 + j * 28
+                  pos = 4 + 28 * j
                   offset = u32(blob, pos)
-
-                  raw = blob[pos + 4:pos + 24].split(
-                      b'\x00', 1
-                  )[0]
-
+                  raw = blob[pos + 4:pos + 24].split(b'\x00', 1)[0]
                   try:
-                      name = raw.decode('ascii').lower()
-                      name = name.replace('\\', '/').split('/')[-1]
+                      name = raw.decode('ascii').lower().replace('\\', '/').split('/')[-1]
                   except UnicodeDecodeError:
                       continue
-
                   size = u32(blob, pos + 24)
-
                   if name in wanted:
                       if name in records:
-                          raise ValueError(
-                              'Duplicate requested asset: ' + name
-                          )
+                          raise ValueError('Duplicate requested asset: ' + name)
                       records[name] = (offset, size)
-
-              missing = wanted - set(records)
-              if missing:
-                  raise ValueError(
-                      'Required SPR files missing: ' + repr(sorted(missing))
-                  )
-
               return records
-
-          def make_assets(idx_path, pak_path, output):
-              records = read_index(idx_path.read_bytes())
-              pak_size = pak_path.stat().st_size
+          
+          
+          def make_assets(args, dest):
+              if args.sample_zip:
+                  samples = zipfile.ZipFile(args.sample_zip)
+                  names = samples.namelist()
+                  def read_sprite(sprite_id, key):
+                      exact = f'sprite_samples/{sprite_id}/Sprite__{sprite_id}-{key}.spr'
+                      matches = [n for n in names if n == exact]
+                      if len(matches) != 1:
+                          raise FileNotFoundError(f'Sample SPR not found for {sprite_id}-{key}')
+                      return samples.read(matches[0])
+              else:
+                  data = Path(args.idx).read_bytes()
+                  records = index_pak(data)
+                  pak = Path(args.pak)
+                  pak_length = pak.stat().st_size
+                  handle = pak.open('rb')
+                  def read_sprite(sprite_id, key):
+                      name = f'{sprite_id}-{key}.spr'
+                      if name not in records:
+                          raise FileNotFoundError('SPR not in IDX: ' + name)
+                      offset, size = records[name]
+                      if not (0 < size < 10 * 1024 * 1024 and 0 <= offset <= pak_length - size):
+                          raise ValueError('Invalid PAK asset bounds: ' + name)
+                      handle.seek(offset)
+                      result = handle.read(size)
+                      if len(result) != size:
+                          raise IOError('Short read: ' + name)
+                      return result
               actors = {}
-
-              with pak_path.open('rb') as pak:
-                  for actor, (sprite_id, keys) in PAIRS.items():
-                      actor_keys = []
-
-                      for key in keys:
-                          name = f'{sprite_id}-{key}.spr'
-                          offset, size = records[name]
-
-                          if not (
-                              0 < size < 10 * 1024 * 1024
-                              and 0 <= offset <= pak_size - size
-                          ):
-                              raise ValueError('Invalid PAK bounds: ' + name)
-
-                          pak.seek(offset)
-                          raw = pak.read(size)
-
-                          if len(raw) != size:
-                              raise IOError('Incomplete SPR read: ' + name)
-
-                          images = decode_spr(raw)
-                          paths = []
-
-                          for frame_index, image in enumerate(images):
-                              relative = (
-                                  f'assets/{actor}-{sprite_id}-'
-                                  f'{key}-{frame_index}.png'
-                              )
-                              target = output / relative
-                              target.parent.mkdir(
-                                  parents=True, exist_ok=True
-                              )
-                              image.save(target, optimize=True)
-                              paths.append(relative)
-
-                          actor_keys.append(paths)
-
-                      actors[actor] = {
-                          'sprite_id': sprite_id,
-                          'provisional_keys': list(keys),
-                          'directions': actor_keys
-                      }
-
+              for actor, (sprite_id, keys) in PAIRS.items():
+                  actor_keys = []
+                  for key in keys:
+                      spr = read_sprite(sprite_id, key)
+                      images = decode_spr(spr, max_frames=4)
+                      paths = []
+                      for frame_idx, image in enumerate(images):
+                          name = f'assets/{actor}-{sprite_id}-{key}-{frame_idx}.png'
+                          (dest / name).parent.mkdir(parents=True, exist_ok=True)
+                          image.save(dest / name, optimize=True)
+                          paths.append(name)
+                      actor_keys.append(paths)
+                  if len(actor_keys) != 8:
+                      raise ValueError('Need eight demo keys per actor')
+                  actors[actor] = {'sprite_id': sprite_id, 'provisional_keys': list(keys), 'directions': actor_keys}
+              if not args.sample_zip:
+                  handle.close()
               return actors
-
+          
+          
           def main():
-              parser = argparse.ArgumentParser()
-              parser.add_argument('--idx', type=Path, required=True)
-              parser.add_argument('--pak', type=Path, required=True)
-              parser.add_argument('--output', type=Path, required=True)
-              parser.add_argument('--template', type=Path, required=True)
-              args = parser.parse_args()
-
+              p = argparse.ArgumentParser()
+              p.add_argument('--idx', type=Path)
+              p.add_argument('--pak', type=Path)
+              p.add_argument('--sample-zip', type=Path)
+              p.add_argument('--output', required=True, type=Path)
+              p.add_argument('--template', required=True, type=Path)
+              args = p.parse_args()
+              if not args.sample_zip and (not args.idx or not args.pak):
+                  p.error('Provide --idx and --pak, or --sample-zip for tests')
               out = args.output
               out.mkdir(parents=True, exist_ok=True)
-
-              actors = make_assets(args.idx, args.pak, out)
-
-              manifest = {
-                  'actors': actors,
-                  'status': 'PLAYABLE_RESEARCH_PROTOTYPE',
-                  'limits': [
-                      'Sprite directions and actions remain unverified',
-                      'Test terrain and combat rules are provisional',
-                      'Original maps and game balance are not implemented'
-                  ]
-              }
-
-              (out / 'manifest.json').write_text(
-                  json.dumps(
-                      manifest, ensure_ascii=False, indent=2
-                  ),
-                  encoding='utf-8'
-              )
-
+              actors = make_assets(args, out)
+              manifest = {'actors': actors, 'status': 'PLAYABLE_RESEARCH_PROTOTYPE',
+                          'limits': ['Sprite key 0..7 direction/action classification unverified',
+                                     'Terrain and enemy behavior are test implementations',
+                                     'Not a port of original game rules or maps']}
+              (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
               html = args.template.read_text(encoding='utf-8')
-              html = html.replace(
-                  '/*__MANIFEST_JSON__*/',
-                  json.dumps(
-                      manifest,
-                      ensure_ascii=False,
-                      separators=(',', ':')
-                  )
-              )
-
-              (out / 'index.html').write_text(
-                  html, encoding='utf-8'
-              )
-
+              html = html.replace('/*__MANIFEST_JSON__*/', json.dumps(manifest, separators=(',', ':'), ensure_ascii=False))
+              (out / 'index.html').write_text(html, encoding='utf-8')
               (out / 'README_KO.txt').write_text(
-                  'Sanctuary of Aden 모바일 테스트 빌드\n'
-                  '이동, 공격, 자동공격, 물약 기능을 시험합니다.\n'
-                  '원본 SPR ID 2786 및 3215 사용.\n'
-                  '방향과 모션 분류는 임시 상태입니다.\n'
-                  '원작 전체 게임 구현본이 아닙니다.\n'
-                  '기존 SLKnight 및 Pages 배포는 변경하지 않습니다.\n',
-                  encoding='utf-8'
-              )
-
-              print(json.dumps({
-                  'sprite_ids': [2786, 3215],
-                  'png_frames': len(list(
-                      (out / 'assets').glob('*.png')
-                  )),
-                  'output': str(out)
-              }, ensure_ascii=False, indent=2))
-
+                  'Sanctuary of Aden - 독립 모바일 플레이 테스트 빌드\n'
+                  '원본 SPR ID 2786 및 3215 추출 성공. 방향 키 0~7은 임시 매핑.\n'
+                  '게임: 터치 패드 이동 / 공격 버튼 / 자동공격 전환 / 물약 / 재시작.\n'
+                  '기존 SLKnight 및 GitHub Pages 배포는 수정하지 않습니다.\n'
+                  '이 HTML 폴더를 정적 서버에 올리거나 index.html을 브라우저에서 열어 테스트하세요.\n'
+                  '원작의 지형·몹 명칭·모션·전투 수치는 검증되지 않았습니다.\n', encoding='utf-8')
+              print(json.dumps({'generated': str(out), 'assets_png': len(list((out / 'assets').glob('*.png'))),
+                                'total_bytes': sum(f.stat().st_size for f in out.rglob('*') if f.is_file()),
+                                'sprite_ids': [2786, 3215]}, ensure_ascii=False, indent=2))
+          
+          
           if __name__ == '__main__':
               main()
           PY_BUILDER
-
           cat > src/index.template.html <<'HTML_GAME'
           <!doctype html>
           <html lang="ko">
           <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,user-scalable=no">
-          <title>Sanctuary of Aden Mobile</title>
+          <title>Sanctuary of Aden | 독립 모바일 플레이 테스트</title>
           <style>
-          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
           :root{color-scheme:dark;font:15px system-ui,-apple-system,'Malgun Gothic',sans-serif}
           html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#081316;color:#e9e4d3}
           #game{position:fixed;inset:0;overflow:hidden;touch-action:none}
           #screen{display:block;width:100%;height:100%;background:#203528;image-rendering:pixelated;touch-action:none}
-          #top{position:absolute;top:env(safe-area-inset-top);left:0;right:0;padding:8px 12px;display:flex;gap:12px;align-items:flex-start;justify-content:space-between;pointer-events:none;background:linear-gradient(180deg,rgba(6,18,21,.92),transparent)}
-          #top .panel{min-width:0;background:rgba(11,22,24,.76);border:1px solid #65806b66;border-radius:10px;padding:8px 10px}
+          #top{position:absolute;top:env(safe-area-inset-top);left:0;right:0;padding:8px 12px;
+           display:flex;gap:12px;align-items:flex-start;justify-content:space-between;pointer-events:none;
+           background:linear-gradient(180deg,rgba(6,18,21,.92),transparent)}
+          #top .panel{min-width:0; background:rgba(11,22,24,.76);border:1px solid #65806b66;border-radius:10px;padding:8px 10px}
           #top strong{display:block;color:#f7df97;font-size:15px;white-space:nowrap}
           #top small{display:block;color:#bed0c2;font-size:11px;margin-top:2px}
           #hp{position:relative;width:125px;max-width:24vw;height:11px;border:1px solid #b0a19888;background:#4a2423;border-radius:7px;overflow:hidden;margin-top:6px}
           #hpfill{height:100%;width:100%;background:linear-gradient(90deg,#c14b4b,#e56e5d)}
           #hpnum,#counter{font-weight:700;text-align:right;color:#f2edcc;font-size:13px}
-          #centerToast{position:absolute;top:79px;left:50%;transform:translateX(-50%);background:rgba(13,21,22,.83);border:1px solid #927c55a8;border-radius:9px;padding:7px 12px;font-size:12px;text-align:center;max-width:80vw;pointer-events:none;opacity:1;transition:opacity .4s}
-          #joystick{position:absolute;left:max(14px,env(safe-area-inset-left));bottom:max(22px,env(safe-area-inset-bottom));width:151px;height:151px;border-radius:50%;border:2px solid rgba(220,230,209,.43);background:radial-gradient(circle,rgba(120,159,131,.24),rgba(12,29,34,.73));box-shadow:0 5px 19px #0008;touch-action:none;user-select:none}
-          #stick{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:64px;height:64px;border:2px solid #eee1b380;border-radius:50%;background:radial-gradient(circle,#748a7b,#2d4548);box-shadow:0 3px 13px #0008;pointer-events:none}
+          #centerToast{position:absolute;top:79px;left:50%;transform:translateX(-50%);
+           background:rgba(13,21,22,.83);border:1px solid #927c55a8;border-radius:9px;padding:7px 12px;
+           font-size:12px;text-align:center;max-width:80vw;pointer-events:none;opacity:1;transition:opacity .4s}
+          #joystick{position:absolute;left:max(14px,env(safe-area-inset-left));bottom:max(22px,env(safe-area-inset-bottom));
+           width:151px;height:151px;border-radius:50%;border:2px solid rgba(220,230,209,.43);
+           background:radial-gradient(circle,rgba(120,159,131,.24),rgba(12,29,34,.73));
+           box-shadow:0 5px 19px #0008;touch-action:none;user-select:none}
+          #stick{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:64px;height:64px;
+           border:2px solid #eee1b380;border-radius:50%;background:radial-gradient(circle,#748a7b,#2d4548);box-shadow:0 3px 13px #0008;pointer-events:none}
           #joystick .label{position:absolute;left:0;right:0;bottom:7px;text-align:center;font-size:10px;color:#ffffffa3;pointer-events:none}
-          #buttons{position:absolute;right:max(12px,env(safe-area-inset-right));bottom:max(24px,env(safe-area-inset-bottom));display:grid;grid-template-columns:73px 82px;gap:9px;align-items:end}
-          button{touch-action:manipulation;user-select:none;cursor:pointer;background:linear-gradient(140deg,#41534f,#1b292d);color:#f7f0cf;border:1px solid #b5a5739c;box-shadow:0 3px 10px #0009;border-radius:13px;font-weight:800;font-size:12px;padding:12px 7px}
+          #buttons{position:absolute;right:max(12px,env(safe-area-inset-right));bottom:max(24px,env(safe-area-inset-bottom));
+           display:grid;grid-template-columns:73px 82px;gap:9px;align-items:end}
+          button{touch-action:manipulation;user-select:none;cursor:pointer;background:linear-gradient(140deg,#41534f,#1b292d);
+           color:#f7f0cf;border:1px solid #b5a5739c;box-shadow:0 3px 10px #0009;border-radius:13px;font-weight:800;font-size:12px;padding:12px 7px}
           button:active{transform:translateY(1px);filter:brightness(1.2)}
-          #attack{grid-row:1/3;grid-column:2;align-self:stretch;font-size:16px;border-radius:22px;background:radial-gradient(circle at 30% 25%,#9d5e44,#5a332b);border-color:#d6b27c}
+          #attack{grid-row:1/3;grid-column:2;align-self:stretch;font-size:16px;border-radius:22px;
+           background:radial-gradient(circle at 30% 25%,#9d5e44,#5a332b);border-color:#d6b27c}
           #auto.active{background:linear-gradient(150deg,#477456,#1c4230);border-color:#a0cc9b}
-          #reset{position:absolute;top:calc(91px + env(safe-area-inset-top));right:12px;padding:7px 10px;font-size:11px;background:#18282acc;border-color:#61736d88;z-index:2}
-          #footnote{position:absolute;bottom:calc(8px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);white-space:nowrap;font-size:10px;color:#f5f0cbb3;pointer-events:none;text-shadow:0 1px 3px #000;max-width:94vw;overflow:hidden}
+          #reset{position:absolute;top:calc(91px + env(safe-area-inset-top));right:12px;padding:7px 10px;font-size:11px;
+           background:#18282acc;border-color:#61736d88;z-index:2}
+          #footnote{position:absolute;bottom:calc(8px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);
+           white-space:nowrap;font-size:10px;color:#f5f0cbb3;pointer-events:none;text-shadow:0 1px 3px #000;max-width:94vw;overflow:hidden}
           @media(max-width:390px){#joystick{width:124px;height:124px}#stick{width:56px;height:56px}#buttons{grid-template-columns:62px 70px;gap:6px}button{font-size:11px;padding:9px 5px}#attack{font-size:13px}#footnote{display:none}}
           @media(max-height:440px){#top .panel{padding:5px 7px}#top strong{font-size:12px}#centerToast{top:55px}#joystick{width:117px;height:117px}#buttons{grid-template-columns:66px 75px}#footnote{display:none}}
           </style>
@@ -500,15 +419,11 @@ jobs:
             <div id="top">
               <div class="panel">
                 <strong>SANCTUARY OF ADEN</strong>
-                <small>원본 SPR · 모바일 플레이 테스트 V1</small>
+                <small>원본 SPR · 독립 플레이 테스트 V1</small>
                 <div id="hp"><div id="hpfill"></div></div>
                 <small id="hpnum">HP 100 / 100</small>
               </div>
-              <div class="panel">
-                <div id="counter">처치 0</div>
-                <small>몬스터 5 · 테스트 필드</small>
-                <small id="status">로딩 중...</small>
-              </div>
+              <div class="panel"><div id="counter">처치 0</div><small>몬스터 5 · 테스트 필드</small><small id="status">로딩 중...</small></div>
             </div>
             <div id="centerToast">준비 중...</div>
             <button id="reset" type="button">다시 시작</button>
@@ -518,578 +433,158 @@ jobs:
               <button id="attack" type="button">공격</button>
               <button id="potion" type="button">물약 × 10</button>
             </div>
-            <div id="footnote">원작 맵·모션·밸런스 미구현 · SPR 임시 매핑</div>
+            <div id="footnote">원작 맵·모션·밸런스 미구현 · 숫자 SPR ID 임시 매핑</div>
           </div>
           <script type="application/json" id="manifest">/*__MANIFEST_JSON__*/</script>
           <script>
           (()=>{'use strict';
-
           const META=JSON.parse(document.getElementById('manifest').textContent);
-          const el=id=>document.getElementById(id);
-          const canvas=el('screen');
-          const ctx=canvas.getContext('2d',{alpha:false});
-          const pad=el('joystick');
-          const stick=el('stick');
-
+          const el=id=>document.getElementById(id),canvas=el('screen'),ctx=canvas.getContext('2d',{alpha:false});
+          const pad=el('joystick'),stick=el('stick');
           const TILE_W=64,TILE_H=32,WORLD=21,MAX_HP=100;
-          const PLAYER_SPEED=2.85,MOB_SPEED=.73;
-
-          let dpr=1,sw=0,sh=0,cx=0,cy=0;
-          let auto=true,movement={x:0,y:0},pointerId=null;
-          let hero,mobs,score,potions,particles;
-          let toastUntil=0,lastTime=0,playable=false;
+          const PLAYER_SPEED=2.85, MOB_SPEED=.73;
+          let dpr=1,sw=0,sh=0,cx=0,cy=0,auto=true,movement={x:0,y:0},pointerId=null;
+          let hero,mobs,score,potions,particles,toastUntil=0,lastTime=0,playable=false;
           const sprites={hero:[],enemy:[]};
-
+          let loaded=0,expected=0;
           function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v))}
           function rand(a,b){return a+Math.random()*(b-a)}
-
-          function resize(){
-            dpr=Math.min(2,window.devicePixelRatio||1);
-            sw=canvas.clientWidth;
-            sh=canvas.clientHeight;
-            canvas.width=Math.max(1,Math.round(sw*dpr));
-            canvas.height=Math.max(1,Math.round(sh*dpr));
-            ctx.setTransform(dpr,0,0,dpr,0,0);
-            ctx.imageSmoothingEnabled=false;
+          function resize(){dpr=Math.min(2,window.devicePixelRatio||1);sw=canvas.clientWidth;sh=canvas.clientHeight;canvas.width=Math.max(1,Math.round(sw*dpr));canvas.height=Math.max(1,Math.round(sh*dpr));ctx.setTransform(dpr,0,0,dpr,0,0);ctx.imageSmoothingEnabled=false}
+          window.addEventListener('resize',resize);resize();
+          function toast(message,seconds=2){const t=el('centerToast');t.textContent=message;t.style.opacity='1';toastUntil=performance.now()+seconds*1000}
+          function spawn(id){const a=rand(0,Math.PI*2),r=rand(2.25,3.8);const x=clamp(hero.x+Math.cos(a)*r,2,WORLD-3),y=clamp(hero.y+Math.sin(a)*r,2,WORLD-3);return {id,x,y,hp:30,max:30,speed:MOB_SPEED*rand(.8,1.15),cd:rand(.3,1.8),dir:0,anim:rand(0,10),hurt:0,dead:false}}
+          function reset(){hero={x:WORLD/2,y:WORLD/2,hp:MAX_HP,cd:0,dir:0,anim:0,hurt:0,target:null};score=0;potions=10;particles=[];movement={x:0,y:0};mobs=Array.from({length:5},(_,i)=>spawn(i));syncHUD();toast('패드 이동 · 공격 · 자동 ON/OFF',2.7)}
+          function syncHUD(){el('hpfill').style.width=(hero.hp/MAX_HP*100)+'%';el('hpnum').textContent=`HP ${Math.ceil(hero.hp)} / ${MAX_HP}`;el('counter').textContent=`처치 ${score}`;el('potion').textContent=`물약 × ${potions}`;el('status').textContent=hero.hp>0?'전투 진행 중':'사망 · 다시 시작';}
+          function hit(amount,x,y,color='#ffc98c',heal=false){particles.push({x,y,text:(heal?'+':'-')+amount,color,ttl:.85});}
+          function nearest(radius){let chosen=null,d=radius;for(const m of mobs){if(m.dead)continue;let t=Math.hypot(hero.x-m.x,hero.y-m.y);if(t<d){d=t;chosen=m}}return chosen}
+          function strike(){if(hero.hp<=0||hero.cd>0)return;const target=nearest(1.65);hero.cd=.52;if(!target){toast('공격 거리 밖입니다',.6);return}target.hp-=11;target.hurt=.2;hit(11,target.x,target.y);if(target.hp<=0){target.dead=true;score++;setTimeout(()=>{if(hero&&hero.hp>0){let i=mobs.findIndex(m=>m.id===target.id);if(i!==-1&&mobs[i]===target)mobs[i]=spawn(target.id)}},2800);}syncHUD()}
+          function potion(){if(hero.hp<=0){toast('다시 시작을 눌러주세요');return}if(!potions){toast('물약이 없습니다');return}if(hero.hp===MAX_HP){toast('이미 HP가 가득합니다',.8);return}potions--;hero.hp=Math.min(MAX_HP,hero.hp+42);hit(42,hero.x,hero.y,'#9af7b3',true);syncHUD()}
+          function angleKey(vx,vy){const a=Math.atan2(vy,vx);return (Math.round((a+Math.PI)*4/Math.PI)+8)%8}
+          function update(dt){if(!playable||hero.hp<=0)return;
+           hero.cd=Math.max(0,hero.cd-dt);hero.hurt=Math.max(0,hero.hurt-dt);let sx=movement.x,sy=movement.y;
+           const keys=window.keys||{};if(keys.ArrowLeft||keys.a)sx-=1;if(keys.ArrowRight||keys.d)sx+=1;if(keys.ArrowUp||keys.w)sy-=1;if(keys.ArrowDown||keys.s)sy+=1;
+           if(sx===0&&sy===0&&hero.target){const t=hero.target;if(t.dead){hero.target=null}else{const dx=t.x-hero.x,dy=t.y-hero.y;const isoDX=(dx-dy)*TILE_W/2,isoDY=(dx+dy)*TILE_H/2;const dist=Math.hypot(dx,dy);if(dist>.85){sx=isoDX;sy=isoDY}else{hero.target=null}}}
+           const len=Math.hypot(sx,sy);if(len>.08){sx/=len;sy/=len;
+            let wx=sx/2+sy,wy=sy-sx/2;const wl=Math.hypot(wx,wy);wx/=wl;wy/=wl;
+            hero.x=clamp(hero.x+wx*dt*PLAYER_SPEED,.5,WORLD-.5);hero.y=clamp(hero.y+wy*dt*PLAYER_SPEED,.5,WORLD-.5);
+            hero.dir=angleKey(sx,sy);hero.anim+=dt*9;}
+           else hero.anim+=dt*2;
+           for(const m of mobs){if(m.dead)continue;m.cd=Math.max(0,m.cd-dt);m.hurt=Math.max(0,m.hurt-dt);
+            const dx=hero.x-m.x,dy=hero.y-m.y,dist=Math.hypot(dx,dy);
+            if(dist<5&&dist>1.05){m.x=clamp(m.x+dx/dist*dt*m.speed,.5,WORLD-.5);m.y=clamp(m.y+dy/dist*dt*m.speed,.5,WORLD-.5);m.anim+=dt*7; m.dir=angleKey((dx-dy)*TILE_W/2,(dx+dy)*TILE_H/2)}
+            else m.anim+=dt*1.5;
+            if(dist<1.25&&m.cd<=0){m.cd=1.35;hero.hp=Math.max(0,hero.hp-7);hero.hurt=.2;hit(7,hero.x,hero.y,'#f88e8e');syncHUD();if(hero.hp===0)toast('사망했습니다 · 다시 시작 버튼을 누르세요',5)}
+           }
+           if(auto&&hero.cd<=0&&nearest(1.6))strike();
+           for(const p of particles)p.ttl-=dt;particles=particles.filter(p=>p.ttl>0);
           }
-          window.addEventListener('resize',resize);
-          resize();
-
-          function toast(message,seconds=2){
-            const t=el('centerToast');
-            t.textContent=message;
-            t.style.opacity='1';
-            toastUntil=performance.now()+seconds*1000;
+          function iso(x,y){return {x:(x-y)*TILE_W/2,y:(x+y)*TILE_H/2}}
+          function pos(x,y){const p=iso(x,y);return {x:sw*.5+p.x-cx,y:sh*.47+p.y-cy}}
+          function drawGround(){ctx.fillStyle='#263e31';ctx.fillRect(0,0,sw,sh);
+           for(let x=0;x<WORLD;x++)for(let y=0;y<WORLD;y++){
+            const p=pos(x,y),a=TILE_W/2,b=TILE_H/2;
+            if(p.x<-a*2||p.x>sw+a*2||p.y<-b*2||p.y>sh+b*2)continue;
+            const hash=((x*92821+y*68917)^1271)>>>0;
+            ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(p.x+a,p.y+b);ctx.lineTo(p.x,p.y+2*b);ctx.lineTo(p.x-a,p.y+b);ctx.closePath();
+            let variation=hash%7;ctx.fillStyle=['#365745','#3a604c','#375948','#3c604c','#365c49','#3b5b49','#41634d'][variation];ctx.fill();
+            ctx.strokeStyle='rgba(15,33,29,.23)';ctx.lineWidth=1;ctx.stroke();
+            if(hash%11===0){ctx.fillStyle='#253e36';ctx.fillRect(p.x+(hash%17)-9,p.y+b+(hash%7),3,2)}
+            if(x===0||y===0||x===WORLD-1||y===WORLD-1){ctx.fillStyle='#8c7f6248';ctx.fill()}
+           }
           }
-
-          function spawn(id){
-            const a=rand(0,Math.PI*2),r=rand(2.25,3.8);
-            const x=clamp(hero.x+Math.cos(a)*r,2,WORLD-3);
-            const y=clamp(hero.y+Math.sin(a)*r,2,WORLD-3);
-            return {
-              id,x,y,hp:30,max:30,
-              speed:MOB_SPEED*rand(.8,1.15),
-              cd:rand(.3,1.8),dir:0,
-              anim:rand(0,10),hurt:0,dead:false
-            };
+          function drawActor(a,kind){if(a.dead)return;const p=pos(a.x,a.y);const frames=sprites[kind][a.dir]||sprites[kind][0]||[];
+           let i=0;if(frames.length)i=Math.floor(a.anim)%frames.length;
+           const img=frames[i];const bottom=p.y+TILE_H/2;
+           ctx.fillStyle='rgba(5,13,11,.4)';ctx.beginPath();ctx.ellipse(p.x,bottom+2,23,8,0,0,Math.PI*2);ctx.fill();
+           if(img&&img.complete&&img.naturalWidth){const w=img.naturalWidth,h=img.naturalHeight;const scale=1.08;
+            ctx.save();ctx.globalAlpha=a.hurt>0?(.55+.45*Math.abs(Math.sin(a.hurt*53))):1;
+            ctx.drawImage(img,Math.round(p.x-w*scale/2),Math.round(bottom-h*scale),w*scale,h*scale);ctx.restore();
+           }else{ctx.fillStyle=kind==='hero'?'#d4bd8c':'#cf8273';ctx.beginPath();ctx.arc(p.x,bottom-18,17,0,Math.PI*2);ctx.fill()}
+           const bw=kind==='hero'?42:34;
+           if(kind==='enemy'&&a.hp<a.max){ctx.fillStyle='#342a29';ctx.fillRect(p.x-bw/2,bottom-93,bw,4);ctx.fillStyle='#e66d65';ctx.fillRect(p.x-bw/2,bottom-93,bw*(a.hp/a.max),4)}
+           if(kind==='hero'){ctx.fillStyle='#ffefbd';ctx.textAlign='center';ctx.font='bold 11px system-ui';ctx.fillText('기사 [시범]',p.x,bottom-99)}
           }
-
-          function reset(){
-            hero={
-              x:WORLD/2,y:WORLD/2,
-              hp:MAX_HP,cd:0,dir:0,anim:0,
-              hurt:0,target:null
-            };
-            score=0;potions=10;particles=[];
-            movement={x:0,y:0};
-            mobs=Array.from({length:5},(_,i)=>spawn(i));
-            syncHUD();
-            toast('패드 이동 · 공격 · 자동 ON/OFF',2.7);
-          }
-
-          function syncHUD(){
-            el('hpfill').style.width=(hero.hp/MAX_HP*100)+'%';
-            el('hpnum').textContent=`HP ${Math.ceil(hero.hp)} / ${MAX_HP}`;
-            el('counter').textContent=`처치 ${score}`;
-            el('potion').textContent=`물약 × ${potions}`;
-            el('status').textContent=hero.hp>0?'전투 진행 중':'사망 · 다시 시작';
-          }
-
-          function hit(amount,x,y,color='#ffc98c',heal=false){
-            particles.push({
-              x,y,text:(heal?'+':'-')+amount,
-              color,ttl:.85
-            });
-          }
-
-          function nearest(radius){
-            let chosen=null,d=radius;
-            for(const m of mobs){
-              if(m.dead)continue;
-              const t=Math.hypot(hero.x-m.x,hero.y-m.y);
-              if(t<d){d=t;chosen=m}
-            }
-            return chosen;
-          }
-
-          function strike(){
-            if(hero.hp<=0||hero.cd>0)return;
-            const target=nearest(1.65);
-            hero.cd=.52;
-            if(!target){toast('공격 거리 밖입니다',.6);return}
-            target.hp-=11;
-            target.hurt=.2;
-            hit(11,target.x,target.y);
-            if(target.hp<=0){
-              target.dead=true;
-              score++;
-              setTimeout(()=>{
-                if(hero&&hero.hp>0){
-                  const i=mobs.findIndex(m=>m.id===target.id);
-                  if(i!==-1&&mobs[i]===target){
-                    mobs[i]=spawn(target.id);
-                  }
-                }
-              },2800);
-            }
-            syncHUD();
-          }
-
-          function potion(){
-            if(hero.hp<=0){toast('다시 시작을 눌러주세요');return}
-            if(!potions){toast('물약이 없습니다');return}
-            if(hero.hp===MAX_HP){toast('이미 HP가 가득합니다',.8);return}
-            potions--;
-            hero.hp=Math.min(MAX_HP,hero.hp+42);
-            hit(42,hero.x,hero.y,'#9af7b3',true);
-            syncHUD();
-          }
-
-          function angleKey(vx,vy){
-            const a=Math.atan2(vy,vx);
-            return (Math.round((a+Math.PI)*4/Math.PI)+8)%8;
-          }
-
-          function update(dt){
-            if(!playable||hero.hp<=0)return;
-
-            hero.cd=Math.max(0,hero.cd-dt);
-            hero.hurt=Math.max(0,hero.hurt-dt);
-
-            let sx=movement.x,sy=movement.y;
-            const keys=window.keys||{};
-
-            if(keys.ArrowLeft||keys.a)sx-=1;
-            if(keys.ArrowRight||keys.d)sx+=1;
-            if(keys.ArrowUp||keys.w)sy-=1;
-            if(keys.ArrowDown||keys.s)sy+=1;
-
-            if(sx===0&&sy===0&&hero.target){
-              const t=hero.target;
-              if(t.dead){
-                hero.target=null;
-              }else{
-                const dx=t.x-hero.x,dy=t.y-hero.y;
-                const isoDX=(dx-dy)*TILE_W/2;
-                const isoDY=(dx+dy)*TILE_H/2;
-                const dist=Math.hypot(dx,dy);
-                if(dist>.85){sx=isoDX;sy=isoDY}
-                else hero.target=null;
-              }
-            }
-
-            const len=Math.hypot(sx,sy);
-
-            if(len>.08){
-              sx/=len;sy/=len;
-              let wx=sx/2+sy,wy=sy-sx/2;
-              const wl=Math.hypot(wx,wy);
-              wx/=wl;wy/=wl;
-              hero.x=clamp(hero.x+wx*dt*PLAYER_SPEED,.5,WORLD-.5);
-              hero.y=clamp(hero.y+wy*dt*PLAYER_SPEED,.5,WORLD-.5);
-              hero.dir=angleKey(sx,sy);
-              hero.anim+=dt*9;
-            }else hero.anim+=dt*2;
-
-            for(const m of mobs){
-              if(m.dead)continue;
-              m.cd=Math.max(0,m.cd-dt);
-              m.hurt=Math.max(0,m.hurt-dt);
-
-              const dx=hero.x-m.x,dy=hero.y-m.y;
-              const dist=Math.hypot(dx,dy);
-
-              if(dist<5&&dist>1.05){
-                m.x=clamp(m.x+dx/dist*dt*m.speed,.5,WORLD-.5);
-                m.y=clamp(m.y+dy/dist*dt*m.speed,.5,WORLD-.5);
-                m.anim+=dt*7;
-                m.dir=angleKey(
-                  (dx-dy)*TILE_W/2,
-                  (dx+dy)*TILE_H/2
-                );
-              }else m.anim+=dt*1.5;
-
-              if(dist<1.25&&m.cd<=0){
-                m.cd=1.35;
-                hero.hp=Math.max(0,hero.hp-7);
-                hero.hurt=.2;
-                hit(7,hero.x,hero.y,'#f88e8e');
-                syncHUD();
-                if(hero.hp===0){
-                  toast('사망했습니다 · 다시 시작 버튼을 누르세요',5);
-                }
-              }
-            }
-
-            if(auto&&hero.cd<=0&&nearest(1.6))strike();
-            for(const p of particles)p.ttl-=dt;
-            particles=particles.filter(p=>p.ttl>0);
-          }
-
-          function iso(x,y){
-            return {x:(x-y)*TILE_W/2,y:(x+y)*TILE_H/2};
-          }
-
-          function pos(x,y){
-            const p=iso(x,y);
-            return {x:sw*.5+p.x-cx,y:sh*.47+p.y-cy};
-          }
-
-          function drawGround(){
-            ctx.fillStyle='#263e31';
-            ctx.fillRect(0,0,sw,sh);
-
-            for(let x=0;x<WORLD;x++){
-              for(let y=0;y<WORLD;y++){
-                const p=pos(x,y),a=TILE_W/2,b=TILE_H/2;
-                if(p.x<-a*2||p.x>sw+a*2||p.y<-b*2||p.y>sh+b*2)continue;
-
-                const hash=((x*92821+y*68917)^1271)>>>0;
-                ctx.beginPath();
-                ctx.moveTo(p.x,p.y);
-                ctx.lineTo(p.x+a,p.y+b);
-                ctx.lineTo(p.x,p.y+2*b);
-                ctx.lineTo(p.x-a,p.y+b);
-                ctx.closePath();
-
-                const variation=hash%7;
-                ctx.fillStyle=[
-                  '#365745','#3a604c','#375948','#3c604c',
-                  '#365c49','#3b5b49','#41634d'
-                ][variation];
-                ctx.fill();
-                ctx.strokeStyle='rgba(15,33,29,.23)';
-                ctx.lineWidth=1;
-                ctx.stroke();
-              }
-            }
-          }
-
-          function drawActor(a,kind){
-            if(a.dead)return;
-
-            const p=pos(a.x,a.y);
-            const frames=sprites[kind][a.dir]||sprites[kind][0]||[];
-            const i=frames.length?Math.floor(a.anim)%frames.length:0;
-            const img=frames[i];
-            const bottom=p.y+TILE_H/2;
-
-            ctx.fillStyle='rgba(5,13,11,.4)';
-            ctx.beginPath();
-            ctx.ellipse(p.x,bottom+2,23,8,0,0,Math.PI*2);
-            ctx.fill();
-
-            if(img&&img.complete&&img.naturalWidth){
-              const w=img.naturalWidth,h=img.naturalHeight;
-              const scale=1.08;
-              ctx.save();
-              ctx.globalAlpha=a.hurt>0
-                ?(.55+.45*Math.abs(Math.sin(a.hurt*53))):1;
-              ctx.drawImage(
-                img,
-                Math.round(p.x-w*scale/2),
-                Math.round(bottom-h*scale),
-                w*scale,h*scale
-              );
-              ctx.restore();
-            }else{
-              ctx.fillStyle=kind==='hero'?'#d4bd8c':'#cf8273';
-              ctx.beginPath();
-              ctx.arc(p.x,bottom-18,17,0,Math.PI*2);
-              ctx.fill();
-            }
-
-            const bw=kind==='hero'?42:34;
-
-            if(kind==='enemy'&&a.hp<a.max){
-              ctx.fillStyle='#342a29';
-              ctx.fillRect(p.x-bw/2,bottom-93,bw,4);
-              ctx.fillStyle='#e66d65';
-              ctx.fillRect(
-                p.x-bw/2,bottom-93,bw*(a.hp/a.max),4
-              );
-            }
-
-            if(kind==='hero'){
-              ctx.fillStyle='#ffefbd';
-              ctx.textAlign='center';
-              ctx.font='bold 11px system-ui';
-              ctx.fillText('캐릭터 [시범]',p.x,bottom-99);
-            }
-          }
-
-          function render(ts){
-            if(!lastTime)lastTime=ts;
-            const dt=Math.min(.05,(ts-lastTime)/1000);
-            lastTime=ts;
-            update(dt);
-
-            ctx.setTransform(dpr,0,0,dpr,0,0);
-            ctx.imageSmoothingEnabled=false;
-
-            if(hero){
-              const camera=iso(hero.x,hero.y);
-              cx=camera.x;cy=camera.y;
-              drawGround();
-
-              const units=[
-                ...mobs.filter(x=>!x.dead).map(v=>({v,kind:'enemy'})),
-                {v:hero,kind:'hero'}
-              ];
-              units.sort(
-                (a,b)=>(a.v.x+a.v.y)-(b.v.x+b.v.y)
-              );
-              for(const u of units)drawActor(u.v,u.kind);
-
-              for(const part of particles){
-                const p=pos(part.x,part.y);
-                ctx.save();
-                ctx.globalAlpha=clamp(part.ttl/.6,0,1);
-                ctx.textAlign='center';
-                ctx.font='bold 17px system-ui';
-                ctx.fillStyle=part.color;
-                ctx.strokeStyle='#121a17';
-                ctx.lineWidth=3;
-                const y=p.y-46+(1-part.ttl)*38;
-                ctx.strokeText(part.text,p.x,y);
-                ctx.fillText(part.text,p.x,y);
-                ctx.restore();
-              }
-
-              if(hero.hp<=0){
-                ctx.fillStyle='#050b0bc4';
-                ctx.fillRect(0,0,sw,sh);
-                ctx.textAlign='center';
-                ctx.fillStyle='#fff0dc';
-                ctx.font='bold 30px system-ui';
-                ctx.fillText('전투 불능',sw/2,sh/2);
-                ctx.font='15px system-ui';
-                ctx.fillText(
-                  '다시 시작 버튼을 누르세요',
-                  sw/2,sh/2+33
-                );
-              }
-            }
-
-            if(ts>toastUntil){
-              el('centerToast').style.opacity='0';
-            }
-            requestAnimationFrame(render);
-          }
-
-          function padInput(e){
-            const r=pad.getBoundingClientRect();
-            const a=r.width/2,b=r.height/2;
-            let x=e.clientX-r.left-a,y=e.clientY-r.top-b;
-            const l=Math.hypot(x,y);
-            const radius=a*.56;
-            if(l>radius){
-              x=x*radius/l;
-              y=y*radius/l;
-            }
-            stick.style.left=(a+x)+'px';
-            stick.style.top=(b+y)+'px';
-            movement.x=x/radius;
-            movement.y=y/radius;
-            hero.target=null;
-          }
-
-          pad.addEventListener('pointerdown',e=>{
-            if(!playable)return;
-            pointerId=e.pointerId;
-            pad.setPointerCapture(pointerId);
-            padInput(e);
-            e.preventDefault();
+          function render(ts){if(!lastTime)lastTime=ts;const dt=Math.min(.05,(ts-lastTime)/1000);lastTime=ts;
+           update(dt);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.imageSmoothingEnabled=false;
+           if(hero){const camera=iso(hero.x,hero.y);cx=camera.x;cy=camera.y;drawGround();
+            const units=[...mobs.filter(x=>!x.dead).map(v=>({v,kind:'enemy'})),{v:hero,kind:'hero'}];units.sort((a,b)=>(a.v.x+a.v.y)-(b.v.x+b.v.y));for(const u of units)drawActor(u.v,u.kind);
+            for(const part of particles){const p=pos(part.x,part.y);ctx.save();ctx.globalAlpha=clamp(part.ttl/.6,0,1);ctx.textAlign='center';ctx.font='bold 17px system-ui';ctx.fillStyle=part.color;ctx.strokeStyle='#121a17';ctx.lineWidth=3;const y=p.y-46+(1-part.ttl)*38;ctx.strokeText(part.text,p.x,y);ctx.fillText(part.text,p.x,y);ctx.restore()}
+            if(hero.hp<=0){ctx.fillStyle='#050b0bc4';ctx.fillRect(0,0,sw,sh);ctx.textAlign='center';ctx.fillStyle='#fff0dc';ctx.font='bold 30px system-ui';ctx.fillText('전투 불능',sw/2,sh/2);ctx.font='15px system-ui';ctx.fillText('다시 시작 버튼을 누르세요',sw/2,sh/2+33)}
+           }
+           if(ts>toastUntil)el('centerToast').style.opacity='0';requestAnimationFrame(render)}
+          function padInput(e){const r=pad.getBoundingClientRect();const a=r.width/2,b=r.height/2;let x=e.clientX-r.left-a,y=e.clientY-r.top-b;const l=Math.hypot(x,y);const radius=a*.56;if(l>radius){x=x*radius/l;y=y*radius/l}stick.style.left=(a+x)+'px';stick.style.top=(b+y)+'px';movement.x=x/radius;movement.y=y/radius;hero.target=null}
+          pad.addEventListener('pointerdown',e=>{if(!playable)return;pointerId=e.pointerId;pad.setPointerCapture(pointerId);padInput(e);e.preventDefault()});
+          pad.addEventListener('pointermove',e=>{if(e.pointerId===pointerId){padInput(e);e.preventDefault()}});
+          function padRelease(e){if(e.pointerId===pointerId){pointerId=null;stick.style.left='50%';stick.style.top='50%';movement={x:0,y:0}}}
+          pad.addEventListener('pointerup',padRelease);pad.addEventListener('pointercancel',padRelease);
+          el('attack').addEventListener('pointerdown',e=>{e.preventDefault();strike()});
+          el('potion').addEventListener('click',potion);el('reset').addEventListener('click',reset);
+          el('auto').addEventListener('click',()=>{auto=!auto;const b=el('auto');b.textContent=auto?'자동 ON':'자동 OFF';b.classList.toggle('active',auto);b.setAttribute('aria-pressed',String(auto));toast(auto?'자동공격 켜짐':'자동공격 꺼짐',.8)});
+          window.keys={};window.addEventListener('keydown',e=>{window.keys[e.key]=true;if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key))e.preventDefault();if(e.key===' '&&!e.repeat)strike();if(e.key.toLowerCase()==='p'&&!e.repeat)potion()});window.addEventListener('keyup',e=>{window.keys[e.key]=false});
+          canvas.addEventListener('pointerdown',e=>{if(!playable||hero.hp<=0)return;const r=canvas.getBoundingClientRect();const px=e.clientX-r.left,py=e.clientY-r.top;
+           const worldX=(px-sw*.5+cx)/(TILE_W/2),worldY=(py-sh*.47+cy)/(TILE_H/2);
+           const targetX=(worldX+worldY)/2,targetY=(worldY-worldX)/2;
+           const enemy=mobs.filter(m=>!m.dead).sort((a,b)=>Math.hypot(a.x-targetX,a.y-targetY)-Math.hypot(b.x-targetX,b.y-targetY))[0];
+           if(enemy&&Math.hypot(enemy.x-targetX,enemy.y-targetY)<1.25){hero.target=enemy;toast('몬스터 선택 · 접근 중',.8)}else{hero.target={x:clamp(targetX,.5,WORLD-.5),y:clamp(targetY,.5,WORLD-.5),hp:1,dead:false};toast('지점 이동',.5)};
           });
-
-          pad.addEventListener('pointermove',e=>{
-            if(e.pointerId===pointerId){
-              padInput(e);
-              e.preventDefault();
-            }
-          });
-
-          function padRelease(e){
-            if(e.pointerId===pointerId){
-              pointerId=null;
-              stick.style.left='50%';
-              stick.style.top='50%';
-              movement={x:0,y:0};
-            }
-          }
-
-          pad.addEventListener('pointerup',padRelease);
-          pad.addEventListener('pointercancel',padRelease);
-
-          el('attack').addEventListener('pointerdown',e=>{
-            e.preventDefault();
-            strike();
-          });
-          el('potion').addEventListener('click',potion);
-          el('reset').addEventListener('click',reset);
-
-          el('auto').addEventListener('click',()=>{
-            auto=!auto;
-            const b=el('auto');
-            b.textContent=auto?'자동 ON':'자동 OFF';
-            b.classList.toggle('active',auto);
-            b.setAttribute('aria-pressed',String(auto));
-            toast(auto?'자동공격 켜짐':'자동공격 꺼짐',.8);
-          });
-
-          window.keys={};
-          window.addEventListener('keydown',e=>{
-            window.keys[e.key]=true;
-            if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)){
-              e.preventDefault();
-            }
-            if(e.key===' '&&!e.repeat)strike();
-            if(e.key.toLowerCase()==='p'&&!e.repeat)potion();
-          });
-          window.addEventListener('keyup',e=>{
-            window.keys[e.key]=false;
-          });
-
-          canvas.addEventListener('pointerdown',e=>{
-            if(!playable||hero.hp<=0)return;
-
-            const r=canvas.getBoundingClientRect();
-            const px=e.clientX-r.left,py=e.clientY-r.top;
-            const wx=(px-sw*.5+cx)/(TILE_W/2);
-            const wy=(py-sh*.47+cy)/(TILE_H/2);
-            const targetX=(wx+wy)/2;
-            const targetY=(wy-wx)/2;
-
-            const enemy=mobs
-              .filter(m=>!m.dead)
-              .sort((a,b)=>
-                Math.hypot(a.x-targetX,a.y-targetY)-
-                Math.hypot(b.x-targetX,b.y-targetY)
-              )[0];
-
-            if(enemy&&Math.hypot(enemy.x-targetX,enemy.y-targetY)<1.25){
-              hero.target=enemy;
-              toast('몬스터 선택 · 접근 중',.8);
-            }else{
-              hero.target={
-                x:clamp(targetX,.5,WORLD-.5),
-                y:clamp(targetY,.5,WORLD-.5),
-                hp:1,dead:false
-              };
-              toast('지점 이동',.5);
-            }
-          });
-
-          let loaded=0,expected=0;
-
-          for(const kind of ['hero','enemy']){
-            for(const files of META.actors[kind].directions){
-              const frames=[];
-              for(const src of files){
-                const im=new Image();
-                im.src=src;
-                frames.push(im);
-                expected++;
-                im.onload=()=>{
-                  loaded++;
-                  el('status').textContent=`원본 SPR ${loaded}/${expected}`;
-                };
-                im.onerror=()=>{
-                  loaded++;
-                  console.warn('Missing image',src);
-                };
-              }
-              sprites[kind].push(frames);
-            }
-          }
-
-          reset();
-          playable=true;
-          el('status').textContent=`원본 SPR ${expected}장`;
-          requestAnimationFrame(render);
+          let n=0;for(const kind of ['hero','enemy'])for(const files of META.actors[kind].directions){const frames=[];for(const src of files){const im=new Image();im.src=src;frames.push(im);n++;im.onload=()=>{loaded++;el('status').textContent=`원본 SPR ${loaded}/${n}`};im.onerror=()=>{loaded++;console.warn('Missing image',src)};}sprites[kind].push(frames)}expected=n;
+          reset();playable=true;el('status').textContent=`원본 SPR ${expected}장`;requestAnimationFrame(render);
           })();
           </script>
           </body>
           </html>
           HTML_GAME
-
           python src/builder.py \
-            --idx client/Sprite.idx \
-            --pak client/Sprite.pak \
+            --idx "$SPR_IDX" \
+            --pak "$SPR_PAK" \
             --template src/index.template.html \
             --output dist/sanctuary-mobile
 
-      - name: Validate mobile build
+      - name: Validate the playable build without altering any other site
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY_CHECK'
           from pathlib import Path
           import json
-
           root = Path('dist/sanctuary-mobile')
-          data = json.loads(
-              (root / 'manifest.json').read_text(encoding='utf-8')
-          )
-          html = (root / 'index.html').read_text(
-              encoding='utf-8'
-          )
-
-          if '<canvas id="screen"' not in html:
-              raise SystemExit('Game canvas missing')
-
-          if '자동 ON' not in html:
-              raise SystemExit('Mobile controls missing')
-
+          data = json.loads((root/'manifest.json').read_text(encoding='utf-8'))
+          html = (root/'index.html').read_text(encoding='utf-8')
+          if '<canvas id="screen"' not in html or '자동 ON' not in html:
+              raise SystemExit('Mobile gameplay controls missing')
           if '/*__MANIFEST_JSON__*/' in html:
-              raise SystemExit('Manifest replacement failed')
-
-          png = sorted((root / 'assets').glob('*.png'))
-
-          expected = sum(
-              len(frames)
-              for actor in data['actors'].values()
-              for frames in actor['directions']
-          )
-
+              raise SystemExit('Manifest was not inserted in HTML')
+          png = sorted((root/'assets').glob('*.png'))
+          expected = sum(len(frames) for a in data['actors'].values() for frames in a['directions'])
           if len(png) != expected or expected < 32:
-              raise SystemExit(
-                  f'Incomplete SPR extraction: {len(png)} / {expected}'
-              )
-
-          if any(p.stat().st_size < 80 for p in png):
-              raise SystemExit('Broken sprite PNG')
-
-          print('MOBILE BUILD VERIFIED')
-          print('REAL SPR PNG FRAMES:', len(png))
+              raise SystemExit(f'Incomplete SPR frame extraction: {len(png)} of {expected}')
+          if any(not p.is_file() or p.stat().st_size < 80 for p in png):
+              raise SystemExit('Broken sprite PNG output')
+          print('Stand-alone mobile prototype successfully packaged:',len(png),'real SPR PNG frames')
           PY_CHECK
-
           {
-            echo '## Sanctuary of Aden Mobile Web V1'
+            echo '## Sanctuary of Aden - independent mobile prototype'
             echo ''
-            echo 'Standalone mobile gameplay prototype generated.'
-            echo 'Original SPR assets were decoded to PNG.'
-            echo 'Existing SLKnight workflow and GitHub Pages were not modified.'
-            echo 'Download Sanctuary-Mobile-Web-V1 from workflow artifacts.'
-            echo 'Original monster identities and motion sequences remain unverified.'
+            echo 'This workflow builds from build-web.yml without modifying SLKnight or deploying to GitHub Pages.'
+            echo 'Download the `Sanctuary-Mobile-Standalone-V1` artifact to obtain the web game.'
+            echo 'SPR keys 0..7 are provisional; maps, labels, action sequences, and balance are not a verified original-game port.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload mobile playable build
+      - name: Upload isolated mobile HTML5 package
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-Web-V1
+          name: Sanctuary-Mobile-Standalone-V1
           path: dist/sanctuary-mobile/
           if-no-files-found: error
           retention-days: 30
           compression-level: 6
 
-      - name: Upload diagnostic logs
+      - name: Upload diagnostic logs if extraction fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-Web-V1-Diagnostics
+          name: Sanctuary-Mobile-Standalone-V1-Diagnostics
           path: reports/
           if-no-files-found: ignore
           retention-days: 14
