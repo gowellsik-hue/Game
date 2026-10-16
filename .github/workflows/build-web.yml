@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Mobile V3 Motion Lab
+name: Sanctuary of Aden Mobile V4 Real S32 Map
 
 on:
   push:
@@ -12,12 +12,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: sanctuary-mobile-v3
+  group: sanctuary-mobile-v4
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build original SPR motion lab and playable mobile preview
+    name: Build original Map 4 and SPR motion lab
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -30,8 +30,7 @@ jobs:
           sudo apt-get install -y -qq zip unzip p7zip-full
           mkdir -p downloads client src reports dist/mobile
           df -h .
-
-      - name: Download verified 46 archive pieces
+      - name: Download 46 original archive pieces
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,63 +39,78 @@ jobs:
           gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern 'Sanctuary.of.Aden.-.Copy.*' --dir downloads
           python3 - <<'PY_PARTS'
           from pathlib import Path
-          base = Path('downloads')
-          parts = [base / f'Sanctuary.of.Aden.-.Copy.z{i:02d}' for i in range(1, 46)]
-          parts.append(base / 'Sanctuary.of.Aden.-.Copy.zip')
+          base=Path('downloads')
+          parts=[base / f'Sanctuary.of.Aden.-.Copy.z{i:02d}' for i in range(1,46)]
+          parts.append(base/'Sanctuary.of.Aden.-.Copy.zip')
           if any(not p.is_file() for p in parts):
-              raise SystemExit('Original archive is incomplete')
-          if any(p.stat().st_size != 100000000 for p in parts[:-1]):
-              raise SystemExit('One of the 45 segments has unexpected size')
-          if parts[-1].stat().st_size <= 0:
-              raise SystemExit('Final ZIP segment is empty')
-          print('Verified original archive:', len(parts), 'pieces')
+              raise SystemExit('Original archive is missing a segment')
+          if any(p.stat().st_size!=100000000 for p in parts[:-1]):
+              raise SystemExit('Split segment file size mismatch')
+          if parts[-1].stat().st_size<=0:
+              raise SystemExit('Final archive part is empty')
+          print('All original pieces verified:',len(parts))
           PY_PARTS
-
-      - name: Restore Sprite.idx and Sprite.pak
+      - name: Restore Sprite, Tile, and nine original Aden map blocks
         shell: bash
         run: |
           set -euo pipefail
-          if ! zip -s 0 downloads/Sanctuary.of.Aden.-.Copy.zip --out joined.zip > reports/reconstruct.log 2>&1; then
-            tail -n 60 reports/reconstruct.log
+          if ! zip -s 0 downloads/Sanctuary.of.Aden.-.Copy.zip --out joined.zip > reports/reconstruction.log 2>&1; then
+            tail -n 80 reports/reconstruction.log
             exit 1
           fi
           test -s joined.zip
           rm -rf downloads
-          if ! 7z x joined.zip -oclient -y '-ir!Sprite.idx' '-ir!Sprite.pak' > reports/extract.log 2>&1; then
-            tail -n 80 reports/extract.log
+          if ! 7z x joined.zip -oclient -y '-ir!Sprite.idx' '-ir!Sprite.pak' '-ir!Tile.idx' '-ir!Tile.pak' > reports/pak_extraction.log 2>&1; then
+            tail -n 100 reports/pak_extraction.log
             exit 1
           fi
-          rm -f joined.zip
-          python3 - <<'PY_PATH'
+          python3 - <<'PY_EXTRACT_MAP'
           from pathlib import Path
+          import zipfile
+          with zipfile.ZipFile('joined.zip') as archive:
+              prefix='Sanctuary of Aden - Copy/map/4/'
+              names=[prefix+f'{x:04x}{y:04x}.s32' for x in range(0x8004,0x8007) for y in range(0x8008,0x800b)]
+              index={i.filename:i for i in archive.infolist()}
+              for name in names:
+                  if name not in index or not 32768+16384<=index[name].file_size<=1000000:
+                      raise SystemExit('Original Map 4 S32 is missing or invalid: '+name)
+                  archive.extract(name,'client')
+          print('Nine verified original Aden Map 4 S32 blocks extracted')
+          PY_EXTRACT_MAP
+          rm -f joined.zip
+          python3 - <<'PY_PATHS'
           import os
-          paths = sorted(Path('client').rglob('Sprite.idx'))
-          if len(paths) != 1:
-              raise SystemExit(f'Unexpected Sprite.idx count: {len(paths)}')
-          idx = paths[0]
-          pak = idx.with_suffix('.pak')
-          if not pak.is_file() or not pak.stat().st_size:
-              raise SystemExit(f'Sprite.pak unavailable: {pak}')
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-              env.write(f'SPR_IDX={idx.resolve()}\n')
-              env.write(f'SPR_PAK={pak.resolve()}\n')
-          print('IDX:', idx, idx.stat().st_size)
-          print('PAK:', pak, pak.stat().st_size)
-          PY_PATH
+          from pathlib import Path
+          matches=sorted(Path('client').rglob('Sprite.idx'))
+          if len(matches)!=1:
+              raise SystemExit(f'Expected unique Sprite.idx, found {len(matches)}')
+          base=matches[0].parent
+          paths={
+              'SPR_IDX':base/'Sprite.idx',
+              'SPR_PAK':base/'Sprite.pak',
+              'TILE_IDX':base/'Tile.idx',
+              'TILE_PAK':base/'Tile.pak',
+              'MAP_DIR':base/'map'/'4'
+          }
+          for key,p in paths.items():
+              if not p.exists() or (p.is_file() and p.stat().st_size<=0):
+                  raise SystemExit('Missing source '+key+': '+str(p))
+          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as e:
+              for key,p in paths.items():
+                  e.write(f'{key}={p.resolve()}\n')
+          print('Sprite, Tile, and map resource paths validated')
+          PY_PATHS
           df -h .
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install PNG conversion library
+      - name: Install image conversion dependency
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check 'Pillow==11.3.0'
-
-      - name: Convert action-key catalog and build mobile motion lab
+      - name: Build mobile game with authentic S32 collision
         shell: bash
         run: |
           set -euo pipefail
@@ -347,13 +361,224 @@ jobs:
                   parser.error('Use --idx and --pak or --sample-zip')
               build(opt)
           PY_BUILDER
+          cat > src/map_builder.py <<'PY_MAP'
+          import argparse
+          import collections
+          import json
+          import re
+          import struct
+          from pathlib import Path
+
+          FILES = [f'{x:04x}{y:04x}.s32' for x in range(0x8004, 0x8007) for y in range(0x8008, 0x800b)]
+          ORIGIN_X = 32767 + (0x8004 - 0x7fff) * 64 - 63
+          ORIGIN_Y = 32767 + (0x8008 - 0x7fff) * 64 - 63
+          SIZE = 192
+
+          def s32(file, block_x, block_y):
+              raw = Path(file).read_bytes()
+              if len(raw) < 32768 + 2 + 16384 + 4:
+                  raise ValueError('Truncated S32: ' + str(file))
+              l2_count = struct.unpack_from('<H', raw, 32768)[0]
+              offset3 = 32768 + 2 + l2_count * 6
+              if offset3 + 16384 + 4 > len(raw):
+                  raise ValueError('Layer3 outside S32: ' + str(file))
+              first = memoryview(raw)[:32768]
+              attributes = struct.unpack_from('<8192h', raw, offset3)
+              groups = struct.unpack_from('<I', raw, offset3 + 16384)[0]
+              if groups > 100000:
+                  raise ValueError('Unexpected S32 Layer4 groups')
+              x0 = 32767 + (block_x - 0x7fff) * 64 - 63
+              y0 = 32767 + (block_y - 0x7fff) * 64 - 63
+              for iy in range(64):
+                  for ix in range(64):
+                      cell = iy * 64 + ix
+                      l1 = (iy * 128 + ix * 2) * 4
+                      ind_a, tile_a, unused_a = struct.unpack_from('<BHB', first, l1)
+                      ind_b, tile_b, unused_b = struct.unpack_from('<BHB', first, l1 + 4)
+                      a1, a2 = attributes[cell * 2:cell * 2 + 2]
+                      yield (x0 + ix, y0 + iy, a1, a2, tile_a * 256 + ind_a, tile_b * 256 + ind_b)
+
+          def tile_index(idx):
+              b = Path(idx).read_bytes()
+              if len(b) < 4:
+                  raise ValueError('Tile.idx missing')
+              n = struct.unpack_from('<I', b)[0]
+              if len(b) != 4 + n * 28:
+                  raise ValueError('Tile.idx count and length differ')
+              out = {}
+              for i in range(n):
+                  p = 4 + i * 28
+                  try:
+                      name = b[p + 4:p + 24].split(b'\x00', 1)[0].decode('ascii').lower()
+                  except UnicodeDecodeError:
+                      continue
+                  m = re.fullmatch(r'(\d+)\.til', name)
+                  if m:
+                      out[int(m[1])] = (struct.unpack_from('<I', b, p)[0], struct.unpack_from('<I', b, p + 24)[0])
+              return out
+
+          def sampled_color(block):
+              if not block:
+                  return '#385746'
+              count = 0
+              r = g = b = 0
+              for k in range(0, len(block) - 1, 2):
+                  val = block[k] | (block[k + 1] << 8)
+                  if val in (0, 32768, 65535):
+                      continue
+                  r += (val >> 10 & 31) * 255 // 31
+                  g += (val >> 5 & 31) * 255 // 31
+                  b += (val & 31) * 255 // 31
+                  count += 1
+              if not count:
+                  return '#385746'
+              rr, gg, bb = r // count, g // count, b // count
+              return f'#{rr:02x}{gg:02x}{bb:02x}'
+
+          def colors(source, idx_path, pak_path):
+              index = tile_index(idx_path)
+              by_tile = collections.defaultdict(set)
+              for packed in source:
+                  by_tile[packed >> 8].add(packed & 255)
+              used = {}
+              missing = []
+              with Path(pak_path).open('rb') as pak:
+                  max_size = Path(pak_path).stat().st_size
+                  for tile_id, indexes in by_tile.items():
+                      info = index.get(tile_id)
+                      if not info:
+                          missing.extend(tile_id * 256 + n for n in indexes)
+                          continue
+                      off, size = info
+                      if not (size >= 16 and off >= 0 and off + size <= max_size and size < 4 * 1024 * 1024):
+                          missing.extend(tile_id * 256 + n for n in indexes)
+                          continue
+                      pak.seek(off)
+                      raw = pak.read(size)
+                      n = struct.unpack_from('<I', raw)[0]
+                      if n <= 0 or n > 10000 or len(raw) < 4 + n * 4:
+                          missing.extend(tile_id * 256 + m for m in indexes)
+                          continue
+                      offsets = struct.unpack_from('<' + 'I' * n, raw, 4)
+                      base = 4 + n * 4
+                      for key in indexes:
+                          packed = tile_id * 256 + key
+                          if key >= n:
+                              missing.append(packed)
+                              continue
+                          a = base + offsets[key]
+                          b = base + (offsets[key + 1] if key + 1 < n else len(raw) - base)
+                          if a < base or b > len(raw) or b <= a:
+                              missing.append(packed)
+                              continue
+                          used[str(packed)] = sampled_color(raw[a:b])
+              return used, missing
+
+          def closest_spawn(origin, flags, width):
+              for distance in range(0, 32):
+                  for dy in range(-distance, distance + 1):
+                      for dx in range(-distance, distance + 1):
+                          if max(abs(dx), abs(dy)) != distance:
+                              continue
+                          x = origin[0] + dx
+                          y = origin[1] + dy
+                          a, b = x - ORIGIN_X, y - ORIGIN_Y
+                          if a < 0 or b < 0 or a >= width or b >= width:
+                              continue
+                          value = flags[b * width + a]
+                          if not (value & 1) and not (value & 4):
+                              return [x, y]
+              raise ValueError('No traversable combat-zone spawn nearby')
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--map-dir', required=True, type=Path)
+              parser.add_argument('--tile-idx', required=True, type=Path)
+              parser.add_argument('--tile-pak', required=True, type=Path)
+              parser.add_argument('--output', required=True, type=Path)
+              args = parser.parse_args()
+              if not args.output.is_file():
+                  raise ValueError('Sprite builder must run first')
+              data = json.loads(args.output.read_text(encoding='utf-8'))
+              flags = [255] * (SIZE * SIZE)
+              floor_a = [0] * (SIZE * SIZE)
+              floor_b = [0] * (SIZE * SIZE)
+              original_ids = set()
+              records = []
+              for filename in FILES:
+                  file = args.map_dir / filename
+                  if not file.is_file():
+                      raise FileNotFoundError('Missing original Aden S32: ' + str(file))
+                  bx, by = int(filename[:4], 16), int(filename[4:8], 16)
+                  for x, y, a1, a2, pa, pb in s32(file, bx, by):
+                      ix = x - ORIGIN_X
+                      iy = y - ORIGIN_Y
+                      if not (0 <= ix < SIZE and 0 <= iy < SIZE):
+                          raise ValueError('Source map coordinates outside selected window')
+                      key = iy * SIZE + ix
+                      if flags[key] != 255:
+                          raise ValueError('Overlapping S32 map cells')
+                      flags[key] = a1 & 255
+                      floor_a[key] = pa
+                      floor_b[key] = pb
+                      original_ids.add(pa)
+                      original_ids.add(pb)
+                  records.append(filename)
+              if any(a == 255 for a in flags):
+                  raise ValueError('Incomplete S32 map grid')
+              palette, missing = colors(original_ids, args.tile_idx, args.tile_pak)
+              spawn = closest_spawn((33130, 33390), flags, SIZE)
+              world = {
+                  'id': 4, 'region': 'Aden / Silver Knight region',
+                  'origin': [ORIGIN_X, ORIGIN_Y], 'size': [SIZE, SIZE],
+                  'spawn': spawn, 'flags': flags,
+                  'floorA': floor_a, 'floorB': floor_b, 'tileColors': palette,
+                  'blocks': records, 'passability_provenance': 'S32 Layer3 Attribute1 bit0',
+                  'floor_provenance': 'S32 Layer1 TileId and IndexId',
+                  'tile_color_mode': 'RGB555 sample approximation, not accurate decoded TIL artwork',
+                  'missing_tile_blocks': len(missing),
+                  'collision_count': sum(bool(a & 1) for a in flags),
+                  'safe_count': sum(not bool(a & 1) and bool(a & 4) for a in flags)
+              }
+              data['version'] = 4
+              data['status'] = 'REAL_S32_MAP_COLLISION_AND_SPR_MOTION_LAB'
+              data['map'] = world
+              args.output.write_text(json.dumps(data, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+              page = args.output.parent / 'index.html'
+              html = page.read_text(encoding='utf-8')
+              tag = '<script id="manifest" type="application/json">'
+              start = html.find(tag)
+              if start < 0:
+                  raise ValueError('Manifest script tag not found')
+              end = html.find('</script>', start + len(tag))
+              if end < 0:
+                  raise ValueError('Manifest closing tag not found')
+              html = html[:start + len(tag)] + json.dumps(data, ensure_ascii=False, separators=(',', ':')) + html[end:]
+              page.write_text(html, encoding='utf-8')
+              (args.output.parent / 'map_diagnostics.json').write_text(json.dumps({
+                  'map_id': 4, 'blocks': records, 'total': len(flags),
+                  'walkable': sum(not a & 1 for a in flags),
+                  'safe': world['safe_count'], 'blocked': world['collision_count'],
+                  'source_tile_pairs': len(original_ids),
+                  'color_samples': len(palette), 'missing_samples': len(missing),
+                  'spawn': spawn
+              }, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('REAL S32 MAP:', json.dumps({
+                  'blocks': len(records), 'walkable': sum(not a & 1 for a in flags),
+                  'blocked': world['collision_count'], 'safe': world['safe_count'],
+                  'colors': len(palette), 'start': spawn
+              }, ensure_ascii=False))
+
+          if __name__ == '__main__':
+              main()
+          PY_MAP
           cat > src/index.template.html <<'HTML_GAME'
           <!doctype html>
           <html lang="ko">
           <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-          <title>Sanctuary of Aden Mobile V3</title>
+          <title>Sanctuary of Aden Mobile V4 · Original S32</title>
           <style>
           *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
           html,body{height:100%;margin:0;overflow:hidden;background:#101a1b;color:#eee7d5;font:14px system-ui,'Malgun Gothic',sans-serif}
@@ -401,14 +626,23 @@ jobs:
           #note{color:#d8bb83;font-size:12px;line-height:1.5;margin:6px 0}
           @media(max-width:385px){#pad{width:115px;height:115px}#knob{width:50px;height:50px}#keys{grid-template-columns:63px 72px;gap:5px}#keys button{padding:8px 4px;font-size:11px}#hitBtn{font-size:14px!important}#gallery{grid-template-columns:repeat(3,minmax(0,1fr))}}
           @media(max-height:445px){#pad{width:111px;height:111px}#keys{grid-template-columns:66px 76px}#hud{padding:5px 7px}#labPreview{height:130px}}
+          #miniToggle{position:absolute;top:calc(103px + env(safe-area-inset-top));right:10px;padding:6px 9px;font-size:11px}
+          #overlayToggle{position:absolute;top:calc(147px + env(safe-area-inset-top));right:10px;padding:6px 9px;font-size:11px}
+          #miniWrap{position:absolute;top:calc(190px + env(safe-area-inset-top));right:10px;padding:6px 7px 5px;border:1px solid #9cad9199;background:#0b1818df;border-radius:10px;font-size:9px;color:#e4eadc;text-align:center;max-width:130px}
+          #miniWrap[hidden]{display:none}
+          #minimap{display:block;width:112px;height:112px;image-rendering:pixelated;touch-action:manipulation;margin:auto}
+          @media(max-height:490px){#miniWrap{display:none}#overlayToggle{top:calc(89px + env(safe-area-inset-top))}#miniToggle{top:calc(128px + env(safe-area-inset-top))}}
           </style>
           </head>
           <body>
           <div id="stage">
           <canvas id="field"></canvas>
-          <div id="hud"><strong>Sanctuary Mobile V3</strong><small>SPR 동작 실험판</small><div id="life"><div id="lifebar"></div></div><small id="hpText">HP 100/100</small><div id="counts">처치 0</div><small id="gameState">시범 캐릭터</small></div>
+          <div id="hud"><strong>Sanctuary Mobile V4</strong><small>원본 S32 맵 + 모션 연구실</small><div id="life"><div id="lifebar"></div></div><small id="hpText">HP 100/100</small><div id="counts">처치 0</div><small id="gameState">맵 데이터 로딩</small><small id="mapText">맵 4 · 원본 S32</small></div>
           <button id="labOpen" type="button">SPR 모션 연구실</button>
           <button id="again" type="button">다시 시작</button>
+          <button id="miniToggle" type="button">미니맵</button>
+          <button id="overlayToggle" type="button">충돌 OFF</button>
+          <div id="miniWrap"><canvas id="minimap" width="192" height="192" aria-label="원본 S32 미니맵"></canvas><div>노랑: 캐릭터 · 주황: 몹</div></div>
           <div id="tip">이동·공격 테스트 · 동작은 연구실에서 지정</div>
           <div id="pad"><div id="knob"></div><span>이동</span></div>
           <div id="keys"><button id="autoBtn" class="good">자동 ON</button><button id="hitBtn">공격</button><button id="potion">물약 10</button></div>
@@ -416,6 +650,7 @@ jobs:
           <div id="lab" hidden>
           <div id="labHead"><strong>원본 SPR 동작 검증 V3</strong><button id="labClose">게임 복귀</button></div>
           <div id="labScroll">
+          <div id="note">원본 맵 4의 S32 통행속성을 사용합니다. 바닥 이미지는 실제 Tile.pak의 평균색 기반 시각화로 아직 정확한 타일 그림이 아닙니다. 모션은 검증되지 않았습니다.</div>
           <div id="note">현재 SPR 번호는 원본 그래픽 키이며 걷기·공격·8방향을 뜻한다는 근거가 없습니다. 직접 재생해 확인한 키만 아래 슬롯에 지정하세요.</div>
           <div id="labTools">
           <label>원본 에셋<select id="labActor"><option value="hero">2786 (시범 플레이어)</option><option value="enemy">3215 (시범 몬스터)</option></select></label>
@@ -438,145 +673,191 @@ jobs:
           <script id="manifest" type="application/json">/*MANIFEST_DATA*/</script>
           <script>
           (()=>{'use strict';
-          const data=JSON.parse(document.getElementById('manifest').textContent),get=id=>document.getElementById(id);
-          const scene=get('field'),ctx=scene.getContext('2d',{alpha:false}),labCanvas=get('labPreview'),lctx=labCanvas.getContext('2d',{alpha:false});
-          const WIDTH=64,HEIGHT=32,GRID=22,cache=new Map(),STATES=['idle','walk','attack','hit','death'];
-          let sx=0,sy=0,dpr=1,cameraX=0,cameraY=0,clock=0,last=0,open=false,auto=true,score=0,pots=10,hero,mobs=[];
-          let stick={x:0,y:0,pointer:null},touch={x:0,y:0},keys={},labPage=0,selectedKey=0,previewT=0,toastUntil=0;
-          const storeKey='sanctuary-v3-local-spr-mapping';
-          let mapping={hero:{},enemy:{}};
-          try{const raw=localStorage.getItem(storeKey);if(raw)loadMap(JSON.parse(raw),false)}catch(e){}
-          function path(actor,key){return data.actors[actor].actions[String(key)]||null}
-          function spriteImage(url){if(!cache.has(url)){const im=new Image();im.src=url;cache.set(url,im)}return cache.get(url)}
-          function frames(actor,mode,dir){const slot=mapping[actor]?.[mode]?.[dir];const chosen=slot!==undefined?path(actor,slot):null;return chosen||path(actor,dir)||path(actor,0)||[]}
-          function resize(){dpr=Math.min(2,devicePixelRatio||1);sx=scene.clientWidth;sy=scene.clientHeight;scene.width=Math.max(1,Math.floor(sx*dpr));scene.height=Math.max(1,Math.floor(sy*dpr))}
+          const D=JSON.parse(document.getElementById('manifest').textContent);
+          const M=D.map, W=M.size[0], H=M.size[1], OX=M.origin[0], OY=M.origin[1];
+          const el=id=>document.getElementById(id);
+          const scene=el('field'),ctx=scene.getContext('2d',{alpha:false});
+          const preview=el('labPreview'),pctx=preview.getContext('2d',{alpha:false});
+          const mapCanvas=el('minimap'),mctx=mapCanvas.getContext('2d');
+          const TW=64, TH=32, KEYS=['idle','walk','attack','hit','death'],imgCache=new Map();
+          const DIRS=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
+          const KEYSTORE='sanctuary-spr-motion-map-v3';
+          const V4KEY='sanctuary-v4-map-overlay';
+          let sw=0,sh=0,dpr=1,clock=0,last=0,open=false,auto=true;
+          let score=0,potions=10,hero,mobs=[],mapped={hero:{},enemy:{}};
+          let stickId=null,stickVector={x:0,y:0},pressed={};
+          let labPage=0,selectedKey=0,toastUntil=0,showBlocked=false;
+          try{let obj=JSON.parse(localStorage.getItem(KEYSTORE)||'null');if(obj)importMapping(obj,false)}catch(e){}
+          try{showBlocked=localStorage.getItem(V4KEY)==='true'}catch(e){}
+          function clamp(n,lo,hi){return Math.max(lo,Math.min(hi,n))}
+          function rnd(lo,hi){return lo+Math.random()*(hi-lo)}
+          function cellIndex(x,y){let a=Math.floor(x)-OX,b=Math.floor(y)-OY;return a>=0&&b>=0&&a<W&&b<H?b*W+a:-1}
+          function flag(x,y){let i=cellIndex(x,y);return i<0?255:M.flags[i]}
+          function passCell(x,y){let i=cellIndex(x,y);return i>=0&&(M.flags[i]&1)===0}
+          function safe(x,y){return (flag(x,y)&4)!==0}
+          function passFoot(x,y){return passCell(x-.2,y-.2)&&passCell(x+.2,y-.2)&&passCell(x-.2,y+.2)&&passCell(x+.2,y+.2)}
+          function moveFoot(a,x,y){let nx=a.x+x,ny=a.y+y;if(passFoot(nx,ny)){a.x=nx;a.y=ny;return true}let ok=false;if(passFoot(nx,a.y)){a.x=nx;ok=true}if(passFoot(a.x,ny)){a.y=ny;ok=true}return ok}
+          function findOpen(x,y,radius=7){let bx=Math.floor(x),by=Math.floor(y);for(let d=0;d<=radius;d++){for(let ay=-d;ay<=d;ay++)for(let ax=-d;ax<=d;ax++){if(Math.max(Math.abs(ax),Math.abs(ay))!==d)continue;let tx=bx+ax,ty=by+ay;if(passCell(tx,ty))return {x:tx+.5,y:ty+.5}}}return null}
+          function findPath(from,to,maxNodes=18000){let start=cellIndex(from.x,from.y),goal=cellIndex(to.x,to.y);if(start<0||goal<0||!passCell(to.x,to.y))return [];
+          if(start===goal)return [{x:Math.floor(to.x)+.5,y:Math.floor(to.y)+.5}];
+          let prev=new Int32Array(W*H);prev.fill(-1);let queue=new Int32Array(W*H),head=0,tail=1;queue[0]=start;prev[start]=start;
+          while(head<tail&&head<maxNodes){let at=queue[head++],x=at%W,y=Math.floor(at/W);
+          for(let [dx,dy] of DIRS){let nx=x+dx,ny=y+dy;if(nx<0||nx>=W||ny<0||ny>=H)continue;let ni=ny*W+nx;if(prev[ni]>=0||(M.flags[ni]&1))continue;if(dx&&dy){if((M.flags[y*W+nx]&1)||(M.flags[ny*W+x]&1))continue}
+          prev[ni]=at;queue[tail++]=ni;if(ni===goal){head=tail;break}}
+          }
+          if(prev[goal]<0)return [];
+          let path=[],id=goal;while(id!==start&&path.length<W*H){path.push({x:OX+(id%W)+.5,y:OY+Math.floor(id/W)+.5});id=prev[id];if(id<0)return []}path.reverse();return path}
+          function img(url){if(!imgCache.has(url)){const image=new Image();image.src=url;imgCache.set(url,image)}return imgCache.get(url)}
+          function paths(actor,mode,dir){let selected=mapped[actor]?.[mode]?.[dir];if(selected!==undefined&&D.actors[actor].actions[selected])return D.actors[actor].actions[selected];return D.actors[actor].actions[String(dir)]||D.actors[actor].actions['0']||[]}
+          function resize(){dpr=Math.min(2,devicePixelRatio||1);sw=scene.clientWidth;sh=scene.clientHeight;scene.width=Math.max(1,Math.round(sw*dpr));scene.height=Math.max(1,Math.round(sh*dpr))}
           window.addEventListener('resize',resize);resize();
-          function msg(t,time=1.5){get('tip').textContent=t;get('tip').style.opacity='1';toastUntil=performance.now()+time*1000}
-          function clamp(x,a,b){return Math.max(a,Math.min(b,x))}
-          function rnd(a,b){return a+Math.random()*(b-a)}
-          function spawn(i){const a=rnd(0,Math.PI*2);return {id:i,x:clamp(hero.x+Math.cos(a)*rnd(3,5),1,GRID-2),y:clamp(hero.y+Math.sin(a)*rnd(3,5),1,GRID-2),hp:35,dir:i%8,anim:0,mode:'idle',dead:false,deadAt:0,moving:false,hurtUntil:0,attackUntil:0,attackCooldown:0,damageAt:0,damageDone:false,target:null}}
-          function start(){hero={x:GRID/2,y:GRID/2,hp:100,dir:0,anim:0,mode:'idle',dead:false,moving:false,hurtUntil:0,attackUntil:0,attackCooldown:0,damageAt:0,damageDone:false,target:null};mobs=Array.from({length:5},(_,i)=>spawn(i));score=0;pots=10;touch={x:0,y:0};hud();msg('모션 연구실에서 원본 동작을 확인하세요',3)}
-          function hud(){get('lifebar').style.width=hero.hp+'%';get('hpText').textContent='HP '+Math.ceil(hero.hp)+'/100';get('counts').textContent='처치 '+score;get('potion').textContent='물약 '+pots;get('gameState').textContent=hero.dead?'전투 불능':'원본 시범 그래픽'}
-          function delta(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
-          function closest(r){let out=null,d=r;for(const m of mobs){if(m.dead)continue;const k=delta(hero,m);if(k<d){d=k;out=m}}return out}
-          function state(unit,mode){if(unit.mode!==mode){unit.mode=mode;unit.anim=0}}
-          function strike(){if(hero.dead||hero.attackCooldown>0||open)return;hero.attackCooldown=.55;hero.attackUntil=clock+.43;hero.damageAt=clock+.21;hero.damageDone=false;hero.target=closest(1.6);state(hero,'attack');if(!hero.target)msg('사정거리 안에 몬스터가 없습니다',.55)}
-          function giveDamage(){const target=hero.target;hero.damageDone=true;if(!target||target.dead||delta(hero,target)>1.75)return;target.hp-=12;target.hurtUntil=clock+.24;if(target.hp<=0){target.dead=true;target.deadAt=clock;state(target,'death');score++;hud()}else state(target,'hit')}
-          function potion(){if(hero.dead){msg('다시 시작을 눌러주세요');return}if(!pots){msg('물약이 없습니다');return}if(hero.hp>=100){msg('HP가 가득합니다');return}hero.hp=Math.min(100,hero.hp+40);pots--;hud()}
-          function direction(dx,dy){return (Math.round((Math.atan2(dy,dx)+Math.PI)*4/Math.PI)+8)%8}
-          function update(dt){if(open||hero.dead)return;clock+=dt;hero.anim+=dt;hero.attackCooldown=Math.max(0,hero.attackCooldown-dt);if(!hero.damageDone&&hero.damageAt>0&&clock>=hero.damageAt)giveDamage();
-          let x=touch.x,y=touch.y;if(keys.ArrowLeft||keys.a)x-=1;if(keys.ArrowRight||keys.d)x+=1;if(keys.ArrowUp||keys.w)y-=1;if(keys.ArrowDown||keys.s)y+=1;
-          if(Math.hypot(x,y)<.03&&hero.target&&hero.target.point){const t=hero.target,dx=t.x-hero.x,dy=t.y-hero.y;if(Math.hypot(dx,dy)>.18){x=(dx-dy)*2;y=dx+dy}else hero.target=null}
-          const len=Math.hypot(x,y);hero.moving=len>.05;
-          if(hero.moving){x/=len;y/=len;let wx=x/2+y,wy=y-x/2;const dl=Math.hypot(wx,wy);wx/=dl;wy/=dl;hero.x=clamp(hero.x+wx*dt*2.85,.4,GRID-.4);hero.y=clamp(hero.y+wy*dt*2.85,.4,GRID-.4);hero.dir=direction(x,y)}
-          if(hero.attackUntil>clock)state(hero,'attack');else if(hero.hurtUntil>clock)state(hero,'hit');else state(hero,hero.moving?'walk':'idle');
-          for(const m of mobs){if(m.dead){if(clock-m.deadAt>2.1){mobs[m.id]=spawn(m.id)}continue}m.anim+=dt;m.attackCooldown=Math.max(0,m.attackCooldown-dt);const d=delta(m,hero),dx=hero.x-m.x,dy=hero.y-m.y;if(d<5&&d>1.05){m.x+=dx/d*dt*.72;m.y+=dy/d*dt*.72;m.dir=direction((dx-dy)*2,dx+dy);m.moving=true}else m.moving=false;
-          if(d<1.24&&m.attackCooldown<=0){m.attackCooldown=1.4;m.attackUntil=clock+.40;hero.hp=Math.max(0,hero.hp-7);hero.hurtUntil=clock+.26;if(hero.hp===0){hero.dead=true;state(hero,'death');msg('전투 불능 · 다시 시작을 누르세요',4)}hud()}
-          if(m.attackUntil>clock)state(m,'attack');else if(m.hurtUntil>clock)state(m,'hit');else state(m,m.moving?'walk':'idle');}
-          if(auto&&hero.attackCooldown<=0&&closest(1.6))strike()}
-          function iso(x,y){return {x:(x-y)*WIDTH/2,y:(x+y)*HEIGHT/2}}
-          function pt(x,y){const t=iso(x,y);return {x:sx/2+t.x-cameraX,y:sy*.46+t.y-cameraY}}
-          function terrain(){ctx.fillStyle='#263c30';ctx.fillRect(0,0,sx,sy);for(let x=0;x<GRID;x++)for(let y=0;y<GRID;y++){const p=pt(x,y);if(p.x<-60||p.x>sx+60||p.y<-40||p.y>sy+40)continue;ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(p.x+32,p.y+16);ctx.lineTo(p.x,p.y+32);ctx.lineTo(p.x-32,p.y+16);ctx.closePath();ctx.fillStyle=['#395947','#3c604a','#3e5c49','#365444','#40634e'][(x*91+y*37)%5];ctx.fill();ctx.strokeStyle='#13251b40';ctx.stroke()}}
-          function drawUnit(unit,actor){if(unit.dead&&clock-unit.deadAt>1.1)return;const p=pt(unit.x,unit.y),bottom=p.y+16,seq=frames(actor,unit.mode,unit.dir),raw=seq.length?seq[Math.min(seq.length-1,Math.floor(unit.anim*9)%seq.length)]:null,img=raw?spriteImage(raw):null;
-          ctx.fillStyle='#09170d78';ctx.beginPath();ctx.ellipse(p.x,bottom+2,22,8,0,0,Math.PI*2);ctx.fill();
-          if(img&&img.complete&&img.naturalWidth){const scale=1.05;const w=img.naturalWidth*scale,h=img.naturalHeight*scale;ctx.save();if(unit.mode==='hit')ctx.globalAlpha=.55+.45*Math.sin(clock*37)**2;ctx.drawImage(img,p.x-w/2,bottom-h,w,h);ctx.restore()}else{ctx.fillStyle=actor==='hero'?'#decb94':'#d18b73';ctx.fillRect(p.x-12,bottom-33,24,33)}
-          if(actor==='enemy'&&unit.hp<35&&!unit.dead){ctx.fillStyle='#422';ctx.fillRect(p.x-20,bottom-78,40,5);ctx.fillStyle='#eb7468';ctx.fillRect(p.x-20,bottom-78,40*unit.hp/35,5)}}
-          function paint(now){const dt=Math.min(.05,last?(now-last)/1000:0);last=now;update(dt);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.imageSmoothingEnabled=false;const cam=iso(hero.x,hero.y);cameraX=cam.x;cameraY=cam.y;terrain();const units=[...mobs.map(m=>({unit:m,actor:'enemy'})),{unit:hero,actor:'hero'}];units.sort((a,b)=>(a.unit.x+a.unit.y)-(b.unit.x+b.unit.y));for(const entry of units)drawUnit(entry.unit,entry.actor);
-          if(hero.dead){ctx.fillStyle='#06100c99';ctx.fillRect(0,0,sx,sy);ctx.fillStyle='#f9ebc7';ctx.textAlign='center';ctx.font='bold 26px system-ui';ctx.fillText('전투 불능',sx/2,sy*.38)}if(now>toastUntil)get('tip').style.opacity='0';renderLab(now);requestAnimationFrame(paint)}
-          function labActor(){return get('labActor').value}
-          function labMode(){return get('labMode').value}
-          function labDir(){return get('labDir').value}
-          function validKeys(){return Object.keys(data.actors[labActor()].actions).map(Number).sort((a,b)=>a-b)}
-          function currentPaths(){return path(labActor(),selectedKey)||[]}
-          function syncLab(resetPage=false){const ks=validKeys();if(resetPage)labPage=0;if(!ks.includes(selectedKey))selectedKey=ks[0];get('searchKey').value=String(selectedKey);const actor=labActor(),kind=labMode(),dir=labDir(),slot=mapping[actor]?.[kind]?.[dir];get('mapInfo').textContent='현재 매핑: '+actor+' / '+kind+' / 방향 '+dir+' → '+(slot===undefined?'미지정':'SPR '+slot)+'\n지정된 슬롯: '+countSlots(actor)+' / 40';get('previewInfo').textContent='원본 SPR '+data.actors[actor].sprite_id+'-'+selectedKey+'.spr   ·   '+currentPaths().length+' 프레임   ·   동작 성격 미검증';buildGallery()}
-          function countSlots(actor){return Object.values(mapping[actor]).reduce((n,r)=>n+Object.keys(r).length,0)}
-          function buildGallery(){const ks=validKeys(),count=16,total=Math.max(1,Math.ceil(ks.length/count));labPage=clamp(labPage,0,total-1);get('pageInfo').textContent=(labPage+1)+' / '+total+' · '+ks.length+'종';const el=get('gallery');el.replaceChildren();for(const key of ks.slice(labPage*count,(labPage+1)*count)){const b=document.createElement('button');b.type='button';b.classList.toggle('selected',key===selectedKey);const first=path(labActor(),key)?.[0];if(first){const im=document.createElement('img');im.src=first;im.loading='lazy';im.alt='SPR '+key;b.appendChild(im)}const label=document.createElement('span');label.textContent='키 '+key;b.appendChild(label);b.onclick=()=>{selectedKey=key;previewT=0;syncLab(false)};el.appendChild(b)}}
-          function renderLab(now){if(!open)return;const canvas=labCanvas,w=canvas.width,h=canvas.height;lctx.fillStyle='#253f34';lctx.fillRect(0,0,w,h);lctx.strokeStyle='#576b5790';for(let x=0;x<w;x+=30){lctx.beginPath();lctx.moveTo(x,0);lctx.lineTo(x,h);lctx.stroke()}const paths=currentPaths();if(!paths.length){lctx.fillStyle='#fff';lctx.fillText('No decoded frames',20,h/2);return}let idx=Number(get('labFrame').value);if(idx<0)idx=Math.floor(now/Number(get('labSpeed').value))%paths.length;idx=clamp(idx,0,paths.length-1);const im=spriteImage(paths[idx]);if(!im.complete||!im.naturalWidth)return;const scale=Math.min(4,(w-24)/im.naturalWidth,(h-26)/im.naturalHeight);lctx.imageSmoothingEnabled=false;lctx.drawImage(im,(w-im.naturalWidth*scale)/2,(h-im.naturalHeight*scale)/2,im.naturalWidth*scale,im.naturalHeight*scale);lctx.fillStyle='#ffe9b9';lctx.font='17px system-ui';lctx.fillText('키 '+selectedKey+' | 프레임 '+idx+'/'+(paths.length-1),12,h-12)}
-          function saveMap(){try{localStorage.setItem(storeKey,JSON.stringify(mapping))}catch(e){msg('브라우저에 매핑을 저장할 수 없습니다')}syncLab(false)}
-          function loadMap(raw,persist=true){const source=raw?.mapping||raw;if(!source||typeof source!=='object')throw Error('Invalid mapping file');const result={hero:{},enemy:{}};for(const actor of ['hero','enemy'])for(const mode of STATES){const entries=source[actor]?.[mode];if(!entries||typeof entries!=='object')continue;for(const [dir,key] of Object.entries(entries)){if(!/^[0-7]$/.test(dir)||!path(actor,key))continue;(result[actor][mode]??={})[dir]=String(key)}}mapping=result;if(persist)saveMap()}
-          get('labOpen').onclick=()=>{open=true;get('lab').hidden=false;syncLab(true)};
-          get('labClose').onclick=()=>{open=false;get('lab').hidden=true;msg('게임에 현재 모션 매핑 적용',1.2)};
-          for(const id of ['labActor','labMode','labDir'])get(id).onchange=()=>syncLab(id==='labActor');
-          get('searchKey').onchange=()=>{const k=Number(get('searchKey').value);if(!path(labActor(),k)){msg('그 SPR 키는 변환되지 않았습니다');get('searchKey').value=String(selectedKey);return}selectedKey=k;const ks=validKeys();labPage=Math.floor(ks.indexOf(k)/16);syncLab(false)};
-          get('assign').onclick=()=>{const actor=labActor(),mode=labMode(),dir=labDir();(mapping[actor][mode]??={})[dir]=String(selectedKey);saveMap();msg('SPR '+selectedKey+' → '+mode+' 방향 '+dir+' 연결됨',1.2)};
-          get('unassign').onclick=()=>{const a=labActor(),m=labMode(),d=labDir();if(mapping[a][m])delete mapping[a][m][d];saveMap()};
-          get('prevPage').onclick=()=>{labPage--;buildGallery()};get('nextPage').onclick=()=>{labPage++;buildGallery()};
-          get('clearMap').onclick=()=>{if(!confirm('전체 모션 매핑을 삭제할까요?'))return;mapping={hero:{},enemy:{}};saveMap()};
-          get('downloadMap').onclick=()=>{const payload=JSON.stringify({version:3,ids:{hero:2786,enemy:3215},mapping},null,2),url=URL.createObjectURL(new Blob([payload],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='sanctuary-v3-motion-map.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)};
-          get('uploadMap').onchange=async e=>{const file=e.target.files?.[0];if(!file)return;try{loadMap(JSON.parse(await file.text()));msg('매핑 JSON 불러오기 완료',1.8)}catch(error){alert('불러오기 실패: '+error.message)}e.target.value=''};
-          get('autoBtn').onclick=()=>{auto=!auto;get('autoBtn').textContent=auto?'자동 ON':'자동 OFF';get('autoBtn').classList.toggle('good',auto)};
-          get('hitBtn').addEventListener('pointerdown',e=>{e.preventDefault();strike()});get('potion').onclick=potion;get('again').onclick=start;
-          const pad=get('pad'),knob=get('knob');function padMove(e){const rect=pad.getBoundingClientRect(),r=rect.width*.31;let x=e.clientX-rect.left-rect.width/2,y=e.clientY-rect.top-rect.height/2;const len=Math.hypot(x,y);if(len>r){x=x*r/len;y=y*r/len}touch.x=x/r;touch.y=y/r;knob.style.left=(rect.width/2+x)+'px';knob.style.top=(rect.height/2+y)+'px';hero.target=null}
-          pad.addEventListener('pointerdown',e=>{if(open)return;stick.pointer=e.pointerId;pad.setPointerCapture(e.pointerId);padMove(e);e.preventDefault()});pad.addEventListener('pointermove',e=>{if(e.pointerId===stick.pointer){padMove(e);e.preventDefault()}});function release(e){if(e.pointerId!==stick.pointer)return;stick.pointer=null;touch={x:0,y:0};knob.style.left='50%';knob.style.top='50%'}pad.addEventListener('pointerup',release);pad.addEventListener('pointercancel',release);
-          window.addEventListener('keydown',e=>{if(open)return;keys[e.key]=true;if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key))e.preventDefault();if(e.key===' '&&!e.repeat)strike();if(e.key==='p'&&!e.repeat)potion()});window.addEventListener('keyup',e=>{keys[e.key]=false});
-          scene.addEventListener('pointerdown',e=>{if(open||hero.dead)return;const r=scene.getBoundingClientRect(),x=(e.clientX-r.left-sx/2+cameraX)/(WIDTH/2),y=(e.clientY-r.top-sy*.46+cameraY)/(HEIGHT/2);hero.target={x:clamp((x+y)/2,.4,GRID-.4),y:clamp((y-x)/2,.4,GRID-.4),point:true};const candidate=mobs.filter(m=>!m.dead).sort((a,b)=>delta(a,hero.target)-delta(b,hero.target))[0];if(candidate&&delta(candidate,hero.target)<1){hero.target={x:candidate.x,y:candidate.y,point:true};msg('몬스터 위치로 이동',.8)}else msg('이동 지점 지정',.6)});
-          start();requestAnimationFrame(paint);
+          function msg(text,delay=1.8){el('tip').textContent=text;el('tip').style.opacity='1';toastUntil=performance.now()+delay*1000}
+          function refresh(){el('lifebar').style.width=clamp(hero.hp,0,100)+'%';el('hpText').textContent='HP '+Math.ceil(hero.hp)+'/100';el('counts').textContent='처치 '+score;el('potion').textContent='물약 '+potions;
+          let area=safe(hero.x,hero.y)?'안전':'일반';el('gameState').textContent='Map 4 · '+Math.floor(hero.x)+','+Math.floor(hero.y)+' · '+area;el('mapText').textContent='맵 4 | 통행속성 '+M.collision_count+'칸 장애';el('overlayToggle').textContent=showBlocked?'충돌 ON':'충돌 OFF'}
+          function begin(){clock=0;score=0;potions=10;let initial=findOpen(M.spawn[0],M.spawn[1],10);if(!initial)throw Error('Spawn location unavailable');
+          hero={x:initial.x,y:initial.y,hp:100,anim:0,dir:0,mode:'idle',dead:false,attackCd:0,attackUntil:0,hurtUntil:0,damageAt:0,damageDone:true,hitTarget:null,path:[],goalMob:null};
+          mobs=Array.from({length:5},(_,i)=>makeMob(i));refresh();msg('원본 3×3 S32 맵 · 벽 통과 불가 · 지도를 누르면 이동',3)}
+          function makeMob(id){let candidate=null;for(let t=0;t<90;t++){let a=rnd(-Math.PI,Math.PI),r=rnd(4,11),x=hero.x+Math.cos(a)*r,y=hero.y+Math.sin(a)*r;if(!passFoot(x,y)||safe(x,y))continue;candidate={x,y};break}if(!candidate)candidate=findOpen(hero.x+4,hero.y+3,15)||{x:hero.x,y:hero.y};return {id,x:candidate.x,y:candidate.y,hp:35,anim:0,dir:id%8,mode:'idle',dead:false,deadAt:0,attackCd:rnd(.3,1.5),attackUntil:0,hurtUntil:0,path:[],repath:0}}
+          function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+          function nearest(radius){let best=null,bd=radius;for(let m of mobs)if(!m.dead){let d=dist(hero,m);if(d<bd){best=m;bd=d}}return best}
+          function setMode(a,newMode){if(a.mode!==newMode){a.mode=newMode;a.anim=0}}
+          function facing(dx,dy){return(Math.round((Math.atan2(dy,dx)+Math.PI)*4/Math.PI)+8)%8}
+          function tryAttack(){if(open||hero.dead||hero.attackCd>0)return;if(safe(hero.x,hero.y)){msg('안전지대에서는 공격할 수 없습니다',.7);return}hero.attackCd=.54;hero.attackUntil=clock+.42;hero.damageAt=clock+.21;hero.damageDone=false;hero.hitTarget=nearest(1.75);setMode(hero,'attack');if(!hero.hitTarget)msg('공격 거리 밖',.6)}
+          function applyHit(){hero.damageDone=true;let mob=hero.hitTarget;if(!mob||mob.dead||dist(hero,mob)>1.85)return;mob.hp-=12;mob.hurtUntil=clock+.26;if(mob.hp<=0){mob.dead=true;mob.deadAt=clock;score++;setMode(mob,'death');refresh()}else setMode(mob,'hit')}
+          function drink(){if(hero.dead){msg('다시 시작하세요');return}if(!potions){msg('물약이 없습니다');return}if(hero.hp>=100){msg('HP가 가득합니다');return}potions--;hero.hp=Math.min(100,hero.hp+40);refresh()}
+          function travel(a,way,dt,speed){if(!way.length)return false;let target=way[0],dx=target.x-a.x,dy=target.y-a.y,d=Math.hypot(dx,dy);if(d<.13){way.shift();return false}let step=Math.min(d,dt*speed);let ok=moveFoot(a,dx/d*step,dy/d*step);if(!ok){way.length=0;return false}a.dir=facing((dx-dy)*TW/2,(dx+dy)*TH/2);return true}
+          function setDestination(x,y){let destination=findOpen(x,y,5);if(!destination){msg('갈 수 없는 위치입니다');return false}let route=findPath(hero,destination);if(!route.length){msg('연결된 이동 경로가 없습니다');return false}hero.path=route;hero.goalMob=null;msg('원본 S32 이동 경로 '+route.length+'칸',.8);return true}
+          function update(dt){if(open||hero.dead)return;clock+=dt;hero.anim+=dt;hero.attackCd=Math.max(0,hero.attackCd-dt);
+          if(!hero.damageDone&&clock>=hero.damageAt)applyHit();
+          let dx=stickVector.x,dy=stickVector.y;if(pressed.ArrowLeft||pressed.a)dx-=1;if(pressed.ArrowRight||pressed.d)dx+=1;if(pressed.ArrowUp||pressed.w)dy-=1;if(pressed.ArrowDown||pressed.s)dy+=1;
+          let moving=false,n=Math.hypot(dx,dy);
+          if(n>.06){hero.path=[];hero.goalMob=null;dx/=n;dy/=n;let wx=dx/2+dy,wy=dy-dx/2,wl=Math.hypot(wx,wy);moving=moveFoot(hero,wx/wl*dt*2.8,wy/wl*dt*2.8);if(moving)hero.dir=facing(dx,dy)}
+          else if(hero.goalMob&&!hero.goalMob.dead){if(dist(hero,hero.goalMob)>1.3){if(clock>=hero.goalMobRepath){hero.path=findPath(hero,hero.goalMob,5000);hero.goalMobRepath=clock+.6}moving=travel(hero,hero.path,dt,2.8)}else {hero.path=[];if(auto&&hero.attackCd<=0)tryAttack()}}
+          else moving=travel(hero,hero.path,dt,2.8);
+          if(clock<hero.attackUntil)setMode(hero,'attack');else if(clock<hero.hurtUntil)setMode(hero,'hit');else setMode(hero,moving?'walk':'idle');
+          for(const mob of mobs){if(mob.dead){if(clock-mob.deadAt>3)mobs[mob.id]=makeMob(mob.id);continue}mob.anim+=dt;mob.attackCd=Math.max(0,mob.attackCd-dt);let dis=dist(mob,hero),mobMoved=false;
+          if(dis<7&&!safe(hero.x,hero.y)&&!safe(mob.x,mob.y)){if(dis>1.1){if(clock>=mob.repath){mob.path=findPath(mob,hero,5000);mob.repath=clock+.95}mobMoved=travel(mob,mob.path,dt,.7)}else if(mob.attackCd<=0){mob.attackCd=1.35;mob.attackUntil=clock+.38;hero.hp=Math.max(0,hero.hp-7);hero.hurtUntil=clock+.28;if(hero.hp<=0){hero.dead=true;hero.path=[];setMode(hero,'death');msg('전투 불능 · 다시 시작 버튼',5)}refresh()}}
+          if(clock<mob.attackUntil)setMode(mob,'attack');else if(clock<mob.hurtUntil)setMode(mob,'hit');else setMode(mob,mobMoved?'walk':'idle')}
+          if(auto&&!hero.goalMob&&hero.attackCd<=0&&nearest(1.65))tryAttack();
+          refresh()}
+          function iso(x,y){return{x:(x-y)*TW/2,y:(x+y)*TH/2}}
+          function screen(x,y){let d=iso(x,y),h=iso(hero.x,hero.y);return{x:sw*.5+d.x-h.x,y:sh*.46+d.y-h.y}}
+          function ground(){ctx.fillStyle='#192a26';ctx.fillRect(0,0,sw,sh);let range=clamp(Math.ceil((sw/32+sh/16)/4)+6,15,35),fx=Math.floor(hero.x),fy=Math.floor(hero.y);
+          for(let y=fy-range;y<=fy+range;y++)for(let x=fx-range;x<=fx+range;x++){let ix=cellIndex(x,y);if(ix<0)continue;let p=screen(x+.5,y+.5);if(p.x< -36||p.x>sw+36||p.y<-36||p.y>sh+36)continue;
+          let c1=M.tileColors[M.floorA[ix]]||'#345247',c2=M.tileColors[M.floorB[ix]]||c1;
+          ctx.beginPath();ctx.moveTo(p.x,p.y-16);ctx.lineTo(p.x+32,p.y);ctx.lineTo(p.x,p.y+16);ctx.closePath();ctx.fillStyle=c1;ctx.fill();
+          ctx.beginPath();ctx.moveTo(p.x,p.y-16);ctx.lineTo(p.x-32,p.y);ctx.lineTo(p.x,p.y+16);ctx.closePath();ctx.fillStyle=c2;ctx.fill();
+          ctx.strokeStyle='#16201b36';ctx.beginPath();ctx.moveTo(p.x,p.y-16);ctx.lineTo(p.x+32,p.y);ctx.lineTo(p.x,p.y+16);ctx.lineTo(p.x-32,p.y);ctx.closePath();ctx.stroke();
+          if(showBlocked){let bits=M.flags[ix];if(bits&1)ctx.fillStyle='#e24f4b8c';else if(bits&4)ctx.fillStyle='#5ba9e33c';else continue;ctx.fill()}
+          }}
+          function drawActor(unit,type){if(unit.dead&&clock-unit.deadAt>1.5)return;let p=screen(unit.x,unit.y),foot=p.y+17,seq=paths(type,unit.mode,unit.dir),frame=seq.length?seq[Math.min(seq.length-1,Math.floor(unit.anim*9)%seq.length)]:null,im=frame?img(frame):null;
+          ctx.fillStyle='#050e0b80';ctx.beginPath();ctx.ellipse(p.x,foot+3,21,7,0,0,Math.PI*2);ctx.fill();
+          if(im&&im.complete&&im.naturalWidth){let scale=1.04,w=im.naturalWidth*scale,h=im.naturalHeight*scale;ctx.save();if(unit.mode==='hit')ctx.globalAlpha=.65+.35*Math.abs(Math.sin(clock*36));ctx.drawImage(im,p.x-w/2,foot-h,w,h);ctx.restore()}
+          else {ctx.fillStyle=type==='hero'?'#e2c992':'#c98478';ctx.fillRect(p.x-13,foot-32,26,32)}
+          if(type==='enemy'&&unit.hp<35&&!unit.dead){ctx.fillStyle='#4f2927';ctx.fillRect(p.x-19,foot-79,38,5);ctx.fillStyle='#da5f50';ctx.fillRect(p.x-19,foot-79,38*unit.hp/35,5)}}
+          let miniBase=document.createElement('canvas');miniBase.width=W;miniBase.height=H;let miniBG=miniBase.getContext('2d');let pix=miniBG.createImageData(W,H);
+          for(let i=0;i<W*H;i++){let a=M.flags[i],k=i*4;if(a&1){pix.data[k]=27;pix.data[k+1]=40;pix.data[k+2]=38}else if(a&4){pix.data[k]=69;pix.data[k+1]=126;pix.data[k+2]=156}else{let key=M.tileColors[M.floorA[i]]||'#395b49';pix.data[k]=parseInt(key.slice(1,3),16);pix.data[k+1]=parseInt(key.slice(3,5),16);pix.data[k+2]=parseInt(key.slice(5,7),16)}pix.data[k+3]=255}
+          miniBG.putImageData(pix,0,0);let mapShown=true;
+          function drawMini(){if(!mapShown)return;mctx.imageSmoothingEnabled=false;mctx.clearRect(0,0,192,192);mctx.drawImage(miniBase,0,0,192,192);for(let m of mobs)if(!m.dead){mctx.fillStyle='#e4986e';mctx.fillRect(m.x-OX-2,m.y-OY-2,4,4)}mctx.fillStyle='#fff6b9';mctx.fillRect(hero.x-OX-3,hero.y-OY-3,6,6)}
+          function render(t){let dt=last?Math.min(.05,(t-last)/1000):0;last=t;update(dt);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.imageSmoothingEnabled=false;ground();let order=[...mobs.map(m=>({unit:m,type:'enemy'})),{unit:hero,type:'hero'}];order.sort((a,b)=>(a.unit.x+a.unit.y)-(b.unit.x+b.unit.y));for(let a of order)drawActor(a.unit,a.type);
+          if(hero.dead){ctx.fillStyle='#000a';ctx.fillRect(0,0,sw,sh);ctx.fillStyle='#fff0ca';ctx.font='bold 27px system-ui';ctx.textAlign='center';ctx.fillText('전투 불능',sw/2,sh*.4)}drawMini();drawLab(t);if(t>toastUntil)el('tip').style.opacity='0';requestAnimationFrame(render)}
+          function startLab(){open=true;el('lab').hidden=false;syncLab(true)}
+          function stopLab(){open=false;el('lab').hidden=true;msg('현재 동작 매핑을 게임에 반영했습니다',1.2)}
+          function actor(){return el('labActor').value}
+          function action(){return el('labMode').value}
+          function facingSlot(){return el('labDir').value}
+          function listKeys(){return Object.keys(D.actors[actor()].actions).map(Number).sort((a,b)=>a-b)}
+          function rawSeq(){return D.actors[actor()].actions[String(selectedKey)]||[]}
+          function countSlots(a){return Object.values(mapped[a]).reduce((n,x)=>n+Object.keys(x).length,0)}
+          function syncLab(resetPage=false){let list=listKeys();if(resetPage)labPage=0;if(!list.includes(selectedKey))selectedKey=list[0];el('searchKey').value=String(selectedKey);
+          let saved=mapped[actor()]?.[action()]?.[facingSlot()];el('mapInfo').textContent=actor()+' '+action()+' 방향 '+facingSlot()+' → '+(saved===undefined?'미지정':'원본 SPR '+saved)+'\n지정 슬롯 '+countSlots(actor())+' / 40';el('previewInfo').textContent='SPR '+D.actors[actor()].sprite_id+'-'+selectedKey+'.spr · '+rawSeq().length+' 프레임 · 모션 성격 미검증';gallery()}
+          function gallery(){let list=listKeys(),chunk=16,total=Math.max(1,Math.ceil(list.length/chunk));labPage=clamp(labPage,0,total-1);el('pageInfo').textContent=(labPage+1)+' / '+total+' · '+list.length+'종';let root=el('gallery');root.replaceChildren();for(let key of list.slice(labPage*chunk,(labPage+1)*chunk)){let b=document.createElement('button');b.type='button';b.classList.toggle('selected',selectedKey===key);let name=D.actors[actor()].actions[String(key)]?.[0];if(name){let image=document.createElement('img');image.src=name;image.loading='lazy';image.alt='SPR '+key;b.appendChild(image)}let label=document.createElement('span');label.textContent='키 '+key;b.appendChild(label);b.onclick=()=>{selectedKey=key;syncLab()};root.appendChild(b)}}
+          function drawLab(t){if(!open)return;let cw=preview.width,ch=preview.height;pctx.fillStyle='#21392f';pctx.fillRect(0,0,cw,ch);let seq=rawSeq();if(!seq.length)return;let i=Number(el('labFrame').value);if(i<0)i=Math.floor(t/Number(el('labSpeed').value))%seq.length;i=clamp(i,0,seq.length-1);let image=img(seq[i]);if(!image.complete||!image.naturalWidth)return;let scale=Math.min(4,(cw-28)/image.naturalWidth,(ch-28)/image.naturalHeight);pctx.imageSmoothingEnabled=false;pctx.drawImage(image,(cw-image.naturalWidth*scale)/2,(ch-image.naturalHeight*scale)/2,image.naturalWidth*scale,image.naturalHeight*scale);pctx.fillStyle='#ffe7b8';pctx.font='17px system-ui';pctx.fillText('원본 키 '+selectedKey+' | 프레임 '+i+'/'+(seq.length-1),12,ch-12)}
+          function persist(){try{localStorage.setItem(KEYSTORE,JSON.stringify(mapped))}catch(e){msg('브라우저 저장 실패')}syncLab()}
+          function importMapping(raw,save=true){let value=raw?.mapping||raw;if(!value||typeof value!=='object')throw Error('매핑 JSON 형식 오류');let next={hero:{},enemy:{}};for(let a of ['hero','enemy'])for(let m of KEYS){let rows=value[a]?.[m];if(!rows||typeof rows!=='object')continue;for(let [dir,key] of Object.entries(rows)){if(/^[0-7]$/.test(dir)&&D.actors[a].actions[String(key)])(next[a][m]??={})[dir]=String(key)}}mapped=next;if(save)persist()}
+          el('labOpen').onclick=startLab;el('labClose').onclick=stopLab;
+          for(let id of ['labActor','labMode','labDir'])el(id).onchange=()=>syncLab(id==='labActor');
+          el('searchKey').onchange=()=>{let key=Number(el('searchKey').value);if(!rawSeq()||!D.actors[actor()].actions[String(key)]){msg('변환되지 않은 SPR 키입니다');el('searchKey').value=selectedKey;return}selectedKey=key;labPage=Math.floor(listKeys().indexOf(key)/16);syncLab()};
+          el('assign').onclick=()=>{let a=actor(),m=action(),dir=facingSlot();(mapped[a][m]??={})[dir]=String(selectedKey);persist();msg('SPR '+selectedKey+'를 '+m+' 방향 '+dir+'에 연결',1.1)};
+          el('unassign').onclick=()=>{let a=actor(),m=action(),d=facingSlot();if(mapped[a][m])delete mapped[a][m][d];persist()};
+          el('prevPage').onclick=()=>{labPage--;gallery()};el('nextPage').onclick=()=>{labPage++;gallery()};
+          el('clearMap').onclick=()=>{if(!confirm('전체 모션 매핑을 지울까요?'))return;mapped={hero:{},enemy:{}};persist()};
+          el('downloadMap').onclick=()=>{let file=JSON.stringify({version:4,ids:{hero:2786,enemy:3215},mapping:mapped},null,2);let url=URL.createObjectURL(new Blob([file],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download='sanctuary-v4-motion-map.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000)};
+          el('uploadMap').onchange=async e=>{let file=e.target.files?.[0];if(!file)return;try{importMapping(JSON.parse(await file.text()));msg('모션 매핑 불러오기 완료')}catch(error){alert('불러오기 실패: '+error.message)}e.target.value=''};
+          el('autoBtn').onclick=()=>{auto=!auto;el('autoBtn').textContent=auto?'자동 ON':'자동 OFF';el('autoBtn').classList.toggle('good',auto)};
+          el('hitBtn').addEventListener('pointerdown',e=>{e.preventDefault();tryAttack()});el('potion').onclick=drink;el('again').onclick=begin;
+          el('overlayToggle').onclick=()=>{showBlocked=!showBlocked;try{localStorage.setItem(V4KEY,String(showBlocked))}catch(e){}refresh()};
+          el('miniToggle').onclick=()=>{mapShown=!mapShown;el('miniWrap').hidden=!mapShown};
+          let pad=el('pad'),knob=el('knob');function padMove(e){let r=pad.getBoundingClientRect(),radius=r.width*.31,x=e.clientX-r.left-r.width/2,y=e.clientY-r.top-r.height/2,n=Math.hypot(x,y);if(n>radius){x=x*radius/n;y=y*radius/n}stickVector={x:x/radius,y:y/radius};knob.style.left=(r.width/2+x)+'px';knob.style.top=(r.height/2+y)+'px';hero.path=[];hero.goalMob=null}
+          pad.addEventListener('pointerdown',e=>{if(open)return;stickId=e.pointerId;pad.setPointerCapture(stickId);padMove(e);e.preventDefault()});pad.addEventListener('pointermove',e=>{if(e.pointerId===stickId){padMove(e);e.preventDefault()}});function stopPad(e){if(e.pointerId!==stickId)return;stickId=null;stickVector={x:0,y:0};knob.style.left='50%';knob.style.top='50%'}pad.addEventListener('pointerup',stopPad);pad.addEventListener('pointercancel',stopPad);
+          window.addEventListener('keydown',e=>{if(open)return;pressed[e.key]=true;if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key))e.preventDefault();if(e.key===' '&&!e.repeat)tryAttack();if(e.key==='p'&&!e.repeat)drink()});window.addEventListener('keyup',e=>{pressed[e.key]=false});
+          scene.addEventListener('pointerdown',e=>{if(open||hero.dead)return;let rect=scene.getBoundingClientRect(),dx=(e.clientX-rect.left-sw*.5)/(TW/2),dy=(e.clientY-rect.top-sh*.46)/(TH/2);let x=hero.x+(dx+dy)/2,y=hero.y+(dy-dx)/2;let target=mobs.filter(m=>!m.dead).sort((a,b)=>Math.hypot(a.x-x,a.y-y)-Math.hypot(b.x-x,b.y-y))[0];if(target&&Math.hypot(target.x-x,target.y-y)<1.2){hero.goalMob=target;hero.goalMobRepath=0;hero.path=[];msg('몬스터 대상으로 경로 탐색',1)}else setDestination(x,y)});
+          mapCanvas.addEventListener('pointerdown',e=>{if(open||hero.dead)return;let r=mapCanvas.getBoundingClientRect(),x=OX+(e.clientX-r.left)/r.width*W,y=OY+(e.clientY-r.top)/r.height*H;setDestination(x,y);e.preventDefault()});
+          begin();requestAnimationFrame(render);
           })();
           </script>
           </body>
           </html>
           HTML_GAME
           python src/builder.py --idx "$SPR_IDX" --pak "$SPR_PAK" --template src/index.template.html --output dist/mobile
-
-      - name: Verify files and JavaScript syntax
+          python src/map_builder.py --map-dir "$MAP_DIR" --tile-idx "$TILE_IDX" --tile-pak "$TILE_PAK" --output dist/mobile/manifest.json
+      - name: Validate authentic map and mobile motion package
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY_VERIFY'
           from pathlib import Path
-          import json
-          import re
-          root = Path('dist/mobile')
-          data = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
-          html = (root / 'index.html').read_text(encoding='utf-8')
+          import json,re
+          root=Path('dist/mobile')
+          data=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
+          html=(root/'index.html').read_text(encoding='utf-8')
+          world=data.get('map')
+          if not world or world['id']!=4 or world['size']!=[192,192] or len(world['blocks'])!=9:
+              raise SystemExit('Original Map 4 data missing')
+          if len(world['flags'])!=192*192 or len(world['floorA'])!=192*192 or len(world['floorB'])!=192*192:
+              raise SystemExit('Unexpected S32 tile grid size')
+          if world['collision_count']<=0 or world['safe_count']<=0:
+              raise SystemExit('Map traversal and safe-zone attributes not decoded')
+          if len(world['tileColors'])<100:
+              raise SystemExit('Original Tile.pak sampled colors missing')
+          if not all(str(k) in item['actions'] for item in data['actors'].values() for k in range(8)):
+              raise SystemExit('V3 sprite fallback keys missing')
+          files=[f for a in data['actors'].values() for frames in a['actions'].values() for f in frames]
+          if len(files)<32 or any(not (root/f).is_file() or (root/f).stat().st_size<80 for f in files):
+              raise SystemExit('PNG output missing or invalid')
+          match=re.search(r'<script>([\s\S]*?)</script>',html)
+          if match is None or 'id="minimap"' not in html or 'id="lab"' not in html:
+              raise SystemExit('Mobile map UI or motion lab missing')
           if '/*MANIFEST_DATA*/' in html:
-              raise SystemExit('Manifest injection failed')
-          for actor in ['hero', 'enemy']:
-              actions = data['actors'][actor]['actions']
-              if not all(str(key) in actions for key in range(8)):
-                  raise SystemExit('Required fallback sprite keys missing for ' + actor)
-              if len(actions) < 8:
-                  raise SystemExit('No sprite action selection available')
-              for paths in actions.values():
-                  for file in paths:
-                      if not (root / file).is_file() or (root / file).stat().st_size < 80:
-                          raise SystemExit('Invalid image output: ' + file)
-          js = re.search(r'<script>([\s\S]*?)</script>', html)
-          if js is None:
-              raise SystemExit('Embedded JavaScript not found')
-          Path('reports/engine.js').write_text(js.group(1), encoding='utf-8')
-          if 'id="lab"' not in html or 'id="field"' not in html:
-              raise SystemExit('Game or motion-lab UI missing')
-          print('Converted sprite keys:', {k: v['converted'] for k, v in data['actors'].items()})
-          print('Generated frame PNG count:', len(list((root/'assets').glob('*.png'))))
-          print('Decode warnings:', data['decode_errors'])
+              raise SystemExit('Manifest substitution failed')
+          Path('reports/game.js').write_text(match.group(1),encoding='utf-8')
+          print('MAP 4:',len(world['blocks']),'S32 blocks;',world['collision_count'],'blocked cells;',world['safe_count'],'safe cells')
+          print('SPR PNG files:',len(files),'estimated tile colors:',len(world['tileColors']))
           PY_VERIFY
-          node --check reports/engine.js
+          node --check reports/game.js
           {
-            echo 'Sanctuary of Aden V3'
-            echo ''
-            echo 'Original Sprite.idx and Sprite.pak decoded into a browseable mobile sprite action catalog.'
-            echo 'Game movement and combat remain playable while verified motion maps can be assigned per direction.'
-            echo 'Unverified names, directions and action categories are never automatically treated as original client data.'
-            echo 'GitHub Pages and the separate SLKnight workflow are unchanged.'
-            echo 'Download the Sanctuary-Mobile-V3-Motion-Lab artifact and open index.html.'
+            echo 'Sanctuary Mobile V4: Original Map 4'
+            echo 'S32 Layer3 passability and safe-area flags are connected to movement and enemy AI.'
+            echo 'S32 Layer1 indices and Tile.pak color samples provide preview terrain.'
+            echo 'TIL textures are not yet fully reconstructed and monster sprite identity is not verified.'
+            echo 'Original V3 SPR inspector, JSON motion mapping, touch pad, attacks and potions remain included.'
+            echo 'The separate SLKnight Pages deployment is not modified.'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload mobile game and motion inspector
+      - name: Upload independent mobile V4
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V3-Motion-Lab
+          name: Sanctuary-Mobile-V4-Original-Map4
           path: dist/mobile/
           if-no-files-found: error
           retention-days: 30
           compression-level: 6
 
-      - name: Upload extraction diagnostics on failure
+      - name: Upload build diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V3-Diagnostics
+          name: Sanctuary-Mobile-V4-Diagnostics
           path: reports/
           if-no-files-found: warn
           retention-days: 14
