@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Original Animation Definitions V11
+name: Sanctuary of Aden External Action Crosscheck V12
 
 on:
   workflow_dispatch:
@@ -16,1062 +16,620 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  discover:
+  crosscheck:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 45
 
     steps:
-      - name: Prepare environment
+      - name: Prepare directories
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p previous/v1 previous/v2 previous/v9
-          mkdir -p reports/raw client downloads
+          mkdir -p previous/v10 previous/v11 reference reports
 
-      - name: Restore verified indexes and frame manifests
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          gh run download 38782357687 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-Monster-Audit \
-            --dir previous/v1
-
-          gh run download 38784834277 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V2-Reports \
-            --dir previous/v2
-
-          gh run download 38838415568 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V9-Original-SPR-Visual-Lab \
-            --dir previous/v9
-
-          test -s previous/v1/01_all_client_files.csv
-          test -s previous/v1/02_pak_records.csv
-          test -n "$(find previous/v2 -name all_sprite_candidates.csv -print -quit)"
-          test -s previous/v9/02_rendered_sprite_manifest.csv
-
-      - name: Find original sprite action definition sources
-        id: scan
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import csv
-          import json
-          import os
-          import re
-          from collections import Counter
-          from pathlib import PurePosixPath, Path
-
-          REPORT = Path("reports")
-
-          def read_csv(path):
-              with path.open(
-                  encoding="utf-8-sig",
-                  newline=""
-              ) as f:
-                  return list(csv.DictReader(f))
-
-          def write_csv(name, rows, fields):
-              with (REPORT / name).open(
-                  "w", encoding="utf-8-sig", newline=""
-              ) as f:
-                  writer = csv.DictWriter(
-                      f, fieldnames=fields,
-                      extrasaction="ignore"
-                  )
-                  writer.writeheader()
-                  writer.writerows(rows)
-
-          def archive_path(value):
-              value = value.replace("\\", "/")
-              parts = PurePosixPath(value).parts
-
-              if "Sanctuary of Aden - Copy" not in parts:
-                  return None
-
-              at = parts.index("Sanctuary of Aden - Copy")
-              selected = parts[at:]
-
-              if any(p in (".", "..") for p in selected):
-                  return None
-
-              return "/".join(selected)
-
-          exact_names = {
-              "list.spr", "wlist.spr",
-              "list.spz", "wlist.spz",
-              "list.sprlist", "wlist.sprlist"
-          }
-
-          def classify(filename):
-              name = filename.replace(
-                  "\\", "/"
-              ).split("/")[-1].lower()
-
-              if name in exact_names:
-                  return "EXACT_ANIMATION_LIST"
-
-              if "sprlist" in name or "spr_list" in name:
-                  return "SPR_LIST_CANDIDATE"
-
-              if (
-                  ("sprite" in name or "spr" in name)
-                  and ("action" in name or "motion" in name)
-                  and Path(name).suffix.lower()
-                  in {".spr", ".spz", ".txt", ".lst", ".tbl"}
-              ):
-                  return "MOTION_METADATA_CANDIDATE"
-
-              return None
-
-          direct = read_csv(
-              Path("previous/v1/01_all_client_files.csv")
-          )
-
-          indexed = read_csv(
-              Path("previous/v1/02_pak_records.csv")
-          )
-
-          candidates = []
-          unresolvable = []
-          counts = Counter()
-
-          for row in direct:
-              reason = classify(row["path"])
-              if not reason:
-                  continue
-
-              location = archive_path(row["path"])
-
-              if not location:
-                  unresolvable.append(row["path"])
-                  continue
-
-              candidates.append({
-                  "kind": "direct",
-                  "name": Path(location).name,
-                  "source": row["path"],
-                  "archive_path": location,
-                  "offset": 0,
-                  "bytes": int(row["bytes"]),
-                  "category": reason
-              })
-
-              counts["direct"] += 1
-
-          for row in indexed:
-              reason = classify(row["file"])
-              if not reason:
-                  continue
-
-              if str(row["valid"]).lower() != "true":
-                  counts["invalid_index"] += 1
-                  continue
-
-              location = archive_path(row["pak"])
-
-              if not location:
-                  unresolvable.append(row["pak"])
-                  continue
-
-              candidates.append({
-                  "kind": "pak",
-                  "name": row["file"],
-                  "source": row["pak"],
-                  "archive_path": location,
-                  "offset": int(row["offset"]),
-                  "bytes": int(row["bytes"]),
-                  "category": reason
-              })
-
-              counts["indexed"] += 1
-
-          candidates.sort(
-              key=lambda r: (
-                  r["category"] != "EXACT_ANIMATION_LIST",
-                  r["name"].lower(),
-                  r["source"]
-              )
-          )
-
-          (REPORT / "candidates.json").write_text(
-              json.dumps(
-                  candidates,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-
-          write_csv(
-              "01_animation_source_candidates.csv",
-              candidates,
-              [
-                  "kind", "name", "source",
-                  "archive_path", "offset",
-                  "bytes", "category"
-              ]
-          )
-
-          selections = sorted({
-              row["archive_path"]
-              for row in candidates
-          })
-
-          (REPORT / "archive_selections.txt").write_text(
-              "\n".join(selections) + (
-                  "\n" if selections else ""
-              ),
-              encoding="utf-8"
-          )
-
-          summary = {
-              "phase": "ORIGINAL_ANIMATION_SOURCE_DISCOVERY",
-              "direct_file_inventory": len(direct),
-              "indexed_file_inventory": len(indexed),
-              "source_candidates": len(candidates),
-              "candidate_categories": dict(
-                  Counter(r["category"] for r in candidates)
-              ),
-              "package_files_to_extract": len(selections),
-              "unresolvable_paths": unresolvable[:30],
-              "actions_verified": False
-          }
-
-          (REPORT / "02_scan_summary.json").write_text(
-              json.dumps(
-                  summary,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-
-          with open(
-              os.environ["GITHUB_OUTPUT"], "a"
-          ) as f:
-              f.write(
-                  "has_sources="
-                  + ("true" if candidates else "false")
-                  + "\n"
-              )
-
-          print("=== V11 SOURCE DISCOVERY ===")
-          print(json.dumps(
-              summary,
-              ensure_ascii=False,
-              indent=2
-          ))
-
-          for row in candidates[:60]:
-              print("CANDIDATE", row)
-          PY
-
-      - name: Prepare selective extraction
-        if: steps.scan.outputs.has_sources == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc
-
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full
-
-          df -h .
-
-      - name: Download verified original archive
-        if: steps.scan.outputs.has_sources == 'true'
+      - name: Restore verified V10 and V11 results
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          gh release download v1.0.0 \
+          gh run download 38866558914 \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "Sanctuary.of.Aden.-.Copy.*" \
-            --dir downloads
+            --name Sanctuary-V10-Full-SPR-Structure-and-Motion-Lab \
+            --dir previous/v10
 
-          python3 - <<'PY'
-          from pathlib import Path
+          gh run download 38869270863 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Sanctuary-V11-Original-Animation-Definitions \
+            --dir previous/v11
 
-          directory = Path("downloads")
-          base = "Sanctuary.of.Aden.-.Copy"
+          test -s previous/v10/01_all_sprite_id_groups.csv
+          test -s previous/v10/Sanctuary-V10-Mobile-Motion-Lab.html
+          test -s previous/v11/06_summary_v11.json
 
-          expected = [
-              f"{base}.z{i:02d}"
-              for i in range(1, 46)
-          ] + [f"{base}.zip"]
+          cp previous/v10/Sanctuary-V10-Mobile-Motion-Lab.html \
+            reports/V10-Original-Sprite-Viewer.html
 
-          missing = [
-              name for name in expected
-              if not (directory / name).is_file()
-          ]
-
-          if missing:
-              raise SystemExit(
-                  "Missing release parts: " + repr(missing)
-              )
-
-          print("VERIFIED ARCHIVE PARTS:", len(expected))
-          PY
-
-      - name: Extract animation metadata source packages
-        if: steps.scan.outputs.has_sources == 'true'
+      - name: Download pinned external reference tables
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t requested < reports/archive_selections.txt
+          base="https://raw.githubusercontent.com/tpai/docker-l1jtw-server/0212802a625b36af3a0df2c513acc2713902f4d0/L1J-TW_3.80c/db"
 
-          if [ "${#requested[@]}" -eq 0 ]; then
-            exit 0
-          fi
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            "$base/Japan/MyISAM/spr_action.sql" \
+            -o reference/jp_spr_action.sql
 
-          archive="downloads/Sanctuary.of.Aden.-.Copy.zip"
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            "$base/Japan/MyISAM/npc.sql" \
+            -o reference/jp_npc.sql
 
-          if ! 7z x "$archive" \
-            "${requested[@]}" \
-            "-o${PWD}/client" \
-            -y > reports/selective_extraction.log 2>&1; then
-            echo "SELECTIVE_EXTRACTION_RETURNED_ERROR" \
-              >> reports/selective_extraction.log
-          fi
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            "$base/Taiwan/spr_action.sql" \
+            -o reference/tw_spr_action.sql
 
-          rm -rf downloads
-          df -h .
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            "$base/Taiwan/npc.sql" \
+            -o reference/tw_npc.sql
 
-      - name: Parse original actions and verify SPR references
+          for file in reference/*.sql; do
+            test -s "$file"
+            sha256sum "$file"
+          done
+
+      - name: Cross-check action and NPC identity references
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import bz2
           import csv
           import hashlib
           import json
-          import lzma
-          import math
           import os
           import re
-          import zlib
-
           from collections import Counter, defaultdict
           from pathlib import Path
 
           ROOT = Path.cwd()
+          REF = ROOT / "reference"
           REPORT = ROOT / "reports"
-          CLIENT = ROOT / "client"
+          V10 = ROOT / "previous/v10"
+          V11 = ROOT / "previous/v11"
 
-          MAX_RAW = 64 * 1024 * 1024
-          MAX_DECODED = 96 * 1024 * 1024
-          MAX_FRAME_ROWS = 500000
-
-          def read_csv(path):
+          def csv_load(path):
               with path.open(
                   encoding="utf-8-sig",
                   newline=""
               ) as f:
                   return list(csv.DictReader(f))
 
-          def write_csv(name, rows, fields):
+          def csv_save(name, rows, columns):
               with (REPORT / name).open(
-                  "w", encoding="utf-8-sig", newline=""
+                  "w",
+                  encoding="utf-8-sig",
+                  newline=""
               ) as f:
                   writer = csv.DictWriter(
                       f,
-                      fieldnames=fields,
+                      fieldnames=columns,
                       extrasaction="ignore"
                   )
                   writer.writeheader()
                   writer.writerows(rows)
 
-          candidates = json.loads(
-              (REPORT / "candidates.json").read_text(
+          def read_source(path):
+              return path.read_text(
+                  encoding="utf-8-sig",
+                  errors="replace"
+              )
+
+          def sql_tuples(text):
+              pos = text.lower().find("insert into")
+              if pos < 0:
+                  return
+
+              text = text[pos:]
+              depth = 0
+              start = -1
+              quoted = False
+              i = 0
+
+              while i < len(text):
+                  ch = text[i]
+
+                  if quoted:
+                      if ch == "\\":
+                          i += 2
+                          continue
+
+                      if ch == "'":
+                          if (
+                              i + 1 < len(text)
+                              and text[i + 1] == "'"
+                          ):
+                              i += 2
+                              continue
+                          quoted = False
+
+                  elif ch == "'":
+                      quoted = True
+
+                  elif ch == "(":
+                      if depth == 0:
+                          start = i + 1
+                      depth += 1
+
+                  elif ch == ")" and depth:
+                      depth -= 1
+                      if depth == 0:
+                          yield text[start:i]
+
+                  i += 1
+
+          def parse_cells(source):
+              try:
+                  return next(csv.reader(
+                      [source],
+                      delimiter=",",
+                      quotechar="'",
+                      escapechar="\\",
+                      skipinitialspace=True
+                  ))
+              except (csv.Error, StopIteration):
+                  return None
+
+          reference_sources = {
+              "JP_380c": {
+                  "actions": REF / "jp_spr_action.sql",
+                  "npcs": REF / "jp_npc.sql"
+              },
+              "TW_380c": {
+                  "actions": REF / "tw_spr_action.sql",
+                  "npcs": REF / "tw_npc.sql"
+              }
+          }
+
+          actor_rows = csv_load(
+              V10 / "01_all_sprite_id_groups.csv"
+          )
+
+          actors = {
+              int(row["sprite_id"]): row
+              for row in actor_rows
+          }
+
+          v11_summary = json.loads(
+              (V11 / "06_summary_v11.json").read_text(
                   encoding="utf-8"
               )
           )
 
-          v2_paths = list(
-              (ROOT / "previous/v2").rglob(
-                  "all_sprite_candidates.csv"
-              )
-          )
-
-          if len(v2_paths) != 1:
-              raise SystemExit("V2 sprite index missing")
-
-          v2 = read_csv(v2_paths[0])
-
-          sprite_pattern = re.compile(
-              r"^(\d+)-(\d+)\.(?:spr|spx|sp2|fspr)$",
-              re.I
-          )
-
-          sprite_lookup = defaultdict(set)
-
-          for row in v2:
-              filename = row["file"].replace(
-                  "\\", "/"
-              ).split("/")[-1]
-
-              match = sprite_pattern.fullmatch(filename)
-              if not match:
-                  continue
-
-              sprite_id = int(match.group(1))
-              subid = int(match.group(2))
-
-              sprite_lookup[(sprite_id, subid)].add(
-                  Path(row["pak"]).name
+          if len(actors) < 1000:
+              raise SystemExit(
+                  "Incomplete V10 sprite inventory"
               )
 
-          rendered_rows = read_csv(
-              ROOT / "previous/v9/02_rendered_sprite_manifest.csv"
-          )
+          if v11_summary["original_list_candidates"] != 0:
+              raise SystemExit(
+                  "V11 evidence changed; recheck original actions"
+              )
 
-          known_frames = defaultdict(list)
+          action_rows = []
+          npc_rows = []
+          source_stats = []
 
-          for row in rendered_rows:
-              known_frames[
-                  (int(row["actor"]), int(row["sub"]))
-              ].append({
-                  "package": row["package"],
-                  "frames": int(row["frames"])
+          action_hints = {
+              0: "walk",
+              1: "attack",
+              2: "damage",
+              3: "idle/breath",
+              8: "death"
+          }
+
+          for source_name, paths in reference_sources.items():
+              action_text = read_source(paths["actions"])
+              npc_text = read_source(paths["npcs"])
+
+              action_count = 0
+              npc_count = 0
+
+              for item in sql_tuples(action_text):
+                  fields = parse_cells(item)
+
+                  if fields is None or len(fields) != 4:
+                      continue
+
+                  try:
+                      sprite_id, action_id, framecount, framerate = (
+                          int(x.strip()) for x in fields
+                      )
+                  except ValueError:
+                      continue
+
+                  if not (
+                      0 <= sprite_id <= 200000
+                      and 0 <= action_id <= 512
+                      and 0 <= framecount <= 10000
+                      and 0 <= framerate <= 10000
+                  ):
+                      continue
+
+                  action_count += 1
+
+                  action_rows.append({
+                      "reference": source_name,
+                      "sprite_id": sprite_id,
+                      "action_id": action_id,
+                      "action_hint": action_hints.get(
+                          action_id, ""
+                      ),
+                      "reference_framecount": framecount,
+                      "reference_framerate": framerate,
+                      "id_present_in_our_v10": (
+                          sprite_id in actors
+                      ),
+                      "verification": "EXTERNAL_REFERENCE_ONLY"
+                  })
+
+              schema_end = npc_text.lower().find(
+                  "insert into"
+              )
+
+              schema = (
+                  npc_text[:schema_end]
+                  if schema_end >= 0
+                  else npc_text
+              )
+
+              columns = re.findall(
+                  r"(?m)^\s*`([^`]+)`\s+",
+                  schema
+              )
+
+              required = (
+                  "npcid",
+                  "name",
+                  "gfxid",
+                  "impl"
+              )
+
+              if not all(
+                  col in columns for col in required
+              ):
+                  raise SystemExit(
+                      "Unknown NPC SQL schema: " + source_name
+                  )
+
+              indices = {
+                  key: columns.index(key)
+                  for key in required
+              }
+
+              note_index = (
+                  columns.index("note")
+                  if "note" in columns
+                  else None
+              )
+
+              for item in sql_tuples(npc_text):
+                  fields = parse_cells(item)
+
+                  if fields is None:
+                      continue
+
+                  if len(fields) < len(columns):
+                      continue
+
+                  try:
+                      npc_id = int(
+                          fields[indices["npcid"]].strip()
+                      )
+                      gfx_id = int(
+                          fields[indices["gfxid"]].strip()
+                      )
+                  except ValueError:
+                      continue
+
+                  npc_count += 1
+
+                  npc_rows.append({
+                      "reference": source_name,
+                      "npc_id": npc_id,
+                      "npc_name": fields[indices["name"]],
+                      "gfx_id": gfx_id,
+                      "implementation": fields[
+                          indices["impl"]
+                      ],
+                      "note": (
+                          fields[note_index]
+                          if note_index is not None
+                          else ""
+                      ),
+                      "id_present_in_our_v10": (
+                          gfx_id in actors
+                      ),
+                      "identity_verified": False
+                  })
+
+              source_stats.append({
+                  "reference": source_name,
+                  "action_rows": action_count,
+                  "npc_rows": npc_count,
+                  "action_sha256": hashlib.sha256(
+                      paths["actions"].read_bytes()
+                  ).hexdigest(),
+                  "npc_sha256": hashlib.sha256(
+                      paths["npcs"].read_bytes()
+                  ).hexdigest()
               })
 
-          HEADER = re.compile(
-              r"(?m)^[ \t]*#(\d+)[ \t]+(\d+)"
-              r"(?:=(\d+))?"
-              r"(?:[ \t]+([^\r\n]*))?"
-          )
+              print(
+                  source_name,
+                  "ACTION_ROWS", action_count,
+                  "NPC_ROWS", npc_count
+              )
 
-          ACTION = re.compile(
-              r"(-?\d+)\.([A-Za-z_][A-Za-z0-9_\s-]*)?"
-              r"\((-?\d+)[ \t]+(-?\d+),([^)]*)\)"
-          )
-
-          FRAME = re.compile(
-              r"(-?\d+)\.(-?\d+):(-?\d+)([^\s,]*)"
-          )
-
-          def parse_standard(content):
-              entries = []
-              headers = list(HEADER.finditer(content))
-
-              for i, header in enumerate(headers):
-                  end = (
-                      headers[i + 1].start()
-                      if i + 1 < len(headers)
-                      else len(content)
+              if action_count < 1000:
+                  raise SystemExit(
+                      "Insufficient action data: " + source_name
                   )
 
-                  entry_id = int(header.group(1))
-                  image_count = int(header.group(2))
-                  linked_id = (
-                      int(header.group(3))
-                      if header.group(3)
-                      else None
-                  )
-
-                  sprite_id = (
-                      linked_id
-                      if linked_id is not None
-                      else entry_id
-                  )
-
-                  tail = header.group(4) or ""
-                  section = tail + "\n" + content[
-                      header.end():end
-                  ]
-
-                  actions = []
-
-                  for match in ACTION.finditer(section):
-                      action_id = int(match.group(1))
-                      name = (match.group(2) or "").strip()
-                      directional = int(match.group(3))
-                      expected_count = int(match.group(4))
-
-                      if (
-                          directional not in (0, 1)
-                          or expected_count < 0
-                          or expected_count > 500
-                      ):
-                          continue
-
-                      frames = []
-
-                      for item in FRAME.finditer(
-                          match.group(5)
-                      ):
-                          frames.append({
-                              "image_id": int(item.group(1)),
-                              "frame_index": int(item.group(2)),
-                              "duration": int(item.group(3)),
-                              "modifiers": item.group(4)
-                          })
-
-                      if len(frames) != expected_count:
-                          continue
-
-                      actions.append({
-                          "action_id": action_id,
-                          "action_name": name,
-                          "directional": directional,
-                          "frames": frames,
-                          "declared_frame_count": expected_count,
-                          "format": "STANDARD"
-                      })
-
-                  if actions:
-                      entries.append({
-                          "entry_id": entry_id,
-                          "sprite_id": sprite_id,
-                          "image_count": image_count,
-                          "actions": actions
-                      })
-
-              return entries
-
-          def parse_compact(content):
-              entries = []
-              headers = list(HEADER.finditer(content))
-
-              for i, header in enumerate(headers):
-                  end = (
-                      headers[i + 1].start()
-                      if i + 1 < len(headers)
-                      else len(content)
-                  )
-
-                  entry_id = int(header.group(1))
-                  linked_id = (
-                      int(header.group(3))
-                      if header.group(3)
-                      else None
-                  )
-                  sprite_id = (
-                      linked_id
-                      if linked_id is not None
-                      else entry_id
-                  )
-
-                  section = (
-                      (header.group(4) or "")
-                      + "\n"
-                      + content[header.end():end]
-                  )
-
-                  actions = []
-
-                  for line in section.splitlines():
-                      tokens = line.strip().split()
-
-                      if len(tokens) < 6:
-                          continue
-
-                      try:
-                          action_id = int(tokens[0])
-                          directional = int(tokens[1])
-                          count = int(tokens[2])
-                      except ValueError:
-                          continue
-
-                      if (
-                          not 0 <= action_id < 100
-                          or directional not in (0, 1)
-                          or not 1 <= count <= 128
-                          or len(tokens) < 3 + 3 * count
-                      ):
-                          continue
-
-                      frames = []
-                      valid = True
-
-                      for n in range(count):
-                          pos = 3 + n * 3
-                          duration_token = tokens[pos + 2]
-                          duration_match = re.match(
-                              r"^(-?\d+)(.*)$",
-                              duration_token
-                          )
-
-                          if not duration_match:
-                              valid = False
-                              break
-
-                          try:
-                              image_id = int(tokens[pos])
-                              index = int(tokens[pos + 1])
-                          except ValueError:
-                              valid = False
-                              break
-
-                          frames.append({
-                              "image_id": image_id,
-                              "frame_index": index,
-                              "duration": int(
-                                  duration_match.group(1)
-                              ),
-                              "modifiers": duration_match.group(2)
-                          })
-
-                      if valid and len(frames) == count:
-                          actions.append({
-                              "action_id": action_id,
-                              "action_name": "",
-                              "directional": directional,
-                              "frames": frames,
-                              "declared_frame_count": count,
-                              "format": "COMPACT_CANDIDATE"
-                          })
-
-                  if actions:
-                      entries.append({
-                          "entry_id": entry_id,
-                          "sprite_id": sprite_id,
-                          "image_count": int(
-                              header.group(2)
-                          ),
-                          "actions": actions
-                      })
-
-              return entries
-
-          def bounded_zlib(data, wbits):
-              try:
-                  decoder = zlib.decompressobj(wbits)
-                  result = decoder.decompress(
-                      data, MAX_DECODED + 1
-                  )
-                  if (
-                      decoder.eof
-                      and 0 < len(result) <= MAX_DECODED
-                  ):
-                      return result
-              except zlib.error:
-                  pass
-              return None
-
-          def variants(raw):
-              results = [("raw", raw)]
-              seen = {
-                  hashlib.sha256(raw).digest()
-              }
-
-              def add(name, data):
-                  if data is None:
-                      return
-
-                  if not 0 < len(data) <= MAX_DECODED:
-                      return
-
-                  digest = hashlib.sha256(
-                      data
-                  ).digest()
-
-                  if digest not in seen:
-                      seen.add(digest)
-                      results.append((name, data))
-
-              for offset in (0, 4, 8, 12, 16):
-                  if offset >= len(raw):
-                      continue
-
-                  chunk = raw[offset:]
-
-                  for name, wbits in (
-                      ("zlib", 15),
-                      ("gzip", 31),
-                      ("deflate", -15)
-                  ):
-                      add(
-                          f"{name}_{offset}",
-                          bounded_zlib(chunk, wbits)
-                      )
-
-              for offset in (0, 4):
-                  if offset >= len(raw):
-                      continue
-
-                  chunk = raw[offset:]
-
-                  if chunk.startswith(b"BZh"):
-                      try:
-                          obj = bz2.BZ2Decompressor()
-                          decoded = obj.decompress(
-                              chunk,
-                              max_length=MAX_DECODED + 1
-                          )
-                          if obj.eof:
-                              add(
-                                  f"bzip2_{offset}",
-                                  decoded
-                              )
-                      except (OSError, EOFError):
-                          pass
-
-                  if chunk.startswith(b"\xfd7zXZ\x00"):
-                      try:
-                          obj = lzma.LZMADecompressor()
-                          decoded = obj.decompress(
-                              chunk,
-                              max_length=MAX_DECODED + 1
-                          )
-                          if obj.eof:
-                              add(
-                                  f"xz_{offset}",
-                                  decoded
-                              )
-                      except (lzma.LZMAError, EOFError):
-                          pass
-
-              return results
-
-          def decode_text(data):
-              for encoding in (
-                  "utf-8-sig", "cp949",
-                  "big5", "utf-16"
-              ):
-                  try:
-                      content = data.decode(
-                          encoding
-                      )
-                  except UnicodeError:
-                      continue
-
-                  if HEADER.search(content):
-                      return content, encoding
-
-              return None, None
-
-          source_rows = []
-          action_rows = []
-          frame_rows = []
-          recovered_entries = 0
-          truncated = False
-
-          for n, candidate in enumerate(candidates):
-              path = CLIENT / candidate["archive_path"]
-
-              record = {
-                  "source": candidate["source"],
-                  "name": candidate["name"],
-                  "kind": candidate["kind"],
-                  "bytes": candidate["bytes"],
-                  "status": "",
-                  "first_32_hex": "",
-                  "sha256": "",
-                  "variant": "",
-                  "encoding": "",
-                  "parsed_entries": 0,
-                  "parsed_actions": 0,
-                  "reason": ""
-              }
-
-              try:
-                  if not path.is_file():
-                      raise FileNotFoundError(
-                          "SOURCE_PACKAGE_NOT_EXTRACTED"
-                      )
-
-                  if candidate["bytes"] > MAX_RAW:
-                      raise ValueError(
-                          "METADATA_EXCEEDS_SIZE_LIMIT"
-                      )
-
-                  with path.open("rb") as f:
-                      f.seek(candidate["offset"])
-                      raw = f.read(
-                          candidate["bytes"]
-                      )
-
-                  if len(raw) != candidate["bytes"]:
-                      raise IOError(
-                          "SHORT_SOURCE_READ"
-                      )
-
-                  sha = hashlib.sha256(raw).hexdigest()
-
-                  record["first_32_hex"] = raw[
-                      :32
-                  ].hex(" ")
-                  record["sha256"] = sha
-
-                  safe_name = re.sub(
-                      r"[^A-Za-z0-9_.-]",
-                      "_",
-                      Path(candidate["name"]).name
-                  )[:75]
-
-                  output = REPORT / "raw" / (
-                      f"{n:04d}_{sha[:12]}_{safe_name}"
-                  )
-
-                  output.write_bytes(raw)
-
-                  best = None
-
-                  for method, decoded in variants(raw):
-                      content, encoding = decode_text(
-                          decoded
-                      )
-
-                      if content is None:
-                          continue
-
-                      entries = parse_standard(
-                          content
-                      )
-
-                      if not entries:
-                          entries = parse_compact(
-                              content
-                          )
-
-                      count = sum(
-                          len(e["actions"])
-                          for e in entries
-                      )
-
-                      if (
-                          best is None
-                          or count > best["count"]
-                      ):
-                          best = {
-                              "count": count,
-                              "entries": entries,
-                              "method": method,
-                              "encoding": encoding
-                          }
-
-                  if best is None:
-                      record["status"] = (
-                          "BINARY_OR_ENCRYPTED_FORMAT"
-                      )
-                      record["reason"] = (
-                          "No recognized plaintext "
-                          "sprite-action list"
-                      )
-                      source_rows.append(record)
-                      continue
-
-                  if best["count"] == 0:
-                      record["status"] = (
-                          "TEXT_WITHOUT_VALID_ACTIONS"
-                      )
-                      source_rows.append(record)
-                      continue
-
-                  record["status"] = (
-                      "PARSED_SOURCE_ACTIONS"
-                  )
-                  record["variant"] = best["method"]
-                  record["encoding"] = best["encoding"]
-                  record["parsed_entries"] = len(
-                      best["entries"]
-                  )
-                  record["parsed_actions"] = best["count"]
-
-                  recovered_entries += len(
-                      best["entries"]
-                  )
-
-                  for entry in best["entries"]:
-                      sprite_id = entry["sprite_id"]
-
-                      for action in entry["actions"]:
-                          action_rows.append({
-                              "source": candidate["source"],
-                              "entry_id": entry["entry_id"],
-                              "sprite_id": sprite_id,
-                              "action_id": action["action_id"],
-                              "source_action_name": (
-                                  action["action_name"]
-                              ),
-                              "directional": action["directional"],
-                              "frame_count": len(
-                                  action["frames"]
-                              ),
-                              "format": action["format"],
-                              "source_sha256": sha
-                          })
-
-                          directions = (
-                              range(8)
-                              if action["directional"] == 1
-                              else (0,)
-                          )
-
-                          for direction in directions:
-                              for order, frame in enumerate(
-                                  action["frames"]
-                              ):
-                                  if len(frame_rows) >= MAX_FRAME_ROWS:
-                                      truncated = True
-                                      break
-
-                                  subid = (
-                                      frame["image_id"]
-                                      + direction
-                                  )
-
-                                  packages = sorted(
-                                      sprite_lookup.get(
-                                          (sprite_id, subid), ()
-                                      )
-                                  )
-
-                                  inspected = known_frames.get(
-                                      (sprite_id, subid), []
-                                  )
-
-                                  if inspected:
-                                      within = any(
-                                          0 <= frame["frame_index"]
-                                          < x["frames"]
-                                          for x in inspected
-                                      )
-
-                                      check = (
-                                          "FRAME_INDEX_CONFIRMED"
-                                          if within
-                                          else "FRAME_INDEX_NOT_FOUND_IN_V9"
-                                      )
-                                  elif packages:
-                                      check = (
-                                          "SPR_FILE_EXISTS_"
-                                          "FRAME_COUNT_UNVERIFIED"
-                                      )
-                                  else:
-                                      check = "SPR_FILE_NOT_IN_V2"
-
-                                  frame_rows.append({
-                                      "source": candidate["source"],
-                                      "entry_id": entry["entry_id"],
-                                      "sprite_id": sprite_id,
-                                      "action_id": action["action_id"],
-                                      "source_action_name": (
-                                          action["action_name"]
-                                      ),
-                                      "directional": (
-                                          action["directional"]
-                                      ),
-                                      "direction": direction,
-                                      "sequence_index": order,
-                                      "image_id": frame["image_id"],
-                                      "subid": subid,
-                                      "frame_index": (
-                                          frame["frame_index"]
-                                      ),
-                                      "original_duration_value": (
-                                          frame["duration"]
-                                      ),
-                                      "modifiers": frame["modifiers"],
-                                      "available_spr_packages": (
-                                          ",".join(packages)
-                                      ),
-                                      "verification": check
-                                  })
-
-                              if truncated:
-                                  break
-
-                          if truncated:
-                              break
-
-                      if truncated:
-                          break
-
-                  source_rows.append(record)
-
-              except Exception as exc:
-                  record["status"] = "READ_OR_PARSE_ERROR"
-                  record["reason"] = str(exc)
-                  source_rows.append(record)
-
-          write_csv(
-              "03_extracted_source_status.csv",
-              source_rows,
+          csv_save(
+              "01_external_reference_sources.csv",
+              source_stats,
               [
-                  "source", "name", "kind", "bytes",
-                  "status", "first_32_hex",
-                  "sha256", "variant", "encoding",
-                  "parsed_entries", "parsed_actions",
-                  "reason"
+                  "reference",
+                  "action_rows",
+                  "npc_rows",
+                  "action_sha256",
+                  "npc_sha256"
               ]
           )
 
-          write_csv(
-              "04_original_action_definitions.csv",
+          csv_save(
+              "02_external_action_records.csv",
               action_rows,
               [
-                  "source", "entry_id",
-                  "sprite_id", "action_id",
-                  "source_action_name", "directional",
-                  "frame_count", "format",
-                  "source_sha256"
-              ]
-          )
-
-          write_csv(
-              "05_original_action_frame_sequences.csv",
-              frame_rows,
-              [
-                  "source", "entry_id",
-                  "sprite_id", "action_id",
-                  "source_action_name",
-                  "directional", "direction",
-                  "sequence_index", "image_id",
-                  "subid", "frame_index",
-                  "original_duration_value",
-                  "modifiers",
-                  "available_spr_packages",
+                  "reference",
+                  "sprite_id",
+                  "action_id",
+                  "action_hint",
+                  "reference_framecount",
+                  "reference_framerate",
+                  "id_present_in_our_v10",
                   "verification"
               ]
           )
 
-          status_counts = Counter(
-              x["status"] for x in source_rows
+          csv_save(
+              "03_external_npc_gfx_candidates.csv",
+              npc_rows,
+              [
+                  "reference",
+                  "npc_id",
+                  "npc_name",
+                  "gfx_id",
+                  "implementation",
+                  "note",
+                  "id_present_in_our_v10",
+                  "identity_verified"
+              ]
           )
 
-          frame_status = Counter(
-              x["verification"] for x in frame_rows
+          action_groups = defaultdict(list)
+          npc_groups = defaultdict(list)
+
+          for row in action_rows:
+              key = (
+                  row["sprite_id"],
+                  row["action_id"]
+              )
+              action_groups[key].append(row)
+
+          for row in npc_rows:
+              npc_groups[row["gfx_id"]].append(row)
+
+          combined = []
+          actions_by_id = defaultdict(list)
+
+          for key, records in sorted(
+              action_groups.items()
+          ):
+              sprite_id, action_id = key
+
+              if sprite_id not in actors:
+                  continue
+
+              sources = sorted({
+                  row["reference"]
+                  for row in records
+              })
+
+              values = sorted({
+                  (
+                      row["reference_framecount"],
+                      row["reference_framerate"]
+                  )
+                  for row in records
+              })
+
+              if len(sources) >= 2 and len(values) == 1:
+                  status = "REGIONAL_REFERENCE_AGREEMENT"
+              elif len(sources) >= 2:
+                  status = "REGIONAL_REFERENCE_CONFLICT"
+              else:
+                  status = "ONE_EXTERNAL_REFERENCE"
+
+              entry = {
+                  "sprite_id": sprite_id,
+                  "action_id": action_id,
+                  "action_hint": action_hints.get(
+                      action_id, ""
+                  ),
+                  "reference_sources": ",".join(sources),
+                  "reference_values": json.dumps(
+                      values
+                  ),
+                  "comparison_status": status,
+                  "sprite_id_present": True,
+                  "original_frame_order_verified": False,
+                  "actual_action_verified": False
+              }
+
+              combined.append(entry)
+              actions_by_id[sprite_id].append(entry)
+
+          csv_save(
+              "04_external_action_crosscheck.csv",
+              combined,
+              [
+                  "sprite_id",
+                  "action_id",
+                  "action_hint",
+                  "reference_sources",
+                  "reference_values",
+                  "comparison_status",
+                  "sprite_id_present",
+                  "original_frame_order_verified",
+                  "actual_action_verified"
+              ]
+          )
+
+          summary_rows = []
+          browser_rows = []
+
+          for sprite_id, actor in sorted(
+              actors.items()
+          ):
+              actions = actions_by_id.get(
+                  sprite_id, []
+              )
+
+              npcs = npc_groups.get(
+                  sprite_id, []
+              )
+
+              names = sorted({
+                  row["npc_name"]
+                  for row in npcs
+                  if row["npc_name"].strip()
+              })
+
+              regions = sorted({
+                  row["reference"]
+                  for row in npcs
+              })
+
+              conflicting = sum(
+                  x["comparison_status"]
+                  == "REGIONAL_REFERENCE_CONFLICT"
+                  for x in actions
+              )
+
+              summary_rows.append({
+                  "sprite_id": sprite_id,
+                  "actual_spr_files": actor["file_records"],
+                  "actual_subids": actor["unique_subids"],
+                  "actual_packages": actor["packages"],
+                  "external_action_records": len(actions),
+                  "external_npc_names": len(names),
+                  "external_name_candidates": " | ".join(
+                      names[:20]
+                  ),
+                  "external_regions": ",".join(regions),
+                  "reference_action_conflicts": conflicting,
+                  "verified_original_action_names": 0,
+                  "verified_original_frame_sequences": 0,
+                  "identity_status": "NUMERIC_ID_MATCH_ONLY"
+              })
+
+              browser_rows.append({
+                  "id": sprite_id,
+                  "files": int(actor["file_records"]),
+                  "subids": int(actor["unique_subids"]),
+                  "packages": actor["package_names"],
+                  "names": names[:20],
+                  "npcs": [
+                      {
+                          "name": row["npc_name"],
+                          "region": row["reference"],
+                          "npcid": row["npc_id"],
+                          "impl": row["implementation"],
+                          "note": row["note"]
+                      }
+                      for row in npcs[:40]
+                  ],
+                  "actions": [
+                      {
+                          "id": entry["action_id"],
+                          "hint": entry["action_hint"],
+                          "sources": entry["reference_sources"],
+                          "values": entry["reference_values"],
+                          "status": entry["comparison_status"]
+                      }
+                      for entry in actions
+                  ]
+              })
+
+          csv_save(
+              "05_full_sprite_identity_candidates.csv",
+              summary_rows,
+              [
+                  "sprite_id",
+                  "actual_spr_files",
+                  "actual_subids",
+                  "actual_packages",
+                  "external_action_records",
+                  "external_npc_names",
+                  "external_name_candidates",
+                  "external_regions",
+                  "reference_action_conflicts",
+                  "verified_original_action_names",
+                  "verified_original_frame_sequences",
+                  "identity_status"
+              ]
           )
 
           summary = {
-              "phase": "ORIGINAL_ANIMATION_DEFINITION_ANALYSIS",
-              "indexed_sprite_files": len(v2),
-              "indexed_sprite_subid_pairs": len(
-                  sprite_lookup
+              "phase": "EXTERNAL_REFERENCE_CROSSCHECK",
+              "actual_sprite_id_groups": len(actors),
+              "external_action_rows": len(action_rows),
+              "external_npc_rows": len(npc_rows),
+              "client_ids_with_external_actions": sum(
+                  bool(row["external_action_records"])
+                  for row in summary_rows
               ),
-              "original_list_candidates": len(candidates),
-              "source_status_counts": dict(status_counts),
-              "parsed_actor_entries": recovered_entries,
-              "parsed_action_records": len(action_rows),
-              "expanded_action_frame_rows": len(frame_rows),
-              "frame_verification": dict(frame_status),
-              "frame_rows_truncated": truncated,
-              "action_names_from_original_source_only": True,
-              "pak_precedence_verified": False,
-              "duration_unit_verified": False,
-              "monster_identity_crosscheck_complete": False
+              "client_ids_with_external_npc_names": sum(
+                  bool(row["external_npc_names"])
+                  for row in summary_rows
+              ),
+              "external_action_pairs_on_client_ids": len(
+                  combined
+              ),
+              "regional_reference_conflicts": sum(
+                  x["comparison_status"]
+                  == "REGIONAL_REFERENCE_CONFLICT"
+                  for x in combined
+              ),
+              "client_list_spr_found_in_v11": False,
+              "verified_original_monster_names": 0,
+              "verified_original_action_sequences": 0,
+              "pak_priority_verified": False,
+              "reference_version": "L1J 3.80c",
+              "reference_provenance": (
+                  "Third-party JP and TW server SQL; "
+                  "not the current game's original client"
+              )
           }
 
-          (REPORT / "06_summary_v11.json").write_text(
+          (REPORT / "06_summary_v12.json").write_text(
               json.dumps(
                   summary,
                   ensure_ascii=False,
@@ -1080,54 +638,199 @@ jobs:
               encoding="utf-8"
           )
 
-          report = [
-              "Sanctuary of Aden V11",
-              "",
-              "Original animation-definition candidates: "
-              + str(len(candidates)),
-              "Parsed action definitions: "
-              + str(len(action_rows)),
-              "Frame-direction references: "
-              + str(len(frame_rows)),
-              "",
-              "Source files were discovered from the V1 inventory.",
-              "Only candidate packages were selectively extracted.",
-              "Binary or unrecognized list.spz sources remain raw.",
-              "Action names are taken only from parsed source text.",
-              "Frame timing units are not assumed.",
-              "PAK precedence is not assumed.",
-              "Absent sources do not imply absent sprite images."
-          ]
+          data = json.dumps(
+              browser_rows,
+              ensure_ascii=False,
+              separators=(",", ":")
+          ).replace("<", "\\u003c")
 
-          (REPORT / "REPORT.txt").write_text(
-              "\n".join(report) + "\n",
+          html = r'''<!doctype html>
+          <html lang="ko">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Sanctuary V12 ID Reference</title>
+          <style>
+          :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101721;color:#e9f1fa}
+          *{box-sizing:border-box}
+          body{max-width:1050px;margin:auto;padding:14px}
+          h1{font-size:1.35rem}
+          h2{font-size:1rem}
+          p{font-size:.85rem;color:#adbed2;line-height:1.5}
+          input,select{width:100%;background:#223244;color:white;border:1px solid #49617b;padding:10px;border-radius:7px;font:inherit}
+          .controls{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+          .panel{background:#192635;border:1px solid #354b62;border-radius:9px;padding:12px;margin:13px 0}
+          .warn{color:#ffcc8f}
+          .meta{font-size:.82rem;color:#bacbe0}
+          table{border-collapse:collapse;width:100%;font-size:.8rem}
+          th,td{text-align:left;padding:8px;border-bottom:1px solid #33485c;overflow-wrap:anywhere}
+          th{color:#a9bed5}
+          .scroll{overflow-x:auto}
+          a{color:#a8ceff}
+          @media(max-width:620px){.controls{grid-template-columns:1fr}th,td{padding:6px}}
+          </style>
+          </head>
+          <body>
+          <h1>Sanctuary V12 · SPR ID 교차검증</h1>
+          <p class="warn">이름과 액션 번호는 별도 L1J 3.80c 서버 자료에서 가져온 참고 후보입니다. 현재 클라이언트에서 원본 액션 정의나 몬스터 이름이 확인된 것은 아닙니다.</p>
+          <p><a href="V10-Original-Sprite-Viewer.html">V10 실제 SPR 이미지 검사기 열기</a></p>
+          <div class="controls">
+          <label>스프라이트 ID·이름 검색<input id="query" placeholder="예: 29, orc, skeleton"></label>
+          <label>검색 결과 선택<select id="sprite"></select></label>
+          </div>
+          <div class="panel" id="info"></div>
+          <h2>외부 NPC 이름 후보</h2>
+          <div class="panel scroll"><table><thead><tr><th>참고 지역</th><th>NPC ID</th><th>이름</th><th>구현형</th><th>비고</th></tr></thead><tbody id="npcs"></tbody></table></div>
+          <h2>외부 액션 표 비교</h2>
+          <div class="panel scroll"><table><thead><tr><th>액션 ID</th><th>참고 분류</th><th>출처</th><th>framecount / framerate</th><th>대조</th></tr></thead><tbody id="actions"></tbody></table></div>
+          <p class="warn">framecount·framerate는 참고 SQL의 필드값 그대로입니다. SPR 내부 프레임 수나 원본 재생시간으로 해석하지 않습니다. 액션별 실제 서브 ID·프레임 순서는 미확정입니다.</p>
+          <script type="application/json" id="inventory">__DATA__</script>
+          <script>
+          'use strict';
+          const DB=JSON.parse(document.getElementById('inventory').textContent);
+          const $=id=>document.getElementById(id);
+          const select=$('sprite');
+          const query=$('query');
+
+          function cell(tr,value){
+            const td=document.createElement('td');
+            td.textContent=String(value??'');
+            tr.append(td);
+          }
+
+          function tableRows(target,rows,keys){
+            const body=$(target);
+            body.replaceChildren();
+            for(const row of rows){
+              const tr=document.createElement('tr');
+              keys.forEach(key=>cell(tr,row[key]));
+              body.append(tr);
+            }
+          }
+
+          function choices(){
+            const q=query.value.trim().toLowerCase();
+            const previous=select.value;
+            const matches=DB.filter(x=>
+              !q ||
+              String(x.id).includes(q) ||
+              x.names.some(name=>name.toLowerCase().includes(q))
+            ).slice(0,200);
+
+            select.replaceChildren();
+
+            matches.forEach(x=>{
+              const option=document.createElement('option');
+              option.value=String(x.id);
+              option.textContent=`${x.id} ${x.names.slice(0,2).join(' / ')}`;
+              select.append(option);
+            });
+
+            if(matches.some(x=>String(x.id)===previous)){
+              select.value=previous;
+            }
+
+            render();
+          }
+
+          function render(){
+            const item=DB.find(x=>String(x.id)===select.value);
+
+            if(!item){
+              $('info').textContent='검색 결과 없음';
+              $('npcs').replaceChildren();
+              $('actions').replaceChildren();
+              return;
+            }
+
+            $('info').textContent=
+              `SPR ${item.id} · 현재 원본 ${item.files}건 · 서브 ID ${item.subids}종 · `+
+              `원본 PAK: ${item.packages} · 외부 이름 후보 ${item.names.length}종 · 외부 액션 후보 ${item.actions.length}건`;
+
+            tableRows('npcs',item.npcs.map(x=>({
+              region:x.region,
+              npcid:x.npcid,
+              name:x.name,
+              impl:x.impl,
+              note:x.note
+            })),['region','npcid','name','impl','note']);
+
+            tableRows('actions',item.actions.map(x=>({
+              id:x.id,
+              hint:x.hint,
+              sources:x.sources,
+              values:x.values,
+              status:x.status
+            })),['id','hint','sources','values','status']);
+          }
+
+          query.addEventListener('input',choices);
+          select.addEventListener('change',render);
+
+          choices();
+          </script>
+          </body>
+          </html>'''
+
+          (REPORT / "V12-Reference-Comparison.html").write_text(
+              html.replace("__DATA__", data),
               encoding="utf-8"
           )
 
-          print("=== V11 SUMMARY ===")
+          explanation = [
+              "Sanctuary of Aden V12",
+              "",
+              "V11 confirmed no original list.spr/list.spz candidate.",
+              "V12 uses third-party regional L1J 3.80c SQL tables.",
+              "Matching graphics IDs are numerical correspondences only.",
+              "NPC names and action labels are candidate references.",
+              "Different regional source values are reported as conflicts.",
+              "The original game package precedence is unknown.",
+              "The original per-frame sequences are not recovered.",
+              "The original frame duration units are not established.",
+              "",
+              "Open V12-Reference-Comparison.html for external metadata.",
+              "Open V10-Original-Sprite-Viewer.html for actual images."
+          ]
+
+          (REPORT / "REPORT.txt").write_text(
+              "\n".join(explanation) + "\n",
+              encoding="utf-8"
+          )
+
+          print("=== V12 SUMMARY ===")
           print(json.dumps(
               summary,
               ensure_ascii=False,
               indent=2
           ))
-
-          for row in source_rows:
-              print("SOURCE", row)
 
           path = os.environ.get("GITHUB_STEP_SUMMARY")
           if path:
               with open(
                   path, "a", encoding="utf-8"
               ) as f:
-                  f.write("\n".join(report) + "\n")
+                  f.write("\n".join(explanation) + "\n")
+                  f.write(
+                      json.dumps(
+                          summary,
+                          ensure_ascii=False,
+                          indent=2
+                      )
+                  )
+
+          if not combined:
+              raise SystemExit(
+                  "No external reference IDs matched the V10 inventory"
+              )
 
           PY
 
-      - name: Upload V11 original motion source analysis
+      - name: Upload V12 ID crosscheck and HTML viewers
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V11-Original-Animation-Definitions
+          name: Sanctuary-V12-External-Action-and-NPC-Crosscheck
           path: reports/
           if-no-files-found: error
           retention-days: 30
