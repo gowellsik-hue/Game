@@ -1,8 +1,14 @@
 
-name: Sanctuary of Aden Mobile Motion Sandbox V15
+name: Sanctuary of Aden Four Monster Motions V16
 
 on:
   workflow_dispatch:
+    inputs:
+      sprite_id:
+        description: Optional monster SPR ID, blank for automatic selection
+        required: false
+        type: string
+        default: ""
   push:
     paths:
       - ".github/workflows/audit-sanctuary-monsters.yml"
@@ -16,1925 +22,1211 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sandbox:
+  four-motions:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 180
 
     steps:
-      - name: Prepare directories
+      - name: Prepare environment
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p previous/v13 previous/v14
-          mkdir -p reports/site/assets
-          node --version
-          python3 --version
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full python3-pil
+          mkdir -p previous/v2 previous/v12 previous/v13
+          mkdir -p downloads client reports/site/sheets
+          python3 -c "from PIL import Image; print('PIL READY')"
 
-      - name: Restore original sprite evidence
+      - name: Restore full sprite indexes and monster references
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
+          gh run download 38784834277 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Sanctuary-V2-Reports \
+            --dir previous/v2
+          gh run download 38872552732 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Sanctuary-V12-External-Action-and-NPC-Crosscheck \
+            --dir previous/v12
           gh run download 38874270054 \
             --repo "$GITHUB_REPOSITORY" \
             --name Sanctuary-V13-Expanded-Monster-Motion-Lab \
             --dir previous/v13
-
-          gh run download 38908557785 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V14-Interactive-Motion-Mapping \
-            --dir previous/v14
-
+          test -n "$(find previous/v2 -name all_sprite_candidates.csv -print -quit)"
+          test -n "$(find previous/v2 -name exported_sprite_manifest.csv -print -quit)"
+          test -s previous/v12/03_external_npc_gfx_candidates.csv
           test -s previous/v13/01_selected_sprite_ids.csv
-          test -s previous/v13/02_all_rendered_sprite_images.csv
-          test -s previous/v14/04_unassigned_motion_candidates.json
-          test -s previous/v14/05_summary_v14.json
-          test -d previous/v14/viewer/sheets
 
-      - name: Build motion sandbox and mapping adapter
+      - name: Select one monster with distinct eight-direction groups
         shell: bash
+        env:
+          REQUESTED_ID: ${{ inputs.sprite_id }}
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import base64
           import csv
           import json
           import os
-          import shutil
+          import re
           from collections import defaultdict
           from pathlib import Path
 
-          ROOT = Path.cwd()
-          V13 = ROOT / "previous/v13"
-          V14 = ROOT / "previous/v14"
-          REPORT = ROOT / "reports"
-          SITE = REPORT / "site"
+          ROOT=Path.cwd()
+          OUT=ROOT/"reports"
 
-          def load_csv(path):
-              with path.open(
-                  encoding="utf-8-sig",
-                  newline=""
-              ) as file:
-                  return list(csv.DictReader(file))
+          def load(root,pattern):
+              paths=list(root.rglob(pattern))
+              if len(paths)!=1:
+                  raise RuntimeError("Missing or duplicated "+pattern)
+              with paths[0].open(encoding="utf-8-sig",newline="") as f:
+                  return list(csv.DictReader(f))
 
-          source = load_csv(
-              V13 / "02_all_rendered_sprite_images.csv"
+          sources=load(ROOT/"previous/v2","all_sprite_candidates.csv")
+          hashes=load(ROOT/"previous/v2","exported_sprite_manifest.csv")
+          npcs=load(ROOT/"previous/v12","03_external_npc_gfx_candidates.csv")
+          previous=load(ROOT/"previous/v13","01_selected_sprite_ids.csv")
+
+          known={int(r["sprite_id"]) for r in previous}
+          sha={
+              (r["pak"],r["sprite_file"].lower(),int(r["bytes"])):r["sha256"]
+              for r in hashes
+          }
+
+          names=defaultdict(set)
+          for r in npcs:
+              if "monster" not in r["implementation"].lower():
+                  continue
+              try:
+                  aid=int(r["gfx_id"])
+              except ValueError:
+                  continue
+              if r["npc_name"].strip():
+                  names[aid].add(r["npc_name"].strip())
+
+          pattern=re.compile(r"^(\d+)-(\d+)\.spr$",re.I)
+          indexed=defaultdict(list)
+          banks=defaultdict(lambda:defaultdict(set))
+
+          for r in sources:
+              filename=r["file"].replace("\\","/").split("/")[-1]
+              m=pattern.fullmatch(filename)
+              if not m:
+                  continue
+              aid,sub=map(int,m.groups())
+              pak=r["pak"]
+              if not Path(pak).name.lower().startswith("sprite"):
+                  continue
+              size=int(r["bytes"])
+              digest=sha.get((pak,filename.lower(),size),"")
+              item={
+                  "actor":aid,
+                  "sub":sub,
+                  "file":filename,
+                  "pak":pak,
+                  "offset":int(r["offset"]),
+                  "bytes":size,
+                  "sha256":digest
+              }
+              indexed[(aid,pak)].append(item)
+              banks[(aid,pak)][sub//8*8].add(sub)
+
+          requested=os.environ.get("REQUESTED_ID","").strip()
+          if requested and not re.fullmatch(r"\d+",requested):
+              raise RuntimeError("sprite_id must be numeric")
+
+          candidate_keys=[]
+          for key,items in indexed.items():
+              aid,pak=key
+              if requested:
+                  if aid!=int(requested):
+                      continue
+              elif aid not in names:
+                  continue
+
+              groups=banks[key]
+              complete=sum(len(s)==8 for s in groups.values())
+              total=sum(len(s) for s in groups.values())
+              score=(
+                  int(complete>=4),
+                  int(aid in known),
+                  complete,
+                  total,
+                  -aid
+              )
+              candidate_keys.append((score,key))
+
+          if not candidate_keys:
+              raise RuntimeError("No sprite ID/package candidate found")
+
+          candidate_keys.sort(reverse=True)
+          _,(actor,pak)=candidate_keys[0]
+
+          groups=banks[(actor,pak)]
+          complete=sorted(
+              b for b,s in groups.items() if len(s)==8
+          )
+          partial=sorted(
+              (b for b,s in groups.items() if len(s)<8),
+              key=lambda b:(-len(groups[b]),b)
+          )
+          chosen_bands=(complete+partial)[:8]
+          wanted={
+              n for b in chosen_bands for n in range(b,b+8)
+          }
+
+          files=[
+              r for r in indexed[(actor,pak)]
+              if r["sub"] in wanted
+          ]
+          files.sort(key=lambda r:(r["sub"],r["offset"]))
+
+          package=Path(pak)
+          if not package.parts or package.parts[0]!="outer":
+              raise RuntimeError("Unexpected source package path")
+
+          archive_path=package.relative_to("outer").as_posix()
+
+          selection={
+              "sprite_id":actor,
+              "external_name_candidates":sorted(names[actor]),
+              "name_verified":False,
+              "pak":pak,
+              "archive_path":archive_path,
+              "package_priority_verified":False,
+              "complete_bands_in_package":len(complete),
+              "four_complete_bands_available":len(complete)>=4,
+              "selected_bands":[
+                  {
+                      "base":b,
+                      "complete":len(groups[b])==8,
+                      "present":len(groups[b])
+                  }
+                  for b in chosen_bands
+              ],
+              "source_files":files
+          }
+
+          (OUT/"selection_v16.json").write_text(
+              json.dumps(selection,ensure_ascii=False,indent=2),
+              encoding="utf-8"
+          )
+          (OUT/"selected_package.txt").write_text(
+              archive_path+"\n",encoding="utf-8"
           )
 
-          selected = load_csv(
-              V13 / "01_selected_sprite_ids.csv"
+          print("=== V16 SELECTED MONSTER ===")
+          print(json.dumps({
+              k:v for k,v in selection.items() if k!="source_files"
+          },ensure_ascii=False,indent=2))
+          print("Indexed SPR files selected:",len(files))
+          PY
+
+      - name: Download original client archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "Sanctuary.of.Aden.-.Copy.*" \
+            --dir downloads
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("downloads")
+          base="Sanctuary.of.Aden.-.Copy"
+          expected=[f"{base}.z{i:02d}" for i in range(1,46)]
+          expected.append(base+".zip")
+          missing=[n for n in expected if not (root/n).is_file()]
+          if missing:
+              raise RuntimeError("Missing archive parts: "+str(missing))
+          print("Verified archive parts:",len(expected))
+          PY
+
+      - name: Extract selected original Sprite PAK
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="downloads/Sanctuary.of.Aden.-.Copy.zip"
+          package="$(cat reports/selected_package.txt)"
+          7z x "$archive" "$package" \
+            "-o${PWD}/client" -y \
+            > reports/extraction_v16.log 2>&1
+          test -s "client/$package"
+          rm -rf downloads
+          df -h .
+
+      - name: Decode source SPR files into full motion atlases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import struct
+          from collections import defaultdict
+          from pathlib import Path
+          from PIL import Image
+
+          ROOT=Path.cwd()
+          OUT=ROOT/"reports"
+          SITE=OUT/"site"
+          SHEETS=SITE/"sheets"
+          SHEETS.mkdir(parents=True,exist_ok=True)
+
+          selection=json.loads(
+              (OUT/"selection_v16.json").read_text(encoding="utf-8")
           )
+          actor=selection["sprite_id"]
+          pak=ROOT/"client"/selection["archive_path"]
 
-          motion_groups = json.loads(
-              (
-                  V14 /
-                  "04_unassigned_motion_candidates.json"
-              ).read_text(encoding="utf-8")
-          )["reviewGroups"]
+          MAX_FRAMES=128
+          MAX_DIMENSION=1000
+          MAX_ATLAS_PIXELS=10000000
 
-          v14_summary = json.loads(
-              (
-                  V14 / "05_summary_v14.json"
-              ).read_text(encoding="utf-8")
-          )
+          class Reader:
+              def __init__(self,data):
+                  self.data=data
+                  self.pos=0
 
-          if len(source) != 1095:
-              raise SystemExit(
-                  "Unexpected V13 sprite inventory count"
+              def read(self,fmt):
+                  size=struct.calcsize(fmt)
+                  if self.pos+size>len(self.data):
+                      raise ValueError("Truncated SPR structure")
+                  value=struct.unpack_from(fmt,self.data,self.pos)
+                  self.pos+=size
+                  return value[0] if len(value)==1 else value
+
+              def decode(self):
+                  count=self.read("<B")
+                  palette=None
+
+                  if count==255:
+                      n=self.read("<B") or 256
+                      palette=[self.read("<H") for _ in range(n)]
+                      count=self.read("<B")
+
+                  if not 1<=count<=MAX_FRAMES:
+                      raise ValueError("Unsupported frame count "+str(count))
+
+                  descriptions=[]
+                  for _ in range(count):
+                      self.read("<hhhh")
+                      self.read("<HH")
+                      n=self.read("<H")
+                      if n>1500:
+                          raise ValueError("Excessive SPR blocks")
+                      blocks=[self.read("<bbBH") for _ in range(n)]
+                      descriptions.append(blocks)
+
+                  nblocks=self.read("<i")
+                  if not 0<=nblocks<=20000:
+                      raise ValueError("Invalid block table")
+
+                  offsets=[self.read("<i") for _ in range(nblocks)]
+                  self.read("<i")
+                  base=self.pos
+
+                  used={
+                      block[3]
+                      for frame in descriptions
+                      for block in frame
+                  }
+                  if any(i>=nblocks for i in used):
+                      raise ValueError("Invalid block reference")
+
+                  decoded={}
+
+                  for block_id in sorted(used):
+                      position=base+offsets[block_id]
+                      if position<base or position+4>len(self.data):
+                          raise ValueError("Invalid pixel offset")
+
+                      def byte():
+                          nonlocal position
+                          if position>=len(self.data):
+                              raise ValueError("Truncated SPR pixels")
+                          value=self.data[position]
+                          position+=1
+                          return value
+
+                      sx=byte()
+                      sy=byte()
+                      byte()
+                      line_count=byte()
+                      pixels=[]
+
+                      for line in range(line_count):
+                          x=sx
+                          for _ in range(byte()):
+                              x+=byte()//2
+                              for _ in range(byte()):
+                                  if palette is None:
+                                      color=byte()|(byte()<<8)
+                                  else:
+                                      index=byte()
+                                      if index>=len(palette):
+                                          raise ValueError("Bad palette index")
+                                      color=palette[index]
+
+                                  if x>=24 or sy+line>=24:
+                                      raise ValueError("Bad block coordinate")
+
+                                  if color!=32768:
+                                      pixels.append((x,sy+line,color))
+                                  x+=1
+
+                      decoded[block_id]=pixels
+
+                  images=[]
+
+                  for blocks in descriptions:
+                      if not blocks:
+                          images.append(None)
+                          continue
+
+                      placements=[]
+                      for a,b,kind,block_id in blocks:
+                          adjusted=a-1 if a<0 else a
+                          half=int(adjusted/2)
+                          placements.append((
+                              24*(b+a-half),
+                              12*(b-half),
+                              block_id
+                          ))
+
+                      minx=min(x for x,y,i in placements)
+                      miny=min(y for x,y,i in placements)
+                      maxx=max(x+24 for x,y,i in placements)
+                      maxy=max(y+24 for x,y,i in placements)
+
+                      width=maxx-minx
+                      height=maxy-miny
+
+                      if not (
+                          1<=width<=MAX_DIMENSION
+                          and 1<=height<=MAX_DIMENSION
+                      ):
+                          raise ValueError("Oversized sprite frame")
+
+                      image=Image.new(
+                          "RGBA",(width,height),(0,0,0,0)
+                      )
+                      pixels=image.load()
+
+                      for x,y,block_id in placements:
+                          for px,py,color in decoded[block_id]:
+                              pixels[
+                                  x+px-minx,
+                                  y+py-miny
+                              ]=(
+                                  ((color>>10)&31)*255//31,
+                                  ((color>>5)&31)*255//31,
+                                  (color&31)*255//31,
+                                  255
+                              )
+
+                      images.append(image)
+
+                  return images
+
+          def save_atlas(images,path):
+              visible=[im for im in images if im is not None]
+              if not visible:
+                  raise ValueError("No visible frames")
+
+              cw=max(im.width for im in visible)
+              ch=max(im.height for im in visible)
+              cols=min(4,len(images))
+              rows=math.ceil(len(images)/cols)
+
+              if cw*ch*cols*rows>MAX_ATLAS_PIXELS:
+                  raise ValueError("Atlas exceeds pixel limit")
+
+              atlas=Image.new(
+                  "RGBA",(cw*cols,ch*rows),(0,0,0,0)
               )
 
-          if len(source) != v14_summary[
-              "validated_sprite_sheets"
-          ]:
-              raise SystemExit(
-                  "V13 and V14 sprite evidence mismatch"
-              )
+              for index,image in enumerate(images):
+                  if image is None:
+                      continue
+                  x=(index%cols)*cw+(cw-image.width)//2
+                  y=(index//cols)*ch+(ch-image.height)//2
+                  atlas.alpha_composite(image,(x,y))
 
-          if len(motion_groups) != v14_summary[
-              "package_specific_bands"
-          ]:
-              raise SystemExit(
-                  "V14 motion group count mismatch"
-              )
+              path.parent.mkdir(parents=True,exist_ok=True)
+              atlas.save(path,optimize=True)
 
-          shutil.copytree(
-              V14 / "viewer/sheets",
-              SITE / "assets/sheets",
-              dirs_exist_ok=True
-          )
-
-          metadata = {}
-
-          for row in selected:
-              actor = int(row["sprite_id"])
-
-              metadata[str(actor)] = {
-                  "referenceName": row[
-                      "external_npc_names"
-                  ],
-                  "selection": row["selection"],
-                  "identityVerified": False
+              return {
+                  "frames":len(images),
+                  "cols":cols,
+                  "cellW":cw,
+                  "cellH":ch,
+                  "path":path.relative_to(SITE).as_posix()
               }
 
-          entries = []
+          output=[]
+          errors=[]
+          seen=set()
 
-          for row in source:
-              path = Path(row["sheet"])
+          with pak.open("rb") as source:
+              for row in selection["source_files"]:
+                  sub=int(row["sub"])
+                  if sub in seen:
+                      continue
+                  seen.add(sub)
 
-              if (
-                  not path.parts
-                  or path.parts[0] != "sheets"
-                  or path.is_absolute()
-                  or ".." in path.parts
-              ):
-                  raise RuntimeError(
-                      "Invalid sprite asset path"
-                  )
+                  try:
+                      size=int(row["bytes"])
+                      if not 0<size<=4194304:
+                          raise ValueError("Invalid SPR file size")
+                      if not row["sha256"]:
+                          raise ValueError("Missing V2 SHA256")
 
-              image_path = SITE / "assets" / path
+                      source.seek(int(row["offset"]))
+                      data=source.read(size)
 
-              if not image_path.is_file():
-                  raise RuntimeError(
-                      "Missing original PNG: "
-                      + str(path)
-                  )
+                      if len(data)!=size:
+                          raise ValueError("Short PAK read")
 
-              with image_path.open("rb") as file:
-                  signature = file.read(8)
+                      digest=hashlib.sha256(data).hexdigest()
 
-              if signature != b"\x89PNG\r\n\x1a\n":
-                  raise RuntimeError(
-                      "Invalid original PNG header"
-                  )
+                      if digest!=row["sha256"]:
+                          raise ValueError("SHA256 mismatch")
 
-              entries.append({
-                  "actor": int(row["actor"]),
-                  "sub": int(row["sub"]),
-                  "package": row["package"],
-                  "sha256": row["sha256"],
-                  "frames": int(row["frames"]),
-                  "renderedFrames": int(
-                      row["renderedFrames"]
-                  ),
-                  "cols": int(row["cols"]),
-                  "cellW": int(row["cellW"]),
-                  "cellH": int(row["cellH"]),
-                  "sheet": path.as_posix(),
-                  "asset": (
-                      "assets/" + path.as_posix()
-                  ),
-                  "origin": row["origin"]
+                      frames=Reader(data).decode()
+                      target=SHEETS/(
+                          f"{actor}-{sub}_{digest[:12]}.png"
+                      )
+                      info=save_atlas(frames,target)
+
+                      output.append({
+                          "actor":actor,
+                          "sub":sub,
+                          "package":Path(selection["pak"]).name,
+                          "sha256":digest,
+                          **info
+                      })
+
+                  except Exception as exc:
+                      errors.append({
+                          "sprite_id":actor,
+                          "subid":sub,
+                          "reason":str(exc)
+                      })
+
+          available={row["sub"] for row in output}
+          groups=[]
+
+          for group in selection["selected_bands"]:
+              base=group["base"]
+              missing=[
+                  base+i for i in range(8)
+                  if base+i not in available
+              ]
+              groups.append({
+                  "base":base,
+                  "complete":len(missing)==0,
+                  "present":8-len(missing),
+                  "missing":missing
               })
 
-          entries.sort(
-              key=lambda x: (
-                  x["actor"],
-                  x["package"],
-                  x["sub"],
-                  x["sha256"]
-              )
+          groups.sort(key=lambda g:(not g["complete"],g["base"]))
+
+          def save_csv(name,rows,fields):
+              with (OUT/name).open(
+                  "w",encoding="utf-8-sig",newline=""
+              ) as file:
+                  writer=csv.DictWriter(
+                      file,fieldnames=fields,extrasaction="ignore"
+                  )
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          save_csv(
+              "01_extracted_original_spr.csv",
+              output,
+              [
+                  "actor","sub","package","sha256",
+                  "frames","cols","cellW","cellH","path"
+              ]
+          )
+          save_csv(
+              "02_spr_extraction_errors.csv",
+              errors,["sprite_id","subid","reason"]
           )
 
-          actors = sorted({
-              x["actor"] for x in entries
-          })
-
-          if len(actors) != 45:
-              raise RuntimeError(
-                  "V14 actor inventory mismatch"
-              )
-
-          adapter = r'''
-          export function resolveSanctuaryMotion(
-            mapping,
-            inventory,
-            spriteId,
-            action,
-            direction,
-            elapsedMs
-          ) {
-            const assignment =
-              mapping?.assignments?.[String(spriteId)]?.[action];
-
-            if (!assignment) return null;
-
-            if (
-              !Number.isInteger(direction) ||
-              direction < 0 ||
-              direction > 7
-            ) return null;
-
-            const rotated = assignment.mirror
-              ? (8 - direction) % 8
-              : direction;
-
-            const subId = assignment.base +
-              (rotated + assignment.rotation) % 8;
-
-            const expected = assignment.directionMap
-              ?.find(x => x.engineDirection === direction);
-
-            const sprite = inventory.entries.find(x =>
-              x.actor === Number(spriteId) &&
-              x.package === assignment.package &&
-              x.sub === subId &&
-              (!expected?.sha256 ||
-                expected.sha256 === x.sha256)
-            );
-
-            if (!sprite) return null;
-
-            const interval = Math.max(
-              40,
-              Number(assignment.intervalMs) || 200
-            );
-
-            const frame = Math.floor(
-              Math.max(0, elapsedMs) / interval
-            ) % sprite.renderedFrames;
-
-            return {
-              spriteId: Number(spriteId),
-              action,
-              engineDirection: direction,
-              sourceSubId: subId,
-              image: sprite.asset,
-              imageSha256: sprite.sha256,
-              frame,
-              sourceX: (frame % sprite.cols) * sprite.cellW,
-              sourceY: Math.floor(frame / sprite.cols) *
-                sprite.cellH,
-              width: sprite.cellW,
-              height: sprite.cellH,
-              intervalMs: interval,
-              originalActionVerified: false,
-              originalTimingVerified: false
-            };
+          manifest={
+              "version":"V16",
+              "spriteId":actor,
+              "externalNames":selection["external_name_candidates"],
+              "sourcePak":selection["pak"],
+              "sourceVerifiedBySHA256":True,
+              "sourceActionDefinitionVerified":False,
+              "originalDirectionMappingVerified":False,
+              "originalTimingVerified":False,
+              "originalMonsterNameVerified":False,
+              "groups":groups,
+              "sprites":sorted(output,key=lambda r:r["sub"])
           }
-          '''
 
-          (REPORT / "sanctuary-motion-adapter.js").write_text(
-              adapter.strip() + "\n",
+          (OUT/"manifest_v16.json").write_text(
+              json.dumps(manifest,ensure_ascii=False,indent=2),
               encoding="utf-8"
           )
 
-          (SITE / "motion-manifest.json").write_text(
-              json.dumps(
-                  {
-                      "version": "V15",
-                      "assetSource": "V13_V14_VERIFIED_SPR",
-                      "actors": actors,
-                      "actorMetadata": metadata,
-                      "entries": entries,
-                      "groups": motion_groups,
-                      "originalMotionMappingsVerified": False
-                  },
-                  ensure_ascii=False,
-                  separators=(",", ":")
-              ),
-              encoding="utf-8"
+          print("=== V16 SPR EXTRACTION ===")
+          print(json.dumps({
+              "sprite_id":actor,
+              "original_spr_rendered":len(output),
+              "extraction_errors":len(errors),
+              "available_banks":len(groups),
+              "complete_eight_direction_banks":sum(
+                  g["complete"] for g in groups
+              )
+          },ensure_ascii=False,indent=2))
+
+          if not output:
+              raise SystemExit("No original SPR frames decoded")
+          PY
+
+      - name: Generate four simultaneous motion animations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          REPORT=ROOT/"reports"
+          SITE=REPORT/"site"
+
+          manifest=json.loads(
+              (REPORT/"manifest_v16.json").read_text(
+                  encoding="utf-8"
+              )
           )
 
-          (REPORT / "motion-mapping-template.json").write_text(
-              json.dumps(
-                  {
-                      "version": "V15",
-                      "kind": "USER_TESTED_MOTION_CANDIDATES",
-                      "verification": {
-                          "originalActionDefinition": False,
-                          "originalDirection": False,
-                          "originalTiming": False,
-                          "packagePrecedence": False
-                      },
-                      "assignments": {}
-                  },
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
+          complete=[
+              group["base"]
+              for group in manifest["groups"]
+              if group["complete"]
+          ]
+          partial=[
+              group["base"]
+              for group in manifest["groups"]
+              if not group["complete"]
+          ]
+          all_banks=complete+partial
 
-          html = r'''<!doctype html>
+          actions=["wait","walk","attack","death"]
+          defaults={
+              action:all_banks[i] if i<len(all_banks) else None
+              for i,action in enumerate(actions)
+          }
+
+          html=r'''<!doctype html>
           <html lang="ko">
           <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>Sanctuary V15 Motion Sandbox</title>
+          <title>Sanctuary V16 Four Monster Motions</title>
           <style>
-          :root{
-            font-family:system-ui,sans-serif;
-            color-scheme:dark;
-            background:#101722;
-            color:#edf4ff
-          }
+          :root{font-family:system-ui,sans-serif;color-scheme:dark;background:#101722;color:#edf4fc}
           *{box-sizing:border-box}
-          body{
-            max-width:1050px;
-            margin:auto;
-            padding:12px
-          }
-          h1{font-size:1.35rem}
-          h2{font-size:1rem;margin:18px 0 9px}
-          p{
-            font-size:.82rem;
-            color:#b6c9dc;
-            line-height:1.5
-          }
-          .warning{color:#ffd098}
-          .toolbar{
-            display:grid;
-            grid-template-columns:
-              repeat(auto-fit,minmax(min(100%,170px),1fr));
-            gap:8px
-          }
-          label{
-            display:flex;
-            flex-direction:column;
-            gap:5px;
-            font-size:.8rem
-          }
-          select,input,button{
-            background:#26394e;
-            color:#f2f7ff;
-            border:1px solid #536c86;
-            border-radius:8px;
-            padding:10px;
-            font:inherit;
-            min-width:0
-          }
-          button{
-            cursor:pointer;
-            touch-action:manipulation
-          }
-          button.active{
-            background:#37698b;
-            border-color:#96ddff
-          }
-          .panel{
-            border:1px solid #344c63;
-            border-radius:10px;
-            background:#192635;
-            padding:10px;
-            margin:12px 0
-          }
-          .game{
-            width:100%;
-            display:block;
-            aspect-ratio:16/9;
-            background:#213142;
-            image-rendering:pixelated;
-            border-radius:7px
-          }
-          .line{
-            display:flex;
-            flex-wrap:wrap;
-            align-items:center;
-            gap:8px;
-            margin:9px 0
-          }
-          .line button{flex:1}
-          .pad{
-            display:grid;
-            grid-template-columns:repeat(3,62px);
-            grid-template-rows:repeat(3,51px);
-            gap:5px;
-            justify-content:center;
-            margin:12px auto;
-            touch-action:none
-          }
-          .pad button{
-            padding:5px;
-            font-size:1.05rem;
-            touch-action:none
-          }
-          .grid{
-            display:grid;
-            grid-template-columns:
-              repeat(auto-fill,minmax(130px,1fr));
-            gap:8px
-          }
-          .card{
-            background:#1b2b3c;
-            border:1px solid #36516b;
-            border-radius:8px;
-            padding:6px;
-            min-width:0
-          }
-          .card canvas{
-            width:100%;
-            aspect-ratio:1;
-            background:#293b4f;
-            image-rendering:pixelated
-          }
-          .small{
-            font-size:.72rem;
-            color:#b9cde0;
-            overflow-wrap:anywhere
-          }
-          .info{
-            font-size:.8rem;
-            color:#cadcf0;
-            white-space:pre-wrap;
-            line-height:1.6;
-            overflow-wrap:anywhere
-          }
-          .mapping{
-            display:grid;
-            grid-template-columns:repeat(3,1fr);
-            gap:6px
-          }
-          .mapping button{padding:9px 5px}
-          .file{
-            display:block;
-            width:100%;
-            max-width:100%
-          }
-          @media(min-width:750px){
-            .play-layout{
-              display:grid;
-              grid-template-columns:minmax(0,1fr) 210px;
-              gap:12px
-            }
-            .pad{margin-top:8px}
-          }
+          body{max-width:1150px;margin:auto;padding:12px}
+          h1{font-size:1.35rem;margin:8px 0}
+          h2{font-size:1rem;margin:16px 0 9px}
+          p{font-size:.82rem;color:#b5c9dc;line-height:1.5}
+          .warning{color:#ffd099}
+          .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin:12px 0}
+          label{display:flex;flex-direction:column;gap:5px;font-size:.79rem}
+          select,input,button{font:inherit;background:#26394d;color:#fff;border:1px solid #536d87;border-radius:8px;padding:9px;min-width:0}
+          button{cursor:pointer;touch-action:manipulation}
+          .active{border-color:#a1e0ff;background:#35638a}
+          .motions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+          .panel{background:#1a2737;border:1px solid #374e65;border-radius:10px;padding:9px;min-width:0}
+          .panel h2{margin:0 0 8px}
+          canvas{display:block;width:100%;aspect-ratio:1;background:#25364a;image-rendering:pixelated;border-radius:6px}
+          .motion-controls{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;margin-top:8px;align-items:end}
+          .meta{font-size:.72rem;color:#adc6dc;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5;margin-top:7px;min-height:50px}
+          .confirm{display:flex;flex-direction:row;align-items:center;gap:6px;margin-top:7px}
+          .confirm input{width:17px;height:17px}
+          .directions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+          .direction-card{border:1px solid #3b526b;background:#1b2b3c;border-radius:8px;padding:5px;min-width:0}
+          .direction-card canvas{width:100%}
+          .direction-label{font-size:.7rem;color:#c9daeb;margin-bottom:4px}
+          .info{font-size:.78rem;color:#c8d9ed;white-space:pre-wrap;line-height:1.6}
+          .actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+          .actions button{flex:1}
+          @media(max-width:550px){.motions{gap:7px}.panel{padding:6px}.motion-controls{grid-template-columns:1fr}.motions h2{font-size:.92rem}}
           </style>
           </head>
           <body>
-          <h1>Sanctuary V15 · 모바일 모션 전투 테스트</h1>
-          <p class="warning">
-          원본 SPR 이미지를 사용하지만 원본 액션 정의는
-          확보되지 않았습니다. 지정하지 않은 동작은
-          검사용 후보를 재생하며, 타이밍과 전투 수치는
-          테스트용입니다.
-          </p>
-
-          <h2>캐릭터와 모션 선택</h2>
+          <h1>Sanctuary V16 · 몬스터 4대 모션</h1>
+          <p id="identity"></p>
+          <p class="warning">네 화면은 원본 SPR에서 추출한 서로 다른 모션 묶음의 후보입니다. 원본 액션 정의가 확인되지 않았으므로 동작 이름은 육안으로 검증해야 합니다.</p>
           <div class="toolbar">
-          <label>스프라이트 ID
-          <select id="actor"></select>
-          </label>
-          <label>원본 PAK
-          <select id="pak"></select>
-          </label>
-          <label>현재 지정할 동작
-          <select id="action">
-          <option value="idle">대기</option>
-          <option value="walk">이동</option>
-          <option value="attack">공격</option>
-          <option value="hit">피격</option>
-          <option value="death">사망</option>
-          <option value="magic">마법</option>
-          </select>
-          </label>
-          <label>서브 ID 8슬롯 그룹
-          <select id="bank"></select>
-          </label>
-          <label>방향 시작번호
-          <select id="rotation"></select>
-          </label>
-          <label>방향 순서
-          <select id="reverse">
-          <option value="0">정방향</option>
-          <option value="1">역방향</option>
-          </select>
-          </label>
-          <label>검사용 프레임 간격
-          <select id="interval">
-          <option value="80">80ms</option>
-          <option value="120">120ms</option>
-          <option value="160">160ms</option>
-          <option value="200" selected>200ms</option>
-          <option value="260">260ms</option>
-          <option value="350">350ms</option>
-          </select>
-          </label>
+          <label>방향 번호<select id="direction"></select></label>
+          <label>방향 시작 오프셋<select id="rotation"></select></label>
+          <label>방향 순서<select id="reverse"><option value="0">기본 순서</option><option value="1">역순</option></select></label>
+          <button id="pause">전체 일시정지</button>
+          <button id="previous">이전 프레임</button>
+          <button id="next">다음 프레임</button>
           </div>
-
-          <div class="panel">
-          <div class="line">
-          <button id="assign">현재 동작에 지정</button>
-          <button id="clear">현재 동작 지정 해제</button>
+          <div class="motions" id="motions"></div>
+          <h2>8방향 원본 동시 확인</h2>
+          <label>비교할 동작<select id="inspect"><option value="wait">정지</option><option value="walk">이동</option><option value="attack">공격</option><option value="death">사망</option></select></label>
+          <div class="directions" id="directionGrid"></div>
+          <div class="actions">
+          <button id="export">4대 모션 매핑 JSON 저장</button>
           </div>
-          <div class="info" id="mappingInfo"></div>
-          </div>
-
-          <h2>모바일 전투 검사</h2>
-          <div class="play-layout">
-          <div class="panel">
-          <canvas id="game" class="game"
-            width="720" height="405"></canvas>
-          <div class="line">
-          <button id="attack">공격</button>
-          <button id="hit">피격</button>
-          <button id="magic">마법</button>
-          <button id="death">사망</button>
-          <button id="revive">회복</button>
-          </div>
-          <div class="info" id="gameStatus"></div>
-          </div>
-
-          <div class="panel">
-          <div class="pad" id="pad">
-          <button data-dir="7">↖</button>
-          <button data-dir="0">↑</button>
-          <button data-dir="1">↗</button>
-          <button data-dir="6">←</button>
-          <button id="padAttack">⚔</button>
-          <button data-dir="2">→</button>
-          <button data-dir="5">↙</button>
-          <button data-dir="4">↓</button>
-          <button data-dir="3">↘</button>
-          </div>
-          <p>
-          방향패드로 이동하고 공격 버튼으로
-          모션을 시험합니다. 키보드는 WASD·방향키를
-          지원합니다.
-          </p>
-          </div>
-          </div>
-
-          <h2>8방향 원본 이미지 비교</h2>
-          <div class="grid" id="previews"></div>
-
-          <h2>매핑 JSON 저장·불러오기</h2>
-          <div class="panel">
-          <div class="line">
-          <button id="export">매핑 JSON 저장</button>
-          </div>
-          <label>V14 또는 V15 매핑 JSON 불러오기
-          <input class="file" id="import"
-            type="file" accept=".json,application/json">
-          </label>
-          <p>
-          매핑은 현재 화면에서 지정한 후보입니다.
-          다른 동작을 검증하려면 지정한 뒤 JSON으로
-          저장하세요.
-          </p>
-          <div class="info" id="importStatus"></div>
-          </div>
-
-          <script type="application/json"
-            id="inventory">__DATA__</script>
-          __APP__
+          <div class="panel info" id="summary"></div>
+          <script type="application/json" id="inventory">__INVENTORY__</script>
+          <script>__SCRIPT__</script>
           </body>
           </html>'''
 
-          js = r'''
+          script=r'''
           'use strict';
 
-          const DB = JSON.parse(
-            document.getElementById('inventory').textContent
-          );
+          const DATA=JSON.parse(document.getElementById('inventory').textContent);
+          const $=id=>document.getElementById(id);
+          const ACTIONS=['wait','walk','attack','death'];
+          const LABELS={wait:'정지',walk:'이동',attack:'공격',death:'사망'};
+          const LOOP={wait:true,walk:true,attack:false,death:false};
+          const INDEX=new Map(DATA.sprites.map(x=>[x.sub,x]));
+          const CACHE=new Map();
+          const CONTROLS={};
+          const START={};
+          const FROZEN={};
+          const VALIDATED={};
+          let paused=false;
+          let previousTick=0;
 
-          const $ = id => document.getElementById(id);
-
-          const ACTIONS = [
-            'idle','walk','attack','hit','death','magic'
-          ];
-
-          const LABELS = {
-            idle:'대기',
-            walk:'이동',
-            attack:'공격',
-            hit:'피격',
-            death:'사망',
-            magic:'마법'
-          };
-
-          const ACTORS = DB.actors;
-          const ENTRIES = DB.entries;
-          const GROUPS = DB.groups;
-
-          const index = new Map();
-          const imageCache = new Map();
-
-          const assignments = {};
-
-          for(const row of ENTRIES){
-            const key=[
-              row.actor,row.package,row.sub
-            ].join('|');
-
-            if(!index.has(key))index.set(key,[]);
-            index.get(key).push(row);
+          function addOption(select,value,label){
+            const o=document.createElement('option');
+            o.value=String(value);
+            o.textContent=label;
+            select.append(o);
           }
 
-          for(const values of index.values()){
-            values.sort(
-              (a,b)=>a.sha256.localeCompare(b.sha256)
-            );
+          function nowMs(){return performance.now()}
+
+          function currentDirection(){
+            return Number($('direction').value);
           }
 
-          const state = {
-            x:285,
-            y:240,
-            direction:4,
-            keySet:new Set(),
-            pointerDirection:null,
-            oneShot:null,
-            dead:false,
-            motion:'idle',
-            elapsed:0,
-            last:performance.now(),
-            targetHp:100,
-            message:'대기'
-          };
-
-          function addOption(select,value,title){
-            const item=document.createElement('option');
-            item.value=String(value);
-            item.textContent=title;
-            select.append(item);
+          function spriteSub(base,direction){
+            const reverse=$('reverse').value==='1';
+            const rotation=Number($('rotation').value);
+            const mapped=reverse?(8-direction)%8:direction;
+            return base+(mapped+rotation)%8;
           }
 
-          function selectedActor(){
-            return Number($('actor').value);
+          function findSprite(action,direction){
+            const base=CONTROLS[action].bank.value;
+            if(base==='')return null;
+            return INDEX.get(spriteSub(Number(base),direction))||null;
           }
 
-          function currentPackage(){
-            return $('pak').value;
-          }
-
-          function currentAction(){
-            return $('action').value;
-          }
-
-          function candidateConfig(){
-            return {
-              package:currentPackage(),
-              base:Number($('bank').value),
-              rotation:Number($('rotation').value),
-              mirror:$('reverse').value==='1',
-              intervalMs:Number($('interval').value)
-            };
-          }
-
-          function lookup(actor,pack,sub){
-            return index.get(
-              [actor,pack,sub].join('|')
-            )?.[0]||null;
-          }
-
-          function spriteSub(config,dir){
-            const physical=config.mirror
-              ?(8-dir)%8
-              :dir;
-
-            return config.base+
-              (physical+config.rotation)%8;
-          }
-
-          function resolveRow(config,dir){
-            if(!config)return null;
-
-            return lookup(
-              selectedActor(),
-              config.package,
-              spriteSub(config,dir)
-            );
-          }
-
-          function mappedConfig(action){
-            return assignments[
-              String(selectedActor())
-            ]?.[action]||null;
-          }
-
-          function activeConfig(action){
-            return mappedConfig(action)||
-              candidateConfig();
-          }
-
-          function isMapped(action){
-            return Boolean(mappedConfig(action));
-          }
-
-          function actorLabel(actor){
-            const name=DB.metadata[
-              String(actor)
-            ]?.referenceName||'';
-
-            return String(actor)+(
-              name?' · '+name.slice(0,45):''
-            );
-          }
-
-          function buildActors(){
-            $('actor').replaceChildren();
-
-            ACTORS.forEach(id=>{
-              addOption(
-                $('actor'),id,actorLabel(id)
-              );
-            });
-
-            if(ACTORS.includes(29)){
-              $('actor').value='29';
-            }
-
-            buildPackages();
-          }
-
-          function buildPackages(preferred){
-            const id=selectedActor();
-
-            const packages=[
-              ...new Set(
-                ENTRIES.filter(x=>x.actor===id)
-                  .map(x=>x.package)
-              )
-            ].sort();
-
-            $('pak').replaceChildren();
-
-            packages.forEach(name=>{
-              addOption($('pak'),name,name);
-            });
-
-            if(packages.includes(preferred)){
-              $('pak').value=preferred;
-            }
-
-            buildBanks();
-          }
-
-          function buildBanks(preferred){
-            const groups=GROUPS.filter(g=>
-              g.actor===selectedActor() &&
-              g.package===currentPackage()
-            ).sort(
-              (a,b)=>b.reviewPriority-a.reviewPriority
-            );
-
-            $('bank').replaceChildren();
-
-            for(const group of groups){
-              addOption(
-                $('bank'),
-                group.base,
-                `${group.base}~${group.end} · `+
-                `${group.present}/8`
-              );
-            }
-
-            if(groups.some(g=>g.base===Number(preferred))){
-              $('bank').value=String(preferred);
-            }
-
-            drawPreviews();
-            updateMappingInfo();
-          }
-
-          function applyConfig(config){
-            if(!config)return;
-
-            if($('pak').value!==config.package){
-              buildPackages(config.package);
-            }
-
-            buildBanks(config.base);
-
-            $('rotation').value=String(
-              config.rotation
-            );
-            $('reverse').value=config.mirror?'1':'0';
-
-            const available=[
-              ...$('interval').options
-            ].some(x=>Number(x.value)===config.intervalMs);
-
-            if(available){
-              $('interval').value=String(
-                config.intervalMs
-              );
-            }
-
-            drawPreviews();
-          }
-
-          function selectAction(action){
-            $('action').value=action;
-
-            applyConfig(mappedConfig(action));
-
-            updateMappingInfo();
-            drawPreviews();
-          }
-
-          function validateConfig(actor,action,raw){
-            if(!ACTIONS.includes(action))return null;
-            if(!ACTORS.includes(Number(actor)))return null;
-            if(!raw||typeof raw!=='object')return null;
-
-            const config={
-              package:String(raw.package||''),
-              base:Number(raw.base),
-              rotation:Number(raw.rotation),
-              mirror:Boolean(raw.mirror),
-              intervalMs:Number(raw.intervalMs)
-            };
-
-            if(
-              !Number.isInteger(config.base) ||
-              !Number.isInteger(config.rotation) ||
-              config.rotation<0 ||
-              config.rotation>7 ||
-              !Number.isFinite(config.intervalMs) ||
-              config.intervalMs<40 ||
-              config.intervalMs>1000
-            )return null;
-
-            if(!GROUPS.some(g=>
-              g.actor===Number(actor) &&
-              g.package===config.package &&
-              g.base===config.base
-            ))return null;
-
-            const directionMap=[];
-
-            for(let dir=0;dir<8;dir++){
-              const sub=spriteSub(config,dir);
-              const row=lookup(
-                Number(actor),
-                config.package,
-                sub
-              );
-
-              const old=Array.isArray(raw.directionMap)
-                ?raw.directionMap.find(
-                  x=>x.engineDirection===dir
-                )
-                :null;
-
-              if(
-                old?.sha256 &&
-                row?.sha256!==old.sha256
-              )return null;
-
-              directionMap.push({
-                engineDirection:dir,
-                sourceSubId:sub,
-                sha256:row?.sha256||null,
-                renderedFrames:row?.renderedFrames||0
-              });
-            }
-
-            return {
-              ...config,
-              spriteId:Number(actor),
-              action,
-              directionMap,
-              allDirectionsPresent:directionMap.every(
-                x=>Boolean(x.sha256)
-              ),
-              mappingStatus:'USER_SELECTED_CANDIDATE',
-              originalActionDefinitionVerified:false,
-              originalFrameTimingVerified:false
-            };
-          }
-
-          function saveAssignment(){
-            const actor=selectedActor();
-            const action=currentAction();
-
-            const config=validateConfig(
-              actor,action,candidateConfig()
-            );
-
-            if(!config){
-              $('mappingInfo').textContent=
-                '잘못된 모션 그룹 설정';
-              return;
-            }
-
-            const key=String(actor);
-
-            if(!assignments[key]){
-              assignments[key]={};
-            }
-
-            assignments[key][action]=config;
-
-            updateMappingInfo();
-          }
-
-          function clearAssignment(){
-            const key=String(selectedActor());
-
-            if(assignments[key]){
-              delete assignments[key][currentAction()];
-            }
-
-            updateMappingInfo();
-          }
-
-          function updateMappingInfo(){
-            const actor=selectedActor();
-            const action=currentAction();
-            const config=mappedConfig(action);
-            const candidate=candidateConfig();
-
-            const active=config||candidate;
-
-            const missing=[];
-
-            for(let dir=0;dir<8;dir++){
-              if(!resolveRow(active,dir)){
-                missing.push(dir);
-              }
-            }
-
-            const mapped=Object.keys(
-              assignments[String(actor)]||{}
-            );
-
-            $('mappingInfo').textContent=[
-              'SPR ID: '+actor,
-              '현재 동작: '+LABELS[action],
-              '상태: '+(
-                config?'지정한 후보':'미지정 · 검사용 후보'
-              ),
-              '서브 ID 그룹: '+active.base+
-                '~'+(active.base+7),
-              '누락 방향: '+(
-                missing.length?missing.join(', '):'없음'
-              ),
-              '지정된 동작: '+(
-                mapped.map(x=>LABELS[x]).join(', ')||
-                '없음'
-              ),
-              '원본 액션 정의: 미확정'
-            ].join('\n');
-          }
-
-          function loadImage(row){
+          function getImage(row){
             if(!row)return null;
-
-            const src=row.asset;
-
-            if(!imageCache.has(src)){
+            if(!CACHE.has(row.path)){
               const img=new Image();
-              img.onload=drawPreviews;
-              img.src=src;
-              imageCache.set(src,img);
+              img.onload=()=>draw(nowMs());
+              img.src=DATA.assets?.[row.path]||row.path;
+              CACHE.set(row.path,img);
             }
-
-            return imageCache.get(src);
+            return CACHE.get(row.path);
           }
 
-          function spriteFrame(
-            ctx,row,elapsed,interval,
-            x,y,maxWidth,maxHeight,
-            oneShot
-          ){
-            if(!row)return false;
+          function frameNumber(action,row,t){
+            if(!row)return 0;
+            if(paused){
+              const value=FROZEN[action]||0;
+              return LOOP[action]?value%row.frames:Math.min(value,row.frames-1);
+            }
+            const interval=Number(CONTROLS[action].interval.value);
+            const raw=Math.max(0,Math.floor((t-START[action])/interval));
+            return LOOP[action]?raw%row.frames:Math.min(raw,row.frames-1);
+          }
 
-            const image=loadImage(row);
-
-            if(
-              !image ||
-              !image.complete ||
-              !image.naturalWidth
-            )return false;
-
-            const count=row.renderedFrames;
-
-            if(count<1)return false;
-
-            let frame=Math.floor(
-              Math.max(0,elapsed)/interval
-            );
-
-            frame=oneShot
-              ?Math.min(frame,count-1)
-              :frame%count;
-
+          function paint(canvas,action,direction,t){
+            const ctx=canvas.getContext('2d');
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            const row=findSprite(action,direction);
+            if(!row){
+              ctx.font='15px system-ui';
+              ctx.fillStyle='#b5c9dd';
+              ctx.textAlign='center';
+              ctx.fillText('모션 미지정 또는 SPR 없음',canvas.width/2,canvas.height/2);
+              return {row:null,frame:0};
+            }
+            const img=getImage(row);
+            const frame=frameNumber(action,row,t);
+            if(!img||!img.complete||!img.naturalWidth){
+              return {row,frame};
+            }
             const sx=(frame%row.cols)*row.cellW;
-            const sy=Math.floor(frame/row.cols)*
-              row.cellH;
-
+            const sy=Math.floor(frame/row.cols)*row.cellH;
             const scale=Math.min(
-              2,
-              maxWidth/row.cellW,
-              maxHeight/row.cellH
+              3,
+              canvas.width/row.cellW,
+              canvas.height/row.cellH
             );
-
-            const width=row.cellW*scale;
-            const height=row.cellH*scale;
-
+            const w=row.cellW*scale;
+            const h=row.cellH*scale;
             ctx.imageSmoothingEnabled=false;
-
             ctx.drawImage(
-              image,
-              sx,sy,row.cellW,row.cellH,
-              x-width/2,y-height,
-              width,height
+              img,sx,sy,row.cellW,row.cellH,
+              (canvas.width-w)/2,
+              canvas.height-h-10,
+              w,h
             );
-
-            return true;
+            return {row,frame};
           }
 
-          function drawPreviews(){
-            $('previews').replaceChildren();
+          function resetMotion(action){
+            START[action]=nowMs();
+            FROZEN[action]=0;
+            CONTROLS[action].confirmed.checked=false;
+            VALIDATED[action]=false;
+            updateSummary();
+          }
 
-            const config=candidateConfig();
+          function buildMotions(){
+            const root=$('motions');
+            root.replaceChildren();
 
-            for(let dir=0;dir<8;dir++){
-              const sub=spriteSub(config,dir);
-              const row=resolveRow(config,dir);
+            for(const action of ACTIONS){
+              const panel=document.createElement('section');
+              panel.className='panel';
+              panel.innerHTML=`
+                <h2>${LABELS[action]}</h2>
+                <canvas width="280" height="280"></canvas>
+                <div class="motion-controls">
+                  <label>원본 SPR 8슬롯 묶음<select class="bank"></select></label>
+                  <button class="restart">다시 재생</button>
+                  <label>검사용 프레임 간격
+                    <select class="interval">
+                      <option value="80">80 ms</option>
+                      <option value="120">120 ms</option>
+                      <option value="160">160 ms</option>
+                      <option value="200" selected>200 ms</option>
+                      <option value="260">260 ms</option>
+                      <option value="350">350 ms</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="confirm">
+                  <input type="checkbox" class="confirmed">
+                  육안으로 동작 확인
+                </label>
+                <div class="meta"></div>`;
 
-              const card=document.createElement('div');
-              card.className='card';
+              const bank=panel.querySelector('.bank');
+              addOption(bank,'','미지정');
 
-              const caption=document.createElement('div');
-              caption.className='small';
-              caption.textContent=
-                '방향 '+dir+' · 서브 ID '+sub;
+              for(const group of DATA.groups){
+                addOption(
+                  bank,
+                  group.base,
+                  `${group.base}~${group.base+7} · ${group.present}/8`
+                );
+              }
 
-              const canvas=document.createElement('canvas');
-              canvas.width=160;
-              canvas.height=160;
-              canvas.dataset.direction=dir;
+              const initial=DATA.defaults[action];
+              if(initial!==null && initial!==undefined){
+                bank.value=String(initial);
+              }
 
-              const meta=document.createElement('div');
-              meta.className='small';
-              meta.textContent=row
-                ?row.renderedFrames+'프레임 · '+
-                  row.package
-                :'해당 원본 없음';
-
-              card.append(caption,canvas,meta);
-
-              card.onclick=()=>{
-                state.direction=dir;
-                drawGame();
+              CONTROLS[action]={
+                canvas:panel.querySelector('canvas'),
+                bank,
+                interval:panel.querySelector('.interval'),
+                restart:panel.querySelector('.restart'),
+                confirmed:panel.querySelector('.confirmed'),
+                meta:panel.querySelector('.meta')
               };
 
-              $('previews').append(card);
-            }
+              START[action]=nowMs();
+              FROZEN[action]=0;
+              VALIDATED[action]=false;
 
-            renderPreviews();
+              bank.onchange=()=>resetMotion(action);
+              CONTROLS[action].interval.onchange=()=>resetMotion(action);
+              CONTROLS[action].restart.onclick=()=>{
+                resetMotion(action);
+                if(paused)FROZEN[action]=0;
+              };
+              CONTROLS[action].confirmed.onchange=()=>{
+                VALIDATED[action]=CONTROLS[action].confirmed.checked;
+                updateSummary();
+              };
+
+              root.append(panel);
+            }
           }
 
-          function renderPreviews(){
-            const config=candidateConfig();
+          function buildDirections(){
+            for(let i=0;i<8;i++){
+              addOption($('direction'),i,`방향 ${i}`);
+              addOption($('rotation'),i,String(i));
+            }
+            $('direction').value='0';
+            $('rotation').value='0';
 
-            document.querySelectorAll(
-              '#previews canvas'
-            ).forEach(canvas=>{
-              const dir=Number(
-                canvas.dataset.direction
-              );
+            const grid=$('directionGrid');
+            for(let i=0;i<8;i++){
+              const card=document.createElement('div');
+              card.className='direction-card';
+              const label=document.createElement('div');
+              label.className='direction-label';
+              label.textContent='방향 '+i;
+              const canvas=document.createElement('canvas');
+              canvas.width=180;
+              canvas.height=180;
+              canvas.dataset.direction=String(i);
+              card.append(label,canvas);
+              card.onclick=()=>{
+                $('direction').value=String(i);
+                draw(nowMs());
+              };
+              grid.append(card);
+            }
+          }
 
-              const ctx=canvas.getContext('2d');
-              ctx.clearRect(0,0,160,160);
+          function draw(t){
+            const direction=currentDirection();
 
-              const row=resolveRow(config,dir);
+            for(const action of ACTIONS){
+              const c=CONTROLS[action];
+              const result=paint(c.canvas,action,direction,t);
+              const row=result.row;
+              const base=c.bank.value;
 
-              spriteFrame(
-                ctx,row,state.elapsed,
-                config.intervalMs,
-                80,145,145,135,false
-              );
+              c.meta.textContent=row
+                ?`서브 ID ${row.sub} · 프레임 ${result.frame+1}/${row.frames}
+원본 SHA ${row.sha256.slice(0,16)} · ${LOOP[action]?'반복':'마지막 프레임 유지'}
+현재 배정: ${base}~${Number(base)+7} · 원본 액션 미확정`
+                :'선택한 방향에 해당하는 원본 SPR이 없습니다.';
+            }
+
+            const inspected=$('inspect').value;
+            document.querySelectorAll('#directionGrid canvas').forEach(canvas=>{
+              paint(canvas,inspected,Number(canvas.dataset.direction),t);
             });
           }
 
-          function keyVector(){
-            let x=0;
-            let y=0;
-
-            const keys=state.keySet;
-
-            if(keys.has('arrowleft')||keys.has('a')){
-              x--;
-            }
-            if(keys.has('arrowright')||keys.has('d')){
-              x++;
-            }
-            if(keys.has('arrowup')||keys.has('w')){
-              y--;
-            }
-            if(keys.has('arrowdown')||keys.has('s')){
-              y++;
-            }
-
-            if(state.pointerDirection!==null){
-              const angle=state.pointerDirection*
-                Math.PI/4-Math.PI/2;
-
-              x+=Math.round(Math.cos(angle));
-              y+=Math.round(Math.sin(angle));
-            }
-
-            if(x===0&&y===0){
-              return {x:0,y:0,moving:false};
-            }
-
-            const length=Math.hypot(x,y);
-
-            return {
-              x:x/length,
-              y:y/length,
-              moving:true
-            };
-          }
-
-          function vectorDirection(x,y){
-            if(!x&&!y)return state.direction;
-
-            const angle=Math.atan2(y,x);
-            return (
-              Math.round(
-                (angle+Math.PI/2)/(Math.PI/4)
-              )+8
-            )%8;
-          }
-
-          function startOneShot(action){
-            if(state.dead&&action!=='death')return;
-
-            state.oneShot=action;
-            state.motion=action;
-            state.elapsed=0;
-            state.message=LABELS[action]+' 입력';
-          }
-
-          function revive(){
-            state.dead=false;
-            state.oneShot=null;
-            state.motion='idle';
-            state.elapsed=0;
-            state.targetHp=100;
-            state.message='테스트 초기화';
-          }
-
-          function actorReset(){
-            state.x=285;
-            state.y=240;
-            state.direction=4;
-            state.elapsed=0;
-            state.oneShot=null;
-            state.dead=false;
-            state.targetHp=100;
-            state.message='캐릭터 변경';
-          }
-
-          function update(dt){
-            const vector=keyVector();
-
-            let motion='idle';
-
-            if(state.dead){
-              motion='death';
-            }else if(state.oneShot){
-              motion=state.oneShot;
-            }else if(vector.moving){
-              motion='walk';
-            }
-
-            if(motion!==state.motion){
-              state.motion=motion;
-              state.elapsed=0;
-            }
-
-            if(
-              !state.dead &&
-              !state.oneShot &&
-              vector.moving
-            ){
-              state.direction=vectorDirection(
-                vector.x,vector.y
-              );
-
-              state.x=Math.max(
-                45,
-                Math.min(
-                  675,
-                  state.x+vector.x*155*dt/1000
-                )
-              );
-
-              state.y=Math.max(
-                155,
-                Math.min(
-                  370,
-                  state.y+vector.y*155*dt/1000
-                )
-              );
-            }
-
-            state.elapsed+=dt;
-
-            const config=activeConfig(motion);
-            const row=resolveRow(
-              config,state.direction
-            );
-
-            if(
-              state.oneShot &&
-              state.oneShot!=='death'
-            ){
-              const duration=(
-                row?.renderedFrames||4
-              )*config.intervalMs;
-
-              if(state.elapsed>=duration){
-                if(state.oneShot==='attack'){
-                  const distance=Math.hypot(
-                    state.x-485,
-                    state.y-240
-                  );
-
-                  if(distance<180){
-                    state.targetHp=Math.max(
-                      0,state.targetHp-10
-                    );
-                    state.message='공격 입력 테스트: 명중';
-                  }else{
-                    state.message='공격 입력 테스트: 거리 밖';
-                  }
-                }
-
-                state.oneShot=null;
-                state.elapsed=0;
+          function updateSummary(){
+            const lines=[
+              'SPR ID: '+DATA.spriteId,
+              '원본 PAK: '+DATA.sourcePak,
+              '외부 참고 이름: '+(DATA.externalNames.join(' / ')||'없음'),
+              '원본 액션 정의: 미확정',
+              '방향의 실제 방위 대응: 미확정',
+              ''
+            ];
+            for(const action of ACTIONS){
+              const bank=CONTROLS[action].bank.value;
+              const missing=[];
+              for(let dir=0;dir<8;dir++){
+                if(!findSprite(action,dir))missing.push(dir);
               }
-            }
-
-            if(
-              state.oneShot==='death' &&
-              state.elapsed>=(
-                (row?.renderedFrames||4)*
-                config.intervalMs
-              )
-            ){
-              state.dead=true;
-              state.oneShot=null;
-              state.elapsed=0;
-            }
-          }
-
-          function drawGame(){
-            const canvas=$('game');
-            const ctx=canvas.getContext('2d');
-
-            ctx.clearRect(
-              0,0,canvas.width,canvas.height
-            );
-
-            ctx.fillStyle='#273a41';
-            ctx.fillRect(0,0,720,405);
-
-            ctx.strokeStyle='#40545a';
-            ctx.lineWidth=1;
-
-            for(let x=0;x<720;x+=40){
-              ctx.beginPath();
-              ctx.moveTo(x,0);
-              ctx.lineTo(x,405);
-              ctx.stroke();
-            }
-
-            for(let y=0;y<405;y+=40){
-              ctx.beginPath();
-              ctx.moveTo(0,y);
-              ctx.lineTo(720,y);
-              ctx.stroke();
-            }
-
-            ctx.fillStyle='#a34c40';
-            ctx.beginPath();
-            ctx.ellipse(
-              485,234,27,18,0,0,Math.PI*2
-            );
-            ctx.fill();
-
-            ctx.fillStyle='#eed7be';
-            ctx.font='16px system-ui';
-            ctx.textAlign='center';
-            ctx.fillText(
-              '테스트 대상',
-              485,190
-            );
-
-            ctx.fillStyle='#28313d';
-            ctx.fillRect(437,201,96,8);
-
-            ctx.fillStyle='#82d36d';
-            ctx.fillRect(
-              437,201,
-              96*state.targetHp/100,8
-            );
-
-            const motion=state.dead
-              ?'death'
-              :state.oneShot||state.motion;
-
-            const config=activeConfig(motion);
-            const row=resolveRow(
-              config,state.direction
-            );
-
-            const oneshot=[
-              'attack','hit','death','magic'
-            ].includes(motion);
-
-            const drawn=spriteFrame(
-              ctx,row,state.elapsed,
-              config.intervalMs,
-              state.x,state.y,
-              165,165,
-              oneshot
-            );
-
-            if(!drawn){
-              ctx.fillStyle='#e2ebf9';
-              ctx.fillRect(
-                state.x-13,
-                state.y-45,
-                26,45
+              lines.push(
+                `${LABELS[action]}: ${bank===''?'미지정':bank+'~'+(Number(bank)+7)} · `+
+                `누락 방향 ${missing.length} · `+
+                `${VALIDATED[action]?'사용자 육안 확인':'미확인'}`
               );
             }
-
-            ctx.textAlign='left';
-            ctx.fillStyle='#eef4ff';
-            ctx.font='14px system-ui';
-
-            const label=isMapped(motion)
-              ?'사용자 지정 후보'
-              :'미지정 · 검사용 후보';
-
-            ctx.fillText(
-              LABELS[motion]+' / '+label,
-              15,25
-            );
-
-            $('gameStatus').textContent=[
-              'ID '+selectedActor(),
-              '방향 '+state.direction,
-              '동작 '+LABELS[motion],
-              '원본 매핑: 미확정',
-              '대상 체력 '+state.targetHp,
-              state.message
-            ].join(' · ');
-          }
-
-          function makeExport(){
-            return {
-              version:'V15',
-              kind:'USER_TESTED_MOTION_CANDIDATES',
-              source:'V13_V14_VERIFIED_SPR',
-              verification:{
-                originalActionDefinition:false,
-                originalDirection:false,
-                originalTiming:false,
-                packagePrecedence:false
-              },
-              assignments
-            };
+            $('summary').textContent=lines.join('\n');
           }
 
           function exportMapping(){
+            const motions={};
+            const used=[];
+
+            for(const action of ACTIONS){
+              const c=CONTROLS[action];
+              const base=c.bank.value;
+              const dirs=[];
+
+              for(let i=0;i<8;i++){
+                const row=findSprite(action,i);
+                dirs.push({
+                  direction:i,
+                  subId:row?.sub??null,
+                  sha256:row?.sha256??null,
+                  frameCount:row?.frames??0,
+                  sheet:row?.path??null
+                });
+              }
+
+              if(base!=='')used.push(base);
+
+              motions[action]={
+                sourceBank:base===''?null:Number(base),
+                frameIntervalMs:Number(c.interval.value),
+                loop:LOOP[action],
+                holdLastFrame:!LOOP[action],
+                userVisualConfirmed:VALIDATED[action],
+                directions:dirs
+              };
+            }
+
+            const result={
+              schema:'sanctuary-four-motions-v16',
+              spriteId:DATA.spriteId,
+              referenceName:DATA.externalNames,
+              sourcePak:DATA.sourcePak,
+              sourceOriginalSPR:true,
+              originalActionDefinitionVerified:false,
+              originalFrameTimingVerified:false,
+              actualCompassOrientationVerified:false,
+              directionRotation:Number($('rotation').value),
+              directionReversed:$('reverse').value==='1',
+              fourDistinctBanks:used.length===4&&new Set(used).size===4,
+              motions
+            };
+
             const blob=new Blob(
-              [
-                JSON.stringify(
-                  makeExport(),null,2
-                )
-              ],
+              [JSON.stringify(result,null,2)],
               {type:'application/json'}
             );
-
             const url=URL.createObjectURL(blob);
             const link=document.createElement('a');
-
             link.href=url;
-            link.download='sanctuary-v15-motion-mapping.json';
+            link.download=`sanctuary-monster-${DATA.spriteId}-four-motions.json`;
             link.click();
-
-            setTimeout(
-              ()=>URL.revokeObjectURL(url),
-              1000
-            );
-          }
-
-          async function importMapping(file){
-            if(!file)return;
-
-            if(file.size>2*1024*1024){
-              $('importStatus').textContent=
-                '매핑 JSON 크기 제한 초과';
-              return;
-            }
-
-            try{
-              const loaded=JSON.parse(
-                await file.text()
-              );
-
-              const incoming=loaded.assignments;
-
-              if(
-                !incoming ||
-                typeof incoming!=='object' ||
-                Array.isArray(incoming)
-              ){
-                throw new Error(
-                  'assignments 항목 없음'
-                );
-              }
-
-              let accepted=0;
-              let rejected=0;
-
-              for(const [actor,actionMap] of Object.entries(
-                incoming
-              )){
-                if(
-                  !actionMap ||
-                  typeof actionMap!=='object'
-                )continue;
-
-                for(const [action,raw] of Object.entries(
-                  actionMap
-                )){
-                  const value=validateConfig(
-                    actor,action,raw
-                  );
-
-                  if(!value){
-                    rejected++;
-                    continue;
-                  }
-
-                  if(!assignments[actor]){
-                    assignments[actor]={};
-                  }
-
-                  assignments[actor][action]=value;
-                  accepted++;
-                }
-              }
-
-              $('importStatus').textContent=
-                '불러온 모션 '+accepted+
-                '개 · 제외 '+rejected+'개';
-
-              selectAction(currentAction());
-            }catch(error){
-              $('importStatus').textContent=
-                'JSON 불러오기 실패: '+
-                error.message;
-            }
-          }
-
-          function bindPad(){
-            document.querySelectorAll(
-              '[data-dir]'
-            ).forEach(button=>{
-              const dir=Number(
-                button.dataset.dir
-              );
-
-              button.addEventListener(
-                'pointerdown',event=>{
-                  event.preventDefault();
-                  state.pointerDirection=dir;
-
-                  button.setPointerCapture?.(
-                    event.pointerId
-                  );
-                }
-              );
-
-              const release=()=>{
-                if(state.pointerDirection===dir){
-                  state.pointerDirection=null;
-                }
-              };
-
-              button.addEventListener(
-                'pointerup',release
-              );
-              button.addEventListener(
-                'pointercancel',release
-              );
-              button.addEventListener(
-                'lostpointercapture',release
-              );
-            });
-
-            $('padAttack').onclick=()=>{
-              startOneShot('attack');
-            };
-          }
-
-          function bindKeyboard(){
-            const keys=new Set([
-              'w','a','s','d',
-              'arrowup','arrowdown',
-              'arrowleft','arrowright'
-            ]);
-
-            document.addEventListener(
-              'keydown',event=>{
-                if(
-                  ['INPUT','SELECT','TEXTAREA'].includes(
-                    document.activeElement?.tagName
-                  )
-                )return;
-
-                const key=event.key.toLowerCase();
-
-                if(keys.has(key)){
-                  event.preventDefault();
-                  state.keySet.add(key);
-                }
-
-                if(
-                  key===' ' &&
-                  !event.repeat
-                ){
-                  event.preventDefault();
-                  startOneShot('attack');
-                }
-              }
-            );
-
-            document.addEventListener(
-              'keyup',event=>{
-                state.keySet.delete(
-                  event.key.toLowerCase()
-                );
-              }
-            );
-
-            window.addEventListener(
-              'blur',()=>{
-                state.keySet.clear();
-                state.pointerDirection=null;
-              }
-            );
+            setTimeout(()=>URL.revokeObjectURL(url),1000);
           }
 
           function boot(){
-            for(let i=0;i<8;i++){
-              addOption(
-                $('rotation'),i,String(i)
-              );
+            $('identity').textContent=
+              '선정 SPR ID '+DATA.spriteId+
+              ' · 외부 참고 이름: '+(DATA.externalNames.join(', ')||'미확인')+
+              ' · 추출 SPR '+DATA.sprites.length+'개';
+
+            buildDirections();
+            buildMotions();
+
+            $('direction').onchange=()=>draw(nowMs());
+            $('rotation').onchange=()=>{
+              for(const action of ACTIONS)VALIDATED[action]=false;
+              for(const action of ACTIONS)CONTROLS[action].confirmed.checked=false;
+              updateSummary();
+            };
+            $('reverse').onchange=$('rotation').onchange;
+            $('inspect').onchange=()=>draw(nowMs());
+
+            $('pause').onclick=()=>{
+              const now=nowMs();
+              if(!paused){
+                for(const action of ACTIONS){
+                  const row=findSprite(action,currentDirection());
+                  FROZEN[action]=row?frameNumber(action,row,now):0;
+                }
+                paused=true;
+              }else{
+                for(const action of ACTIONS){
+                  START[action]=now-FROZEN[action]*
+                    Number(CONTROLS[action].interval.value);
+                }
+                paused=false;
+              }
+              $('pause').textContent=paused?'전체 재생':'전체 일시정지';
+            };
+
+            function step(amount){
+              if(!paused)$('pause').click();
+              for(const action of ACTIONS){
+                FROZEN[action]=Math.max(0,FROZEN[action]+amount);
+              }
+              draw(nowMs());
             }
 
-            buildActors();
-
-            $('actor').onchange=()=>{
-              actorReset();
-              buildPackages();
-              selectAction('idle');
-            };
-
-            $('pak').onchange=()=>{
-              buildBanks();
-            };
-
-            $('bank').onchange=()=>{
-              drawPreviews();
-              updateMappingInfo();
-            };
-
-            $('rotation').onchange=drawPreviews;
-            $('reverse').onchange=drawPreviews;
-            $('interval').onchange=drawPreviews;
-
-            $('action').onchange=()=>{
-              selectAction(currentAction());
-            };
-
-            $('assign').onclick=saveAssignment;
-            $('clear').onclick=clearAssignment;
-
-            $('attack').onclick=()=>{
-              startOneShot('attack');
-            };
-
-            $('hit').onclick=()=>{
-              startOneShot('hit');
-            };
-
-            $('magic').onclick=()=>{
-              startOneShot('magic');
-            };
-
-            $('death').onclick=()=>{
-              startOneShot('death');
-            };
-
-            $('revive').onclick=revive;
+            $('previous').onclick=()=>step(-1);
+            $('next').onclick=()=>step(1);
             $('export').onclick=exportMapping;
+            updateSummary();
 
-            $('import').onchange=event=>{
-              importMapping(
-                event.target.files?.[0]
-              );
-            };
-
-            bindPad();
-            bindKeyboard();
-
-            selectAction('idle');
-
-            requestAnimationFrame(tick);
-          }
-
-          function tick(now){
-            const dt=Math.min(
-              50,
-              Math.max(0,now-state.last)
-            );
-
-            state.last=now;
-
-            update(dt);
-            drawGame();
-            renderPreviews();
-
+            function tick(t){
+              if(t-previousTick>=40){
+                previousTick=t;
+                draw(t);
+              }
+              requestAnimationFrame(tick);
+            }
             requestAnimationFrame(tick);
           }
 
           boot();
           '''
 
-          (SITE / "app.js").write_text(
-              js.strip() + "\n",
-              encoding="utf-8"
-          )
-
-          def encode_data(data):
-              return json.dumps(
-                  data,
-                  ensure_ascii=False,
-                  separators=(",", ":")
-              ).replace("<", "\\u003c")
-
-          def make_page(rows,groups,standalone):
-              selected_ids=sorted({
-                  x["actor"] for x in rows
-              })
-
-              copied=[]
-
-              for row in rows:
-                  entry=dict(row)
-
-                  if standalone:
-                      image_path=(
-                          SITE / entry["asset"]
-                      )
-
-                      entry["asset"]=(
-                          "data:image/png;base64,"
-                          +base64.b64encode(
-                              image_path.read_bytes()
-                          ).decode("ascii")
-                      )
-
-                  copied.append(entry)
-
-              payload={
-                  "version":"V15",
-                  "actors":selected_ids,
-                  "metadata":{
-                      str(actor):metadata.get(
-                          str(actor),{}
-                      )
-                      for actor in selected_ids
-                  },
-                  "entries":copied,
-                  "groups":[
-                      group for group in groups
-                      if group["actor"] in selected_ids
-                  ],
-                  "originalMotionVerified":False
-              }
-
-              app_tag=(
-                  "<script>"+js+"</script>"
-                  if standalone
-                  else '<script src="app.js"></script>'
-              )
-
-              return (
-                  html.replace(
-                      "__DATA__",encode_data(payload)
-                  ).replace(
-                      "__APP__",app_tag
-                  )
-              )
-
-          (SITE / "index.html").write_text(
-              make_page(
-                  entries,motion_groups,False
-              ),
-              encoding="utf-8"
-          )
-
-          selected_groups=[]
-          selected_ids=set()
-          sample_bytes=0
-          sample_limit=5*1024*1024
-
-          for group in sorted(
-              motion_groups,
-              key=lambda x:(
-                  -int(x["complete"]),
-                  -float(x["reviewPriority"]),
-                  x["actor"]
-              )
-          ):
-              actor=group["actor"]
-
-              if actor in selected_ids:
-                  continue
-
-              if not group["complete"]:
-                  continue
-
-              candidate=[
-                  row for row in entries
-                  if (
-                      row["actor"]==actor
-                      and row["package"]==group["package"]
-                      and group["base"]<=row["sub"]<=group["end"]
-                  )
-              ]
-
-              cost=sum(
-                  (SITE / row["asset"]).stat().st_size
-                  for row in candidate
-              )
-
-              if sample_bytes+cost>sample_limit:
-                  continue
-
-              selected_ids.add(actor)
-              selected_groups.append(group)
-              sample_bytes+=cost
-
-              if len(selected_ids)>=5:
-                  break
-
-          if not selected_groups:
-              raise RuntimeError(
-                  "No complete group for mobile sample"
-              )
-
-          sample_entries=[
-              row for row in entries
-              if any(
-                  row["actor"]==group["actor"]
-                  and row["package"]==group["package"]
-                  and group["base"]<=row["sub"]<=group["end"]
-                  for group in selected_groups
-              )
-          ]
-
-          (REPORT / "V15-Standalone-Mobile-Sandbox.html").write_text(
-              make_page(
-                  sample_entries,
-                  selected_groups,
-                  True
-              ),
-              encoding="utf-8"
-          )
-
-          summary={
-              "version":"V15",
-              "phase":"MOBILE_MOTION_SANDBOX",
-              "sprite_actor_ids":len(actors),
-              "verified_sprite_sheets":len(entries),
-              "candidate_motion_groups":len(
-                  motion_groups
-              ),
-              "standalone_actor_ids":sorted(
-                  selected_ids
-              ),
-              "standalone_image_sheets":len(
-                  sample_entries
-              ),
-              "v14_image_errors":v14_summary[
-                  "image_errors"
-              ],
-              "json_export_import_supported":True,
-              "v14_mapping_import_supported":True,
-              "mobile_movement_test":True,
-              "attack_hit_death_test":True,
-              "automatic_original_action_assignment":False,
-              "original_animation_timing_verified":False,
-              "game_build_modified":False
+          inventory={
+              **manifest,
+              "defaults":defaults
           }
 
-          (REPORT / "summary_v15.json").write_text(
-              json.dumps(
-                  summary,
-                  ensure_ascii=False,
-                  indent=2
-              ),
+          def write_page(destination,sprites,groups,embedded):
+              assets={}
+              if embedded:
+                  for row in sprites:
+                      path=SITE/row["path"]
+                      assets[row["path"]]=(
+                          "data:image/png;base64,"
+                          +base64.b64encode(path.read_bytes()).decode("ascii")
+                      )
+
+              data={
+                  **inventory,
+                  "sprites":sprites,
+                  "groups":groups,
+                  "assets":assets
+              }
+
+              encoded=json.dumps(
+                  data,ensure_ascii=False,separators=(",",":")
+              ).replace("<","\\u003c")
+
+              destination.write_text(
+                  html.replace("__INVENTORY__",encoded)
+                      .replace("__SCRIPT__",script),
+                  encoding="utf-8"
+              )
+
+          (SITE/"app.js").write_text(
+              script,encoding="utf-8"
+          )
+
+          write_page(
+              SITE/"index.html",
+              manifest["sprites"],
+              manifest["groups"],
+              False
+          )
+
+          standalone_banks={
+              b for b in defaults.values() if b is not None
+          }
+          standalone_sprites=[
+              row for row in manifest["sprites"]
+              if row["sub"]//8*8 in standalone_banks
+          ]
+          standalone_groups=[
+              group for group in manifest["groups"]
+              if group["base"] in standalone_banks
+          ]
+
+          write_page(
+              REPORT/"V16-Monster-Four-Motions-Standalone.html",
+              standalone_sprites,
+              standalone_groups,
+              True
+          )
+
+          full_banks=sum(g["complete"] for g in manifest["groups"])
+
+          summary={
+              "version":"V16",
+              "phase":"FOUR_ORIGINAL_SPR_MOTION_HTML",
+              "selected_sprite_id":manifest["spriteId"],
+              "original_spr_sheets":len(manifest["sprites"]),
+              "candidate_banks":len(manifest["groups"]),
+              "complete_eight_direction_banks":full_banks,
+              "four_distinct_default_banks":len(standalone_banks)==4,
+              "four_complete_direction_banks":full_banks>=4,
+              "standalone_spr_sheets":len(standalone_sprites),
+              "wait_walk_attack_death_panels":4,
+              "attack_ends_at_final_frame":True,
+              "death_holds_final_frame":True,
+              "original_motion_identity_verified":False,
+              "original_animation_timing_verified":False,
+              "manual_review_supported":True,
+              "build_web_modified":False
+          }
+
+          (REPORT/"summary_v16.json").write_text(
+              json.dumps(summary,ensure_ascii=False,indent=2),
               encoding="utf-8"
           )
 
-          print("=== V15 SUMMARY ===")
-          print(json.dumps(
-              summary,
-              ensure_ascii=False,
-              indent=2
-          ))
+          print("=== V16 SUMMARY ===")
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
 
-          with open(
-              os.environ["GITHUB_STEP_SUMMARY"],
-              "a",
-              encoding="utf-8"
-          ) as file:
-              file.write(
-                  "V15 Mobile Motion Sandbox\n\n"
-              )
-              file.write(
-                  "Original sprite sheets: "
-                  +str(len(entries))+"\n\n"
-              )
-              file.write(
-                  "Actor IDs: "+str(len(actors))+"\n\n"
-              )
-              file.write(
-                  "Motion candidate groups: "
-                  +str(len(motion_groups))+"\n\n"
-              )
-              file.write(
-                  "Original action mapping remains unverified.\n"
-              )
-
+          path=os.environ.get("GITHUB_STEP_SUMMARY")
+          if path:
+              with open(path,"a",encoding="utf-8") as f:
+                  f.write("## V16 Four Monster Motions\n\n")
+                  for key,value in summary.items():
+                      f.write(f"- {key}: {value}\n")
           PY
 
-      - name: Validate generated JavaScript and files
+      - name: Validate animation HTML and JavaScript
         shell: bash
         run: |
           set -euo pipefail
-
           node --check reports/site/app.js
-          node --check reports/sanctuary-motion-adapter.js
-
           python3 - <<'PY'
           import json
           from pathlib import Path
 
           root=Path("reports")
+          data=json.loads(
+              (root/"manifest_v16.json").read_text(encoding="utf-8")
+          )
+          summary=json.loads(
+              (root/"summary_v16.json").read_text(encoding="utf-8")
+          )
 
           required=[
-              "site/index.html",
-              "site/app.js",
-              "site/motion-manifest.json",
-              "V15-Standalone-Mobile-Sandbox.html",
-              "sanctuary-motion-adapter.js",
-              "motion-mapping-template.json",
-              "summary_v15.json"
+              root/"site/index.html",
+              root/"site/app.js",
+              root/"V16-Monster-Four-Motions-Standalone.html",
+              root/"01_extracted_original_spr.csv",
+              root/"02_spr_extraction_errors.csv"
           ]
 
-          for relative in required:
-              path=root/relative
+          for path in required:
+              if not path.is_file() or path.stat().st_size==0:
+                  raise RuntimeError("Missing output: "+str(path))
 
-              if not path.is_file():
-                  raise SystemExit(
-                      "Missing V15 output: "+relative
-                  )
+          for sprite in data["sprites"]:
+              file=root/"site"/sprite["path"]
+              if not file.is_file():
+                  raise RuntimeError("Missing PNG: "+str(file))
+              with file.open("rb") as f:
+                  if f.read(8)!=b"\x89PNG\r\n\x1a\n":
+                      raise RuntimeError("Invalid PNG: "+str(file))
 
-              if path.stat().st_size==0:
-                  raise SystemExit(
-                      "Empty V15 output: "+relative
-                  )
-
-          manifest=json.loads(
-              (root/"site/motion-manifest.json").read_text()
+          html=(root/"V16-Monster-Four-Motions-Standalone.html").read_text(
+              encoding="utf-8"
           )
 
-          for item in manifest["entries"]:
-              if not (
-                  root/"site"/item["asset"]
-              ).is_file():
-                  raise SystemExit(
-                      "Missing referenced PNG: "
-                      +item["asset"]
-                  )
+          if "__SCRIPT__" in html or "__INVENTORY__" in html:
+              raise RuntimeError("Unresolved HTML template")
 
-          print(
-              "V15 FILES VALIDATED:",
-              len(manifest["entries"])
-          )
+          print("V16 PNG files:",len(data["sprites"]))
+          print("Eight-direction banks:",summary["complete_eight_direction_banks"])
+          print("Four complete banks:",summary["four_complete_direction_banks"])
+          print("HTML validation passed")
           PY
 
-      - name: Upload V15 mobile sandbox and motion data
+      - name: Upload V16 original four-motion HTML
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V15-Mobile-Motion-Sandbox
+          name: Sanctuary-V16-Monster-Four-Motions
           path: reports/
           if-no-files-found: error
           retention-days: 30
