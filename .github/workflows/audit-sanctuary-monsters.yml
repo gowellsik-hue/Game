@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Animation Loader Audit V5
+name: Sanctuary of Aden XML Header Test V6
 
 on:
   workflow_dispatch:
@@ -16,9 +16,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  analyze:
+  test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 20
 
     steps:
       - name: Prepare environment
@@ -26,23 +26,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc
+          mkdir -p previous/v4 previous/v5
+          mkdir -p reports/patches
 
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full
-
-          mkdir -p \
-            previous/v4 \
-            downloads \
-            client \
-            reports
-
-          df -h .
-
-      - name: Restore verified V4 binary evidence
+      - name: Restore V4 original XML and V5 loader evidence
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,78 +41,16 @@ jobs:
             --name Sanctuary-V4-Binary-Animation-Analysis \
             --dir previous/v4
 
-          test -n "$(
-            find previous/v4/raw \
-              -name '*_Actions.xml' \
-              -print -quit
-          )"
-
-          test -n "$(
-            find previous/v4/raw \
-              -name '*_QMotionInfo.xml' \
-              -print -quit
-          )"
-
-          echo "V4 ORIGINAL BINARY DATA RESTORED"
-
-      - name: Download original 46 client parts
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          gh release download v1.0.0 \
+          gh run download 38830296261 \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "Sanctuary.of.Aden.-.Copy.*" \
-            --dir downloads
+            --name Sanctuary-V5-Animation-Loader-Evidence \
+            --dir previous/v5
 
-          python3 - <<'PY'
-          from pathlib import Path
+          test -d previous/v4/raw
 
-          root = Path("downloads")
-          base = "Sanctuary.of.Aden.-.Copy"
+          echo "V4 AND V5 EVIDENCE RESTORED"
 
-          expected = [
-              f"{base}.z{i:02d}"
-              for i in range(1, 46)
-          ] + [f"{base}.zip"]
-
-          missing = [
-              name for name in expected
-              if not (root / name).is_file()
-          ]
-
-          if missing:
-              raise SystemExit(
-                  f"Missing archive parts: {missing}"
-              )
-
-          print("VERIFIED PARTS:", len(expected))
-          print("TOTAL BYTES:", sum(
-              (root / name).stat().st_size
-              for name in expected
-          ))
-          PY
-
-      - name: Extract original game client
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          7z x \
-            "downloads/Sanctuary.of.Aden.-.Copy.zip" \
-            "-o${PWD}/client" \
-            -y > reports/extraction.log 2>&1
-
-          rm -rf downloads
-
-          echo "EXTRACTED FILE COUNT:"
-          find client -type f | wc -l
-
-          df -h .
-
-      - name: Trace XML decoder and animation loader
+      - name: Test original and modified XML headers
         shell: bash
         run: |
           set -euo pipefail
@@ -135,67 +60,28 @@ jobs:
           import hashlib
           import json
           import math
-          import os
-          import re
-          import struct
+          import xml.etree.ElementTree as ET
 
           from collections import Counter
           from pathlib import Path
 
           ROOT = Path.cwd()
-          CLIENT = ROOT / "client"
-          V4 = ROOT / "previous/v4/raw"
+          V4 = ROOT / "previous/v4"
+          V5 = ROOT / "previous/v5"
           REPORT = ROOT / "reports"
+          PATCHES = REPORT / "patches"
 
           REPORT.mkdir(exist_ok=True)
+          PATCHES.mkdir(exist_ok=True)
 
-          MAX_BINARY = 150 * 1024 * 1024
-          MAX_FILE_HITS = 700
-          MAX_TOTAL_HITS = 30000
-
-          IMPORTANT_FILES = (
-              "Actions.xml",
-              "QMotionInfo.xml"
-          )
-
-          EXEC_EXTENSIONS = {
-              ".exe", ".dll", ".ocx",
-              ".pyd", ".so", ".sys"
+          TARGETS = {
+              "Actions.xml":
+                  "b79e4058e0b6e27111fd469bf0249ec1321da7d3f55c5009d42fb0369edec27f",
+              "QMotionInfo.xml":
+                  "5672c352dfcca91f2cad57bcaceb273aafdc9a80fd97118bc9ac996c7e4913f2"
           }
 
-          SCRIPT_EXTENSIONS = {
-              ".py", ".js", ".lua",
-              ".cs", ".rb", ".ini"
-          }
-
-          REFERENCE_PATTERN = re.compile(
-              r"X\?xm|"
-              r"QMotionInfo|Actions\.xml|"
-              r"Tile\.pak|Sprite[^ ]*\.pak|"
-              r"sprite|animation|animate|"
-              r"motion|action|"
-              r"decrypt|encrypt|"
-              r"decode|decryptor|"
-              r"CryptDecrypt|CryptEncrypt|"
-              r"BCryptDecrypt|BCryptEncrypt|"
-              r"CryptAcquireContext|"
-              r"RtlDecompressBuffer|"
-              r"RC4|AES|Rijndael|"
-              r"inflate|deflate|"
-              r"zlib|LZ4|LZMA|"
-              r"QMotion",
-              re.I
-          )
-
-          ASCII_PATTERN = re.compile(
-              rb"[\x20-\x7e]{5,220}"
-          )
-
-          WIDE_PATTERN = re.compile(
-              rb"(?:[\x20-\x7e]\x00){5,220}"
-          )
-
-          def csv_write(name, rows, fields):
+          def save_csv(name, rows, fields):
               with (REPORT / name).open(
                   "w",
                   encoding="utf-8-sig",
@@ -209,400 +95,282 @@ jobs:
                   writer.writeheader()
                   writer.writerows(rows)
 
-          def sha256(data):
-              return hashlib.sha256(
-                  data
-              ).hexdigest()
-
           def entropy(data):
-              sample = data[:65536]
-
-              if not sample:
+              if not data:
                   return 0.0
 
-              counts = Counter(sample)
-              total = len(sample)
+              counts = Counter(data)
+              size = len(data)
 
               return -sum(
-                  (n / total)
-                  * math.log2(n / total)
-                  for n in counts.values()
+                  (count / size)
+                  * math.log2(count / size)
+                  for count in counts.values()
               )
 
-          # --------------------------------------------
-          # Part 1: Verify known encoded XML originals
-          # --------------------------------------------
+          def printable_ratio(data):
+              if not data:
+                  return 0.0
 
-          raw_results = {}
-          xml_rows = []
-
-          for filename in IMPORTANT_FILES:
-              paths = sorted(
-                  V4.glob("*_" + filename)
+              printable = sum(
+                  32 <= b <= 126 or b in (9, 10, 13)
+                  for b in data
               )
 
-              if len(paths) != 1:
+              return printable / len(data)
+
+          def try_xml(data):
+              try:
+                  root = ET.fromstring(data)
+
+                  return {
+                      "valid": True,
+                      "root": str(root.tag),
+                      "error": ""
+                  }
+
+              except ET.ParseError as ex:
+                  return {
+                      "valid": False,
+                      "root": "",
+                      "error": str(ex)
+                  }
+
+              except (ValueError, UnicodeError) as ex:
+                  return {
+                      "valid": False,
+                      "root": "",
+                      "error": str(ex)
+                  }
+
+          test_rows = []
+          original_rows = []
+          successful = []
+          raw_samples = {}
+
+          for filename, expected_sha in TARGETS.items():
+              candidates = list(
+                  (V4 / "raw").glob("*_" + filename)
+              )
+
+              if len(candidates) != 1:
                   raise SystemExit(
-                      f"Expected one original: {filename}. "
-                      f"Found {len(paths)}"
+                      f"Missing unique original: {filename}"
                   )
 
-              path = paths[0]
-              data = path.read_bytes()
+              original = candidates[0].read_bytes()
 
-              raw_results[filename] = data
+              digest = hashlib.sha256(
+                  original
+              ).hexdigest()
 
-              xml_rows.append({
+              if digest != expected_sha:
+                  raise SystemExit(
+                      f"SHA256 mismatch: {filename}"
+                  )
+
+              if not original.startswith(b"X?xm"):
+                  raise SystemExit(
+                      f"Unexpected header: {filename}"
+                  )
+
+              raw_samples[filename] = original
+
+              original_rows.append({
                   "file": filename,
-                  "bytes": len(data),
-                  "first_4_hex": data[:4].hex(" "),
-                  "first_4_ascii": data[:4].decode(
-                      "ascii", errors="replace"
+                  "bytes": len(original),
+                  "sha256": digest,
+                  "first_16_hex": original[:16].hex(" "),
+                  "first_64_hex": original[:64].hex(" "),
+                  "header_ascii": repr(original[:5]),
+                  "full_entropy": round(
+                      entropy(original), 5
                   ),
-                  "first_64_hex": data[:64].hex(" "),
-                  "sha256": sha256(data),
-                  "entropy": round(entropy(data), 5),
-                  "starts_X_question_xm": (
-                      data.startswith(b"X?xm")
+                  "body_entropy": round(
+                      entropy(original[4:]), 5
                   ),
-                  "starts_standard_xml": (
-                      data.startswith(b"<?xm")
+                  "printable_ratio": round(
+                      printable_ratio(original), 5
                   ),
-                  "payload_mod_16": (
-                      (len(data) - 4) % 16
+                  "after_header_printable_ratio": round(
+                      printable_ratio(original[4:]), 5
+                  ),
+                  "internal_xml_prolog_count": (
+                      original.count(b"<?xml")
                   )
               })
 
-          csv_write(
-              "01_encoded_xml_fingerprints.csv",
-              xml_rows,
-              [
-                  "file", "bytes",
-                  "first_4_hex", "first_4_ascii",
-                  "first_64_hex", "sha256",
-                  "entropy",
-                  "starts_X_question_xm",
-                  "starts_standard_xml",
-                  "payload_mod_16"
-              ]
-          )
+              variants = {
+                  "01_original":
+                      original,
 
-          a = raw_results["Actions.xml"]
-          b = raw_results["QMotionInfo.xml"]
+                  "02_replace_question_mark_only":
+                      original[:1]
+                      + b"<"
+                      + original[2:],
 
-          common_prefix = 0
+                  "03_replace_X_with_less_than":
+                      b"<" + original[1:],
 
-          for left, right in zip(a, b):
-              if left != right:
-                  break
+                  "04_force_first_four_to_xml":
+                      b"<?xm" + original[4:],
 
-              common_prefix += 1
+                  "05_force_first_five_to_xml":
+                      b"<?xml" + original[5:],
 
-          # --------------------------------------------
-          # Part 2: Find actual client loaders and DLLs
-          # --------------------------------------------
+                  "06_remove_first_byte":
+                      original[1:],
 
-          binaries = sorted(
-              [
-                  p for p in CLIENT.rglob("*")
-                  if (
-                      p.is_file()
-                      and not p.is_symlink()
-                      and p.suffix.lower()
-                      in EXEC_EXTENSIONS
-                  )
-              ],
-              key=lambda p: str(p).lower()
-          )
+                  "07_remove_first_four_bytes":
+                      original[4:]
+              }
 
-          scripts = sorted(
-              [
-                  p for p in CLIENT.rglob("*")
-                  if (
-                      p.is_file()
-                      and not p.is_symlink()
-                      and p.suffix.lower()
-                      in SCRIPT_EXTENSIONS
-                  )
-              ],
-              key=lambda p: str(p).lower()
-          )
+              for method, data in variants.items():
+                  result = try_xml(data)
 
-          scan_files = binaries + scripts
+                  record = {
+                      "file": filename,
+                      "method": method,
+                      "first_16_hex": data[:16].hex(" "),
+                      "first_32_ascii": repr(data[:32]),
+                      "xml_valid": result["valid"],
+                      "xml_root": result["root"],
+                      "parse_error": result["error"],
+                      "printable_ratio": round(
+                          printable_ratio(data), 5
+                      ),
+                      "bytes": len(data)
+                  }
 
-          binary_inventory = []
-          string_hits = []
-          magic_hits = []
+                  test_rows.append(record)
 
-          total_scanned = 0
-          skipped_large = 0
-
-          def pe_machine(data):
-              if len(data) < 64:
-                  return ""
-
-              if data[:2] != b"MZ":
-                  return ""
-
-              offset = struct.unpack_from(
-                  "<I", data, 0x3C
-              )[0]
-
-              if offset + 6 > len(data):
-                  return "INVALID_PE_HEADER"
-
-              if data[offset:offset + 4] != b"PE\x00\x00":
-                  return "MZ_WITHOUT_PE"
-
-              machine = struct.unpack_from(
-                  "<H", data, offset + 4
-              )[0]
-
-              return {
-                  0x014c: "x86",
-                  0x8664: "x64",
-                  0x01c0: "ARM",
-                  0xaa64: "ARM64"
-              }.get(machine, f"UNKNOWN_{machine:04X}")
-
-          for path in scan_files:
-              relative = str(
-                  path.relative_to(CLIENT)
-              ).replace("\\", "/")
-
-              size = path.stat().st_size
-
-              if size == 0 or size > MAX_BINARY:
-                  skipped_large += 1
-
-                  binary_inventory.append({
-                      "file": relative,
-                      "bytes": size,
-                      "status": "SKIPPED_SIZE",
-                      "pe_architecture": "",
-                      "sha256": "",
-                      "reference_hits": 0,
-                      "magic_hits": 0
-                  })
-
-                  continue
-
-              data = path.read_bytes()
-              total_scanned += 1
-
-              local_hits = 0
-
-              # Search exact encoded XML signature in code.
-              position = 0
-              local_magic = 0
-
-              while True:
-                  position = data.find(
-                      b"X?xm", position
-                  )
-
-                  if position < 0:
-                      break
-
-                  local_magic += 1
-
-                  magic_hits.append({
-                      "file": relative,
-                      "offset": position,
-                      "signature": "X?xm"
-                  })
-
-                  position += 4
-
-              # Search plain ASCII and UTF-16LE strings.
-              for encoding, pattern in (
-                  ("ascii", ASCII_PATTERN),
-                  ("utf16le", WIDE_PATTERN)
-              ):
-                  for match in pattern.finditer(data):
-                      if (
-                          local_hits >= MAX_FILE_HITS
-                          or len(string_hits)
-                          >= MAX_TOTAL_HITS
-                      ):
-                          break
-
-                      raw = match.group()
-
-                      if encoding == "utf16le":
-                          decoded = raw[::2].decode(
-                              "ascii", errors="replace"
-                          )
-                      else:
-                          decoded = raw.decode(
-                              "ascii", errors="replace"
-                          )
-
-                      found = REFERENCE_PATTERN.search(
-                          decoded
+                  if method in (
+                      "03_replace_X_with_less_than",
+                      "05_force_first_five_to_xml"
+                  ):
+                      destination = PATCHES / (
+                          filename.replace(".xml", "")
+                          + "_"
+                          + method
+                          + ".xml"
                       )
 
-                      if not found:
-                          continue
+                      destination.write_bytes(data)
 
-                      string_hits.append({
-                          "file": relative,
-                          "offset": match.start(),
-                          "encoding": encoding,
-                          "matched_keyword": found.group(),
-                          "string": decoded[:220]
+                  if result["valid"]:
+                      successful.append({
+                          "file": filename,
+                          "method": method,
+                          "root": result["root"]
                       })
 
-                      local_hits += 1
+                  print(
+                      "TEST",
+                      filename,
+                      method,
+                      "VALID =", result["valid"],
+                      "ERROR =", result["error"]
+                  )
 
-              binary_inventory.append({
-                  "file": relative,
-                  "bytes": size,
-                  "status": "SCANNED",
-                  "pe_architecture": pe_machine(data),
-                  "sha256": sha256(data),
-                  "reference_hits": local_hits,
-                  "magic_hits": local_magic
-              })
-
-              del data
-
-          csv_write(
-              "02_client_loader_inventory.csv",
-              binary_inventory,
+          save_csv(
+              "01_original_binary_diagnostics.csv",
+              original_rows,
               [
-                  "file", "bytes", "status",
-                  "pe_architecture", "sha256",
-                  "reference_hits", "magic_hits"
+                  "file", "bytes", "sha256",
+                  "first_16_hex", "first_64_hex",
+                  "header_ascii", "full_entropy",
+                  "body_entropy", "printable_ratio",
+                  "after_header_printable_ratio",
+                  "internal_xml_prolog_count"
               ]
           )
 
-          csv_write(
-              "03_loader_string_references.csv",
-              string_hits,
+          save_csv(
+              "02_header_patch_results.csv",
+              test_rows,
               [
-                  "file", "offset", "encoding",
-                  "matched_keyword", "string"
+                  "file", "method",
+                  "first_16_hex",
+                  "first_32_ascii",
+                  "xml_valid", "xml_root",
+                  "parse_error",
+                  "printable_ratio", "bytes"
               ]
           )
 
-          csv_write(
-              "04_encoded_xml_magic_references.csv",
-              magic_hits,
-              [
-                  "file", "offset", "signature"
-              ]
-          )
+          # Read V5's evidence for the identical X?xm
+          # signature observed in client executables.
 
-          # --------------------------------------------
-          # Part 3: Prioritize real evidence
-          # --------------------------------------------
-
-          STRONG_MARKERS = re.compile(
-              r"X\?xm|QMotionInfo|Actions\.xml|"
-              r"CryptDecrypt|BCryptDecrypt|"
-              r"CryptEncrypt|BCryptEncrypt|"
-              r"RtlDecompressBuffer",
-              re.I
-          )
-
-          strong_hits = [
-              row for row in string_hits
-              if STRONG_MARKERS.search(
-                  row["string"]
+          evidence_files = list(
+              V5.rglob(
+                  "04_encoded_xml_magic_references.csv"
               )
+          )
+
+          magic_evidence = []
+
+          if len(evidence_files) == 1:
+              with evidence_files[0].open(
+                  "r",
+                  encoding="utf-8-sig",
+                  newline=""
+              ) as f:
+                  magic_evidence = list(
+                      csv.DictReader(f)
+                  )
+
+          save_csv(
+              "03_v5_magic_references.csv",
+              magic_evidence,
+              ["file", "offset", "signature"]
+          )
+
+          # Compare the bytes after the common marker.
+          a = raw_samples["Actions.xml"]
+          b = raw_samples["QMotionInfo.xml"]
+
+          shared_prefix = 0
+
+          for x, y in zip(a, b):
+              if x != y:
+                  break
+
+              shared_prefix += 1
+
+          # Test whether changing the header is enough.
+          first_byte_tests = [
+              row for row in test_rows
+              if row["method"]
+              == "03_replace_X_with_less_than"
           ]
 
-          csv_write(
-              "05_high_priority_loader_evidence.csv",
-              strong_hits,
-              [
-                  "file", "offset", "encoding",
-                  "matched_keyword", "string"
-              ]
-          )
-
-          file_hit_counts = Counter(
-              row["file"] for row in string_hits
-          )
-
-          ranked_files = sorted(
-              binary_inventory,
-              key=lambda row: (
-                  -sum(
-                      x["file"] == row["file"]
-                      for x in strong_hits
-                  ),
-                  -row["reference_hits"],
-                  row["file"]
-              )
-          )
-
-          csv_write(
-              "06_priority_binary_targets.csv",
-              [
-                  {
-                      "file": row["file"],
-                      "reference_hits": (
-                          file_hit_counts[row["file"]]
-                      ),
-                      "strong_hits": sum(
-                          x["file"] == row["file"]
-                          for x in strong_hits
-                      ),
-                      "magic_hits": row["magic_hits"],
-                      "bytes": row["bytes"],
-                      "pe_architecture": (
-                          row["pe_architecture"]
-                      )
-                  }
-                  for row in ranked_files
-              ],
-              [
-                  "file", "reference_hits",
-                  "strong_hits", "magic_hits",
-                  "bytes", "pe_architecture"
-              ]
-          )
-
-          # --------------------------------------------
-          # Part 4: Final results and next investigation
-          # --------------------------------------------
+          forced_xml_tests = [
+              row for row in test_rows
+              if row["method"]
+              == "05_force_first_five_to_xml"
+          ]
 
           summary = {
-              "phase": "STATIC_ANIMATION_LOADER_ANALYSIS",
-              "v4_run_id": 38828891785,
-              "original_xml_files_verified": len(
-                  raw_results
+              "phase": "XML_HEADER_PATCH_VERIFICATION",
+              "verified_originals": len(raw_samples),
+              "total_tests": len(test_rows),
+              "valid_xml_results": len(successful),
+              "shared_original_prefix_bytes": shared_prefix,
+              "first_byte_patch_both_valid": all(
+                  row["xml_valid"]
+                  for row in first_byte_tests
               ),
-              "shared_xml_prefix_bytes": common_prefix,
-              "both_have_X_question_xm": all(
-                  row["starts_X_question_xm"]
-                  for row in xml_rows
+              "force_xml_prefix_both_valid": all(
+                  row["xml_valid"]
+                  for row in forced_xml_tests
               ),
-              "client_executables_and_libraries": len(
-                  binaries
+              "v5_magic_references": len(
+                  magic_evidence
               ),
-              "script_candidates": len(scripts),
-              "files_scanned": total_scanned,
-              "files_skipped_due_to_size": skipped_large,
-              "total_reference_hits": len(string_hits),
-              "high_priority_string_hits": len(
-                  strong_hits
-              ),
-              "encoded_header_occurrences": len(
-                  magic_hits
-              ),
-              "candidate_loader_files": len({
-                  row["file"]
-                  for row in strong_hits
-              }),
-              "decoder_algorithm_verified": False,
-              "monster_identity_verified": False,
-              "animation_sequences_verified": False
+              "successful_variants": successful
           }
 
-          (REPORT / "07_summary_v5.json").write_text(
+          (REPORT / "04_summary_v6.json").write_text(
               json.dumps(
                   summary,
                   ensure_ascii=False,
@@ -612,36 +380,38 @@ jobs:
           )
 
           report_lines = [
-              "# Sanctuary of Aden V5 Loader Analysis",
+              "# Sanctuary of Aden XML Header Test V6",
               "",
-              "## Binary XML evidence",
+              "## Results",
               "",
-              f"Shared header bytes: {common_prefix}",
-              f"EXE/DLL candidates: {len(binaries)}",
-              f"Scripts: {len(scripts)}",
-              f"Scanned files: {total_scanned}",
-              f"Matching strings: {len(string_hits)}",
-              f"Strong references: {len(strong_hits)}",
-              f"Encoded header occurrences: {len(magic_hits)}",
+              f"Original files: {len(raw_samples)}",
+              f"Header experiments: {len(test_rows)}",
+              f"Valid XML variants: {len(successful)}",
+              f"V5 loader signature references: {len(magic_evidence)}",
+              "",
+              "## First-byte repair",
+              "",
+              "Both XML files parsed: "
+              + str(
+                  summary["first_byte_patch_both_valid"]
+              ),
+              "",
+              "## Five-byte header repair",
+              "",
+              "Both XML files parsed: "
+              + str(
+                  summary["force_xml_prefix_both_valid"]
+              ),
               "",
               "## Interpretation",
               "",
-              "X?xm is an observed signature,",
-              "not yet a confirmed encryption algorithm.",
+              "A successful XML parse proves this specific",
+              "transformation produces well-formed XML.",
+              "A failed parse disproves only that specific",
+              "transformation, not all decoding methods.",
               "",
-              "Static strings are investigative evidence.",
-              "They do not prove that a function is called.",
-              "",
-              "No client executable was run.",
-              "No unknown decryption key was assumed.",
-              "Monster identity remains unverified.",
-              "Animation frame order remains unverified.",
-              "",
-              "## Next step",
-              "",
-              "Examine strong references and related PE code.",
-              "Verify the file loader and decoding algorithm.",
-              "Only then parse actual actor and motion data."
+              "Original binary files were not modified.",
+              "Patched copies are available in patches/."
           ]
 
           (REPORT / "REPORT.md").write_text(
@@ -649,55 +419,39 @@ jobs:
               encoding="utf-8"
           )
 
-          print("=== V5 SUMMARY ===")
+          print("=== V6 FINAL SUMMARY ===")
           print(json.dumps(
               summary,
               ensure_ascii=False,
               indent=2
           ))
 
-          print("=== ENCODED XML HEADERS ===")
-          for row in xml_rows:
-              print(json.dumps(
-                  row, ensure_ascii=False
-              ))
-
-          print("=== HIGH PRIORITY REFERENCES ===")
-          for row in strong_hits[:100]:
-              print(json.dumps(
-                  row, ensure_ascii=False
-              ))
-
-          print("=== FIRST 40 CANDIDATE FILES ===")
-          for row in ranked_files[:40]:
-              print(json.dumps(
-                  row, ensure_ascii=False
-              ))
-
-          if "GITHUB_STEP_SUMMARY" in os.environ:
-              with open(
-                  os.environ["GITHUB_STEP_SUMMARY"],
-                  "a", encoding="utf-8"
-              ) as f:
-                  f.write("\n".join(report_lines))
-
-          if len(raw_results) != 2:
-              raise SystemExit(
-                  "Missing required original XML samples"
+          for row in original_rows:
+              print(
+                  "ORIGINAL_HEADER",
+                  row["file"],
+                  row["first_16_hex"]
               )
 
-          if total_scanned == 0:
-              raise SystemExit(
-                  "No client executable or script inspected"
-              )
+          for row in magic_evidence:
+              print("V5_MAGIC", row)
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+              encoding="utf-8"
+          ) as f:
+              f.write("\n".join(report_lines))
 
           PY
+        env:
+          PYTHONIOENCODING: utf-8
 
-      - name: Upload V5 loader analysis
+      - name: Upload V6 patch test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V5-Animation-Loader-Evidence
+          name: Sanctuary-V6-XML-Header-Test
           path: reports/
           if-no-files-found: error
           retention-days: 30
