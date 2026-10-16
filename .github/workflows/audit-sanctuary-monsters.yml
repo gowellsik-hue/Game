@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden XML Header Test V6
+name: Sanctuary of Aden XML Loader Investigation V7
 
 on:
   workflow_dispatch:
@@ -16,41 +16,87 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test:
+  investigate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 180
 
     steps:
       - name: Prepare environment
         shell: bash
         run: |
           set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+          mkdir -p downloads client previous/v4
+          mkdir -p reports/samples reports/contexts
+          df -h .
 
-          mkdir -p previous/v4 previous/v5
-          mkdir -p reports/patches
-
-      - name: Restore V4 original XML and V5 loader evidence
+      - name: Restore V4 verified XML originals
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           gh run download 38828891785 \
             --repo "$GITHUB_REPOSITORY" \
             --name Sanctuary-V4-Binary-Animation-Analysis \
             --dir previous/v4
-
-          gh run download 38830296261 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V5-Animation-Loader-Evidence \
-            --dir previous/v5
-
           test -d previous/v4/raw
+          echo "V4 ORIGINALS RESTORED"
 
-          echo "V4 AND V5 EVIDENCE RESTORED"
+      - name: Download original client archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "Sanctuary.of.Aden.-.Copy.*" \
+            --dir downloads
 
-      - name: Test original and modified XML headers
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("downloads")
+          base = "Sanctuary.of.Aden.-.Copy"
+
+          names = [
+              f"{base}.z{i:02d}"
+              for i in range(1, 46)
+          ]
+          names.append(f"{base}.zip")
+
+          missing = [
+              name for name in names
+              if not (root / name).is_file()
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing archive parts: " + repr(missing)
+              )
+
+          print("VERIFIED PARTS:", len(names))
+          PY
+
+      - name: Extract original client
+        shell: bash
+        run: |
+          set -euo pipefail
+          7z x \
+            "downloads/Sanctuary.of.Aden.-.Copy.zip" \
+            "-o${PWD}/client" \
+            -y > reports/extraction.log 2>&1
+          rm -rf downloads
+          echo "CLIENT EXTRACTED"
+          df -h .
+
+      - name: Investigate X question xm loader signatures
         shell: bash
         run: |
           set -euo pipefail
@@ -59,30 +105,41 @@ jobs:
           import csv
           import hashlib
           import json
-          import math
-          import xml.etree.ElementTree as ET
+          import os
+          import shutil
+          import struct
 
-          from collections import Counter
           from pathlib import Path
 
           ROOT = Path.cwd()
-          V4 = ROOT / "previous/v4"
-          V5 = ROOT / "previous/v5"
+          CLIENT = ROOT / "client"
+          V4 = ROOT / "previous/v4/raw"
           REPORT = ROOT / "reports"
-          PATCHES = REPORT / "patches"
+          SAMPLES = REPORT / "samples"
+          CONTEXT = REPORT / "contexts"
 
-          REPORT.mkdir(exist_ok=True)
-          PATCHES.mkdir(exist_ok=True)
+          SAMPLES.mkdir(parents=True, exist_ok=True)
+          CONTEXT.mkdir(parents=True, exist_ok=True)
 
-          TARGETS = {
+          MAGIC = b"X?xm"
+
+          EXPECTED_XML = {
               "Actions.xml":
                   "b79e4058e0b6e27111fd469bf0249ec1321da7d3f55c5009d42fb0369edec27f",
               "QMotionInfo.xml":
                   "5672c352dfcca91f2cad57bcaceb273aafdc9a80fd97118bc9ac996c7e4913f2"
           }
 
-          def save_csv(name, rows, fields):
-              with (REPORT / name).open(
+          EXPECTED_DLL_SHA = (
+              "34f438999d3415e1f0b63e204ea180"
+              "7a223e3dafea9199137d44f55b77cc22ab"
+          )
+
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def save_csv(filename, rows, fields):
+              with (REPORT / filename).open(
                   "w",
                   encoding="utf-8-sig",
                   newline=""
@@ -95,282 +152,431 @@ jobs:
                   writer.writeheader()
                   writer.writerows(rows)
 
-          def entropy(data):
-              if not data:
-                  return 0.0
+          def occurrences(data, token):
+              result = []
+              start = 0
 
-              counts = Counter(data)
-              size = len(data)
+              while True:
+                  offset = data.find(token, start)
 
-              return -sum(
-                  (count / size)
-                  * math.log2(count / size)
-                  for count in counts.values()
-              )
+                  if offset < 0:
+                      break
 
-          def printable_ratio(data):
-              if not data:
-                  return 0.0
+                  result.append(offset)
+                  start = offset + 1
 
-              printable = sum(
-                  32 <= b <= 126 or b in (9, 10, 13)
-                  for b in data
-              )
+              return result
 
-              return printable / len(data)
+          def get_sections(data):
+              if len(data) < 64 or data[:2] != b"MZ":
+                  raise ValueError("Not an MZ executable")
 
-          def try_xml(data):
-              try:
-                  root = ET.fromstring(data)
+              pe_offset = struct.unpack_from(
+                  "<I", data, 0x3c
+              )[0]
 
-                  return {
-                      "valid": True,
-                      "root": str(root.tag),
-                      "error": ""
-                  }
+              if pe_offset + 24 > len(data):
+                  raise ValueError("Invalid PE offset")
 
-              except ET.ParseError as ex:
-                  return {
-                      "valid": False,
-                      "root": "",
-                      "error": str(ex)
-                  }
+              if data[
+                  pe_offset:pe_offset + 4
+              ] != b"PE\x00\x00":
+                  raise ValueError("Missing PE signature")
 
-              except (ValueError, UnicodeError) as ex:
-                  return {
-                      "valid": False,
-                      "root": "",
-                      "error": str(ex)
-                  }
+              section_count = struct.unpack_from(
+                  "<H", data, pe_offset + 6
+              )[0]
 
-          test_rows = []
-          original_rows = []
-          successful = []
-          raw_samples = {}
+              optional_size = struct.unpack_from(
+                  "<H", data, pe_offset + 20
+              )[0]
 
-          for filename, expected_sha in TARGETS.items():
-              candidates = list(
-                  (V4 / "raw").glob("*_" + filename)
-              )
+              optional_offset = pe_offset + 24
 
-              if len(candidates) != 1:
-                  raise SystemExit(
-                      f"Missing unique original: {filename}"
+              optional_magic = struct.unpack_from(
+                  "<H", data, optional_offset
+              )[0]
+
+              if optional_magic == 0x10b:
+                  pointer_size = 4
+                  image_base = struct.unpack_from(
+                      "<I", data, optional_offset + 28
+                  )[0]
+              elif optional_magic == 0x20b:
+                  pointer_size = 8
+                  image_base = struct.unpack_from(
+                      "<Q", data, optional_offset + 24
+                  )[0]
+              else:
+                  raise ValueError(
+                      "Unsupported PE optional header"
                   )
 
-              original = candidates[0].read_bytes()
+              section_table = (
+                  optional_offset + optional_size
+              )
 
-              digest = hashlib.sha256(
-                  original
-              ).hexdigest()
+              sections = []
 
-              if digest != expected_sha:
-                  raise SystemExit(
-                      f"SHA256 mismatch: {filename}"
+              for i in range(section_count):
+                  pos = section_table + i * 40
+
+                  if pos + 40 > len(data):
+                      raise ValueError(
+                          "Truncated PE section table"
+                      )
+
+                  name = data[
+                      pos:pos + 8
+                  ].split(b"\x00")[0].decode(
+                      "ascii", errors="replace"
                   )
 
-              if not original.startswith(b"X?xm"):
+                  rva = struct.unpack_from(
+                      "<I", data, pos + 12
+                  )[0]
+
+                  raw_size = struct.unpack_from(
+                      "<I", data, pos + 16
+                  )[0]
+
+                  raw_offset = struct.unpack_from(
+                      "<I", data, pos + 20
+                  )[0]
+
+                  flags = struct.unpack_from(
+                      "<I", data, pos + 36
+                  )[0]
+
+                  sections.append({
+                      "name": name,
+                      "rva": rva,
+                      "raw_offset": raw_offset,
+                      "raw_size": raw_size,
+                      "flags": flags
+                  })
+
+              return image_base, pointer_size, sections
+
+          def locate_offset(offset, sections):
+              for section in sections:
+                  begin = section["raw_offset"]
+                  end = begin + section["raw_size"]
+
+                  if begin <= offset < end:
+                      rva = (
+                          section["rva"]
+                          + offset - begin
+                      )
+
+                      return section["name"], rva
+
+              return "UNMAPPED", None
+
+          def context_dump(data, offset, radius=128):
+              start = max(0, offset - radius)
+              end = min(len(data), offset + radius)
+
+              chunk = data[start:end]
+
+              return {
+                  "start": start,
+                  "end": end,
+                  "hex": chunk.hex(" "),
+                  "ascii": "".join(
+                      chr(x) if 32 <= x <= 126 else "."
+                      for x in chunk
+                  )
+              }
+
+          # -------------------------------------------
+          # Confirm encoded originals from V4
+          # -------------------------------------------
+
+          xml_rows = []
+
+          for name, expected_sha in EXPECTED_XML.items():
+              paths = list(
+                  V4.glob("*_" + name)
+              )
+
+              if len(paths) != 1:
                   raise SystemExit(
-                      f"Unexpected header: {filename}"
+                      "Missing V4 XML original: " + name
                   )
 
-              raw_samples[filename] = original
+              raw = paths[0].read_bytes()
+              sha = digest(raw)
 
-              original_rows.append({
-                  "file": filename,
-                  "bytes": len(original),
-                  "sha256": digest,
-                  "first_16_hex": original[:16].hex(" "),
-                  "first_64_hex": original[:64].hex(" "),
-                  "header_ascii": repr(original[:5]),
-                  "full_entropy": round(
-                      entropy(original), 5
+              if sha != expected_sha:
+                  raise SystemExit(
+                      "XML SHA mismatch: " + name
+                  )
+
+              if not raw.startswith(MAGIC):
+                  raise SystemExit(
+                      "Unexpected XML signature: " + name
+                  )
+
+              xml_rows.append({
+                  "filename": name,
+                  "bytes": len(raw),
+                  "sha256": sha,
+                  "header": raw[:16].hex(" "),
+                  "magic": raw[:4].decode("ascii")
+              })
+
+          save_csv(
+              "01_verified_xml_origins.csv",
+              xml_rows,
+              [
+                  "filename", "bytes",
+                  "sha256", "header", "magic"
+              ]
+          )
+
+          # -------------------------------------------
+          # Locate the actual original DLL files
+          # -------------------------------------------
+
+          dll_names = (
+              "Login.dll",
+              "Redemption.dll"
+          )
+
+          binary_files = []
+
+          for name in dll_names:
+              matches = list(CLIENT.rglob(name))
+
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Expected one {name}, found {len(matches)}"
+                  )
+
+              binary_files.append(matches[0])
+
+          dll_a = binary_files[0].read_bytes()
+          dll_b = binary_files[1].read_bytes()
+
+          if digest(dll_a) != EXPECTED_DLL_SHA:
+              raise SystemExit(
+                  "Login.dll differs from V5"
+              )
+
+          if digest(dll_b) != EXPECTED_DLL_SHA:
+              raise SystemExit(
+                  "Redemption.dll differs from V5"
+              )
+
+          if dll_a != dll_b:
+              raise SystemExit(
+                  "Previously identical DLLs now differ"
+              )
+
+          # Save the exact DLL for future direct analysis.
+          shutil.copyfile(
+              binary_files[0],
+              SAMPLES / "Login.dll"
+          )
+
+          # Keep the actual game executable as well.
+          lineage = list(
+              CLIENT.rglob("Lineage.exe")
+          )
+
+          if len(lineage) == 1:
+              shutil.copyfile(
+                  lineage[0],
+                  SAMPLES / "Lineage.exe"
+              )
+
+          # -------------------------------------------
+          # Classify X?xm locations and look for xrefs
+          # -------------------------------------------
+
+          marker_rows = []
+          xref_rows = []
+          section_rows = []
+
+          image_base, ptr_size, sections = get_sections(
+              dll_a
+          )
+
+          for section in sections:
+              section_rows.append({
+                  "section": section["name"],
+                  "rva": section["rva"],
+                  "raw_offset": section["raw_offset"],
+                  "raw_size": section["raw_size"],
+                  "flags": hex(section["flags"])
+              })
+
+          marker_offsets = occurrences(
+              dll_a, MAGIC
+          )
+
+          for marker_index, marker_offset in enumerate(
+              marker_offsets
+          ):
+              section_name, rva = locate_offset(
+                  marker_offset, sections
+              )
+
+              va = (
+                  image_base + rva
+                  if rva is not None
+                  else None
+              )
+
+              evidence = context_dump(
+                  dll_a, marker_offset, 256
+              )
+
+              context_path = CONTEXT / (
+                  f"marker_{marker_index + 1:02d}.json"
+              )
+
+              context_path.write_text(
+                  json.dumps(
+                      evidence,
+                      ensure_ascii=False,
+                      indent=2
                   ),
-                  "body_entropy": round(
-                      entropy(original[4:]), 5
+                  encoding="utf-8"
+              )
+
+              marker_rows.append({
+                  "file": "Login.dll",
+                  "offset": marker_offset,
+                  "section": section_name,
+                  "rva": (
+                      hex(rva) if rva is not None else ""
                   ),
-                  "printable_ratio": round(
-                      printable_ratio(original), 5
+                  "virtual_address": (
+                      hex(va) if va is not None else ""
                   ),
-                  "after_header_printable_ratio": round(
-                      printable_ratio(original[4:]), 5
-                  ),
-                  "internal_xml_prolog_count": (
-                      original.count(b"<?xml")
+                  "context": str(
+                      context_path.relative_to(REPORT)
                   )
               })
 
-              variants = {
-                  "01_original":
-                      original,
+              if va is None:
+                  continue
 
-                  "02_replace_question_mark_only":
-                      original[:1]
-                      + b"<"
-                      + original[2:],
+              code_sections = [
+                  section
+                  for section in sections
+                  if section["flags"] & 0x20
+              ]
 
-                  "03_replace_X_with_less_than":
-                      b"<" + original[1:],
+              for value_type, value in (
+                  ("absolute_va", va),
+                  ("rva", rva)
+              ):
+                  fmt = (
+                      "<I" if ptr_size == 4
+                      else "<Q"
+                  )
 
-                  "04_force_first_four_to_xml":
-                      b"<?xm" + original[4:],
+                  pointer = struct.pack(fmt, value)
 
-                  "05_force_first_five_to_xml":
-                      b"<?xml" + original[5:],
-
-                  "06_remove_first_byte":
-                      original[1:],
-
-                  "07_remove_first_four_bytes":
-                      original[4:]
-              }
-
-              for method, data in variants.items():
-                  result = try_xml(data)
-
-                  record = {
-                      "file": filename,
-                      "method": method,
-                      "first_16_hex": data[:16].hex(" "),
-                      "first_32_ascii": repr(data[:32]),
-                      "xml_valid": result["valid"],
-                      "xml_root": result["root"],
-                      "parse_error": result["error"],
-                      "printable_ratio": round(
-                          printable_ratio(data), 5
-                      ),
-                      "bytes": len(data)
-                  }
-
-                  test_rows.append(record)
-
-                  if method in (
-                      "03_replace_X_with_less_than",
-                      "05_force_first_five_to_xml"
-                  ):
-                      destination = PATCHES / (
-                          filename.replace(".xml", "")
-                          + "_"
-                          + method
-                          + ".xml"
+                  for code_section in code_sections:
+                      start = code_section["raw_offset"]
+                      end = min(
+                          len(dll_a),
+                          start + code_section["raw_size"]
                       )
 
-                      destination.write_bytes(data)
+                      code = dll_a[start:end]
 
-                  if result["valid"]:
-                      successful.append({
-                          "file": filename,
-                          "method": method,
-                          "root": result["root"]
-                      })
+                      for local_pos in occurrences(
+                          code, pointer
+                      )[:100]:
+                          reference_offset = (
+                              start + local_pos
+                          )
 
-                  print(
-                      "TEST",
-                      filename,
-                      method,
-                      "VALID =", result["valid"],
-                      "ERROR =", result["error"]
-                  )
+                          reference_section, reference_rva = (
+                              locate_offset(
+                                  reference_offset,
+                                  sections
+                              )
+                          )
+
+                          xref_rows.append({
+                              "marker_offset": marker_offset,
+                              "reference_offset": reference_offset,
+                              "reference_section": reference_section,
+                              "reference_rva": (
+                                  hex(reference_rva)
+                                  if reference_rva is not None
+                                  else ""
+                              ),
+                              "reference_type": value_type,
+                              "evidence": dll_a[
+                                  max(0, reference_offset - 16):
+                                  reference_offset + 24
+                              ].hex(" ")
+                          })
 
           save_csv(
-              "01_original_binary_diagnostics.csv",
-              original_rows,
+              "02_dll_pe_sections.csv",
+              section_rows,
               [
-                  "file", "bytes", "sha256",
-                  "first_16_hex", "first_64_hex",
-                  "header_ascii", "full_entropy",
-                  "body_entropy", "printable_ratio",
-                  "after_header_printable_ratio",
-                  "internal_xml_prolog_count"
+                  "section", "rva",
+                  "raw_offset", "raw_size", "flags"
               ]
           )
 
           save_csv(
-              "02_header_patch_results.csv",
-              test_rows,
+              "03_xml_magic_locations.csv",
+              marker_rows,
               [
-                  "file", "method",
-                  "first_16_hex",
-                  "first_32_ascii",
-                  "xml_valid", "xml_root",
-                  "parse_error",
-                  "printable_ratio", "bytes"
+                  "file", "offset", "section",
+                  "rva", "virtual_address", "context"
               ]
           )
 
-          # Read V5's evidence for the identical X?xm
-          # signature observed in client executables.
-
-          evidence_files = list(
-              V5.rglob(
-                  "04_encoded_xml_magic_references.csv"
-              )
-          )
-
-          magic_evidence = []
-
-          if len(evidence_files) == 1:
-              with evidence_files[0].open(
-                  "r",
-                  encoding="utf-8-sig",
-                  newline=""
-              ) as f:
-                  magic_evidence = list(
-                      csv.DictReader(f)
-                  )
-
           save_csv(
-              "03_v5_magic_references.csv",
-              magic_evidence,
-              ["file", "offset", "signature"]
+              "04_possible_code_references.csv",
+              xref_rows,
+              [
+                  "marker_offset",
+                  "reference_offset",
+                  "reference_section",
+                  "reference_rva",
+                  "reference_type",
+                  "evidence"
+              ]
           )
 
-          # Compare the bytes after the common marker.
-          a = raw_samples["Actions.xml"]
-          b = raw_samples["QMotionInfo.xml"]
+          # These are candidate references, not proof
+          # that the executable uses an XML decoder.
 
-          shared_prefix = 0
-
-          for x, y in zip(a, b):
-              if x != y:
-                  break
-
-              shared_prefix += 1
-
-          # Test whether changing the header is enough.
-          first_byte_tests = [
-              row for row in test_rows
-              if row["method"]
-              == "03_replace_X_with_less_than"
-          ]
-
-          forced_xml_tests = [
-              row for row in test_rows
-              if row["method"]
-              == "05_force_first_five_to_xml"
-          ]
+          expected_offsets = {311840, 320536}
+          discovered_offsets = set(marker_offsets)
 
           summary = {
-              "phase": "XML_HEADER_PATCH_VERIFICATION",
-              "verified_originals": len(raw_samples),
-              "total_tests": len(test_rows),
-              "valid_xml_results": len(successful),
-              "shared_original_prefix_bytes": shared_prefix,
-              "first_byte_patch_both_valid": all(
-                  row["xml_valid"]
-                  for row in first_byte_tests
+              "phase": "STATIC_LOADER_REFERENCE_INVESTIGATION",
+              "v4_original_xml_verified": 2,
+              "login_redemption_dll_identical": True,
+              "original_dll_sha256": digest(dll_a),
+              "xml_marker_offsets": marker_offsets,
+              "v5_offsets_confirmed": (
+                  discovered_offsets == expected_offsets
               ),
-              "force_xml_prefix_both_valid": all(
-                  row["xml_valid"]
-                  for row in forced_xml_tests
-              ),
-              "v5_magic_references": len(
-                  magic_evidence
-              ),
-              "successful_variants": successful
+              "pe_image_base": hex(image_base),
+              "pe_pointer_size": ptr_size,
+              "pe_sections": len(sections),
+              "candidate_code_references": len(xref_rows),
+              "dll_sample_exported": True,
+              "decoder_algorithm_verified": False,
+              "xml_recovered": False,
+              "monster_motion_mapping_verified": False
           }
 
-          (REPORT / "04_summary_v6.json").write_text(
+          (REPORT / "05_summary_v7.json").write_text(
               json.dumps(
                   summary,
                   ensure_ascii=False,
@@ -379,79 +585,75 @@ jobs:
               encoding="utf-8"
           )
 
-          report_lines = [
-              "# Sanctuary of Aden XML Header Test V6",
+          report_text = [
+              "# Sanctuary of Aden V7 Loader Investigation",
               "",
-              "## Results",
+              "## Verified",
               "",
-              f"Original files: {len(raw_samples)}",
-              f"Header experiments: {len(test_rows)}",
-              f"Valid XML variants: {len(successful)}",
-              f"V5 loader signature references: {len(magic_evidence)}",
+              "- V4 XML originals verified by SHA256",
+              "- Login.dll and Redemption.dll identical",
+              f"- X?xm occurrences: {len(marker_offsets)}",
+              f"- Candidate code references: {len(xref_rows)}",
               "",
-              "## First-byte repair",
+              "## Limits",
               "",
-              "Both XML files parsed: "
-              + str(
-                  summary["first_byte_patch_both_valid"]
-              ),
+              "A matching pointer is not proof of execution.",
+              "A marker in a DLL is not proof of decryption.",
+              "No client executable or DLL was executed.",
+              "No decrypted XML has been established.",
               "",
-              "## Five-byte header repair",
+              "## Preserved samples",
               "",
-              "Both XML files parsed: "
-              + str(
-                  summary["force_xml_prefix_both_valid"]
-              ),
+              "- samples/Login.dll",
+              "- samples/Lineage.exe if present",
               "",
-              "## Interpretation",
-              "",
-              "A successful XML parse proves this specific",
-              "transformation produces well-formed XML.",
-              "A failed parse disproves only that specific",
-              "transformation, not all decoding methods.",
-              "",
-              "Original binary files were not modified.",
-              "Patched copies are available in patches/."
+              "The next investigation can examine these",
+              "samples without downloading all 46 parts."
           ]
 
           (REPORT / "REPORT.md").write_text(
-              "\n".join(report_lines),
+              "\n".join(report_text),
               encoding="utf-8"
           )
 
-          print("=== V6 FINAL SUMMARY ===")
+          print("=== V7 SUMMARY ===")
           print(json.dumps(
               summary,
               ensure_ascii=False,
               indent=2
           ))
 
-          for row in original_rows:
-              print(
-                  "ORIGINAL_HEADER",
-                  row["file"],
-                  row["first_16_hex"]
-              )
+          print("=== PE SECTIONS ===")
+          for row in section_rows:
+              print(row)
 
-          for row in magic_evidence:
-              print("V5_MAGIC", row)
+          print("=== XML MAGIC LOCATIONS ===")
+          for row in marker_rows:
+              print(row)
 
-          with open(
-              os.environ["GITHUB_STEP_SUMMARY"],
-              "a",
-              encoding="utf-8"
-          ) as f:
-              f.write("\n".join(report_lines))
+          print("=== CANDIDATE REFERENCES ===")
+          for row in xref_rows[:50]:
+              print(row)
+
+          summary_path = os.environ.get(
+              "GITHUB_STEP_SUMMARY"
+          )
+
+          if summary_path:
+              with open(
+                  summary_path,
+                  "a",
+                  encoding="utf-8"
+              ) as f:
+                  f.write("\n".join(report_text))
 
           PY
-        env:
-          PYTHONIOENCODING: utf-8
 
-      - name: Upload V6 patch test results
+      - name: Upload V7 investigation evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V6-XML-Header-Test
+          name: Sanctuary-V7-XML-Loader-References
           path: reports/
           if-no-files-found: error
           retention-days: 30
