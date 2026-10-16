@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Mobile V5 Original TIL Graphics
+name: Sanctuary of Aden Mobile V6 Directional Combat and SPR Roster
 
 on:
   push:
@@ -12,12 +12,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: sanctuary-mobile-v5
+  group: sanctuary-mobile-v6
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build authentic TIL art and original S32 objects
+    name: Build V6 original S32 terrain and eight actor SPR motion sets
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -25,6 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Prepare isolated build
         shell: bash
         run: |
@@ -34,6 +35,7 @@ jobs:
           sudo apt-get install -y -qq zip unzip p7zip-full
           mkdir -p downloads client src reports dist/mobile
           df -h .
+
       - name: Download 46 original client pieces
         shell: bash
         env:
@@ -54,6 +56,7 @@ jobs:
               raise SystemExit('Final ZIP segment is empty')
           print('Archive verified:',len(paths),'pieces')
           PY_PARTS
+
       - name: Extract Sprite, Tile and real Aden Map 4
         shell: bash
         run: |
@@ -98,10 +101,12 @@ jobs:
           print('Source extraction verified')
           PY_PATHS
           df -h .
+
       - name: Configure Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install decoder and restore V4 mobile engine
         shell: bash
         run: |
@@ -122,492 +127,225 @@ jobs:
               Path('src',name).write_text(content,encoding='utf-8')
           print('Pinned, previously successful V4 engine restored')
           PY_RESTORE
-      - name: Create original TIL decoder and V5 renderer
+
+      - name: Restore pinned V5 tile decoder and expand original SPR actions
         shell: bash
         run: |
           set -euo pipefail
-          cat > src/map_builder.py <<'PY_MAP'
-          import argparse
-          import collections
-          import json
-          import re
-          import struct
-          import zlib
+          git cat-file -e 'fe7c554c7c6e469f7df5b7c117b2c8ec48781aca^{commit}'
+          git show fe7c554c7c6e469f7df5b7c117b2c8ec48781aca:.github/workflows/build-web.yml > reports/pinned-v5.yml
+          python3 - <<'PY_V5_RESTORE'
           from pathlib import Path
-          from PIL import Image
-
-          FILES = [f'{x:04x}{y:04x}.s32' for x in range(0x8004, 0x8007) for y in range(0x8008, 0x800b)]
-          OX = 32767 + (0x8004 - 0x7fff) * 64 - 63
-          OY = 32767 + (0x8008 - 0x7fff) * 64 - 63
-          SIZE = 192
-
-          def rgb555(color, alpha=255):
-              return (((color >> 10 & 31) * 255 + 15) // 31,
-                      ((color >> 5 & 31) * 255 + 15) // 31,
-                      ((color & 31) * 255 + 15) // 31, alpha)
-
-          def decode_tile(block):
-              if not block:
-                  raise ValueError('Empty TIL block')
-              typ = block[0]
-              pic = Image.new('RGBA', (24, 24))
-              pixels = pic.load()
-              p = 1
-              opaque = 0
-
-              def put(x, y, c):
-                  nonlocal opaque
-                  if 0 <= x < 24 and 0 <= y < 24 and c & 32767:
-                      alpha = 128 if typ & 4 else 255
-                      pixels[x, y] = rgb555(c, alpha)
-                      opaque += 1
-
-              if not typ & 2:
-                  for y in range(24):
-                      n = (y + 1) * 2 if y <= 11 else (23 - y) * 2
-                      x0 = 0 if typ & 1 else 24 - n
-                      if p + 2 * n > len(block):
-                          raise ValueError('Truncated diamond pixel scan')
-                      for x in range(n):
-                          c = struct.unpack_from('<H', block, p)[0]
-                          p += 2
-                          put(x0 + x, y, c)
-              else:
-                  if len(block) < 5:
-                      raise ValueError('Truncated compressed tile header')
-                  x0, y0, dx, dy = block[1:5]
-                  p = 5
-                  if x0 + dx > 48 or y0 + dy > 48 or dy > 48:
-                      raise ValueError('Unreasonable tile coordinate bounds')
-                  high_res = (x0 + dx > 24 or y0 + dy > 24)
-                  if high_res:
-                      canvas = Image.new('RGBA', (48, 48))
-                      cp = canvas.load()
-                  for y in range(dy):
-                      if p >= len(block):
-                          raise ValueError('Truncated tile segment line')
-                      segments = block[p]
-                      p += 1
-                      x = x0
-                      for s in range(segments):
-                          if p + 2 > len(block):
-                              raise ValueError('Truncated tile segment header')
-                          skip, count = block[p:p+2]
-                          p += 2
-                          x += skip // 2
-                          if p + count * 2 > len(block):
-                              raise ValueError('Truncated tile segment colors')
-                          for _ in range(count):
-                              c = struct.unpack_from('<H', block, p)[0]
-                              p += 2
-                              px, py = x, y0 + y
-                              if high_res:
-                                  if 0 <= px < 48 and 0 <= py < 48 and c & 32767:
-                                      cp[px,py] = rgb555(c, 128 if typ & 4 else 255)
-                                      opaque += 1
-                              else:
-                                  put(px,py,c)
-                              x += 1
-                  if high_res:
-                      return canvas.resize((24,24), Image.Resampling.BOX), opaque
-              return pic, opaque
-
-          def tile_idx(path):
-              raw = path.read_bytes()
-              count = struct.unpack_from('<I', raw)[0]
-              if len(raw) != 4 + count * 28:
-                  raise ValueError('Tile.idx is not a 28-byte-record IDX file')
-              result = {}
-              for i in range(count):
-                  off = 4 + i * 28
-                  name = raw[off+4:off+24].split(b'\0')[0]
-                  try:
-                      name = name.decode('ascii').lower()
-                  except UnicodeDecodeError:
-                      continue
-                  match = re.fullmatch(r'(\d+)\.til', name)
-                  if match:
-                      result[int(match.group(1))] = (
-                          struct.unpack_from('<I', raw, off)[0],
-                          struct.unpack_from('<I', raw, off+24)[0]
-                      )
-              return result
-
-          def read_s32(path):
-              block_x, block_y = int(path.stem[:4], 16), int(path.stem[4:8],16)
-              local_x = 32767 + (block_x - 0x7fff) * 64 - 63
-              local_y = 32767 + (block_y - 0x7fff) * 64 - 63
-              raw = path.read_bytes()
-              if len(raw) < 32768+2+16384+4:
-                  raise ValueError('S32 is too short: ' + path.name)
-              floor = memoryview(raw)[:32768]
-              l2count = struct.unpack_from('<H',raw,32768)[0]
-              pointer = 32768+2
-              if pointer + l2count*6 + 16384 + 4 > len(raw):
-                  raise ValueError('S32 layer2 exceeds file: ' + path.name)
-              overlays=[]
-              for i in range(l2count):
-                  lx,ly,ind,tid,unk = struct.unpack_from('<BBBHB',raw,pointer)
-                  pointer += 6
-                  if lx < 128 and ly < 64:
-                      overlays.append((lx,ly,tid*256+ind))
-              a1 = struct.unpack_from('<8192h',raw,pointer)
-              pointer += 16384
-              ngroups = struct.unpack_from('<I',raw,pointer)[0]
-              pointer += 4
-              if ngroups > 10000:
-                  raise ValueError('Unreasonable S32 object group count')
-              objects=[]
-              for _ in range(ngroups):
-                  if pointer + 4 > len(raw):
-                      raise ValueError('S32 object group header out of range')
-                  group, count = struct.unpack_from('<hH',raw,pointer)
-                  pointer += 4
-                  if pointer + count*7 > len(raw):
-                      raise ValueError('S32 object tile outside file')
-                  for i in range(count):
-                      lx,ly,layer,idx,tid,unk=struct.unpack_from('<BBBBhB',raw,pointer)
-                      pointer += 7
-                      if 0 <= tid <= 65535 and lx < 128 and ly < 64:
-                          objects.append((lx,ly,tid*256+idx,layer,group))
-              for y in range(64):
-                  for x in range(64):
-                      p=(y*128+x*2)*4
-                      ia,ta,ua=struct.unpack_from('<BHB',floor,p)
-                      ib,tb,ub=struct.unpack_from('<BHB',floor,p+4)
-                      yield 'floor',(local_x+x,local_y+y,a1[(y*64+x)*2]&65535,ta*256+ia,tb*256+ib)
-              for lx,ly,packed in overlays:
-                  yield 'cover',(local_x*2+lx,local_y+ly,packed)
-              for lx,ly,packed,layer,group in objects:
-                  yield 'object',(local_x*2+lx,local_y+ly,packed,layer,group)
-
-          def convert_tiles(used, out, index_path, pak_path):
-              index=tile_idx(index_path)
-              by_tile=collections.defaultdict(set)
-              for packed in used:
-                  tid,variant=divmod(packed,256)
-                  if packed and tid >= 0:
-                      by_tile[tid].add(variant)
-              images_dir=out/'tiles'
-              images_dir.mkdir(parents=True,exist_ok=True)
-              statistics=collections.Counter()
-              bad=[]
-              map_colors={}
-              with pak_path.open('rb') as handle:
-                  pak_size=pak_path.stat().st_size
-                  for tid, variants in sorted(by_tile.items()):
-                      if tid not in index:
-                          statistics['missing_packages']+=1
-                          bad.append((tid,'missing TIL package'))
-                          continue
-                      offset,size=index[tid]
-                      if not (16<size<4_000_000 and 0<=offset<=pak_size-size):
-                          bad.append((tid,'invalid PAK record bounds'))
-                          continue
-                      handle.seek(offset)
-                      raw=handle.read(size)
-                      if len(raw) != size:
-                          bad.append((tid,'short TIL read'))
-                          continue
-                      if raw[0] == 0x78:
-                          try:
-                              maybe=zlib.decompress(raw)
-                              if 4 < len(maybe) < 4_000_000:
-                                  raw=maybe
-                          except zlib.error:
-                              pass
-                      if len(raw) < 8:
-                          bad.append((tid,'short TIL data'))
-                          continue
-                      count=struct.unpack_from('<I',raw)[0]
-                      if not (1<=count<=65536 and 4 + 4*(count+1) < len(raw)):
-                          bad.append((tid,'invalid tile table count'))
-                          continue
-                      offs=struct.unpack_from('<'+'I'*(count+1),raw,4)
-                      base=4+(count+1)*4
-                      if any(v<0 or v>len(raw)-base for v in offs):
-                          bad.append((tid,'tile block offsets out of bounds'))
-                          continue
-                      atlas=Image.new('RGBA',(384,384))
-                      valid=0
-                      for v in sorted(variants):
-                          if not 0<=v<count:
-                              bad.append((tid,'tile index outside group '+str(v)))
-                              continue
-                          begin=base+offs[v]
-                          end=base+offs[v+1]
-                          if not (begin<end<=len(raw)):
-                              bad.append((tid,'tile block range invalid '+str(v)))
-                              continue
-                          try:
-                              decoded,nonzero=decode_tile(raw[begin:end])
-                          except (IndexError,struct.error,ValueError) as ex:
-                              bad.append((tid,'tile pixel decode '+str(v)+' '+str(ex)))
-                              continue
-                          atlas.alpha_composite(decoded,(v%16*24,v//16*24))
-                          if nonzero:
-                              valid+=1
-                              colors=decoded.get_flattened_data() if hasattr(decoded, 'get_flattened_data') else decoded.getdata()
-                              rs=gs=bs=total=0
-                              for r,g,b,a in colors:
-                                  if a:
-                                      rs+=r
-                                      gs+=g
-                                      bs+=b
-                                      total+=1
-                              if total:
-                                  map_colors[str(tid*256+v)]='#%02x%02x%02x'%(rs//total,gs//total,bs//total)
-                      if valid:
-                          atlas.save(images_dir/f'{tid}.png',optimize=True)
-                          statistics['atlases']+=1
-                          statistics['decoded_variants']+=valid
-                      else:
-                          bad.append((tid,'zero usable pixels'))
-              statistics['requested_groups']=len(by_tile)
-              statistics['requested_variants']=len(used)
-              statistics['errors']=len(bad)
-              return dict(statistics),bad,map_colors
-
-          def nearest_spawn(spawn, flags):
-              x,y=spawn
-              for d in range(33):
-                  for dy in range(-d,d+1):
-                      for dx in range(-d,d+1):
-                          if max(abs(dx),abs(dy)) != d:
-                              continue
-                          px,py=x+dx,y+dy
-                          ix,iy=px-OX,py-OY
-                          if 0<=ix<SIZE and 0<=iy<SIZE:
-                              flag=flags[iy*SIZE+ix]
-                              if not (flag&1) and not (flag&4):
-                                  return [px,py]
-              raise ValueError('No playable spawn location')
-
-          def main():
-              arg=argparse.ArgumentParser()
-              arg.add_argument('--map-dir',required=True,type=Path)
-              arg.add_argument('--tile-idx',required=True,type=Path)
-              arg.add_argument('--tile-pak',required=True,type=Path)
-              arg.add_argument('--output',required=True,type=Path)
-              args=arg.parse_args()
-              out=args.output
-              if not out.is_file():
-                  raise ValueError('Sprite builder must run first')
-              data=json.loads(out.read_text('utf-8'))
-              flags=[-1]*(SIZE*SIZE)
-              floor_a=[0]*(SIZE*SIZE)
-              floor_b=[0]*(SIZE*SIZE)
-              overlay_a=[-1]*(SIZE*SIZE)
-              overlay_b=[-1]*(SIZE*SIZE)
-              objects=[]
-              used=set()
-              stats=collections.Counter()
-              for fname in FILES:
-                  file=args.map_dir/fname
-                  if not file.is_file():
-                      raise FileNotFoundError(str(file))
-                  for kind,row in read_s32(file):
-                      stats[kind]+=1
-                      if kind=='floor':
-                          wx,wy,fl,pa,pb=row
-                          ix,iy=wx-OX,wy-OY
-                          if not (0<=ix<SIZE and 0<=iy<SIZE):
-                              raise ValueError('S32 grid coordinate outside map bounds')
-                          key=iy*SIZE+ix
-                          if flags[key]>=0:
-                              raise ValueError('S32 floor overlap')
-                          flags[key]=fl
-                          floor_a[key]=pa
-                          floor_b[key]=pb
-                          used.add(pa)
-                          used.add(pb)
-                      elif kind=='cover':
-                          wx2,wy,packed=row
-                          ix=(wx2-OX*2)//2
-                          iy=wy-OY
-                          if 0<=ix<SIZE and 0<=iy<SIZE:
-                              key=iy*SIZE+ix
-                              if wx2%2:
-                                  overlay_b[key]=packed
-                              else:
-                                  overlay_a[key]=packed
-                              used.add(packed)
-                      else:
-                          wx2,wy,packed,layer,group=row
-                          ix=(wx2-OX*2)//2
-                          iy=wy-OY
-                          if 0<=ix<SIZE and 0<=iy<SIZE:
-                              objects.append([wx2-OX*2,iy,packed,layer,group])
-                              used.add(packed)
-              if any(v<0 for v in flags):
-                  raise ValueError('Missing S32 cell attributes')
-              tile_stats,errors,colors=convert_tiles(used,args.output.parent,args.tile_idx,args.tile_pak)
-              if tile_stats.get('atlases',0)<10 or tile_stats.get('decoded_variants',0)<100:
-                  raise ValueError('Original TIL pixel decoding produced insufficient output')
-              objects.sort(key=lambda row:(row[0]/2+row[1],row[4],row[3]))
-              world={
-                  'id':4,'region':'Aden nine-segment test window',
-                  'origin':[OX,OY],'size':[SIZE,SIZE],
-                  'spawn':nearest_spawn((33130,33390),flags),
-                  'flags':flags,'floorA':floor_a,'floorB':floor_b,
-                  'overlayA':overlay_a,'overlayB':overlay_b,
-                  'objects':objects,'tileColors':colors,
-                  'blocks':FILES,
-                  'collision_count':sum(bool(f&1) for f in flags),
-                  'safe_count':sum(bool(f&4) and not (f&1) for f in flags),
-                  'tile_decode':tile_stats,
-                  'object_layer_source':'S32 Layer4 native half-column coordinates and layer/group identifiers',
-                  'tile_pixel_source':'Original Tile.pak TIL RGB555 decoded to 24x24 atlas images',
-                  'render_note':'Object sorting is provisional; exact original client depth rules unverified'
-              }
-              data['version']=5
-              data['status']='REAL_TIL_TILE_ATLAS_AND_S32_OBJECT_RENDERER'
-              data['map']=world
-              out.write_text(json.dumps(data,ensure_ascii=False,separators=(',',':')),'utf-8')
-              page=out.parent/'index.html'
-              html=page.read_text('utf-8')
-              tag='<script id="manifest" type="application/json">'
-              a=html.find(tag)
-              b=html.find('</script>',a+len(tag))
-              if a<0 or b<0:
-                  raise ValueError('Manifest HTML tag unavailable')
-              html=html[:a+len(tag)]+json.dumps(data,ensure_ascii=False,separators=(',',':'))+html[b:]
-              page.write_text(html,'utf-8')
-              report={
-                  'map_id':4,'s32_files':FILES,
-                  'floor_cells':stats['floor'],
-                  'overlays':stats['cover'],
-                  'layer4_objects':len(objects),
-                  'flags_blocked':world['collision_count'],
-                  'flags_safe':world['safe_count'],
-                  'tile_decode':tile_stats,
-                  'tile_errors':errors[:300],
-                  'no_full_original_game_claim':True
-              }
-              (out.parent/'map_diagnostics.json').write_text(
-                  json.dumps(report,ensure_ascii=False,indent=2),'utf-8'
-              )
-              print(json.dumps({
-                  k:report[k] for k in [
-                      'floor_cells','overlays','layer4_objects',
-                      'flags_blocked','tile_decode'
-                  ]
-              },ensure_ascii=False,indent=2))
-
-          if __name__=='__main__':
-              main()
-          PY_MAP
-          cat > src/upgrade.py <<'PY_UPGRADE'
-          from pathlib import Path
-          p=Path('src/index.template.html')
-          s=p.read_text('utf-8')
-          s=s.replace('Sanctuary of Aden Mobile V4 · Original S32','Sanctuary of Aden Mobile V5 · Original Tile Artwork')
-          s=s.replace('Sanctuary Mobile V4</strong>', 'Sanctuary Mobile V5</strong>')
-          s=s.replace('원본 S32 맵 + 모션 연구실','원본 TIL 지형·오브젝트 + SPR 모션')
-          s=s.replace('원본 맵 4의 S32 통행속성을 사용합니다. 바닥 이미지는 실제 Tile.pak의 평균색 기반 시각화로 아직 정확한 타일 그림이 아닙니다. 모션은 검증되지 않았습니다.','원본 S32 지형과 Tile.pak 픽셀을 복원했습니다. 건물·나무 등 Layer4 원본 오브젝트 표시를 추가했습니다. 오브젝트 앞뒤 겹침 순서는 시범 구현이며 모션 분류도 아직 검증되지 않았습니다.')
-          s=s.replace('<button id="overlayToggle" type="button">충돌 OFF</button>','<button id="overlayToggle" type="button">충돌 OFF</button>\n<button id="objectToggle" type="button">오브젝트 ON</button>\n<button id="textureToggle" type="button">원본 타일 ON</button>')
-          s=s.replace('#miniWrap{position:absolute;top:calc(190px + env(safe-area-inset-top))','#miniWrap{position:absolute;top:calc(280px + env(safe-area-inset-top))')
-          s=s.replace('          @media(max-height:490px)', '          #objectToggle{position:absolute;top:calc(191px + env(safe-area-inset-top));right:10px;padding:6px 9px;font-size:11px}\n          #textureToggle{position:absolute;top:calc(235px + env(safe-area-inset-top));right:10px;padding:6px 9px;font-size:11px}\n          @media(max-height:490px)')
-          s=s.replace('let labPage=0,selectedKey=0,toastUntil=0,showBlocked=false;', 'let labPage=0,selectedKey=0,toastUntil=0,showBlocked=false,showObjects=true,showTextures=true;\n          const atlases=new Map(),objectCells=Array.from({length:W*H},()=>null);\n          for(const ob of M.objects){let ix=ob[0]>>1,iy=ob[1];if(ix>=0&&ix<W&&iy>=0&&iy<H){let key=iy*W+ix;(objectCells[key]??=[]).push(ob)}}')
-          s=s.replace('function ground(){', '''function tileAtlas(id){if(!atlases.has(id)){let image=new Image();image.src='tiles/'+id+'.png';atlases.set(id,image)}return atlases.get(id)}
-          function tileHalf(packed,dx,dy){if(packed<0)return false;let id=Math.floor(packed/256),key=packed%256,atlas=tileAtlas(id);if(showTextures&&atlas.complete&&atlas.naturalWidth){ctx.drawImage(atlas,key%16*24,Math.floor(key/16)*24,24,24,dx,dy,32,32);return true}return false}
-          function drawObject(ob){let half=ob[0]%2,wx=OX+Math.floor(ob[0]/2)+.5,wy=OY+ob[1]+.5,p=screen(wx,wy);tileHalf(ob[2],p.x-32+half*32,p.y-16)}
-          function getVisibleObjects(){if(!showObjects||!showTextures)return [];let range=clamp(Math.ceil((sw/32+sh/16)/4)+6,15,35),cx=Math.floor(hero.x-OX),cy=Math.floor(hero.y-OY),result=[];
-          for(let iy=Math.max(0,cy-range);iy<=Math.min(H-1,cy+range);iy++)for(let ix=Math.max(0,cx-range);ix<=Math.min(W-1,cx+range);ix++){let list=objectCells[iy*W+ix];if(!list)continue;let wx=OX+ix+.5,wy=OY+iy+.5,p=screen(wx,wy);if(p.x < -64||p.x > sw+64||p.y < -80||p.y > sh+72)continue;for(let ob of list)result.push({ob,depth:wx+wy+ob[3]/2048})}
-          return result}
-          function ground(){''')
-          a=s.find('function ground(){')
-          b=s.find('function drawActor(',a)
-          if a<0 or b<0:
-              raise ValueError('Cannot locate original ground function')
-          s=s[:a]+'''function ground(){ctx.fillStyle='#192a26';ctx.fillRect(0,0,sw,sh);let range=clamp(Math.ceil((sw/32+sh/16)/4)+6,15,35),fx=Math.floor(hero.x),fy=Math.floor(hero.y);
-          for(let y=fy-range;y<=fy+range;y++)for(let x=fx-range;x<=fx+range;x++){let ix=cellIndex(x,y);if(ix<0)continue;let p=screen(x+.5,y+.5);if(p.x < -36||p.x > sw+36||p.y < -36||p.y > sh+36)continue;
-          let c1=M.tileColors[M.floorA[ix]]||'#345247',c2=M.tileColors[M.floorB[ix]]||c1;
-          if(!tileHalf(M.floorA[ix],p.x-32,p.y-16)){ctx.fillStyle=c1;ctx.beginPath();ctx.moveTo(p.x,p.y-16);ctx.lineTo(p.x-32,p.y);ctx.lineTo(p.x,p.y+16);ctx.fill()}
-          if(!tileHalf(M.floorB[ix],p.x,p.y-16)){ctx.fillStyle=c2;ctx.beginPath();ctx.moveTo(p.x,p.y-16);ctx.lineTo(p.x+32,p.y);ctx.lineTo(p.x,p.y+16);ctx.fill()}
-          if(M.overlayA[ix]>=0)tileHalf(M.overlayA[ix],p.x-32,p.y-16);
-          if(M.overlayB[ix]>=0)tileHalf(M.overlayB[ix],p.x,p.y-16);
-          if(showBlocked){let bits=M.flags[ix];if(bits&1)ctx.fillStyle='#e24f4b8c';else if(bits&4)ctx.fillStyle='#5ba9e33c';else continue;ctx.beginPath();ctx.moveTo(p.x,p.y-16);ctx.lineTo(p.x+32,p.y);ctx.lineTo(p.x,p.y+16);ctx.lineTo(p.x-32,p.y);ctx.closePath();ctx.fill()}
-          }}
-          '''+s[b:]
-          old="let order=[...mobs.map(m=>({unit:m,type:'enemy'})),{unit:hero,type:'hero'}];order.sort((a,b)=>(a.unit.x+a.unit.y)-(b.unit.x+b.unit.y));for(let a of order)drawActor(a.unit,a.type);"
-          new="let order=[...getVisibleObjects().map(v=>({ob:v.ob,depth:v.depth})),...mobs.map(m=>({unit:m,type:'enemy',depth:m.x+m.y+.1})),{unit:hero,type:'hero',depth:hero.x+hero.y+.1}];order.sort((a,b)=>a.depth-b.depth);for(let a of order){if(a.ob)drawObject(a.ob);else drawActor(a.unit,a.type)};"
-          if old not in s:
-              raise ValueError('Render order block not found')
-          s=s.replace(old,new,1)
-          needle="el('overlayToggle').onclick=()=>{showBlocked=!showBlocked;try{localStorage.setItem(V4KEY,String(showBlocked))}catch(e){}refresh()};"
-          new='''el('overlayToggle').onclick=()=>{showBlocked=!showBlocked;try{localStorage.setItem(V4KEY,String(showBlocked))}catch(e){}refresh()};
-          el('objectToggle').onclick=()=>{showObjects=!showObjects;el('objectToggle').textContent=showObjects?'오브젝트 ON':'오브젝트 OFF';msg(showObjects?'원본 오브젝트 표시':'원본 오브젝트 숨김',.9)};
-          el('textureToggle').onclick=()=>{showTextures=!showTextures;el('textureToggle').textContent=showTextures?'원본 타일 ON':'원본 타일 OFF';msg(showTextures?'원본 Tile.pak 그래픽 사용':'색상 미리보기 사용',.9)};'''
-          if needle not in s:
-              raise ValueError('Missing existing overlay button')
-          s=s.replace(needle,new)
-          s=s.replace("el('mapText').textContent='맵 4 | 통행속성 '+M.collision_count+'칸 장애'","el('mapText').textContent='맵 4 | TIL '+M.tile_decode.decoded_variants+'칸 · 오브젝트 '+M.objects.length")
-          p.write_text(s,'utf-8')
-          print('HTML_V5',len(s))
-          PY_UPGRADE
+          raw=Path('reports/pinned-v5.yml').read_text(encoding='utf-8')
+          for name,delimiter in [('map_builder.py','PY_MAP'),('upgrade.py','PY_UPGRADE')]:
+              head="          cat > src/"+name+" <<'"+delimiter+"'\n"
+              tail='          '+delimiter+'\n'
+              if raw.count(head)!=1 or tail not in raw.split(head,1)[1]:
+                  raise SystemExit('Pinned V5 source not found: '+name)
+              section=raw.split(head,1)[1].split(tail,1)[0]
+              if any(line.strip() and not line.startswith('          ') for line in section.splitlines()):
+                  raise SystemExit('Unexpected V5 source indentation: '+name)
+              content=''.join(line[10:] if line.startswith('          ') else line for line in section.splitlines(True))
+              Path('src',name).write_text(content,encoding='utf-8')
+          print('Pinned V5 TIL decoder and renderer recovered')
+          PY_V5_RESTORE
           python src/upgrade.py
+          cat > src/patch_v6.py <<'PY_V6'
+          from pathlib import Path
+
+          root = Path('src')
+          builder = root / 'builder.py'
+          html_path = root / 'index.template.html'
+          b = builder.read_text(encoding='utf-8')
+          s = html_path.read_text(encoding='utf-8')
+
+          def change(value, old, new, label):
+              count = value.count(old)
+              if count != 1:
+                  raise ValueError(f'{label}: expected one match, found {count}')
+              return value.replace(old, new, 1)
+
+          b = change(b, "IDS = {'hero': 2786, 'enemy': 3215}", "IDS = {'hero': 2786, 'enemy': 3215, 'mob56': 56, 'mob1022': 1022, 'mob54': 54, 'mob998': 998, 'mob1002': 1002, 'mob55': 55}", 'sprite roster')
+          b = change(b, "frames = unpack_spr(read((sid, key)), limit=4)", "frames = unpack_spr(read((sid, key)), limit=14 if key < 40 else 4)", 'full action frames')
+          builder.write_text(b, encoding='utf-8')
+
+          s = change(s, 'Sanctuary of Aden Mobile V5 · Original Tile Artwork', 'Sanctuary of Aden Mobile V6 · Multi Sprite Animations', 'title')
+          s = change(s, 'Sanctuary Mobile V5</strong>', 'Sanctuary Mobile V6</strong>', 'hud title')
+          s = change(s, '원본 TIL 지형·오브젝트 + SPR 모션', '원본 지형 + 8방향 모션 + 다종 SPR 몬스터', 'hud subtitle')
+          s = change(s,
+              '현재 SPR 번호는 원본 그래픽 키이며 걷기·공격·8방향을 뜻한다는 근거가 없습니다. 직접 재생해 확인한 키만 아래 슬롯에 지정하세요.',
+              '0~7 이동, 8~15 공격, 16~23 피격, 24~31 사망, 32~39 대기 모션 후보입니다. 실제 SPR 이미지를 비교해 도출한 기본 배정으로, 모든 캐릭터에 동일하게 적용된다는 원본 정의는 아직 미확인입니다. 직접 확인한 키로 덮어쓸 수 있습니다.',
+              'motion research caveat')
+          s = change(s,
+              '<label>원본 에셋<select id="labActor"><option value="hero">2786 (시범 플레이어)</option><option value="enemy">3215 (시범 몬스터)</option></select></label>',
+              '<label>원본 에셋<select id="labActor"></select></label>',
+              'dynamic actor menu')
+          s = change(s,
+              "let score=0,potions=10,hero,mobs=[],mapped={hero:{},enemy:{}};",
+              "const ROSTER=['enemy','mob56','mob1022','mob54','mob998','mob1002','mob55'];\nlet score=0,potions=10,hero,mobs=[],mapped=Object.fromEntries(Object.keys(D.actors).map(k=>[k,{}]));",
+              'roster state')
+          s = change(s,
+              "function paths(actor,mode,dir){let selected=mapped[actor]?.[mode]?.[dir];if(selected!==undefined&&D.actors[actor].actions[selected])return D.actors[actor].actions[selected];return D.actors[actor].actions[String(dir)]||D.actors[actor].actions['0']||[]}",
+              """const GROUP_BASE={walk:0,attack:8,hit:16,death:24,idle:32};
+          function paths(actor,mode,dir){const a=D.actors[actor]?.actions;if(!a)return [];let assigned=mapped[actor]?.[mode]?.[dir];if(assigned!==undefined&&a[String(assigned)])return a[String(assigned)];let first=GROUP_BASE[mode]??0;let alternatives=[first+dir,mode==='idle'?24+dir:32+dir,mode==='death'?16+dir:0+dir,0+dir];for(let k of alternatives){const seq=a[String(k)];if(seq?.length)return seq}return []}
+          """.strip(),
+              'visual action octets')
+          s = change(s,
+              'mobs=Array.from({length:5},(_,i)=>makeMob(i));refresh();msg(\'원본 3×3 S32 맵 · 벽 통과 불가 · 지도를 누르면 이동\',3)',
+              "mobs=Array.from({length:7},(_,i)=>makeMob(i));refresh();msg('7종 원본 SPR 그래픽·이동·공격 모션 시험',3)",
+              'seven original sprite units')
+          s = change(s,
+              "return {id,x:candidate.x,y:candidate.y,hp:35,anim:0,dir:id%8,mode:'idle',dead:false,deadAt:0,attackCd:rnd(.3,1.5),attackUntil:0,hurtUntil:0,path:[],repath:0}}",
+              "return {id,x:candidate.x,y:candidate.y,visual:ROSTER[(id+score)%ROSTER.length],hp:35,anim:0,dir:id%8,mode:'idle',dead:false,deadAt:0,attackCd:rnd(.3,1.5),attackUntil:0,hurtUntil:0,path:[],repath:0}}",
+              'monster visual assignment')
+          s = change(s,
+              "hero.dead=true;hero.path=[];setMode(hero,'death');msg('전투 불능 · 다시 시작 버튼',5)",
+              "hero.dead=true;hero.deadAt=clock;hero.path=[];setMode(hero,'death');msg('전투 불능 · 다시 시작 버튼',5)",
+              'hero death sequence origin')
+          s = change(s,
+              "function update(dt){if(open||hero.dead)return;clock+=dt;hero.anim+=dt;",
+              "function update(dt){if(open)return;clock+=dt;if(hero.dead){hero.anim+=dt;return}hero.anim+=dt;",
+              'death animation continuity')
+          s = change(s,
+              "let p=screen(unit.x,unit.y),foot=p.y+17,seq=paths(type,unit.mode,unit.dir),frame=seq.length?seq[Math.min(seq.length-1,Math.floor(unit.anim*9)%seq.length)]:null,im=frame?img(frame):null;",
+              "let p=screen(unit.x,unit.y),foot=p.y+17,seq=paths(type,unit.mode,unit.dir),duration=unit.mode==='attack'?.42:unit.mode==='hit'?.26:unit.mode==='death'?1.25:0,elapsed=unit.dead?Math.max(0,clock-unit.deadAt):unit.anim,fi=seq.length?(duration?Math.min(seq.length-1,Math.floor(elapsed/duration*seq.length)):Math.floor(elapsed*9)%seq.length):0,frame=seq.length?seq[fi]:null,im=frame?img(frame):null;",
+              'complete action playback')
+          s = change(s,
+              "if(type==='enemy'&&unit.hp<35&&!unit.dead)",
+              "if(type!=='hero'&&unit.hp<35&&!unit.dead)",
+              'enemy health status')
+          s = change(s,
+              "...mobs.map(m=>({unit:m,type:'enemy',depth:m.x+m.y+.1}))",
+              "...mobs.map(m=>({unit:m,type:m.visual||'enemy',depth:m.x+m.y+.1}))",
+              'distinct visual sprite id')
+          s = change(s,
+              "function countSlots(a){return Object.values(mapped[a]).reduce((n,x)=>n+Object.keys(x).length,0)}",
+              "function countSlots(a){return Object.values(mapped[a]||{}).reduce((n,x)=>n+Object.keys(x).length,0)}",
+              'safe mapping slot counter')
+          s = change(s,
+              "let next={hero:{},enemy:{}};for(let a of ['hero','enemy'])for(let m of KEYS)",
+              "let next=Object.fromEntries(Object.keys(D.actors).map(k=>[k,{}]));for(let a of Object.keys(D.actors))for(let m of KEYS)",
+              'multi actor saved mapping')
+          s = change(s,
+              "for(let id of ['labActor','labMode','labDir'])el(id).onchange=()=>syncLab(id==='labActor');",
+              """const options=el('labActor');for(const [key,entry] of Object.entries(D.actors)){let o=document.createElement('option');o.value=key;o.textContent='SPR '+entry.sprite_id+(key==='hero'?' · 플레이어 시험':' · 원본 몬스터 후보');options.appendChild(o)}
+          for(let id of ['labActor','labMode','labDir'])el(id).onchange=()=>{let wanted=(GROUP_BASE[action()]??0)+Number(facingSlot());if(D.actors[actor()].actions[String(wanted)]){selectedKey=wanted;labPage=Math.floor(listKeys().indexOf(wanted)/16)}syncLab(id==='labActor')};""",
+              'dynamic motion lab actors')
+          s = change(s,
+              "el('previewInfo').textContent='SPR '+D.actors[actor()].sprite_id+'-'+selectedKey+'.spr · '+rawSeq().length+' 프레임 · 모션 성격 미검증'",
+              "el('previewInfo').textContent='SPR '+D.actors[actor()].sprite_id+'-'+selectedKey+'.spr · '+rawSeq().length+' 프레임 · 8개 단위 모션 후보, 원본 확정 아님'",
+              'motion uncertainty label')
+          s = change(s,
+              "'맵 4 | TIL '+M.tile_decode.decoded_variants+'칸 · 오브젝트 '+M.objects.length",
+              "'Map 4 | TIL '+M.tile_decode.decoded_variants+'종 · SPR '+ROSTER.length+'종'",
+              'hud sprite counts')
+          html_path.write_text(s, encoding='utf-8')
+          print('PATCH_V6_OK', len(b), len(s))
+          PY_V6
+          python src/patch_v6.py
+          python -m py_compile src/builder.py src/map_builder.py src/patch_v6.py
           python src/builder.py --idx "$SPR_IDX" --pak "$SPR_PAK" --template src/index.template.html --output dist/mobile
           python src/map_builder.py --map-dir "$MAP_DIR" --tile-idx "$TILE_IDX" --tile-pak "$TILE_PAK" --output dist/mobile/manifest.json
-      - name: Validate mobile runtime and original artwork
+          python3 - <<'PY_FINAL'
+          from pathlib import Path
+          import json
+          output=Path('dist/mobile')
+          data_file=output/'manifest.json'
+          data=json.loads(data_file.read_text(encoding='utf-8'))
+          data['version']=6
+          data['status']='REAL_MAP_AND_MULTIPLE_SPR_DIRECTIONAL_ACTION_CANDIDATES'
+          data['action_group_candidates']={'walk':[0,7],'attack':[8,15],'hit':[16,23],'death':[24,31],'idle':[32,39]}
+          data['actor_identity_verified']=False
+          data['motion_sequence_verified_for_every_actor']=False
+          data['reference_limit']='Eight-direction groups observed in selected original sprites; exact original action semantics require further validation'
+          data_file.write_text(json.dumps(data,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+          page=output/'index.html'
+          html=page.read_text(encoding='utf-8')
+          tag='<script id="manifest" type="application/json">'
+          start=html.find(tag)
+          end=html.find('</script>',start+len(tag))
+          if start<0 or end<0:
+              raise SystemExit('Manifest injection target absent')
+          html=html[:start+len(tag)]+json.dumps(data,ensure_ascii=False,separators=(',',':'))+html[end:]
+          page.write_text(html,encoding='utf-8')
+          (output/'README_KO.txt').write_text(
+              'Sanctuary of Aden Mobile V6\n'
+              '원본 아덴 S32, TIL 지형과 오브젝트가 유지됩니다.\n'
+              '원본 SPR 8개 ID의 이동·공격 등 방향별 모션 후보를 표시합니다.\n'
+              '모션 연구실에서 실제 프레임을 비교하고 매핑을 수정할 수 있습니다.\n'
+              '몬스터 명칭 및 모든 동작 의미는 아직 원작 기준으로 확정되지 않았습니다.\n'
+              '기존 SLKnight 빌드 및 GitHub Pages에는 영향을 주지 않습니다.\n',
+              encoding='utf-8')
+          print('V6 finalize complete:',len(data['actors']),'sprite IDs')
+          PY_FINAL
+
+      - name: Validate eight directional motions and original map
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_CHECK'
-          import json,re
+          python3 - <<'PY_VERIFY'
           from pathlib import Path
-          p=Path('dist/mobile')
-          m=json.loads((p/'manifest.json').read_text('utf-8'))
-          html=(p/'index.html').read_text('utf-8')
-          world=m['map']
-          if world['id']!=4 or world['size']!=[192,192] or len(world['blocks'])!=9:
-              raise SystemExit('Original S32 map incomplete')
-          if len(world['floorA'])!=192*192 or len(world['flags'])!=192*192:
-              raise SystemExit('Original terrain grid incomplete')
-          if len(world['overlayA'])!=192*192 or len(world['overlayB'])!=192*192:
-              raise SystemExit('Original floor cover incomplete')
-          if len(world['objects'])<10000:
-              raise SystemExit('Original object layer missing')
-          if world['tile_decode']['atlases']<100 or world['tile_decode']['decoded_variants']<5000:
-              raise SystemExit('Original TIL pixel conversion incomplete')
-          atlas=list((p/'tiles').glob('*.png'))
-          if len(atlas)!=world['tile_decode']['atlases'] or any(x.stat().st_size<100 for x in atlas):
-              raise SystemExit('Tile atlas output inconsistent')
-          if not all(str(i) in m['actors'][key]['actions'] for key in ['hero','enemy'] for i in range(8)):
-              raise SystemExit('Original SPR motion inspector fallback missing')
-          if not all(token in html for token in ['id="lab"','id="minimap"','id="objectToggle"','id="textureToggle"']):
-              raise SystemExit('Mobile interface feature missing')
+          import json,re
+          out=Path('dist/mobile')
+          data=json.loads((out/'manifest.json').read_text(encoding='utf-8'))
+          html=(out/'index.html').read_text(encoding='utf-8')
+          expected={'hero':2786,'enemy':3215,'mob56':56,'mob1022':1022,'mob54':54,'mob998':998,'mob1002':1002,'mob55':55}
+          if {k:v['sprite_id'] for k,v in data['actors'].items()}!=expected:
+              raise SystemExit('Eight original SPR identities are incomplete')
+          for key in expected:
+              actions=data['actors'][key]['actions']
+              if not all(str(k) in actions for k in range(16)):
+                  raise SystemExit('Walk/attack directional files missing: '+key)
+              if any(not (out/file).is_file() for k in range(16) for file in actions[str(k)]):
+                  raise SystemExit('Missing original SPR PNG data: '+key)
+          if len(data['actors']['hero']['actions']['8'])<8 or len(data['actors']['mob56']['actions']['8'])<4:
+              raise SystemExit('Original attack frames were truncated')
+          count=len(list((out/'assets').glob('*.png')))
+          if count<3000:
+              raise SystemExit('Insufficient original SPR frames: '+str(count))
+          world=data['map']
+          if world['size']!=[192,192] or len(world['blocks'])!=9 or world['tile_decode']['atlases']<100:
+              raise SystemExit('V5 original TIL terrain lost')
+          if len(world['objects'])<10000 or len(world['flags'])!=192*192:
+              raise SystemExit('S32 native obstacles and objects incomplete')
+          if any(text not in html for text in ['Sanctuary Mobile V6','id="lab"','id="field"','id="minimap"']):
+              raise SystemExit('V6 mobile interface is incomplete')
+          if html.count('<script id="manifest" type="application/json">')!=1:
+              raise SystemExit('Manifest embedded more than once')
           match=re.search(r'<script>([\s\S]*?)</script>',html)
-          if not match:
+          if match is None:
               raise SystemExit('Game JavaScript missing')
-          Path('reports/game.js').write_text(match.group(1),'utf-8')
-          print('Map:',len(world['floorA']),'cells, blocked',world['collision_count'])
-          print('Objects:',len(world['objects']),'atlases:',len(atlas),'TIL variants:',world['tile_decode']['decoded_variants'])
-          print('SPR motion keys:',{k:len(a['actions']) for k,a in m['actors'].items()})
-          PY_CHECK
+          Path('reports/game.js').write_text(match.group(1),encoding='utf-8')
+          print('V6 actors:',expected)
+          print('Original SPR images:',count)
+          print('Original tile atlases:',world['tile_decode']['atlases'])
+          print('Original S32 objects:',len(world['objects']))
+          PY_VERIFY
           node --check reports/game.js
           {
-            echo 'Sanctuary of Aden Mobile V5: Real TIL Graphics'
-            echo 'Original 9 S32 map blocks, Layer1 floors, Layer2 covers, Layer3 collisions and Layer4 objects.'
-            echo 'Original TIL RGB555 pixels converted to PNG atlases.'
-            echo 'V4 touch movement, pathfinding, minimap, fighting and V3 motion inspector preserved.'
-            echo 'Object depth sorting and original monster identity remain provisional.'
-            echo 'No deployment to SLKnight GitHub Pages.'
+            echo 'Sanctuary Mobile V6'
+            echo 'Original Map4 S32 and TIL artwork retained.'
+            echo 'Eight original sprite IDs, full directional motion frames for groups 0-39.'
+            echo 'Attack, hit, death and walk frames use separate action group candidates.'
+            echo 'Monster names and full original action meaning are not verified.'
+            echo 'Existing SLKnight GitHub Pages deployment is not changed.'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload mobile game V5
+
+      - name: Upload independent playable mobile V6
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V5-Original-TIL-Map4
+          name: Sanctuary-Mobile-V6-MultiSPR-Original-Map4
           path: dist/mobile/
           if-no-files-found: error
           retention-days: 30
           compression-level: 6
-      - name: Upload failure diagnostics
+
+      - name: Upload build diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V5-Diagnostics
+          name: Sanctuary-Mobile-V6-Diagnostics
           path: reports/
           if-no-files-found: warn
           retention-days: 14
