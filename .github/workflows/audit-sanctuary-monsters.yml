@@ -1,8 +1,19 @@
 
-name: Sanctuary of Aden External Action Crosscheck V12
+name: Sanctuary of Aden Monster Motion Expansion V13
 
 on:
   workflow_dispatch:
+    inputs:
+      extra_actors:
+        description: Number of additional monster sprite IDs
+        required: false
+        type: string
+        default: "32"
+      max_subids:
+        description: Maximum distinct sub IDs per new sprite ID
+        required: false
+        type: string
+        default: "24"
   push:
     paths:
       - ".github/workflows/audit-sanctuary-monsters.yml"
@@ -16,101 +27,197 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  crosscheck:
+  expand:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 180
 
     steps:
-      - name: Prepare directories
+      - name: Prepare environment
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p previous/v10 previous/v11 reference reports
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full python3-pil
+          mkdir -p downloads client previous/v2 previous/v9 previous/v12
+          mkdir -p reports/viewer/sheets
+          python3 -c "from PIL import Image; print('PIL_READY')"
+          df -h .
 
-      - name: Restore verified V10 and V11 results
+      - name: Restore verified sprite and reference data
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          gh run download 38866558914 \
+          gh run download 38784834277 \
             --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V10-Full-SPR-Structure-and-Motion-Lab \
-            --dir previous/v10
+            --name Sanctuary-V2-Reports \
+            --dir previous/v2
 
-          gh run download 38869270863 \
+          gh run download 38838415568 \
             --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V11-Original-Animation-Definitions \
-            --dir previous/v11
+            --name Sanctuary-V9-Original-SPR-Visual-Lab \
+            --dir previous/v9
 
-          test -s previous/v10/01_all_sprite_id_groups.csv
-          test -s previous/v10/Sanctuary-V10-Mobile-Motion-Lab.html
-          test -s previous/v11/06_summary_v11.json
+          gh run download 38872552732 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Sanctuary-V12-External-Action-and-NPC-Crosscheck \
+            --dir previous/v12
 
-          cp previous/v10/Sanctuary-V10-Mobile-Motion-Lab.html \
-            reports/V10-Original-Sprite-Viewer.html
+          test -n "$(find previous/v2 -name all_sprite_candidates.csv -print -quit)"
+          test -n "$(find previous/v2 -name exported_sprite_manifest.csv -print -quit)"
+          test -s previous/v9/02_rendered_sprite_manifest.csv
+          test -d previous/v9/viewer/sheets
+          test -s previous/v12/03_external_npc_gfx_candidates.csv
+          test -s previous/v12/04_external_action_crosscheck.csv
 
-      - name: Download pinned external reference tables
+      - name: Download original sprite packages
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          base="https://raw.githubusercontent.com/tpai/docker-l1jtw-server/0212802a625b36af3a0df2c513acc2713902f4d0/L1J-TW_3.80c/db"
+          gh release download v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "Sanctuary.of.Aden.-.Copy.*" \
+            --dir downloads
 
-          curl --fail --location --silent --show-error \
-            --retry 3 \
-            "$base/Japan/MyISAM/spr_action.sql" \
-            -o reference/jp_spr_action.sql
+          python3 - <<'PY'
+          from pathlib import Path
 
-          curl --fail --location --silent --show-error \
-            --retry 3 \
-            "$base/Japan/MyISAM/npc.sql" \
-            -o reference/jp_npc.sql
+          root = Path("downloads")
+          base = "Sanctuary.of.Aden.-.Copy"
 
-          curl --fail --location --silent --show-error \
-            --retry 3 \
-            "$base/Taiwan/spr_action.sql" \
-            -o reference/tw_spr_action.sql
+          files = [
+              f"{base}.z{i:02d}"
+              for i in range(1, 46)
+          ] + [f"{base}.zip"]
 
-          curl --fail --location --silent --show-error \
-            --retry 3 \
-            "$base/Taiwan/npc.sql" \
-            -o reference/tw_npc.sql
+          missing = [
+              name for name in files
+              if not (root / name).is_file()
+          ]
 
-          for file in reference/*.sql; do
-            test -s "$file"
-            sha256sum "$file"
-          done
+          if missing:
+              raise SystemExit(
+                  "Missing release parts: " + repr(missing)
+              )
 
-      - name: Cross-check action and NPC identity references
+          print("ARCHIVE_PARTS_VERIFIED", len(files))
+          PY
+
+          archive="downloads/Sanctuary.of.Aden.-.Copy.zip"
+
+          if ! 7z x "$archive" \
+            'Sanctuary of Aden - Copy/Sprite*.pak' \
+            "-o${PWD}/client" \
+            -y > reports/extraction.log 2>&1; then
+            7z x "$archive" \
+              "-o${PWD}/client" \
+              -y >> reports/extraction.log 2>&1
+          fi
+
+          if [ "$(find client -name 'Sprite*.pak' -type f | wc -l)" -ne 17 ]; then
+            7z x "$archive" \
+              "-o${PWD}/client" \
+              -y >> reports/extraction.log 2>&1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("client/Sanctuary of Aden - Copy")
+          names = ["Sprite.pak"] + [
+              f"Sprite{i:02d}.pak"
+              for i in range(16)
+          ]
+
+          missing = [
+              name for name in names
+              if not (root / name).is_file()
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing SPR packages: " + repr(missing)
+              )
+
+          print("SPR_PACKAGES_VERIFIED", len(names))
+          PY
+
+          rm -rf downloads
+          df -h .
+
+      - name: Render additional sprites and compare action candidates
         shell: bash
+        env:
+          AUTO_ACTORS: ${{ inputs.extra_actors }}
+          MAX_SUBIDS: ${{ inputs.max_subids }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
+          import base64
           import csv
           import hashlib
           import json
+          import math
           import os
           import re
+          import shutil
+          import statistics
+          import struct
+
           from collections import Counter, defaultdict
           from pathlib import Path
+          from PIL import Image
 
           ROOT = Path.cwd()
-          REF = ROOT / "reference"
+          V2 = ROOT / "previous/v2"
+          V9 = ROOT / "previous/v9"
+          V12 = ROOT / "previous/v12"
+          CLIENT = ROOT / "client"
           REPORT = ROOT / "reports"
-          V10 = ROOT / "previous/v10"
-          V11 = ROOT / "previous/v11"
+          VIEW = REPORT / "viewer"
+          SHEETS = VIEW / "sheets"
 
-          def csv_load(path):
-              with path.open(
+          AUTO_ACTORS = int(
+              os.environ.get("AUTO_ACTORS") or 32
+          )
+          MAX_SUBIDS = int(
+              os.environ.get("MAX_SUBIDS") or 24
+          )
+
+          if not 1 <= AUTO_ACTORS <= 100:
+              raise SystemExit("extra_actors must be 1..100")
+
+          if not 8 <= MAX_SUBIDS <= 64:
+              raise SystemExit("max_subids must be 8..64")
+
+          MAX_EXPORTS = 1800
+          MAX_SPR_BYTES = 4 * 1024 * 1024
+          MAX_RENDERED_FRAMES = 24
+          MAX_FRAME_DIM = 1000
+          MAX_ATLAS_PIXELS = 5000000
+
+          def read_csv(root, name):
+              files = list(root.rglob(name))
+
+              if len(files) != 1:
+                  raise RuntimeError(
+                      f"Expected one {name}, found {len(files)}"
+                  )
+
+              with files[0].open(
                   encoding="utf-8-sig",
                   newline=""
               ) as f:
                   return list(csv.DictReader(f))
 
-          def csv_save(name, rows, columns):
+          def write_csv(name, rows, columns):
               with (REPORT / name).open(
                   "w",
                   encoding="utf-8-sig",
@@ -124,512 +231,913 @@ jobs:
                   writer.writeheader()
                   writer.writerows(rows)
 
-          def read_source(path):
-              return path.read_text(
-                  encoding="utf-8-sig",
-                  errors="replace"
-              )
+          source_rows = read_csv(
+              V2, "all_sprite_candidates.csv"
+          )
 
-          def sql_tuples(text):
-              pos = text.lower().find("insert into")
-              if pos < 0:
-                  return
+          hashes = read_csv(
+              V2, "exported_sprite_manifest.csv"
+          )
 
-              text = text[pos:]
-              depth = 0
-              start = -1
-              quoted = False
-              i = 0
+          old_images = read_csv(
+              V9, "02_rendered_sprite_manifest.csv"
+          )
 
-              while i < len(text):
-                  ch = text[i]
+          npc_rows = read_csv(
+              V12, "03_external_npc_gfx_candidates.csv"
+          )
 
-                  if quoted:
-                      if ch == "\\":
-                          i += 2
-                          continue
+          action_rows = read_csv(
+              V12, "04_external_action_crosscheck.csv"
+          )
 
-                      if ch == "'":
-                          if (
-                              i + 1 < len(text)
-                              and text[i + 1] == "'"
-                          ):
-                              i += 2
-                              continue
-                          quoted = False
-
-                  elif ch == "'":
-                      quoted = True
-
-                  elif ch == "(":
-                      if depth == 0:
-                          start = i + 1
-                      depth += 1
-
-                  elif ch == ")" and depth:
-                      depth -= 1
-                      if depth == 0:
-                          yield text[start:i]
-
-                  i += 1
-
-          def parse_cells(source):
-              try:
-                  return next(csv.reader(
-                      [source],
-                      delimiter=",",
-                      quotechar="'",
-                      escapechar="\\",
-                      skipinitialspace=True
-                  ))
-              except (csv.Error, StopIteration):
-                  return None
-
-          reference_sources = {
-              "JP_380c": {
-                  "actions": REF / "jp_spr_action.sql",
-                  "npcs": REF / "jp_npc.sql"
-              },
-              "TW_380c": {
-                  "actions": REF / "tw_spr_action.sql",
-                  "npcs": REF / "tw_npc.sql"
-              }
+          hash_lookup = {
+              (
+                  row["pak"],
+                  row["sprite_file"].lower(),
+                  int(row["bytes"])
+              ): row["sha256"]
+              for row in hashes
           }
 
-          actor_rows = csv_load(
-              V10 / "01_all_sprite_id_groups.csv"
+          sprite_pattern = re.compile(
+              r"^(\d+)-(\d+)\.spr$",
+              re.I
           )
 
-          actors = {
-              int(row["sprite_id"]): row
-              for row in actor_rows
-          }
+          indexed = defaultdict(list)
 
-          v11_summary = json.loads(
-              (V11 / "06_summary_v11.json").read_text(
-                  encoding="utf-8"
-              )
-          )
+          for row in source_rows:
+              name = row["file"].replace(
+                  "\\", "/"
+              ).split("/")[-1]
 
-          if len(actors) < 1000:
-              raise SystemExit(
-                  "Incomplete V10 sprite inventory"
-              )
+              match = sprite_pattern.fullmatch(name)
 
-          if v11_summary["original_list_candidates"] != 0:
-              raise SystemExit(
-                  "V11 evidence changed; recheck original actions"
-              )
-
-          action_rows = []
-          npc_rows = []
-          source_stats = []
-
-          action_hints = {
-              0: "walk",
-              1: "attack",
-              2: "damage",
-              3: "idle/breath",
-              8: "death"
-          }
-
-          for source_name, paths in reference_sources.items():
-              action_text = read_source(paths["actions"])
-              npc_text = read_source(paths["npcs"])
-
-              action_count = 0
-              npc_count = 0
-
-              for item in sql_tuples(action_text):
-                  fields = parse_cells(item)
-
-                  if fields is None or len(fields) != 4:
-                      continue
-
-                  try:
-                      sprite_id, action_id, framecount, framerate = (
-                          int(x.strip()) for x in fields
-                      )
-                  except ValueError:
-                      continue
-
-                  if not (
-                      0 <= sprite_id <= 200000
-                      and 0 <= action_id <= 512
-                      and 0 <= framecount <= 10000
-                      and 0 <= framerate <= 10000
-                  ):
-                      continue
-
-                  action_count += 1
-
-                  action_rows.append({
-                      "reference": source_name,
-                      "sprite_id": sprite_id,
-                      "action_id": action_id,
-                      "action_hint": action_hints.get(
-                          action_id, ""
-                      ),
-                      "reference_framecount": framecount,
-                      "reference_framerate": framerate,
-                      "id_present_in_our_v10": (
-                          sprite_id in actors
-                      ),
-                      "verification": "EXTERNAL_REFERENCE_ONLY"
-                  })
-
-              schema_end = npc_text.lower().find(
-                  "insert into"
-              )
-
-              schema = (
-                  npc_text[:schema_end]
-                  if schema_end >= 0
-                  else npc_text
-              )
-
-              columns = re.findall(
-                  r"(?m)^\s*`([^`]+)`\s+",
-                  schema
-              )
-
-              required = (
-                  "npcid",
-                  "name",
-                  "gfxid",
-                  "impl"
-              )
-
-              if not all(
-                  col in columns for col in required
-              ):
-                  raise SystemExit(
-                      "Unknown NPC SQL schema: " + source_name
-                  )
-
-              indices = {
-                  key: columns.index(key)
-                  for key in required
-              }
-
-              note_index = (
-                  columns.index("note")
-                  if "note" in columns
-                  else None
-              )
-
-              for item in sql_tuples(npc_text):
-                  fields = parse_cells(item)
-
-                  if fields is None:
-                      continue
-
-                  if len(fields) < len(columns):
-                      continue
-
-                  try:
-                      npc_id = int(
-                          fields[indices["npcid"]].strip()
-                      )
-                      gfx_id = int(
-                          fields[indices["gfxid"]].strip()
-                      )
-                  except ValueError:
-                      continue
-
-                  npc_count += 1
-
-                  npc_rows.append({
-                      "reference": source_name,
-                      "npc_id": npc_id,
-                      "npc_name": fields[indices["name"]],
-                      "gfx_id": gfx_id,
-                      "implementation": fields[
-                          indices["impl"]
-                      ],
-                      "note": (
-                          fields[note_index]
-                          if note_index is not None
-                          else ""
-                      ),
-                      "id_present_in_our_v10": (
-                          gfx_id in actors
-                      ),
-                      "identity_verified": False
-                  })
-
-              source_stats.append({
-                  "reference": source_name,
-                  "action_rows": action_count,
-                  "npc_rows": npc_count,
-                  "action_sha256": hashlib.sha256(
-                      paths["actions"].read_bytes()
-                  ).hexdigest(),
-                  "npc_sha256": hashlib.sha256(
-                      paths["npcs"].read_bytes()
-                  ).hexdigest()
-              })
-
-              print(
-                  source_name,
-                  "ACTION_ROWS", action_count,
-                  "NPC_ROWS", npc_count
-              )
-
-              if action_count < 1000:
-                  raise SystemExit(
-                      "Insufficient action data: " + source_name
-                  )
-
-          csv_save(
-              "01_external_reference_sources.csv",
-              source_stats,
-              [
-                  "reference",
-                  "action_rows",
-                  "npc_rows",
-                  "action_sha256",
-                  "npc_sha256"
-              ]
-          )
-
-          csv_save(
-              "02_external_action_records.csv",
-              action_rows,
-              [
-                  "reference",
-                  "sprite_id",
-                  "action_id",
-                  "action_hint",
-                  "reference_framecount",
-                  "reference_framerate",
-                  "id_present_in_our_v10",
-                  "verification"
-              ]
-          )
-
-          csv_save(
-              "03_external_npc_gfx_candidates.csv",
-              npc_rows,
-              [
-                  "reference",
-                  "npc_id",
-                  "npc_name",
-                  "gfx_id",
-                  "implementation",
-                  "note",
-                  "id_present_in_our_v10",
-                  "identity_verified"
-              ]
-          )
-
-          action_groups = defaultdict(list)
-          npc_groups = defaultdict(list)
-
-          for row in action_rows:
-              key = (
-                  row["sprite_id"],
-                  row["action_id"]
-              )
-              action_groups[key].append(row)
-
-          for row in npc_rows:
-              npc_groups[row["gfx_id"]].append(row)
-
-          combined = []
-          actions_by_id = defaultdict(list)
-
-          for key, records in sorted(
-              action_groups.items()
-          ):
-              sprite_id, action_id = key
-
-              if sprite_id not in actors:
+              if not match:
                   continue
 
-              sources = sorted({
-                  row["reference"]
-                  for row in records
-              })
+              actor = int(match.group(1))
+              subid = int(match.group(2))
 
-              values = sorted({
-                  (
-                      row["reference_framecount"],
-                      row["reference_framerate"]
+              indexed[actor].append({
+                  "actor": actor,
+                  "sub": subid,
+                  "file": name,
+                  "pak": row["pak"],
+                  "package": Path(row["pak"]).name,
+                  "offset": int(row["offset"]),
+                  "bytes": int(row["bytes"]),
+                  "sha256": hash_lookup.get(
+                      (
+                          row["pak"],
+                          name.lower(),
+                          int(row["bytes"])
+                      ),
+                      ""
                   )
-                  for row in records
               })
 
-              if len(sources) >= 2 and len(values) == 1:
-                  status = "REGIONAL_REFERENCE_AGREEMENT"
-              elif len(sources) >= 2:
-                  status = "REGIONAL_REFERENCE_CONFLICT"
-              else:
-                  status = "ONE_EXTERNAL_REFERENCE"
+          npcs = defaultdict(list)
 
-              entry = {
-                  "sprite_id": sprite_id,
-                  "action_id": action_id,
-                  "action_hint": action_hints.get(
-                      action_id, ""
-                  ),
-                  "reference_sources": ",".join(sources),
-                  "reference_values": json.dumps(
-                      values
-                  ),
-                  "comparison_status": status,
-                  "sprite_id_present": True,
-                  "original_frame_order_verified": False,
-                  "actual_action_verified": False
+          for row in npc_rows:
+              if str(
+                  row["id_present_in_our_v10"]
+              ).lower() != "true":
+                  continue
+
+              try:
+                  actor = int(row["gfx_id"])
+              except ValueError:
+                  continue
+
+              if actor not in indexed:
+                  continue
+
+              npcs[actor].append(row)
+
+          actions = defaultdict(list)
+
+          for row in action_rows:
+              actor = int(row["sprite_id"])
+              actions[actor].append(row)
+
+          old_actors = sorted({
+              int(row["actor"])
+              for row in old_images
+          })
+
+          def monster_references(actor):
+              return [
+                  row for row in npcs[actor]
+                  if "monster" in row["implementation"].lower()
+              ]
+
+          eligible = [
+              actor for actor in npcs
+              if (
+                  actor not in old_actors
+                  and actions.get(actor)
+                  and monster_references(actor)
+              )
+          ]
+
+          def priority(actor):
+              references = monster_references(actor)
+
+              regions = {
+                  row["reference"]
+                  for row in references
               }
 
-              combined.append(entry)
-              actions_by_id[sprite_id].append(entry)
+              named = {
+                  row["npc_name"].strip()
+                  for row in references
+                  if row["npc_name"].strip()
+              }
 
-          csv_save(
-              "04_external_action_crosscheck.csv",
-              combined,
+              return (
+                  -len(regions),
+                  -len(named),
+                  -min(len(actions[actor]), 30),
+                  -len(indexed[actor]),
+                  actor
+              )
+
+          eligible.sort(key=priority)
+
+          added_actors = eligible[:AUTO_ACTORS]
+
+          selected_actors = list(
+              dict.fromkeys(
+                  old_actors + added_actors
+              )
+          )
+
+          selection_rows = []
+
+          for actor in selected_actors:
+              references = monster_references(actor)
+
+              selection_rows.append({
+                  "sprite_id": actor,
+                  "selection": (
+                      "V9_VERIFIED_BASE"
+                      if actor in old_actors
+                      else "V12_EXTERNAL_MONSTER_CANDIDATE"
+                  ),
+                  "indexed_spr_files": len(
+                      indexed[actor]
+                  ),
+                  "external_action_candidates": len(
+                      actions[actor]
+                  ),
+                  "external_npc_names": " | ".join(
+                      sorted({
+                          x["npc_name"]
+                          for x in references
+                          if x["npc_name"].strip()
+                      })[:20]
+                  ),
+                  "external_regions": ",".join(
+                      sorted({
+                          x["reference"]
+                          for x in references
+                      })
+                  ),
+                  "identity_confirmed": False
+              })
+
+          write_csv(
+              "01_selected_sprite_ids.csv",
+              selection_rows,
               [
                   "sprite_id",
-                  "action_id",
-                  "action_hint",
-                  "reference_sources",
-                  "reference_values",
-                  "comparison_status",
-                  "sprite_id_present",
-                  "original_frame_order_verified",
-                  "actual_action_verified"
+                  "selection",
+                  "indexed_spr_files",
+                  "external_action_candidates",
+                  "external_npc_names",
+                  "external_regions",
+                  "identity_confirmed"
               ]
           )
 
-          summary_rows = []
-          browser_rows = []
+          shutil.copytree(
+              V9 / "viewer/sheets",
+              SHEETS,
+              dirs_exist_ok=True
+          )
 
-          for sprite_id, actor in sorted(
-              actors.items()
-          ):
-              actions = actions_by_id.get(
-                  sprite_id, []
-              )
+          image_entries = []
 
-              npcs = npc_groups.get(
-                  sprite_id, []
-              )
-
-              names = sorted({
-                  row["npc_name"]
-                  for row in npcs
-                  if row["npc_name"].strip()
-              })
-
-              regions = sorted({
-                  row["reference"]
-                  for row in npcs
-              })
-
-              conflicting = sum(
-                  x["comparison_status"]
-                  == "REGIONAL_REFERENCE_CONFLICT"
-                  for x in actions
-              )
-
-              summary_rows.append({
-                  "sprite_id": sprite_id,
-                  "actual_spr_files": actor["file_records"],
-                  "actual_subids": actor["unique_subids"],
-                  "actual_packages": actor["packages"],
-                  "external_action_records": len(actions),
-                  "external_npc_names": len(names),
-                  "external_name_candidates": " | ".join(
-                      names[:20]
+          for row in old_images:
+              image_entries.append({
+                  "actor": int(row["actor"]),
+                  "sub": int(row["sub"]),
+                  "package": row["package"],
+                  "sha256": row["sha256"],
+                  "frames": int(row["frames"]),
+                  "renderedFrames": int(
+                      row["frameCountRendered"]
                   ),
-                  "external_regions": ",".join(regions),
-                  "reference_action_conflicts": conflicting,
-                  "verified_original_action_names": 0,
-                  "verified_original_frame_sequences": 0,
-                  "identity_status": "NUMERIC_ID_MATCH_ONLY"
+                  "cols": int(row["cols"]),
+                  "cellW": int(row["cellW"]),
+                  "cellH": int(row["cellH"]),
+                  "sheet": row["sheet"],
+                  "origin": "V9_ORIGINAL_SPR"
               })
 
-              browser_rows.append({
-                  "id": sprite_id,
-                  "files": int(actor["file_records"]),
-                  "subids": int(actor["unique_subids"]),
-                  "packages": actor["package_names"],
-                  "names": names[:20],
-                  "npcs": [
-                      {
-                          "name": row["npc_name"],
-                          "region": row["reference"],
-                          "npcid": row["npc_id"],
-                          "impl": row["implementation"],
-                          "note": row["note"]
-                      }
-                      for row in npcs[:40]
-                  ],
-                  "actions": [
-                      {
-                          "id": entry["action_id"],
-                          "hint": entry["action_hint"],
-                          "sources": entry["reference_sources"],
-                          "values": entry["reference_values"],
-                          "status": entry["comparison_status"]
-                      }
-                      for entry in actions
+          class SpriteReader:
+              def __init__(self, data):
+                  self.buf = data
+                  self.pos = 0
+
+              def read(self, fmt):
+                  length = struct.calcsize(fmt)
+
+                  if self.pos + length > len(self.buf):
+                      raise ValueError("Truncated SPR header")
+
+                  value = struct.unpack_from(
+                      fmt, self.buf, self.pos
+                  )
+
+                  self.pos += length
+
+                  if len(value) == 1:
+                      return value[0]
+
+                  return value
+
+              def decode(self):
+                  framecount = self.read("<B")
+                  palette = None
+
+                  if framecount == 255:
+                      size = self.read("<B") or 256
+                      palette = [
+                          self.read("<H")
+                          for _ in range(size)
+                      ]
+                      framecount = self.read("<B")
+
+                  if not 1 <= framecount <= 240:
+                      raise ValueError(
+                          "Invalid SPR frame count"
+                      )
+
+                  frame_defs = []
+
+                  for _ in range(framecount):
+                      box = self.read("<hhhh")
+                      self.read("<HH")
+                      blockcount = self.read("<H")
+
+                      if blockcount > 1500:
+                          raise ValueError(
+                              "Too many SPR block definitions"
+                          )
+
+                      blocks = [
+                          self.read("<bbBH")
+                          for _ in range(blockcount)
+                      ]
+
+                      frame_defs.append(
+                          (box, blocks)
+                      )
+
+                  table_size = self.read("<i")
+
+                  if not 0 <= table_size <= 20000:
+                      raise ValueError(
+                          "Invalid SPR block table"
+                      )
+
+                  offsets = [
+                      self.read("<i")
+                      for _ in range(table_size)
                   ]
+
+                  self.read("<i")
+                  data_start = self.pos
+
+                  used_blocks = {
+                      block[3]
+                      for _, blocks in frame_defs
+                      for block in blocks
+                  }
+
+                  if any(
+                      idx >= table_size
+                      for idx in used_blocks
+                  ):
+                      raise ValueError(
+                          "Invalid SPR block ID"
+                      )
+
+                  decoded_blocks = {}
+
+                  for blockid in sorted(used_blocks):
+                      pos = (
+                          data_start + offsets[blockid]
+                      )
+
+                      if (
+                          pos < data_start
+                          or pos + 4 > len(self.buf)
+                      ):
+                          raise ValueError(
+                              "Invalid SPR block offset"
+                          )
+
+                      def byte():
+                          nonlocal pos
+
+                          if pos >= len(self.buf):
+                              raise ValueError(
+                                  "Truncated SPR pixel data"
+                              )
+
+                          value = self.buf[pos]
+                          pos += 1
+
+                          return value
+
+                      start_x = byte()
+                      start_y = byte()
+                      byte()
+                      lines = byte()
+
+                      pixels = []
+
+                      for y in range(lines):
+                          x = start_x
+
+                          for _ in range(byte()):
+                              x += byte() // 2
+
+                              for _ in range(byte()):
+                                  if palette is not None:
+                                      index = byte()
+
+                                      if index >= len(palette):
+                                          raise ValueError(
+                                              "Invalid palette index"
+                                          )
+
+                                      color = palette[index]
+
+                                  else:
+                                      color = (
+                                          byte()
+                                          | (byte() << 8)
+                                      )
+
+                                  if (
+                                      x >= 24
+                                      or start_y + y >= 24
+                                  ):
+                                      raise ValueError(
+                                          "Invalid pixel position"
+                                      )
+
+                                  if color != 32768:
+                                      pixels.append((
+                                          x,
+                                          start_y + y,
+                                          color
+                                      ))
+
+                                  x += 1
+
+                      decoded_blocks[blockid] = pixels
+
+                  images = []
+
+                  for box, blocks in frame_defs[
+                      :MAX_RENDERED_FRAMES
+                  ]:
+                      if not blocks:
+                          images.append(None)
+                          continue
+
+                      positions = []
+
+                      for a, b, kind, blockid in blocks:
+                          adjusted = (
+                              a - 1 if a < 0 else a
+                          )
+
+                          half = int(adjusted / 2)
+
+                          positions.append((
+                              24 * (b + a - half),
+                              12 * (b - half),
+                              blockid
+                          ))
+
+                      minx = min(
+                          x for x, y, blockid in positions
+                      )
+
+                      miny = min(
+                          y for x, y, blockid in positions
+                      )
+
+                      maxx = max(
+                          x + 24
+                          for x, y, blockid in positions
+                      )
+
+                      maxy = max(
+                          y + 24
+                          for x, y, blockid in positions
+                      )
+
+                      width = maxx - minx
+                      height = maxy - miny
+
+                      if not (
+                          1 <= width <= MAX_FRAME_DIM
+                          and 1 <= height <= MAX_FRAME_DIM
+                      ):
+                          raise ValueError(
+                              "SPR frame dimension out of range"
+                          )
+
+                      image = Image.new(
+                          "RGBA",
+                          (width, height),
+                          (0, 0, 0, 0)
+                      )
+
+                      pixels = image.load()
+
+                      for x, y, blockid in positions:
+                          for px, py, color in decoded_blocks[
+                              blockid
+                          ]:
+                              pixels[
+                                  x + px - minx,
+                                  y + py - miny
+                              ] = (
+                                  ((color >> 10) & 31) * 255 // 31,
+                                  ((color >> 5) & 31) * 255 // 31,
+                                  (color & 31) * 255 // 31,
+                                  255
+                              )
+
+                      images.append(image)
+
+                  return framecount, images
+
+          def save_atlas(images, destination):
+              visible = [
+                  image
+                  for image in images
+                  if image is not None
+              ]
+
+              if not visible:
+                  raise ValueError(
+                      "No visible sprite frames"
+                  )
+
+              cell_width = max(
+                  image.width
+                  for image in visible
+              )
+
+              cell_height = max(
+                  image.height
+                  for image in visible
+              )
+
+              cols = min(4, len(images))
+              rows = math.ceil(
+                  len(images) / cols
+              )
+
+              if (
+                  cell_width * cell_height
+                  * cols * rows
+                  > MAX_ATLAS_PIXELS
+              ):
+                  raise ValueError(
+                      "SPR atlas size exceeded"
+                  )
+
+              output = Image.new(
+                  "RGBA",
+                  (
+                      cols * cell_width,
+                      rows * cell_height
+                  ),
+                  (0, 0, 0, 0)
+              )
+
+              for index, image in enumerate(images):
+                  if image is None:
+                      continue
+
+                  x = (
+                      (index % cols) * cell_width
+                      + (cell_width - image.width) // 2
+                  )
+
+                  y = (
+                      (index // cols) * cell_height
+                      + (cell_height - image.height) // 2
+                  )
+
+                  output.alpha_composite(
+                      image,
+                      (x, y)
+                  )
+
+              destination.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              output.save(
+                  destination,
+                  optimize=True
+              )
+
+              return {
+                  "sheet": destination.relative_to(
+                      VIEW
+                  ).as_posix(),
+                  "renderedFrames": len(images),
+                  "cols": cols,
+                  "cellW": cell_width,
+                  "cellH": cell_height
+              }
+
+          failures = []
+          added_entries = []
+          inspected = 0
+          cap_reached = False
+
+          for actor in added_actors:
+              records = sorted(
+                  indexed[actor],
+                  key=lambda x: (
+                      x["sub"],
+                      x["package"],
+                      x["offset"]
+                  )
+              )
+
+              chosen = sorted({
+                  row["sub"]
+                  for row in records
+              })[:MAX_SUBIDS]
+
+              for row in records:
+                  if row["sub"] not in chosen:
+                      continue
+
+                  if inspected >= MAX_EXPORTS:
+                      cap_reached = True
+                      break
+
+                  inspected += 1
+
+                  try:
+                      if row["bytes"] > MAX_SPR_BYTES:
+                          raise ValueError(
+                              "SPR exceeds size limit"
+                          )
+
+                      if not row["sha256"]:
+                          raise ValueError(
+                              "V2 SHA256 unavailable"
+                          )
+
+                      package_path = (
+                          CLIENT
+                          / Path(row["pak"]).relative_to(
+                              "outer"
+                          )
+                      )
+
+                      if not package_path.is_file():
+                          raise FileNotFoundError(
+                              "Original sprite PAK missing"
+                          )
+
+                      with package_path.open("rb") as f:
+                          f.seek(row["offset"])
+                          raw = f.read(row["bytes"])
+
+                      if len(raw) != row["bytes"]:
+                          raise IOError(
+                              "Short indexed PAK read"
+                          )
+
+                      sha = hashlib.sha256(
+                          raw
+                      ).hexdigest()
+
+                      if sha != row["sha256"]:
+                          raise ValueError(
+                              "V2 SHA256 mismatch"
+                          )
+
+                      count, frames = SpriteReader(
+                          raw
+                      ).decode()
+
+                      destination = (
+                          SHEETS / "v13"
+                          / str(actor)
+                          / row["package"]
+                          / (
+                              f"{actor}-{row['sub']}_"
+                              f"{sha[:10]}.png"
+                          )
+                      )
+
+                      atlas = save_atlas(
+                          frames,
+                          destination
+                      )
+
+                      result = {
+                          "actor": actor,
+                          "sub": row["sub"],
+                          "package": row["package"],
+                          "sha256": sha,
+                          "frames": count,
+                          "origin": "V13_ORIGINAL_SPR",
+                          **atlas
+                      }
+
+                      image_entries.append(result)
+                      added_entries.append(result)
+
+                  except Exception as exc:
+                      failures.append({
+                          "sprite_id": actor,
+                          "subid": row["sub"],
+                          "package": row["package"],
+                          "reason": str(exc)
+                      })
+
+              if cap_reached:
+                  break
+
+          image_columns = [
+              "actor", "sub", "package",
+              "sha256", "frames",
+              "renderedFrames",
+              "cols", "cellW", "cellH",
+              "sheet", "origin"
+          ]
+
+          write_csv(
+              "02_all_rendered_sprite_images.csv",
+              image_entries,
+              image_columns
+          )
+
+          write_csv(
+              "03_new_sprite_render_failures.csv",
+              failures,
+              [
+                  "sprite_id", "subid",
+                  "package", "reason"
+              ]
+          )
+
+          bands = defaultdict(list)
+
+          for entry in image_entries:
+              key = (
+                  entry["actor"],
+                  entry["package"],
+                  entry["sub"] // 8 * 8
+              )
+
+              bands[key].append(entry)
+
+          comparison = []
+          band_inventory = []
+
+          for key, entries in sorted(
+              bands.items()
+          ):
+              actor, package, start = key
+
+              slots = {
+                  row["sub"]: row
+                  for row in entries
+              }
+
+              complete = all(
+                  sub in slots
+                  for sub in range(start, start + 8)
+              )
+
+              total_frames = (
+                  sum(
+                      slots[sub]["frames"]
+                      for sub in range(
+                          start, start + 8
+                      )
+                  )
+                  if complete else None
+              )
+
+              band_inventory.append({
+                  "sprite_id": actor,
+                  "package": package,
+                  "band_start": start,
+                  "band_end": start + 7,
+                  "slots_present": len(slots),
+                  "complete_eight_slots": complete,
+                  "total_internal_frames": (
+                      total_frames
+                  ),
+                  "action_verified": False
               })
 
-          csv_save(
-              "05_full_sprite_identity_candidates.csv",
-              summary_rows,
+              for action in actions[actor]:
+                  try:
+                      values = json.loads(
+                          action["reference_values"]
+                      )
+                  except json.JSONDecodeError:
+                      values = []
+
+                  counts = sorted({
+                      int(value[0])
+                      for value in values
+                      if (
+                          isinstance(value, list)
+                          and len(value) == 2
+                      )
+                  })
+
+                  if complete and counts:
+                      difference = min(
+                          abs(
+                              total_frames - count
+                          )
+                          for count in counts
+                      )
+
+                      status = (
+                          "FRAMECOUNT_EQUAL_NUMERIC_ONLY"
+                          if difference == 0
+                          else "FRAMECOUNT_DIFFERENT"
+                      )
+
+                  else:
+                      difference = None
+                      status = (
+                          "INCOMPLETE_EIGHT_SLOT_GROUP"
+                          if not complete
+                          else "NO_COMPARABLE_REFERENCE"
+                      )
+
+                  comparison.append({
+                      "sprite_id": actor,
+                      "package": package,
+                      "band_start": start,
+                      "band_end": start + 7,
+                      "action_id": int(
+                          action["action_id"]
+                      ),
+                      "external_action_hint": (
+                          action["action_hint"]
+                      ),
+                      "external_sources": (
+                          action["reference_sources"]
+                      ),
+                      "external_reference_values": (
+                          action["reference_values"]
+                      ),
+                      "actual_total_internal_frames": (
+                          total_frames
+                      ),
+                      "numerical_difference": difference,
+                      "comparison_status": status,
+                      "original_action_verified": False
+                  })
+
+          write_csv(
+              "04_actual_eight_slot_bands.csv",
+              band_inventory,
               [
                   "sprite_id",
-                  "actual_spr_files",
-                  "actual_subids",
-                  "actual_packages",
-                  "external_action_records",
-                  "external_npc_names",
-                  "external_name_candidates",
-                  "external_regions",
-                  "reference_action_conflicts",
-                  "verified_original_action_names",
-                  "verified_original_frame_sequences",
-                  "identity_status"
+                  "package",
+                  "band_start",
+                  "band_end",
+                  "slots_present",
+                  "complete_eight_slots",
+                  "total_internal_frames",
+                  "action_verified"
               ]
+          )
+
+          write_csv(
+              "05_external_action_numeric_comparison.csv",
+              comparison,
+              [
+                  "sprite_id",
+                  "package",
+                  "band_start",
+                  "band_end",
+                  "action_id",
+                  "external_action_hint",
+                  "external_sources",
+                  "external_reference_values",
+                  "actual_total_internal_frames",
+                  "numerical_difference",
+                  "comparison_status",
+                  "original_action_verified"
+              ]
+          )
+
+          comparison_lookup = defaultdict(list)
+
+          for row in comparison:
+              comparison_lookup[
+                  str(row["sprite_id"])
+              ].append(row)
+
+          names_by_actor = defaultdict(list)
+
+          for actor, records in npcs.items():
+              names_by_actor[actor] = [
+                  {
+                      "name": row["npc_name"],
+                      "source": row["reference"],
+                      "implementation": (
+                          row["implementation"]
+                      )
+                  }
+                  for row in records
+                  if row["npc_name"].strip()
+              ][:30]
+
+          action_payload = {}
+
+          for actor in selected_actors:
+              action_payload[str(actor)] = [
+                  {
+                      "id": int(row["action_id"]),
+                      "hint": row["action_hint"],
+                      "sources": row["reference_sources"],
+                      "values": row["reference_values"]
+                  }
+                  for row in actions[actor]
+              ]
+
+          image_entries.sort(
+              key=lambda row: (
+                  row["actor"],
+                  row["package"],
+                  row["sub"]
+              )
           )
 
           summary = {
-              "phase": "EXTERNAL_REFERENCE_CROSSCHECK",
-              "actual_sprite_id_groups": len(actors),
-              "external_action_rows": len(action_rows),
-              "external_npc_rows": len(npc_rows),
-              "client_ids_with_external_actions": sum(
-                  bool(row["external_action_records"])
-                  for row in summary_rows
+              "phase": "EXPANDED_ORIGINAL_SPR_MOTION_COMPARISON",
+              "v9_seed_actor_ids": len(old_actors),
+              "additional_actor_ids_selected": len(
+                  added_actors
               ),
-              "client_ids_with_external_npc_names": sum(
-                  bool(row["external_npc_names"])
-                  for row in summary_rows
+              "total_selected_actor_ids": len(
+                  selected_actors
               ),
-              "external_action_pairs_on_client_ids": len(
-                  combined
+              "v9_image_variants": len(old_images),
+              "new_image_variants": len(added_entries),
+              "all_image_variants": len(image_entries),
+              "render_failures": len(failures),
+              "render_file_cap_reached": cap_reached,
+              "eight_slot_groups": len(band_inventory),
+              "complete_eight_slot_groups": sum(
+                  row["complete_eight_slots"]
+                  for row in band_inventory
               ),
-              "regional_reference_conflicts": sum(
-                  x["comparison_status"]
-                  == "REGIONAL_REFERENCE_CONFLICT"
-                  for x in combined
+              "external_action_comparisons": len(comparison),
+              "numeric_framecount_matches": sum(
+                  row["comparison_status"]
+                  == "FRAMECOUNT_EQUAL_NUMERIC_ONLY"
+                  for row in comparison
               ),
-              "client_list_spr_found_in_v11": False,
-              "verified_original_monster_names": 0,
-              "verified_original_action_sequences": 0,
-              "pak_priority_verified": False,
-              "reference_version": "L1J 3.80c",
-              "reference_provenance": (
-                  "Third-party JP and TW server SQL; "
-                  "not the current game's original client"
-              )
+              "original_action_mappings_verified": 0,
+              "original_monster_names_verified": 0,
+              "original_action_timing_verified": False,
+              "client_package_precedence_verified": False
           }
 
-          (REPORT / "06_summary_v12.json").write_text(
+          (REPORT / "06_summary_v13.json").write_text(
               json.dumps(
                   summary,
                   ensure_ascii=False,
@@ -638,199 +1146,572 @@ jobs:
               encoding="utf-8"
           )
 
-          data = json.dumps(
-              browser_rows,
-              ensure_ascii=False,
-              separators=(",", ":")
-          ).replace("<", "\\u003c")
-
           html = r'''<!doctype html>
           <html lang="ko">
           <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>Sanctuary V12 ID Reference</title>
+          <title>Sanctuary V13 Monster Motion Lab</title>
           <style>
-          :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101721;color:#e9f1fa}
+          :root{font-family:system-ui,sans-serif;color-scheme:dark;background:#101722;color:#edf3fa}
           *{box-sizing:border-box}
-          body{max-width:1050px;margin:auto;padding:14px}
-          h1{font-size:1.35rem}
-          h2{font-size:1rem}
-          p{font-size:.85rem;color:#adbed2;line-height:1.5}
-          input,select{width:100%;background:#223244;color:white;border:1px solid #49617b;padding:10px;border-radius:7px;font:inherit}
-          .controls{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-          .panel{background:#192635;border:1px solid #354b62;border-radius:9px;padding:12px;margin:13px 0}
-          .warn{color:#ffcc8f}
-          .meta{font-size:.82rem;color:#bacbe0}
-          table{border-collapse:collapse;width:100%;font-size:.8rem}
-          th,td{text-align:left;padding:8px;border-bottom:1px solid #33485c;overflow-wrap:anywhere}
-          th{color:#a9bed5}
-          .scroll{overflow-x:auto}
-          a{color:#a8ceff}
-          @media(max-width:620px){.controls{grid-template-columns:1fr}th,td{padding:6px}}
+          body{margin:auto;padding:12px;max-width:1100px}
+          h1{font-size:1.3rem}
+          h2{font-size:1rem;margin-top:20px}
+          p{font-size:.84rem;color:#afc3d9;line-height:1.5}
+          .warning{color:#ffc486}
+          .toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:8px}
+          .field{display:flex;flex-direction:column;gap:5px;font-size:.8rem}
+          select,input,button{font:inherit;background:#25384b;color:white;border:1px solid #4d6681;border-radius:8px;padding:10px;min-width:0}
+          button{cursor:pointer}
+          .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0}
+          .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:9px}
+          .card{border:1px solid #38516a;background:#192635;padding:7px;border-radius:9px;min-width:0}
+          .heading{font-size:.84rem;font-weight:700}
+          .meta{font-size:.7rem;color:#b7c9dc;overflow-wrap:anywhere;margin-top:5px}
+          canvas{display:block;width:100%;aspect-ratio:1;image-rendering:pixelated;background:#273649;border-radius:5px}
+          .info{padding:11px;background:#192635;border-radius:8px;margin:12px 0;font-size:.82rem;line-height:1.6}
+          .annotation{display:flex;gap:8px;flex-wrap:wrap}
+          .annotation select{flex:1}
           </style>
           </head>
           <body>
-          <h1>Sanctuary V12 · SPR ID 교차검증</h1>
-          <p class="warn">이름과 액션 번호는 별도 L1J 3.80c 서버 자료에서 가져온 참고 후보입니다. 현재 클라이언트에서 원본 액션 정의나 몬스터 이름이 확인된 것은 아닙니다.</p>
-          <p><a href="V10-Original-Sprite-Viewer.html">V10 실제 SPR 이미지 검사기 열기</a></p>
-          <div class="controls">
-          <label>스프라이트 ID·이름 검색<input id="query" placeholder="예: 29, orc, skeleton"></label>
-          <label>검색 결과 선택<select id="sprite"></select></label>
+          <h1>Sanctuary V13 · 몬스터 SPR 확대 검사기</h1>
+          <p class="warning">현재 클라이언트의 SPR 그림은 원본입니다. 몬스터 이름과 액션 번호는 외부 L1J 자료의 참고 후보이며, 수치가 같아도 원본 액션으로 확정하지 않습니다.</p>
+          <div class="toolbar">
+          <label class="field">ID·이름 검색<input id="query" placeholder="스프라이트 ID 또는 몬스터 이름"></label>
+          <label class="field">스프라이트 ID<select id="actor"></select></label>
+          <label class="field">PAK 원본<select id="pak"></select></label>
+          <label class="field">외부 액션 후보<select id="action"></select></label>
+          <label class="field">8개 서브 ID 묶음<select id="band"></select></label>
+          <label class="field">중복 비교 서브 ID<select id="sub"></select></label>
           </div>
-          <div class="panel" id="info"></div>
-          <h2>외부 NPC 이름 후보</h2>
-          <div class="panel scroll"><table><thead><tr><th>참고 지역</th><th>NPC ID</th><th>이름</th><th>구현형</th><th>비고</th></tr></thead><tbody id="npcs"></tbody></table></div>
-          <h2>외부 액션 표 비교</h2>
-          <div class="panel scroll"><table><thead><tr><th>액션 ID</th><th>참고 분류</th><th>출처</th><th>framecount / framerate</th><th>대조</th></tr></thead><tbody id="actions"></tbody></table></div>
-          <p class="warn">framecount·framerate는 참고 SQL의 필드값 그대로입니다. SPR 내부 프레임 수나 원본 재생시간으로 해석하지 않습니다. 액션별 실제 서브 ID·프레임 순서는 미확정입니다.</p>
-          <script type="application/json" id="inventory">__DATA__</script>
+          <div class="controls">
+          <button id="play">일시정지</button>
+          <button id="prev">이전 프레임</button>
+          <button id="next">다음 프레임</button>
+          <label>검사용 간격 <input id="speed" type="range" min="80" max="600" value="180" step="20"></label>
+          <span id="rate">180 ms</span>
+          <span id="frame">프레임 0</span>
+          </div>
+          <div class="info" id="info"></div>
+          <h2>8개 서브 ID 동시 재생</h2>
+          <div class="grid" id="slots"></div>
+          <h2>동일 서브 ID의 PAK별 원본 비교</h2>
+          <div class="grid" id="duplicates"></div>
+          <h2>사용자 검증 후보 기록</h2>
+          <p>원본 액션 정의가 없으므로 아래 선택은 임시 검토 기록입니다. 자동 확정되지 않습니다.</p>
+          <div class="annotation">
+          <select id="classification">
+          <option value="">동작 미확정</option>
+          <option value="idle">대기 후보</option>
+          <option value="walk">이동 후보</option>
+          <option value="attack">공격 후보</option>
+          <option value="damage">피격 후보</option>
+          <option value="death">사망 후보</option>
+          <option value="magic">마법 후보</option>
+          <option value="other">기타</option>
+          </select>
+          <button id="save">현재 그룹 기록</button>
+          <button id="export">검토 JSON 저장</button>
+          </div>
+          <script type="application/json" id="inventory">__PAYLOAD__</script>
           <script>
           'use strict';
+
           const DB=JSON.parse(document.getElementById('inventory').textContent);
+          const rows=DB.entries;
           const $=id=>document.getElementById(id);
-          const select=$('sprite');
-          const query=$('query');
+          const actor=$('actor'),pak=$('pak'),action=$('action'),band=$('band'),sub=$('sub');
+          const cache=new Map();
+          const annotations={};
+          let frame=0;
+          let playing=true;
+          let interval=180;
+          let last=performance.now();
 
-          function cell(tr,value){
-            const td=document.createElement('td');
-            td.textContent=String(value??'');
-            tr.append(td);
+          function option(el,value,label){
+            const o=document.createElement('option');
+            o.value=String(value);
+            o.textContent=label;
+            el.append(o);
           }
 
-          function tableRows(target,rows,keys){
-            const body=$(target);
-            body.replaceChildren();
-            for(const row of rows){
-              const tr=document.createElement('tr');
-              keys.forEach(key=>cell(tr,row[key]));
-              body.append(tr);
-            }
+          function currentActor(){
+            return Number(actor.value);
           }
 
-          function choices(){
-            const q=query.value.trim().toLowerCase();
-            const previous=select.value;
-            const matches=DB.filter(x=>
-              !q ||
-              String(x.id).includes(q) ||
-              x.names.some(name=>name.toLowerCase().includes(q))
-            ).slice(0,200);
+          function actorRows(){
+            return rows.filter(r=>r.actor===currentActor());
+          }
 
-            select.replaceChildren();
+          function visibleRows(){
+            return actorRows().filter(r=>r.package===pak.value);
+          }
 
-            matches.forEach(x=>{
-              const option=document.createElement('option');
-              option.value=String(x.id);
-              option.textContent=`${x.id} ${x.names.slice(0,2).join(' / ')}`;
-              select.append(option);
+          function actorLabel(id){
+            const values=DB.names[String(id)]||[];
+            const names=[...new Set(values.map(x=>x.name))].slice(0,2);
+            return id+(names.length?' · '+names.join(' / '):'');
+          }
+
+          function setupActors(){
+            const q=$('query').value.trim().toLowerCase();
+            const previous=actor.value;
+            actor.replaceChildren();
+
+            const ids=DB.actors.filter(id=>{
+              if(!q)return true;
+              if(String(id).includes(q))return true;
+              return (DB.names[String(id)]||[]).some(x=>x.name.toLowerCase().includes(q));
             });
 
-            if(matches.some(x=>String(x.id)===previous)){
-              select.value=previous;
-            }
+            ids.forEach(id=>option(actor,id,actorLabel(id)));
 
-            render();
+            if(ids.some(id=>String(id)===previous))actor.value=previous;
+            setupPaks();
           }
 
-          function render(){
-            const item=DB.find(x=>String(x.id)===select.value);
-
-            if(!item){
-              $('info').textContent='검색 결과 없음';
-              $('npcs').replaceChildren();
-              $('actions').replaceChildren();
-              return;
-            }
-
-            $('info').textContent=
-              `SPR ${item.id} · 현재 원본 ${item.files}건 · 서브 ID ${item.subids}종 · `+
-              `원본 PAK: ${item.packages} · 외부 이름 후보 ${item.names.length}종 · 외부 액션 후보 ${item.actions.length}건`;
-
-            tableRows('npcs',item.npcs.map(x=>({
-              region:x.region,
-              npcid:x.npcid,
-              name:x.name,
-              impl:x.impl,
-              note:x.note
-            })),['region','npcid','name','impl','note']);
-
-            tableRows('actions',item.actions.map(x=>({
-              id:x.id,
-              hint:x.hint,
-              sources:x.sources,
-              values:x.values,
-              status:x.status
-            })),['id','hint','sources','values','status']);
+          function setupPaks(){
+            pak.replaceChildren();
+            const names=[...new Set(actorRows().map(r=>r.package))].sort();
+            names.forEach(name=>option(pak,name,name));
+            setupActions();
           }
 
-          query.addEventListener('input',choices);
-          select.addEventListener('change',render);
+          function setupActions(){
+            action.replaceChildren();
+            option(action,'','액션 기준 없이 비교');
 
-          choices();
+            const entries=DB.actions[String(currentActor())]||[];
+
+            entries.forEach(a=>{
+              option(action,a.id,`${a.id} · ${a.hint||'분류 미확정'} · ${a.sources}`);
+            });
+
+            setupBands();
+          }
+
+          function comparison(start){
+            return DB.matches.find(x=>
+              x.sprite_id===currentActor() &&
+              x.package===pak.value &&
+              x.band_start===start &&
+              String(x.action_id)===action.value
+            );
+          }
+
+          function setupBands(){
+            band.replaceChildren();
+
+            const starts=[...new Set(
+              visibleRows().map(r=>Math.floor(r.sub/8)*8)
+            )];
+
+            starts.sort((a,b)=>{
+              if(!action.value)return a-b;
+              const x=comparison(a),y=comparison(b);
+              const dx=x&&x.numerical_difference!==null?Number(x.numerical_difference):999999;
+              const dy=y&&y.numerical_difference!==null?Number(y.numerical_difference):999999;
+              return dx-dy||a-b;
+            });
+
+            starts.forEach(start=>{
+              const match=comparison(start);
+              const note=match&&match.comparison_status==='FRAMECOUNT_EQUAL_NUMERIC_ONLY'?' · 수치 일치 후보':'';
+              option(band,start,`${start}~${start+7}${note}`);
+            });
+
+            setupSubs();
+            renderSlots();
+          }
+
+          function setupSubs(){
+            sub.replaceChildren();
+            const ids=[...new Set(actorRows().map(r=>r.sub))].sort((a,b)=>a-b);
+            ids.forEach(id=>option(sub,id,id));
+
+            const start=Number(band.value);
+
+            if(ids.includes(start))sub.value=String(start);
+            renderDuplicates();
+          }
+
+          function getImage(row){
+            if(!cache.has(row.sheet)){
+              const img=new Image();
+              img.onload=draw;
+              img.src=DB.assets[row.sheet]||'';
+              cache.set(row.sheet,img);
+            }
+            return cache.get(row.sheet);
+          }
+
+          function createCard(row,title){
+            const node=document.createElement('div');
+            node.className='card';
+
+            const heading=document.createElement('div');
+            heading.className='heading';
+            heading.textContent=title;
+
+            const canvas=document.createElement('canvas');
+            canvas.width=240;
+            canvas.height=240;
+
+            const meta=document.createElement('div');
+            meta.className='meta';
+
+            meta.textContent=row
+              ? `${row.package} · ${row.renderedFrames}/${row.frames}프레임 · ${row.origin}`
+              : '해당 원본 없음';
+
+            node.append(heading,canvas,meta);
+            node._row=row;
+            return node;
+          }
+
+          function renderSlots(){
+            $('slots').replaceChildren();
+            const start=Number(band.value);
+
+            for(let i=0;i<8;i++){
+              const id=start+i;
+              const entry=visibleRows().find(r=>r.sub===id);
+              const card=createCard(entry||null,`서브 ID ${id}`);
+
+              card.onclick=()=>{
+                if([...sub.options].some(x=>Number(x.value)===id)){
+                  sub.value=String(id);
+                  renderDuplicates();
+                }
+              };
+
+              $('slots').append(card);
+            }
+
+            const names=DB.names[String(currentActor())]||[];
+            const nameList=[...new Set(names.map(x=>x.name))].slice(0,8).join(', ');
+            const match=comparison(start);
+
+            let info=`SPR ${actor.value} · ${pak.value} · 범위 ${start}~${start+7}`;
+            if(nameList)info+=` · 외부 NPC 이름 후보: ${nameList}`;
+
+            if(match){
+              info+=` · 외부 액션 수치 비교: ${match.comparison_status}`;
+              if(match.actual_total_internal_frames!==null){
+                info+=` · 내부 프레임 합계 ${match.actual_total_internal_frames}`;
+              }
+            }
+
+            info+=' · 실제 액션·방향·원본 시간 미확정';
+
+            $('info').textContent=info;
+            frame=0;
+            draw();
+          }
+
+          function renderDuplicates(){
+            $('duplicates').replaceChildren();
+
+            actorRows()
+              .filter(r=>r.sub===Number(sub.value))
+              .sort((a,b)=>a.package.localeCompare(b.package))
+              .forEach(row=>{
+                $('duplicates').append(
+                  createCard(row,`${row.package} / ${row.sub}`)
+                );
+              });
+
+            draw();
+          }
+
+          function draw(){
+            document.querySelectorAll('.card').forEach(node=>{
+              const canvas=node.querySelector('canvas');
+              const ctx=canvas.getContext('2d');
+              ctx.clearRect(0,0,240,240);
+
+              const row=node._row;
+              if(!row)return;
+
+              const image=getImage(row);
+              if(!image.complete||!image.naturalWidth)return;
+
+              const n=frame%row.renderedFrames;
+              const sx=(n%row.cols)*row.cellW;
+              const sy=Math.floor(n/row.cols)*row.cellH;
+              const scale=Math.min(240/row.cellW,240/row.cellH,3);
+              const w=row.cellW*scale;
+              const h=row.cellH*scale;
+
+              ctx.imageSmoothingEnabled=false;
+
+              ctx.drawImage(
+                image,
+                sx,sy,row.cellW,row.cellH,
+                (240-w)/2,(240-h)/2,w,h
+              );
+            });
+
+            $('frame').textContent='프레임 '+frame;
+          }
+
+          $('query').oninput=setupActors;
+          actor.onchange=setupPaks;
+          pak.onchange=setupBands;
+          action.onchange=setupBands;
+          band.onchange=()=>{
+            setupSubs();
+            renderSlots();
+          };
+          sub.onchange=renderDuplicates;
+
+          $('play').onclick=()=>{
+            playing=!playing;
+            $('play').textContent=playing?'일시정지':'재생';
+          };
+
+          $('prev').onclick=()=>{
+            frame=Math.max(0,frame-1);
+            draw();
+          };
+
+          $('next').onclick=()=>{
+            frame++;
+            draw();
+          };
+
+          $('speed').oninput=e=>{
+            interval=Number(e.target.value);
+            $('rate').textContent=interval+' ms';
+          };
+
+          $('save').onclick=()=>{
+            const key=[
+              actor.value,
+              pak.value,
+              band.value,
+              action.value
+            ].join('|');
+
+            annotations[key]={
+              sprite_id:currentActor(),
+              package:pak.value,
+              band_start:Number(band.value),
+              band_end:Number(band.value)+7,
+              external_action_id:action.value===''?null:Number(action.value),
+              candidate_action:$('classification').value||null,
+              verification:'USER_CANDIDATE_NOT_SOURCE_VERIFIED',
+              original_frame_sequence:null,
+              original_duration:null
+            };
+
+            $('info').textContent='후보 검토 기록: '+key;
+          };
+
+          $('export').onclick=()=>{
+            const content=JSON.stringify({
+              version:'V13',
+              type:'MANUAL_ACTION_CANDIDATES',
+              verified_original_mappings:false,
+              entries:Object.values(annotations)
+            },null,2);
+
+            const blob=new Blob([content],{
+              type:'application/json'
+            });
+
+            const url=URL.createObjectURL(blob);
+            const link=document.createElement('a');
+
+            link.href=url;
+            link.download='sanctuary-v13-motion-candidates.json';
+            link.click();
+
+            setTimeout(()=>URL.revokeObjectURL(url),1000);
+          };
+
+          function tick(now){
+            if(playing&&now-last>=interval){
+              frame++;
+              last=now;
+              draw();
+            }
+            requestAnimationFrame(tick);
+          }
+
+          setupActors();
+          requestAnimationFrame(tick);
           </script>
           </body>
           </html>'''
 
-          (REPORT / "V12-Reference-Comparison.html").write_text(
-              html.replace("__DATA__", data),
-              encoding="utf-8"
+          actor_ids = sorted({
+              row["actor"]
+              for row in image_entries
+          })
+
+          def payload_for(rows, embedded):
+              assets = {}
+
+              for row in rows:
+                  path = VIEW / row["sheet"]
+
+                  if embedded:
+                      assets[row["sheet"]] = (
+                          "data:image/png;base64,"
+                          + base64.b64encode(
+                              path.read_bytes()
+                          ).decode("ascii")
+                      )
+                  else:
+                      assets[row["sheet"]] = (
+                          "viewer/" + row["sheet"]
+                      )
+
+              selected = {
+                  row["actor"]
+                  for row in rows
+              }
+
+              return {
+                  "actors": sorted(selected),
+                  "entries": rows,
+                  "assets": assets,
+                  "names": {
+                      str(actor): names_by_actor[actor]
+                      for actor in selected
+                  },
+                  "actions": {
+                      str(actor): action_payload[str(actor)]
+                      for actor in selected
+                  },
+                  "matches": [
+                      row for row in comparison
+                      if row["sprite_id"] in selected
+                  ]
+              }
+
+          def save_html(filename, payload):
+              encoded = json.dumps(
+                  payload,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              ).replace("<", "\\u003c")
+
+              (REPORT / filename).write_text(
+                  html.replace("__PAYLOAD__", encoded),
+                  encoding="utf-8"
+              )
+
+          save_html(
+              "V13-Full-Monster-Motion-Lab.html",
+              payload_for(image_entries, False)
           )
 
-          explanation = [
-              "Sanctuary of Aden V12",
+          grouped_images = defaultdict(list)
+
+          for entry in image_entries:
+              grouped_images[
+                  entry["actor"]
+              ].append(entry)
+
+          subset = []
+          subset_bytes = 0
+          subset_limit = 12000000
+
+          preferred_ids = list(
+              dict.fromkeys(
+                  old_actors[:3]
+                  + added_actors
+                  + old_actors[3:]
+              )
+          )
+
+          for actor in preferred_ids:
+              entries = grouped_images.get(
+                  actor, []
+              )
+
+              cost = sum(
+                  (VIEW / row["sheet"]).stat().st_size
+                  for row in entries
+              )
+
+              if (
+                  subset
+                  and subset_bytes + cost > subset_limit
+              ):
+                  continue
+
+              subset.extend(entries)
+              subset_bytes += cost
+
+          save_html(
+              "V13-Standalone-Mobile-Sample.html",
+              payload_for(subset, True)
+          )
+
+          report = [
+              "Sanctuary of Aden V13",
               "",
-              "V11 confirmed no original list.spr/list.spz candidate.",
-              "V12 uses third-party regional L1J 3.80c SQL tables.",
-              "Matching graphics IDs are numerical correspondences only.",
-              "NPC names and action labels are candidate references.",
-              "Different regional source values are reported as conflicts.",
-              "The original game package precedence is unknown.",
-              "The original per-frame sequences are not recovered.",
-              "The original frame duration units are not established.",
+              "V9 sprite images retained: "
+              + str(len(old_images)),
+              "New sprite variants: "
+              + str(len(added_entries)),
+              "Total sprite variants: "
+              + str(len(image_entries)),
+              "New actor IDs: "
+              + str(len(added_actors)),
+              "Numeric-only framecount matches: "
+              + str(summary["numeric_framecount_matches"]),
+              "Render failures: "
+              + str(len(failures)),
               "",
-              "Open V12-Reference-Comparison.html for external metadata.",
-              "Open V10-Original-Sprite-Viewer.html for actual images."
+              "The full HTML uses adjacent PNG files in viewer/sheets.",
+              "The standalone sample embeds its own PNGs.",
+              "Original monster identity is not verified.",
+              "External reference actions are not original action mappings.",
+              "Eight-slot grouping is not proof of direction or animation.",
+              "Framecount numerical equality is not animation proof.",
+              "Original animation timing is not established."
           ]
 
           (REPORT / "REPORT.txt").write_text(
-              "\n".join(explanation) + "\n",
+              "\n".join(report) + "\n",
               encoding="utf-8"
           )
 
-          print("=== V12 SUMMARY ===")
+          print("=== V13 SUMMARY ===")
           print(json.dumps(
               summary,
               ensure_ascii=False,
               indent=2
           ))
 
-          path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if path:
-              with open(
-                  path, "a", encoding="utf-8"
-              ) as f:
-                  f.write("\n".join(explanation) + "\n")
-                  f.write(
-                      json.dumps(
-                          summary,
-                          ensure_ascii=False,
-                          indent=2
-                      )
-                  )
+          output = os.environ.get(
+              "GITHUB_STEP_SUMMARY"
+          )
 
-          if not combined:
+          if output:
+              with open(
+                  output, "a", encoding="utf-8"
+              ) as f:
+                  f.write("\n".join(report) + "\n")
+
+          if not added_entries:
               raise SystemExit(
-                  "No external reference IDs matched the V10 inventory"
+                  "No additional original SPR images rendered"
               )
 
           PY
 
-      - name: Upload V12 ID crosscheck and HTML viewers
+      - name: Upload V13 monster sprite expansion
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V12-External-Action-and-NPC-Crosscheck
+          name: Sanctuary-V13-Expanded-Monster-Motion-Lab
           path: reports/
           if-no-files-found: error
           retention-days: 30
