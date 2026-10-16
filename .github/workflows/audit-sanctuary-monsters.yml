@@ -1,19 +1,8 @@
 
-name: Sanctuary of Aden Original SPR Motion Lab V9
+name: Sanctuary of Aden SPR Structure and Motion Lab V10
 
 on:
   workflow_dispatch:
-    inputs:
-      actor_ids:
-        description: Numeric sprite IDs separated by commas
-        required: false
-        type: string
-        default: "0,29,113,199,3225,3227,12237,12240,12681,12702,13152,12299,12750"
-      max_subids:
-        description: Maximum distinct sub IDs per actor (8 to 64)
-        required: false
-        type: string
-        default: "24"
   push:
     paths:
       - ".github/workflows/audit-sanctuary-monsters.yml"
@@ -27,355 +16,1074 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  inspect:
+  analyze:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 45
+
     steps:
-      - name: Prepare tools and output directories
+      - name: Prepare analysis environment
         shell: bash
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full python3-pil
-          python3 -c 'from PIL import Image; print("Pillow ready")'
-          mkdir -p downloads client previous/v2 previous/v8 reports
-          df -h .
+          sudo apt-get install -y -qq python3-pil
+          mkdir -p previous/v2 previous/v8 previous/v9 reports
+          python3 -c "from PIL import Image; print('PIL_OK')"
 
-      - name: Restore V2 sprite manifests and V8 XML references
+      - name: Restore successful V2 V8 and V9 artifacts
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           gh run download 38784834277 \
             --repo "$GITHUB_REPOSITORY" \
             --name Sanctuary-V2-Reports \
             --dir previous/v2
+
           gh run download 38835390184 \
             --repo "$GITHUB_REPOSITORY" \
             --name Sanctuary-V8-Recovered-XML-and-Animation-Tables \
             --dir previous/v8
-          test -n "$(find previous/v2 -name all_sprite_candidates.csv -print -quit)"
-          test -n "$(find previous/v2 -name exported_sprite_manifest.csv -print -quit)"
-          test -n "$(find previous/v8 -name 08_explicit_target_sprite_ids.csv -print -quit)"
 
-      - name: Download and extract the original sprite packages
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release download v1.0.0 \
+          gh run download 38838415568 \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "Sanctuary.of.Aden.-.Copy.*" \
-            --dir downloads
-          python3 - <<'PY'
-          from pathlib import Path
-          d=Path('downloads')
-          names=[f'Sanctuary.of.Aden.-.Copy.z{i:02d}' for i in range(1,46)]
-          names.append('Sanctuary.of.Aden.-.Copy.zip')
-          missing=[n for n in names if not (d/n).is_file()]
-          if missing: raise SystemExit('Missing release parts: '+str(missing))
-          print('VERIFIED:',len(names),'release files')
-          PY
-          archive="downloads/Sanctuary.of.Aden.-.Copy.zip"
-          if ! 7z x "$archive" 'Sanctuary of Aden - Copy/Sprite*.pak' \
-            "-o${PWD}/client" -y > reports/extraction.log 2>&1; then
-            echo 'Selective extraction failed; retrying full extraction' >> reports/extraction.log
-            7z x "$archive" "-o${PWD}/client" -y >> reports/extraction.log 2>&1
-          fi
-          count="$(find client -type f -name 'Sprite*.pak' | wc -l)"
-          if [ "$count" -ne 17 ]; then
-            echo 'Selective extraction incomplete; retrying full extraction' >> reports/extraction.log
-            7z x "$archive" "-o${PWD}/client" -y >> reports/extraction.log 2>&1
-          fi
-          python3 - <<'PY'
-          from pathlib import Path
-          d=Path('client/Sanctuary of Aden - Copy')
-          expected=['Sprite.pak']+[f'Sprite{i:02d}.pak' for i in range(16)]
-          missing=[n for n in expected if not (d/n).is_file()]
-          if missing: raise SystemExit('Missing original PAK files: '+str(missing))
-          print('SPRITE PAKS VERIFIED:',len(expected))
-          PY
-          rm -rf downloads
-          df -h .
+            --name Sanctuary-V9-Original-SPR-Visual-Lab \
+            --dir previous/v9
 
-      - name: Verify SHA256 and render real SPR frames and mobile HTML
+          test -n "$(find previous/v2 -name all_sprite_candidates.csv -print -quit)"
+          test -n "$(find previous/v8 -name 08_explicit_target_sprite_ids.csv -print -quit)"
+          test -s previous/v9/02_rendered_sprite_manifest.csv
+          test -s previous/v9/summary_v9.json
+          test -d previous/v9/viewer/sheets
+
+          echo "V2 V8 V9 VERIFIED INPUTS RESTORED"
+
+      - name: Analyze all sprite IDs and verified frame images
         shell: bash
-        env:
-          ACTOR_IDS: ${{ inputs.actor_ids }}
-          MAX_SUBIDS: ${{ inputs.max_subids }}
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
+          import base64
           import csv
           import hashlib
-          import io
           import json
           import math
           import os
           import re
-          import struct
-          import zipfile
+          import statistics
+
           from collections import Counter, defaultdict
           from pathlib import Path
           from PIL import Image
 
-          BASE = Path.cwd()
-          DATA = BASE / 'previous/v2'
-          XML = BASE / 'previous/v8'
-          CLIENT = BASE / 'client'
-          REPORT = BASE / 'reports'
-          VIEW = REPORT / 'viewer'
-          SHEETS = VIEW / 'sheets'
-          for d in (REPORT,VIEW,SHEETS): d.mkdir(parents=True,exist_ok=True)
+          ROOT = Path.cwd()
+          V2 = ROOT / "previous/v2"
+          V8 = ROOT / "previous/v8"
+          V9 = ROOT / "previous/v9"
+          REPORT = ROOT / "reports"
 
-          def csv_read(pattern, root=DATA):
-              files=list(root.rglob(pattern))
-              if len(files)!=1: raise RuntimeError(f'Expected one {pattern}, got {len(files)}')
-              with files[0].open(encoding='utf-8-sig',newline='') as f:
+          REPORT.mkdir(parents=True, exist_ok=True)
+
+          def read_csv(root, name):
+              files = list(root.rglob(name))
+              if len(files) != 1:
+                  raise RuntimeError(
+                      f"Expected one {name}, found {len(files)}"
+                  )
+              with files[0].open(
+                  "r",
+                  encoding="utf-8-sig",
+                  newline=""
+              ) as f:
                   return list(csv.DictReader(f))
 
-          def csv_write(name,rows,fields):
-              with (REPORT/name).open('w',encoding='utf-8-sig',newline='') as f:
-                  writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore')
-                  writer.writeheader(); writer.writerows(rows)
+          def write_csv(name, fields, rows):
+              with (REPORT / name).open(
+                  "w",
+                  encoding="utf-8-sig",
+                  newline=""
+              ) as f:
+                  writer = csv.DictWriter(
+                      f,
+                      fieldnames=fields,
+                      extrasaction="ignore"
+                  )
+                  writer.writeheader()
+                  writer.writerows(rows)
 
-          records=csv_read('all_sprite_candidates.csv')
-          manifest=csv_read('exported_sprite_manifest.csv')
-          xml_targets=csv_read('08_explicit_target_sprite_ids.csv',XML)
-          known_ids={int(r['sprite_id']) for r in xml_targets if r['in_v2_sprite_index'].lower()=='true'}
-          checks={(r['pak'],r['sprite_file'].lower(),int(r['bytes'])):r['sha256'] for r in manifest}
-          actor_rows=defaultdict(list)
-          by_name=defaultdict(list)
-          pat=re.compile(r'^(\d+)-(\d+)\.spr$',re.I)
-          for row in records:
-              nm=row['file'].split('/')[-1]
-              match=pat.fullmatch(nm)
-              if not match:continue
-              aid,sub=map(int,match.groups())
-              x={'actor':aid,'sub':sub,'file':nm,'pak':row['pak'],'package':Path(row['pak']).name,'offset':int(row['offset']),'bytes':int(row['bytes'])}
-              x['sha256']=checks.get((x['pak'],nm.lower(),x['bytes']),'')
-              actor_rows[aid].append(x)
-              by_name[nm.lower()].append(x)
+          all_sprites = read_csv(
+              V2, "all_sprite_candidates.csv"
+          )
 
-          dup=[]
-          for name,items in by_name.items():
-              if len(items)>1:
-                  distinct=len({x['sha256'] for x in items})
-                  dup.append({'file':name,'copies':len(items),'distinct_sha256':distinct,'different_contents':distinct>1,'packages':';'.join(sorted(set(x['package'] for x in items)))})
-          csv_write('01_duplicate_spr_filenames.csv',sorted(dup,key=lambda x:x['file']),['file','copies','distinct_sha256','different_contents','packages'])
+          rendered = read_csv(
+              V9, "02_rendered_sprite_manifest.csv"
+          )
 
-          ids_text=os.environ.get('ACTOR_IDS','').strip() or '0,29,113,199,3225,3227,12237,12240,12681,12702,13152,12299,12750'
-          if not re.fullmatch(r'\s*\d+(?:[\s,;]+\d+)*\s*',ids_text):raise RuntimeError(f'Only numeric actor IDs allowed: {ids_text!r}')
-          selected=list(dict.fromkeys(int(x) for x in re.findall(r'\d+',ids_text)))
-          if not 1<=len(selected)<=40:raise RuntimeError('ACTOR_IDS must contain 1..40 IDs')
-          MAX_SUBIDS=int(os.environ.get('MAX_SUBIDS') or 24)
-          if MAX_SUBIDS<8 or MAX_SUBIDS>64:raise RuntimeError('MAX_SUBIDS must be 8..64')
-          MAX_FILES=1400
-          MAX_FRAMES=24
-          MAX_SPR_BYTES=4*1024*1024
-          MAX_CELL_DIM=1000
-          MAX_ATLAS_PIXELS=5_000_000
+          duplicate_rows = read_csv(
+              V9, "01_duplicate_spr_filenames.csv"
+          )
 
-          class SpriteReader:
-              def __init__(self,data):
-                  self.buf=data;self.pos=0
-              def read(self,fmt):
-                  n=struct.calcsize(fmt)
-                  if self.pos+n>len(self.buf):raise ValueError('truncated header')
-                  v=struct.unpack_from(fmt,self.buf,self.pos);self.pos+=n
-                  return v[0] if len(v)==1 else v
-              def decode(self):
-                  fc=self.read('<B');pal=None
-                  if fc==255:
-                      size=self.read('<B') or 256
-                      pal=[self.read('<H') for _ in range(size)]
-                      fc=self.read('<B')
-                  if fc<1 or fc>240:raise ValueError(f'invalid frame count {fc}')
-                  fr=[]
-                  for _ in range(fc):
-                      box=self.read('<hhhh');unknown=self.read('<HH');n=self.read('<H')
-                      if n>1500:raise ValueError('too many block definitions')
-                      blocks=[self.read('<bbBH') for _ in range(n)]
-                      fr.append((box,blocks))
-                  nblocks=self.read('<i')
-                  if nblocks<0 or nblocks>20000:raise ValueError('invalid block table')
-                  offsets=[self.read('<i') for _ in range(nblocks)]
-                  self.read('<i')
-                  base=self.pos
-                  ids={item[3] for _,specs in fr for item in specs}
-                  if any(i>=nblocks for i in ids):raise ValueError('invalid block id')
-                  cached={}
-                  for idx in sorted(ids):
-                      pos=base+offsets[idx]
-                      if pos<base or pos+4>len(self.buf):raise ValueError('invalid block offset')
-                      def byte():
-                          nonlocal pos
-                          if pos>=len(self.buf):raise ValueError('truncated pixel data')
-                          v=self.buf[pos];pos+=1
-                          return v
-                      sx,sy,unused,nlines=byte(),byte(),byte(),byte()
-                      pixels=[]
-                      for ly in range(nlines):
-                          x=sx
-                          for _ in range(byte()):
-                              x+=byte()//2
-                              for _ in range(byte()):
-                                  if pal is not None:
-                                      p=byte()
-                                      if p>=len(pal):raise ValueError('invalid palette index')
-                                      c=pal[p]
-                                  else: c=byte()|(byte()<<8)
-                                  if x>=24 or sy+ly>=24:raise ValueError('invalid block pixel coordinates')
-                                  if c!=32768: pixels.append((x,sy+ly,c))
-                                  x+=1
-                      cached[idx]=pixels
-                  images=[]
-                  for box,specs in fr[:MAX_FRAMES]:
-                      if not specs:
-                          images.append(None);continue
-                      positions=[]
-                      for a,b,typ,idx in specs:
-                          ah=a-(1 if a<0 else 0)
-                          half=int(ah/2)
-                          positions.append((24*(b+a-half),12*(b-half),idx))
-                      minx=min(x for x,y,_ in positions);miny=min(y for x,y,_ in positions)
-                      maxx=max(x+24 for x,y,_ in positions);maxy=max(y+24 for x,y,_ in positions)
-                      w=maxx-minx;h=maxy-miny
-                      if w<1 or h<1 or w>MAX_CELL_DIM or h>MAX_CELL_DIM:raise ValueError(f'oversize frame {w}x{h}')
-                      img=Image.new('RGBA',(w,h),(0,0,0,0));p=img.load()
-                      for x,y,idx in positions:
-                          for px,py,col in cached[idx]:
-                              p[x+px-minx,y+py-miny]=(((col>>10)&31)*255//31,((col>>5)&31)*255//31,(col&31)*255//31,255)
-                      images.append(img)
-                  return fc, images
+          xml_targets = read_csv(
+              V8, "08_explicit_target_sprite_ids.csv"
+          )
 
-          def atlas(images,outpath):
-              valid=[im for im in images if im is not None]
-              if not valid:raise ValueError('no visible frame blocks')
-              cw=max(im.width for im in valid);ch=max(im.height for im in valid)
-              cols=min(4,len(images));rows=math.ceil(len(images)/cols)
-              if cw*ch*cols*rows>MAX_ATLAS_PIXELS:raise ValueError('atlas pixel budget exceeded')
-              out=Image.new('RGBA',(cw*cols,ch*rows),(0,0,0,0))
-              for i,im in enumerate(images):
-                  if im:
-                      x=(i%cols)*cw+(cw-im.width)//2
-                      y=(i//cols)*ch+(ch-im.height)//2
-                      out.alpha_composite(im,(x,y))
-              outpath.parent.mkdir(parents=True,exist_ok=True)
-              out.save(outpath,optimize=True)
-              return {'sheet':outpath.relative_to(VIEW).as_posix(),'frameCountRendered':len(images),'cols':cols,'cellW':cw,'cellH':ch}
+          v9_summary = json.loads(
+              (V9 / "summary_v9.json").read_text(
+                  encoding="utf-8"
+              )
+          )
 
-          out_records=[];errors=[];num=0
-          for aid in selected:
-              source=sorted(actor_rows.get(aid,[]),key=lambda r:(r['sub'],r['package'],r['offset']))
-              chosen_subs=sorted({x['sub'] for x in source})[:MAX_SUBIDS]
-              pool=[x for x in source if x['sub'] in chosen_subs]
-              for row in pool:
-                  if num>=MAX_FILES:break
-                  num+=1
-                  if row['bytes']>MAX_SPR_BYTES:
-                      errors.append({'actor':aid,'sub':row['sub'],'package':row['package'],'reason':'TOO_LARGE'})
-                      continue
-                  pak=CLIENT/Path(row['pak']).relative_to('outer')
-                  if not pak.is_file():
-                      errors.append({'actor':aid,'sub':row['sub'],'package':row['package'],'reason':'MISSING_PACKAGE'})
-                      continue
-                  try:
-                      with pak.open('rb') as f:
-                          f.seek(row['offset']);raw=f.read(row['bytes'])
-                      if len(raw)!=row['bytes']:raise ValueError('short PAK read')
-                      sha=hashlib.sha256(raw).hexdigest()
-                      if not row['sha256'] or sha!=row['sha256']:
-                          raise ValueError('V2_SHA256_MISMATCH')
-                      fc,images=SpriteReader(raw).decode()
-                      path=SHEETS/str(aid)/row['package']/(f"{aid}-{row['sub']}_{sha[:10]}.png")
-                      desc=atlas(images,path)
-                      out_records.append({**row,'sha256':sha,'frames':fc,**desc})
-                  except Exception as exc:
-                      errors.append({'actor':aid,'sub':row['sub'],'package':row['package'],'reason':f'{type(exc).__name__}: {exc}'})
+          if len(rendered) != int(
+              v9_summary["renderedSPRVariants"]
+          ):
+              raise RuntimeError(
+                  "V9 manifest does not match successful run"
+              )
 
-          csv_write('02_rendered_sprite_manifest.csv',out_records,['actor','sub','file','pak','package','offset','bytes','sha256','frames','frameCountRendered','sheet','cols','cellW','cellH'])
-          csv_write('03_render_failures.csv',errors,['actor','sub','package','reason'])
-          actor_info=[]
-          for aid in selected:
-              matches=[r for r in out_records if r['actor']==aid]
-              actor_info.append({'id':aid,'xmlTarget':aid in known_ids,'available':len(actor_rows.get(aid,[])),'rendered':len(matches),'packages':sorted(set(x['package'] for x in matches))})
-          summary={'phase':'ORIGINAL_SPR_ATLAS_AND_PACKAGE_COMPARISON','selectedActorIds':selected,'v2SpriteEntries':len(records),'duplicatedFileNames':len(dup),'conflictingDuplicateNames':sum(x['different_contents'] for x in dup),'renderedSPRVariants':len(out_records),'renderFailures':len(errors),'actorCountWithImages':sum(a['rendered']>0 for a in actor_info),'xmlTargetIds':sorted(known_ids),'verifiedMotionNames':0,'confirmedPackagePrecedence':False,'previewSelectionRule':'Alphabetical PAK only for display; not gameplay priority'}
-          (REPORT/'README.txt').write_text('Original sprite files read from V2 indexed package offsets.\nSame-name files in different PAKs remain separate.\nIn all-packages view the preview is the alphabetically first package for inspection ONLY, never a statement of actual client priority.\nSub-ID groups of eight are comparison slots, not verified movement directions or action IDs.\nOriginal frame timing and monster identity remain unverified.\n',encoding='utf-8')
-          (REPORT/'summary_v9.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8')
-          (REPORT/'04_selected_actor_summary.json').write_text(json.dumps(actor_info,indent=2,ensure_ascii=False),encoding='utf-8')
+          xml_ids = {
+              int(row["sprite_id"])
+              for row in xml_targets
+              if str(
+                  row["in_v2_sprite_index"]
+              ).lower() == "true"
+          }
 
-          index={'version':'V9','entries':out_records,'actors':actor_info,'summary':summary}
-          encoded=json.dumps(index,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')
-          html='''<!doctype html>
-          <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sanctuary V9 SPR Motion Lab</title>
+          sprite_pattern = re.compile(
+              r"^(\d+)-(\d+)\.(spr|spx|sp2|fspr)$",
+              re.I
+          )
+
+          actors = defaultdict(list)
+          bands = defaultdict(list)
+          parse_skipped = 0
+
+          for row in all_sprites:
+              filename = row["file"].replace(
+                  "\\", "/"
+              ).split("/")[-1]
+
+              match = sprite_pattern.fullmatch(
+                  filename
+              )
+
+              if not match:
+                  parse_skipped += 1
+                  continue
+
+              actor = int(match.group(1))
+              subid = int(match.group(2))
+              extension = match.group(3).lower()
+              package = Path(
+                  row["pak"]
+              ).name
+
+              record = {
+                  "actor": actor,
+                  "subid": subid,
+                  "package": package,
+                  "extension": extension,
+                  "filename": filename
+              }
+
+              actors[actor].append(record)
+
+              band = subid // 8 * 8
+
+              bands[
+                  (actor, package, extension, band)
+              ].append(record)
+
+          all_actor_rows = []
+
+          for actor, rows in sorted(actors.items()):
+              subids = {
+                  row["subid"] for row in rows
+              }
+
+              packages = {
+                  row["package"] for row in rows
+              }
+
+              extensions = {
+                  row["extension"] for row in rows
+              }
+
+              all_actor_rows.append({
+                  "sprite_id": actor,
+                  "file_records": len(rows),
+                  "unique_subids": len(subids),
+                  "packages": len(packages),
+                  "package_names": ",".join(
+                      sorted(packages)
+                  ),
+                  "extensions": ",".join(
+                      sorted(extensions)
+                  ),
+                  "min_subid": min(subids),
+                  "max_subid": max(subids),
+                  "eight_slot_bands": len({
+                      n // 8 * 8 for n in subids
+                  }),
+                  "in_v8_xml_targets": actor in xml_ids,
+                  "motion_identity_verified": False
+              })
+
+          write_csv(
+              "01_all_sprite_id_groups.csv",
+              [
+                  "sprite_id",
+                  "file_records",
+                  "unique_subids",
+                  "packages",
+                  "package_names",
+                  "extensions",
+                  "min_subid",
+                  "max_subid",
+                  "eight_slot_bands",
+                  "in_v8_xml_targets",
+                  "motion_identity_verified"
+              ],
+              all_actor_rows
+          )
+
+          band_rows = []
+
+          for key, records in sorted(
+              bands.items()
+          ):
+              actor, package, extension, band = key
+
+              present = sorted({
+                  x["subid"] for x in records
+              })
+
+              expected = list(
+                  range(band, band + 8)
+              )
+
+              missing = [
+                  x for x in expected
+                  if x not in present
+              ]
+
+              band_rows.append({
+                  "sprite_id": actor,
+                  "package": package,
+                  "extension": extension,
+                  "band_start": band,
+                  "band_end": band + 7,
+                  "slots_present": len(present),
+                  "subids_present": ",".join(
+                      map(str, present)
+                  ),
+                  "missing_subids": ",".join(
+                      map(str, missing)
+                  ),
+                  "file_records": len(records),
+                  "all_eight_present": (
+                      len(present) == 8
+                  ),
+                  "meaning": "UNVERIFIED_SUBID_GROUP"
+              })
+
+          write_csv(
+              "02_all_eight_slot_bands.csv",
+              [
+                  "sprite_id",
+                  "package",
+                  "extension",
+                  "band_start",
+                  "band_end",
+                  "slots_present",
+                  "subids_present",
+                  "missing_subids",
+                  "file_records",
+                  "all_eight_present",
+                  "meaning"
+              ],
+              band_rows
+          )
+
+          write_csv(
+              "03_duplicate_package_conflicts.csv",
+              [
+                  "file",
+                  "copies",
+                  "distinct_sha256",
+                  "different_contents",
+                  "packages"
+              ],
+              duplicate_rows
+          )
+
+          feature_rows = []
+          display_entries = []
+          render_bands = defaultdict(list)
+          image_errors = []
+
+          for row in rendered:
+              actor = int(row["actor"])
+              subid = int(row["sub"])
+              package = row["package"]
+
+              frames = int(
+                  row["frameCountRendered"]
+              )
+
+              cols = int(row["cols"])
+              cw = int(row["cellW"])
+              ch = int(row["cellH"])
+
+              sheet_relative = row["sheet"]
+
+              if (
+                  not sheet_relative.startswith("sheets/")
+                  or ".." in Path(sheet_relative).parts
+              ):
+                  raise RuntimeError(
+                      "Unsafe V9 sheet path"
+                  )
+
+              path = (
+                  V9 / "viewer" / sheet_relative
+              )
+
+              if not path.is_file():
+                  image_errors.append({
+                      "actor": actor,
+                      "subid": subid,
+                      "package": package,
+                      "error": "MISSING_V9_SHEET"
+                  })
+                  continue
+
+              try:
+                  with Image.open(path) as source:
+                      atlas = source.convert("RGBA")
+
+                  expected_width = cols * cw
+                  expected_rows = math.ceil(
+                      frames / cols
+                  )
+
+                  if atlas.width != expected_width:
+                      raise ValueError(
+                          "Sheet width mismatch"
+                      )
+
+                  if atlas.height != expected_rows * ch:
+                      raise ValueError(
+                          "Sheet height mismatch"
+                      )
+
+                  previous_pixels = None
+                  changes = []
+                  visible_frames = 0
+
+                  for frame in range(frames):
+                      x = (frame % cols) * cw
+                      y = (frame // cols) * ch
+
+                      image = atlas.crop((
+                          x, y, x + cw, y + ch
+                      ))
+
+                      alpha = image.getchannel("A")
+                      bbox = alpha.getbbox()
+
+                      if bbox is None:
+                          width = 0
+                          height = 0
+                          cx = 0
+                          cy = 0
+                      else:
+                          visible_frames += 1
+                          width = bbox[2] - bbox[0]
+                          height = bbox[3] - bbox[1]
+                          cx = (
+                              bbox[0] + bbox[2]
+                          ) / 2
+                          cy = (
+                              bbox[1] + bbox[3]
+                          ) / 2
+
+                      small = alpha.resize(
+                          (16, 16),
+                          Image.Resampling.BOX
+                      )
+
+                      pixels = list(
+                          small.getdata()
+                      )
+
+                      if previous_pixels is None:
+                          change = 0.0
+                      else:
+                          change = sum(
+                              abs(a - b)
+                              for a, b in zip(
+                                  pixels,
+                                  previous_pixels
+                              )
+                          ) / (256 * 255)
+
+                      previous_pixels = pixels
+                      changes.append(change)
+
+                      feature_rows.append({
+                          "sprite_id": actor,
+                          "subid": subid,
+                          "package": package,
+                          "sha256": row["sha256"],
+                          "frame_index": frame,
+                          "visible": bbox is not None,
+                          "width": width,
+                          "height": height,
+                          "center_x": round(cx, 2),
+                          "center_y": round(cy, 2),
+                          "difference_from_previous": (
+                              round(change, 6)
+                          )
+                      })
+
+                  mean_change = (
+                      statistics.mean(changes[1:])
+                      if len(changes) > 1
+                      else 0.0
+                  )
+
+                  display = {
+                      "actor": actor,
+                      "sub": subid,
+                      "package": package,
+                      "sha256": row["sha256"],
+                      "frames": int(row["frames"]),
+                      "renderedFrames": frames,
+                      "cols": cols,
+                      "cellW": cw,
+                      "cellH": ch,
+                      "visibleFrames": visible_frames,
+                      "meanChange": round(
+                          mean_change, 5
+                      ),
+                      "sheet": (
+                          "data:image/png;base64,"
+                          + base64.b64encode(
+                              path.read_bytes()
+                          ).decode("ascii")
+                      )
+                  }
+
+                  display_entries.append(display)
+
+                  key = (
+                      actor,
+                      package,
+                      subid // 8 * 8
+                  )
+
+                  render_bands[key].append(display)
+
+              except Exception as exc:
+                  image_errors.append({
+                      "actor": actor,
+                      "subid": subid,
+                      "package": package,
+                      "error": str(exc)
+                  })
+
+          write_csv(
+              "04_original_frame_features.csv",
+              [
+                  "sprite_id",
+                  "subid",
+                  "package",
+                  "sha256",
+                  "frame_index",
+                  "visible",
+                  "width",
+                  "height",
+                  "center_x",
+                  "center_y",
+                  "difference_from_previous"
+              ],
+              feature_rows
+          )
+
+          rendered_band_rows = []
+          action_candidates = []
+
+          for key, entries in sorted(
+              render_bands.items()
+          ):
+              actor, package, band = key
+
+              subids = sorted({
+                  x["sub"] for x in entries
+              })
+
+              counts = [
+                  x["renderedFrames"]
+                  for x in entries
+              ]
+
+              motion = [
+                  x["meanChange"]
+                  for x in entries
+              ]
+
+              record = {
+                  "sprite_id": actor,
+                  "package": package,
+                  "band_start": band,
+                  "band_end": band + 7,
+                  "present_slots": len(subids),
+                  "subids": ",".join(
+                      map(str, subids)
+                  ),
+                  "rendered_variants": len(entries),
+                  "mean_frame_count": round(
+                      statistics.mean(counts), 3
+                  ),
+                  "mean_frame_change": round(
+                      statistics.mean(motion), 6
+                  ),
+                  "eight_slots_complete": (
+                      len(subids) == 8
+                  ),
+                  "action_name_verified": False,
+                  "actual_direction_verified": False,
+                  "package_priority_verified": False
+              }
+
+              rendered_band_rows.append(
+                  record
+              )
+
+              action_candidates.append({
+                  "sprite_id": actor,
+                  "package": package,
+                  "subid_band_start": band,
+                  "subid_band_end": band + 7,
+                  "possible_action": None,
+                  "verification": "NOT_YET_CLASSIFIED",
+                  "known_frame_count": counts,
+                  "original_timing": None,
+                  "original_direction_mapping": None
+              })
+
+          write_csv(
+              "05_rendered_band_analysis.csv",
+              [
+                  "sprite_id",
+                  "package",
+                  "band_start",
+                  "band_end",
+                  "present_slots",
+                  "subids",
+                  "rendered_variants",
+                  "mean_frame_count",
+                  "mean_frame_change",
+                  "eight_slots_complete",
+                  "action_name_verified",
+                  "actual_direction_verified",
+                  "package_priority_verified"
+              ],
+              rendered_band_rows
+          )
+
+          write_csv(
+              "06_image_analysis_errors.csv",
+              [
+                  "actor",
+                  "subid",
+                  "package",
+                  "error"
+              ],
+              image_errors
+          )
+
+          (REPORT / "07_action_candidate_structure.json").write_text(
+              json.dumps(
+                  action_candidates,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          summary = {
+              "phase": "GLOBAL_SPR_STRUCTURE_AND_VISUAL_ANALYSIS",
+              "v2_sprite_records": len(all_sprites),
+              "parsed_sprite_id_groups": len(actors),
+              "all_package_eight_slot_groups": len(band_rows),
+              "unparsed_candidate_records": parse_skipped,
+              "duplicate_filenames": len(duplicate_rows),
+              "conflicting_duplicate_filenames": sum(
+                  str(row["different_contents"]).lower()
+                  == "true"
+                  for row in duplicate_rows
+              ),
+              "v9_rendered_variants": len(rendered),
+              "v10_verified_image_sheets": len(display_entries),
+              "v10_image_errors": len(image_errors),
+              "analyzed_individual_frames": len(feature_rows),
+              "rendered_eight_slot_groups": len(rendered_band_rows),
+              "v8_matched_target_ids": sorted(xml_ids),
+              "verified_monster_action_mappings": 0,
+              "verified_pak_priority": False,
+              "verified_original_animation_timing": False
+          }
+
+          (REPORT / "08_summary_v10.json").write_text(
+              json.dumps(
+                  summary,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          payload = {
+              "actors": sorted({
+                  x["actor"]
+                  for x in display_entries
+              }),
+              "entries": display_entries,
+              "bands": rendered_band_rows,
+              "xmlIds": sorted(xml_ids),
+              "summary": summary
+          }
+
+          encoded = json.dumps(
+              payload,
+              ensure_ascii=False,
+              separators=(",", ":")
+          ).replace("<", "\\u003c")
+
+          html = r'''<!doctype html>
+          <html lang="ko">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Sanctuary V10 Motion Matrix</title>
           <style>
-          :root{font-family:system-ui,sans-serif;color-scheme:dark;background:#0e131b;color:#ecf1f8}*{box-sizing:border-box}body{margin:0;padding:12px;max-width:1200px;margin-inline:auto}h1{font-size:1.35rem;margin:8px 0}p{line-height:1.5;color:#b8c7d8;font-size:.88rem}button,select,input{font:inherit}select,button{background:#253447;color:#eff6ff;border:1px solid #47617a;border-radius:8px;padding:10px;min-width:0}button{cursor:pointer}.toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));gap:8px;align-items:end}.field{display:flex;flex-direction:column;gap:4px;font-size:.82rem}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,170px),1fr));gap:10px}.card{border:1px solid #344a62;border-radius:10px;padding:6px;min-width:0;background:#15202e}.title{font-size:.87rem;font-weight:700}.meta{font-size:.72rem;color:#9eb3c9;overflow-wrap:anywhere;margin:4px 0}.screen{width:100%;aspect-ratio:1/1;background-color:#16202a;background-image:linear-gradient(45deg,#273445 25%,transparent 25%),linear-gradient(-45deg,#273445 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#273445 75%),linear-gradient(-45deg,transparent 75%,#273445 75%);background-size:18px 18px;background-position:0 0,0 9px,9px -9px,-9px 0;display:block;image-rendering:pixelated}.panel{padding:10px 0;border-top:1px solid #304258;margin-top:18px}h2{font-size:1.02rem;margin:8px 0}.info{font-size:.8rem;color:#c6d8ee}.warn{color:#ffd29e;font-size:.81rem}.empty{padding:30px 0;color:#a7bacd}.wide{width:100%}
-          </style></head><body>
-          <h1>Sanctuary of Aden — V9 원본 SPR 검사</h1>
-          <p>PAK별 파일을 분리해 표시합니다. 8개 번호 슬롯은 원본 서브 ID의 연속 범위이며, 실제 방향·공격·이동 액션으로 확정된 것이 아닙니다. 게임 내 PAK 우선순위도 미확정입니다.</p>
-          <div class="toolbar"><label class="field">스프라이트 ID<select id="actor"></select></label><label class="field">원본 PAK<select id="pak"></select></label><label class="field">8개 서브 ID 범위<select id="band"></select></label><label class="field">중복 비교 서브 ID<select id="sub"></select></label></div>
-          <div class="controls"><button id="play">재생 중지</button><label>재생 간격 <input id="ms" type="range" min="80" max="600" value="200" step="20"><span id="rate">200</span> ms</label><button id="prev">이전 프레임</button><button id="next">다음 프레임</button><span id="frame">프레임 0</span></div>
-          <div class="info" id="info"></div><section class="panel"><h2>서브 ID별 원본 프레임</h2><div class="grid" id="slots"></div></section>
-          <section class="panel"><h2>동일 파일명 · PAK별 내용 비교</h2><p>같은 서브 ID를 가진 파일을 PAK별로 나란히 표시합니다. SHA가 다르면 다른 원본입니다.</p><div class="grid" id="comparisons"></div></section>
-          <p class="warn">추출 성공은 실제 몬스터 이름, 액션 ID, 원본 재생 시간의 확정을 의미하지 않습니다. PAK 자동 병합 및 이름 임의 부여 없음.</p>
-          <script type="application/json" id="inventory">__MANIFEST__</script>
+          :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101722;color:#eaf2fc}
+          *{box-sizing:border-box}
+          body{max-width:1180px;margin:auto;padding:12px}
+          h1{font-size:1.3rem}
+          h2{font-size:1rem;margin-top:20px}
+          p{font-size:.83rem;color:#afc2d7;line-height:1.5}
+          .toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+          .field{display:flex;flex-direction:column;gap:5px;font-size:.8rem}
+          select,button{background:#26384d;color:white;border:1px solid #536b84;border-radius:7px;padding:9px;font:inherit}
+          button{cursor:pointer}
+          .controls{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+          .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:9px}
+          .card{border:1px solid #34475d;background:#192636;border-radius:10px;padding:7px;min-width:0}
+          .heading{font-weight:700;font-size:.83rem}
+          .meta{font-size:.72rem;color:#b2c5da;overflow-wrap:anywhere;margin-top:6px}
+          canvas{display:block;width:100%;aspect-ratio:1;background:#253343;border-radius:5px;image-rendering:pixelated}
+          .notice{color:#ffc889}
+          .details{margin:12px 0;font-size:.82rem;color:#cadbea}
+          </style>
+          </head>
+          <body>
+          <h1>Sanctuary of Aden V10 · SPR 원본 모션 비교</h1>
+          <p>이 HTML 하나에 V9에서 검증한 원본 SPR 시트가 포함돼 있습니다. 외부 이미지 파일이나 네트워크 연결이 필요하지 않습니다.</p>
+          <p class="notice">8개 슬롯은 비교용 서브 ID 묶음입니다. 실제 방향·대기·공격·피격·사망 동작으로 확정한 것이 아닙니다. 재생 간격도 원본 타이밍이 아닙니다.</p>
+
+          <div class="toolbar">
+          <label class="field">스프라이트 ID<select id="actor"></select></label>
+          <label class="field">PAK 원본<select id="package"></select></label>
+          <label class="field">8개 슬롯 묶음<select id="band"></select></label>
+          <label class="field">중복 비교 서브 ID<select id="subid"></select></label>
+          </div>
+
+          <div class="controls">
+          <button id="play">일시정지</button>
+          <button id="prev">이전 프레임</button>
+          <button id="next">다음 프레임</button>
+          <label>간격 <input id="speed" type="range" min="80" max="600" step="20" value="180"></label>
+          <span id="clock">180 ms</span>
+          <span id="frame">0</span>
+          </div>
+
+          <div class="details" id="details"></div>
+
+          <h2>원본 서브 ID 8슬롯 동시 비교</h2>
+          <div class="grid" id="slots"></div>
+
+          <h2>같은 서브 ID의 PAK별 원본</h2>
+          <div class="grid" id="comparisons"></div>
+
+          <h2>동작 검증 결과 임시 기록</h2>
+          <p>확인 전에는 동작을 자동으로 지정하지 않습니다. 아래 표기는 사용자가 확인한 후보를 별도 JSON으로 내보내는 용도입니다.</p>
+
+          <div class="toolbar">
+          <label class="field">후보 동작
+          <select id="action">
+          <option value="">미확정</option>
+          <option value="idle">대기 후보</option>
+          <option value="walk">이동 후보</option>
+          <option value="attack">공격 후보</option>
+          <option value="damage">피격 후보</option>
+          <option value="death">사망 후보</option>
+          <option value="magic">마법 후보</option>
+          <option value="other">기타 동작</option>
+          </select>
+          </label>
+          <button id="save">현재 그룹 임시 기록</button>
+          <button id="export">기록한 후보 JSON 저장</button>
+          </div>
+
+          <script type="application/json" id="data">__DATA__</script>
           <script>
           'use strict';
-          const data=JSON.parse(document.getElementById('inventory').textContent);
-          const entries=data.entries,actors=data.actors;
+
+          const DATA=JSON.parse(document.getElementById('data').textContent);
+          const rows=DATA.entries;
           const $=id=>document.getElementById(id);
-          const actor=$('actor'),pak=$('pak'),band=$('band'),sub=$('sub');
-          let frame=0,playing=true,wait=200,last=performance.now();
-          const imgs={};
-          function option(sel,value,title){const e=document.createElement('option');e.value=value;e.textContent=title;sel.append(e)}
-          function selected(){return Number(actor.value)}
-          function actorEntries(){return entries.filter(e=>e.actor===selected())}
-          function updateActors(){actors.forEach(a=>option(actor,String(a.id),`${a.id} (${a.rendered}개, ${a.xmlTarget?'XML 대상':'수동 조사'})`));if(!actors.length)return; actor.value=String(actors.find(a=>a.rendered)||actors[0]).id;updatePak()}
-          function updatePak(){const rows=actorEntries();pak.replaceChildren();option(pak,'__ALL__','전체 PAK · 충돌은 별도 비교');const ps=[...new Set(rows.map(e=>e.package))].sort();ps.forEach(p=>option(pak,p,`${p} (${rows.filter(e=>e.package===p).length})`));pak.value='__ALL__';updateBand()}
-          function updateBand(){const rows=actorEntries().filter(e=>pak.value==='__ALL__'||e.package===pak.value);band.replaceChildren();const nums=[...new Set(rows.map(e=>Math.floor(e.sub/8)*8))].sort((a,b)=>a-b);nums.forEach(n=>option(band,n,`${n}~${n+7}`));updateSub();updateSlots()}
-          function updateSub(){sub.replaceChildren();const ss=[...new Set(actorEntries().map(e=>e.sub))].sort((a,b)=>a-b);ss.forEach(n=>option(sub,n,`서브 ID ${n}`));const bandValue=Number(band.value);if(ss.includes(bandValue))sub.value=String(bandValue);updateCompare()}
-          function image(path){if(!imgs[path]){const x=new Image();x.onload=()=>drawAll();x.src=path;imgs[path]=x}return imgs[path]}
-          function card(e,label){const c=document.createElement('article');c.className='card';const title=document.createElement('div');title.className='title';title.textContent=label;const cn=document.createElement('canvas');cn.className='screen';cn.width=240;cn.height=240;const meta=document.createElement('div');meta.className='meta';meta.textContent=e?`${e.package} · ${e.frameCountRendered}/${e.frames}프레임 표시 · SHA ${e.sha256.slice(0,12)}`:'이 패키지에 해당 SPR 없음';c.append(title,cn,meta);if(e)c.dataset.sheet=e.sheet; c._entry=e;return c}
-          function updateSlots(){const list=$('slots');list.replaceChildren();const n=Number(band.value);for(let i=0;i<8;i++){const id=n+i;const variants=entries.filter(e=>e.actor===selected()&&(pak.value==='__ALL__'||e.package===pak.value)&&e.sub===id).sort((a,b)=>a.package.localeCompare(b.package));const e=variants[0];const suffix=variants.length>1?` · ${variants.length}개 원본 변형`:'';const node=card(e,`서브 ID ${id} · 슬롯 ${i}${suffix}`);node.onclick=()=>{if(sub.querySelector(`option[value="${id}"]`)){sub.value=String(id);updateCompare()}};list.append(node)}const a=actors.find(x=>x.id===selected());$('info').textContent=a?`ID ${a.id} · V2 원본 ${a.available}건 · 이번 표시 ${a.rendered}건 · XML 명시 대상 ${a.xmlTarget?'예':'아니오'}`:'';frame=0;drawAll()}
-          function updateCompare(){const list=$('comparisons');list.replaceChildren();const rows=actorEntries().filter(e=>e.sub===Number(sub.value)).sort((a,b)=>a.package.localeCompare(b.package));rows.forEach(e=>list.append(card(e,`${e.package} / ${e.file}`)));drawAll()}
-          function drawAll(){document.querySelectorAll('.card').forEach(c=>{const ctx=c.querySelector('canvas').getContext('2d');ctx.clearRect(0,0,240,240);const e=c._entry;if(!e)return;const img=image(e.sheet);if(!img.complete||!img.naturalWidth)return;const index=frame%e.frameCountRendered;const x=(index%e.cols)*e.cellW;const y=Math.floor(index/e.cols)*e.cellH;const sc=Math.min(240/e.cellW,240/e.cellH,3);const w=e.cellW*sc,h=e.cellH*sc;ctx.imageSmoothingEnabled=false;ctx.drawImage(img,x,y,e.cellW,e.cellH,(240-w)/2,(240-h)/2,w,h)});$('frame').textContent='프레임 '+frame}
-          actor.onchange=updatePak;pak.onchange=updateBand;band.onchange=()=>{updateSub();updateSlots()};sub.onchange=updateCompare;
-          $('play').onclick=()=>{playing=!playing;$('play').textContent=playing?'재생 중지':'재생 시작'};
-          $('prev').onclick=()=>{frame=Math.max(0,frame-1);drawAll()};$('next').onclick=()=>{frame++;drawAll()};
-          $('ms').oninput=e=>{wait=Number(e.target.value);$('rate').textContent=wait};
-          function tick(t){if(playing&&t-last>=wait){frame++;drawAll();last=t}requestAnimationFrame(tick)}
-          updateActors();requestAnimationFrame(tick);
-          </script></body></html>'''
-          (VIEW/'index.html').write_text(html.replace('__MANIFEST__',encoded),encoding='utf-8')
-          print('=== V9 SUMMARY ===')
-          print(json.dumps(summary,ensure_ascii=False,indent=2))
-          if not out_records:raise SystemExit('No SPR atlases created. Check reports/03_render_failures.csv')
-          PY
-          test -s reports/viewer/index.html
-          python3 - <<'PY'
-          import json,os
-          from pathlib import Path
-          d=json.loads(Path('reports/summary_v9.json').read_text())
-          lines=['## V9 original SPR motion lab', '',
-                 '- Rendered original SPR variants: '+str(d['renderedSPRVariants']),
-                 '- Render failures: '+str(d['renderFailures']),
-                 '- Case-insensitive duplicate filenames: '+str(d['duplicatedFileNames']),
-                 '- Conflicting duplicate filenames: '+str(d['conflictingDuplicateNames']),
-                 '- Game package precedence and motion IDs are not verified.']
-          p=os.environ.get('GITHUB_STEP_SUMMARY')
-          if p:
-            with open(p,'a',encoding='utf-8') as f: f.write('\n'.join(lines)+'\n')
+          const actor=$('actor');
+          const pack=$('package');
+          const band=$('band');
+          const subid=$('subid');
+
+          const images=new Map();
+          const labels={};
+
+          let counter=0;
+          let playing=true;
+          let interval=180;
+          let last=performance.now();
+
+          function option(el,value,label){
+            const item=document.createElement('option');
+            item.value=String(value);
+            item.textContent=label;
+            el.append(item);
+          }
+
+          function activeRows(){
+            return rows.filter(r=>r.actor===Number(actor.value));
+          }
+
+          function setupActors(){
+            actor.replaceChildren();
+            DATA.actors.forEach(id=>{
+              const count=rows.filter(r=>r.actor===id).length;
+              option(actor,id,`${id} (${count}종 원본)`);
+            });
+            if(DATA.actors.length)setupPacks();
+          }
+
+          function setupPacks(){
+            pack.replaceChildren();
+            option(pack,'ALL','전체 PAK 비교');
+            const names=[...new Set(activeRows().map(r=>r.package))].sort();
+            names.forEach(name=>option(pack,name,name));
+            setupBands();
+          }
+
+          function visibleRows(){
+            return activeRows().filter(r=>
+              pack.value==='ALL'||r.package===pack.value
+            );
+          }
+
+          function setupBands(){
+            band.replaceChildren();
+            const starts=[...new Set(
+              visibleRows().map(r=>Math.floor(r.sub/8)*8)
+            )].sort((a,b)=>a-b);
+            starts.forEach(start=>option(band,start,`${start} ~ ${start+7}`));
+            setupSubs();
+            renderSlots();
+          }
+
+          function setupSubs(){
+            subid.replaceChildren();
+            const ids=[...new Set(activeRows().map(r=>r.sub))]
+              .sort((a,b)=>a-b);
+            ids.forEach(id=>option(subid,id,String(id)));
+            if(ids.includes(Number(band.value)))subid.value=String(band.value);
+            renderComparison();
+          }
+
+          function getImage(row){
+            if(!images.has(row.sheet)){
+              const img=new Image();
+              img.onload=drawAll;
+              img.src=row.sheet;
+              images.set(row.sheet,img);
+            }
+            return images.get(row.sheet);
+          }
+
+          function card(row,title){
+            const node=document.createElement('div');
+            node.className='card';
+
+            const head=document.createElement('div');
+            head.className='heading';
+            head.textContent=title;
+
+            const canvas=document.createElement('canvas');
+            canvas.width=240;
+            canvas.height=240;
+
+            const meta=document.createElement('div');
+            meta.className='meta';
+
+            if(row){
+              meta.textContent=
+                `${row.package} · ${row.renderedFrames}프레임 · 변화량 ${row.meanChange} · SHA ${row.sha256.slice(0,12)}`;
+              node._row=row;
+            }else{
+              meta.textContent='해당 서브 ID의 원본 없음';
+            }
+
+            node.append(head,canvas,meta);
+            return node;
+          }
+
+          function renderSlots(){
+            $('slots').replaceChildren();
+            const base=Number(band.value);
+
+            for(let i=0;i<8;i++){
+              const n=base+i;
+              const matches=visibleRows()
+                .filter(r=>r.sub===n)
+                .sort((a,b)=>a.package.localeCompare(b.package));
+
+              const title=`서브 ${n}`+
+                (matches.length>1?` · 원본 ${matches.length}종`:'');
+
+              const node=card(matches[0]||null,title);
+
+              node.onclick=()=>{
+                if([...subid.options].some(o=>o.value===String(n))){
+                  subid.value=String(n);
+                  renderComparison();
+                }
+              };
+
+              $('slots').append(node);
+            }
+
+            const group=DATA.bands.filter(r=>
+              r.sprite_id===Number(actor.value) &&
+              r.band_start===Number(band.value) &&
+              (pack.value==='ALL'||r.package===pack.value)
+            );
+
+            $('details').textContent=
+              `ID ${actor.value} · 슬롯 ${band.value}~${Number(band.value)+7} · `+
+              `PAK 그룹 ${group.length}개 · 원본 타이밍 미확정`;
+
+            counter=0;
+            drawAll();
+          }
+
+          function renderComparison(){
+            $('comparisons').replaceChildren();
+
+            activeRows()
+              .filter(r=>r.sub===Number(subid.value))
+              .sort((a,b)=>a.package.localeCompare(b.package))
+              .forEach(row=>{
+                $('comparisons').append(card(row,
+                  `${row.package} / ${row.sub}`
+                ));
+              });
+
+            drawAll();
+          }
+
+          function drawAll(){
+            document.querySelectorAll('.card').forEach(node=>{
+              const canvas=node.querySelector('canvas');
+              const ctx=canvas.getContext('2d');
+              ctx.clearRect(0,0,240,240);
+
+              const row=node._row;
+              if(!row)return;
+
+              const image=getImage(row);
+
+              if(!image.complete||!image.naturalWidth)return;
+
+              const frame=counter%row.renderedFrames;
+              const sx=(frame%row.cols)*row.cellW;
+              const sy=Math.floor(frame/row.cols)*row.cellH;
+              const scale=Math.min(240/row.cellW,240/row.cellH,3);
+              const width=row.cellW*scale;
+              const height=row.cellH*scale;
+
+              ctx.imageSmoothingEnabled=false;
+
+              ctx.drawImage(
+                image,
+                sx,sy,row.cellW,row.cellH,
+                (240-width)/2,(240-height)/2,width,height
+              );
+            });
+
+            $('frame').textContent=`프레임 ${counter}`;
+          }
+
+          actor.onchange=setupPacks;
+          pack.onchange=setupBands;
+          band.onchange=()=>{
+            setupSubs();
+            renderSlots();
+          };
+          subid.onchange=renderComparison;
+
+          $('play').onclick=()=>{
+            playing=!playing;
+            $('play').textContent=playing?'일시정지':'재생';
+          };
+
+          $('prev').onclick=()=>{
+            counter=Math.max(0,counter-1);
+            drawAll();
+          };
+
+          $('next').onclick=()=>{
+            counter++;
+            drawAll();
+          };
+
+          $('speed').oninput=e=>{
+            interval=Number(e.target.value);
+            $('clock').textContent=interval+' ms';
+          };
+
+          $('save').onclick=()=>{
+            const key=`${actor.value}|${pack.value}|${band.value}`;
+            labels[key]={
+              sprite_id:Number(actor.value),
+              package:pack.value,
+              subid_band_start:Number(band.value),
+              subid_band_end:Number(band.value)+7,
+              candidate_action:$('action').value||null,
+              verification:'USER_MARKED_UNVERIFIED',
+              original_frame_timing:null,
+              original_direction_mapping:null,
+              actual_package_precedence:null
+            };
+            $('details').textContent=
+              `현재 그룹 후보 기록 완료 · ${key}`;
+          };
+
+          $('export').onclick=()=>{
+            const content=JSON.stringify({
+              version:'V10',
+              type:'VISUAL_CANDIDATE_MAPPING',
+              verified_by_original_action_metadata:false,
+              entries:Object.values(labels)
+            },null,2);
+
+            const blob=new Blob(
+              [content],
+              {type:'application/json'}
+            );
+
+            const url=URL.createObjectURL(blob);
+            const link=document.createElement('a');
+            link.href=url;
+            link.download='sanctuary-v10-action-candidates.json';
+            link.click();
+            URL.revokeObjectURL(url);
+          };
+
+          function tick(now){
+            if(playing&&now-last>=interval){
+              counter++;
+              last=now;
+              drawAll();
+            }
+            requestAnimationFrame(tick);
+          }
+
+          setupActors();
+          requestAnimationFrame(tick);
+          </script>
+          </body>
+          </html>'''
+
+          html = html.replace(
+              "__DATA__", encoded
+          )
+
+          (REPORT / "Sanctuary-V10-Mobile-Motion-Lab.html").write_text(
+              html,
+              encoding="utf-8"
+          )
+
+          report_lines = [
+              "Sanctuary of Aden V10",
+              "",
+              f"Full sprite records: {len(all_sprites)}",
+              f"Sprite ID groups: {len(actors)}",
+              f"All PAK/subid bands: {len(band_rows)}",
+              f"V9 PNG variants: {len(rendered)}",
+              f"Verified image sheets: {len(display_entries)}",
+              f"Individual rendered frames analyzed: {len(feature_rows)}",
+              f"Image errors: {len(image_errors)}",
+              "",
+              "Action labels are not inferred from sub ID order.",
+              "Package ordering is not considered client priority.",
+              "All eight-slot groups are comparison structures only.",
+              "Original animation timing remains unverified."
+          ]
+
+          (REPORT / "REPORT.txt").write_text(
+              "\n".join(report_lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print("=== V10 SUMMARY ===")
+          print(json.dumps(
+              summary,
+              ensure_ascii=False,
+              indent=2
+          ))
+
+          summary_path=os.environ.get(
+              "GITHUB_STEP_SUMMARY"
+          )
+
+          if summary_path:
+              with open(
+                  summary_path,
+                  "a",
+                  encoding="utf-8"
+              ) as f:
+                  f.write("\n".join(report_lines)+"\n")
+
+          if not display_entries:
+              raise SystemExit(
+                  "No original SPR images available"
+              )
+
+          if image_errors:
+              raise SystemExit(
+                  "V9 sprite image validation failed"
+              )
+
           PY
 
-      - name: Upload V9 visual inspector and inventory
+      - name: Upload V10 all-ID reports and offline motion lab
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V9-Original-SPR-Visual-Lab
+          name: Sanctuary-V10-Full-SPR-Structure-and-Motion-Lab
           path: reports/
           if-no-files-found: error
           retention-days: 30
