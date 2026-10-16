@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Binary Animation Analysis V4
+name: Sanctuary of Aden Animation Loader Audit V5
 
 on:
   workflow_dispatch:
@@ -34,34 +34,41 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full
 
-          mkdir -p downloads client previous/v1 previous/v2
-          mkdir -p reports/raw reports/decoded
+          mkdir -p \
+            previous/v4 \
+            downloads \
+            client \
+            reports
 
           df -h .
 
-      - name: Restore verified V1 and V2 indexes
+      - name: Restore verified V4 binary evidence
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          gh run download 38782357687 \
+          gh run download 38828891785 \
             --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-Monster-Audit \
-            --dir previous/v1
+            --name Sanctuary-V4-Binary-Animation-Analysis \
+            --dir previous/v4
 
-          gh run download 38784834277 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V2-Reports \
-            --dir previous/v2
+          test -n "$(
+            find previous/v4/raw \
+              -name '*_Actions.xml' \
+              -print -quit
+          )"
 
-          test -n "$(find previous/v1 -name '02_pak_records.csv' -print -quit)"
-          test -n "$(find previous/v2 -name 'sprite_id_groups.csv' -print -quit)"
+          test -n "$(
+            find previous/v4/raw \
+              -name '*_QMotionInfo.xml' \
+              -print -quit
+          )"
 
-          echo "PREVIOUS INDEXES RESTORED"
+          echo "V4 ORIGINAL BINARY DATA RESTORED"
 
-      - name: Download all original client parts
+      - name: Download original 46 client parts
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,25 +89,26 @@ jobs:
           expected = [
               f"{base}.z{i:02d}"
               for i in range(1, 46)
-          ]
-          expected.append(f"{base}.zip")
+          ] + [f"{base}.zip"]
 
           missing = [
-              x for x in expected
-              if not (root / x).is_file()
+              name for name in expected
+              if not (root / name).is_file()
           ]
 
           if missing:
-              raise SystemExit(f"Missing: {missing}")
+              raise SystemExit(
+                  f"Missing archive parts: {missing}"
+              )
 
-          print("PARTS VERIFIED:", len(expected))
+          print("VERIFIED PARTS:", len(expected))
           print("TOTAL BYTES:", sum(
-              (root / x).stat().st_size
-              for x in expected
+              (root / name).stat().st_size
+              for name in expected
           ))
           PY
 
-      - name: Extract original client
+      - name: Extract original game client
         shell: bash
         run: |
           set -euo pipefail
@@ -112,86 +120,86 @@ jobs:
 
           rm -rf downloads
 
-          echo "EXTRACTED CLIENT FILES:"
+          echo "EXTRACTED FILE COUNT:"
           find client -type f | wc -l
 
           df -h .
 
-      - name: Inspect raw animation metadata formats
+      - name: Trace XML decoder and animation loader
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import bz2
           import csv
           import hashlib
           import json
-          import lzma
           import math
           import os
           import re
           import struct
-          import xml.etree.ElementTree as ET
-          import zlib
 
-          from collections import Counter, defaultdict
+          from collections import Counter
           from pathlib import Path
 
           ROOT = Path.cwd()
           CLIENT = ROOT / "client"
+          V4 = ROOT / "previous/v4/raw"
           REPORT = ROOT / "reports"
-          RAW = REPORT / "raw"
-          DECODED = REPORT / "decoded"
 
-          RAW.mkdir(parents=True, exist_ok=True)
-          DECODED.mkdir(parents=True, exist_ok=True)
+          REPORT.mkdir(exist_ok=True)
 
-          MAX_INPUT = 4 * 1024 * 1024
-          MAX_OUTPUT = 8 * 1024 * 1024
-          MAX_SAVED_RAW = 32 * 1024 * 1024
+          MAX_BINARY = 150 * 1024 * 1024
+          MAX_FILE_HITS = 700
+          MAX_TOTAL_HITS = 30000
 
-          IMPORTANT = {
-              "actions.xml",
-              "qmotioninfo.xml",
-              "list.spr",
-              "wlist.spr"
+          IMPORTANT_FILES = (
+              "Actions.xml",
+              "QMotionInfo.xml"
+          )
+
+          EXEC_EXTENSIONS = {
+              ".exe", ".dll", ".ocx",
+              ".pyd", ".so", ".sys"
           }
 
-          CONFIG_EXT = {
-              ".xml", ".txt", ".ini", ".cfg",
-              ".json", ".csv", ".tbl", ".lst",
-              ".dat", ".bin", ".def", ".str",
-              ".lua"
+          SCRIPT_EXTENSIONS = {
+              ".py", ".js", ".lua",
+              ".cs", ".rb", ".ini"
           }
 
-          NAME_HINT = re.compile(
-              r"action|motion|anim|sprite|"
-              r"monster|npc|actor|character|"
-              r"graphic|shape|polyid|object",
+          REFERENCE_PATTERN = re.compile(
+              r"X\?xm|"
+              r"QMotionInfo|Actions\.xml|"
+              r"Tile\.pak|Sprite[^ ]*\.pak|"
+              r"sprite|animation|animate|"
+              r"motion|action|"
+              r"decrypt|encrypt|"
+              r"decode|decryptor|"
+              r"CryptDecrypt|CryptEncrypt|"
+              r"BCryptDecrypt|BCryptEncrypt|"
+              r"CryptAcquireContext|"
+              r"RtlDecompressBuffer|"
+              r"RC4|AES|Rijndael|"
+              r"inflate|deflate|"
+              r"zlib|LZ4|LZMA|"
+              r"QMotion",
               re.I
           )
 
-          SPRITE_FIELD = re.compile(
-              r"sprite|sprid|sprno|"
-              r"graphic|gfx|shape|polyid",
-              re.I
+          ASCII_PATTERN = re.compile(
+              rb"[\x20-\x7e]{5,220}"
           )
 
-          ACTION_FIELD = re.compile(
-              r"action|motion|anim|frame|direction",
-              re.I
+          WIDE_PATTERN = re.compile(
+              rb"(?:[\x20-\x7e]\x00){5,220}"
           )
 
-          def load_csv(path):
-              with path.open(
-                  "r", encoding="utf-8-sig", newline=""
-              ) as f:
-                  return list(csv.DictReader(f))
-
-          def save_csv(name, rows, fields):
+          def csv_write(name, rows, fields):
               with (REPORT / name).open(
-                  "w", encoding="utf-8-sig", newline=""
+                  "w",
+                  encoding="utf-8-sig",
+                  newline=""
               ) as f:
                   writer = csv.DictWriter(
                       f,
@@ -201,57 +209,14 @@ jobs:
                   writer.writeheader()
                   writer.writerows(rows)
 
-          v1 = list(
-              (ROOT / "previous/v1").rglob(
-                  "02_pak_records.csv"
-              )
-          )
-          v2 = list(
-              (ROOT / "previous/v2").rglob(
-                  "sprite_id_groups.csv"
-              )
-          )
-
-          if len(v1) != 1 or len(v2) != 1:
-              raise SystemExit(
-                  "Previous inventory files missing"
-              )
-
-          records = load_csv(v1[0])
-          groups = load_csv(v2[0])
-
-          sprite_groups = {
-              int(row["sprite_id"]): int(row["files"])
-              for row in groups
-          }
-
-          # -------------------------------------------
-          # File format and binary signature functions
-          # -------------------------------------------
-
-          def signature(data):
-              if data.startswith(b"PK\x03\x04"):
-                  return "ZIP"
-              if data.startswith(b"\x1f\x8b"):
-                  return "GZIP"
-              if data.startswith(b"BZh"):
-                  return "BZIP2"
-              if data.startswith(b"\xfd7zXZ\x00"):
-                  return "XZ"
-              if data.startswith(b"7z\xbc\xaf\x27\x1c"):
-                  return "7ZIP"
-              if data.startswith(b"<?xml"):
-                  return "XML_UTF8"
-              if data.startswith(b"\xff\xfe"):
-                  return "UTF16_LE_BOM"
-              if data.startswith(b"\xfe\xff"):
-                  return "UTF16_BE_BOM"
-              if data.startswith(b"\xef\xbb\xbf"):
-                  return "UTF8_BOM"
-              return "UNKNOWN"
+          def sha256(data):
+              return hashlib.sha256(
+                  data
+              ).hexdigest()
 
           def entropy(data):
               sample = data[:65536]
+
               if not sample:
                   return 0.0
 
@@ -259,623 +224,385 @@ jobs:
               total = len(sample)
 
               return -sum(
-                  (n / total) * math.log2(n / total)
+                  (n / total)
+                  * math.log2(n / total)
                   for n in counts.values()
               )
 
-          def ascii_strings(data):
-              matches = re.findall(
-                  rb"[\x20-\x7e]{6,}",
-                  data[:262144]
+          # --------------------------------------------
+          # Part 1: Verify known encoded XML originals
+          # --------------------------------------------
+
+          raw_results = {}
+          xml_rows = []
+
+          for filename in IMPORTANT_FILES:
+              paths = sorted(
+                  V4.glob("*_" + filename)
               )
 
-              result = []
-
-              for value in matches[:30]:
-                  result.append(
-                      value[:100].decode(
-                          "ascii", errors="replace"
-                      )
+              if len(paths) != 1:
+                  raise SystemExit(
+                      f"Expected one original: {filename}. "
+                      f"Found {len(paths)}"
                   )
 
-              return result
+              path = paths[0]
+              data = path.read_bytes()
 
-          def decode_text(data):
-              for encoding in (
-                  "utf-8-sig",
-                  "utf-16",
-                  "utf-16-le",
-                  "utf-16-be",
-                  "cp949",
-                  "big5"
-              ):
-                  try:
-                      text = data.decode(encoding)
-                  except UnicodeError:
-                      continue
+              raw_results[filename] = data
 
-                  sample = text[:4000]
-
-                  if not sample:
-                      continue
-
-                  printable = sum(
-                      ch.isprintable()
-                      or ch in "\r\n\t"
-                      for ch in sample
-                  ) / len(sample)
-
-                  if printable < 0.94:
-                      continue
-
-                  # Require some textual structure to
-                  # reduce binary false positives.
-                  markers = sum(
-                      text.count(ch)
-                      for ch in ("<", ">", "=", "\n", "{", "}")
+              xml_rows.append({
+                  "file": filename,
+                  "bytes": len(data),
+                  "first_4_hex": data[:4].hex(" "),
+                  "first_4_ascii": data[:4].decode(
+                      "ascii", errors="replace"
+                  ),
+                  "first_64_hex": data[:64].hex(" "),
+                  "sha256": sha256(data),
+                  "entropy": round(entropy(data), 5),
+                  "starts_X_question_xm": (
+                      data.startswith(b"X?xm")
+                  ),
+                  "starts_standard_xml": (
+                      data.startswith(b"<?xm")
+                  ),
+                  "payload_mod_16": (
+                      (len(data) - 4) % 16
                   )
-
-                  if markers < 2:
-                      continue
-
-                  return text, encoding
-
-              return None, None
-
-          def safe_zlib(payload, wbits):
-              try:
-                  obj = zlib.decompressobj(wbits)
-                  output = obj.decompress(
-                      payload, MAX_OUTPUT + 1
-                  )
-
-                  if not obj.eof:
-                      return None
-
-                  if not 0 < len(output) <= MAX_OUTPUT:
-                      return None
-
-                  return output
-              except (zlib.error, ValueError):
-                  return None
-
-          def zlib_header(b):
-              if len(b) < 2:
-                  return False
-
-              cmf, flg = b[:2]
-
-              return (
-                  (cmf & 15) == 8
-                  and (cmf >> 4) <= 7
-                  and ((cmf << 8) + flg) % 31 == 0
-              )
-
-          def try_unpack(data, important):
-              variants = [("raw", data)]
-              seen = {hashlib.sha256(data).digest()}
-
-              def add(label, candidate):
-                  if candidate is None:
-                      return
-
-                  if not 0 < len(candidate) <= MAX_OUTPUT:
-                      return
-
-                  digest = hashlib.sha256(
-                      candidate
-                  ).digest()
-
-                  if digest not in seen:
-                      seen.add(digest)
-                      variants.append(
-                          (label, candidate)
-                      )
-
-              # Recognize headers even if the archive
-              # prepends a short custom binary header.
-              offsets = range(
-                  0, min(64, max(0, len(data) - 2))
-              )
-
-              for offset in offsets:
-                  chunk = data[offset:]
-
-                  if chunk.startswith(b"\x1f\x8b"):
-                      add(
-                          f"gzip_offset_{offset}",
-                          safe_zlib(chunk, 31)
-                      )
-
-                  if zlib_header(chunk[:2]):
-                      add(
-                          f"zlib_offset_{offset}",
-                          safe_zlib(chunk, 15)
-                      )
-
-                  if chunk.startswith(b"BZh"):
-                      try:
-                          obj = bz2.BZ2Decompressor()
-                          decoded = obj.decompress(
-                              chunk, max_length=MAX_OUTPUT + 1
-                          )
-
-                          if obj.eof:
-                              add(
-                                  f"bzip2_offset_{offset}",
-                                  decoded
-                              )
-                      except (OSError, EOFError):
-                          pass
-
-                  if chunk.startswith(b"\xfd7zXZ\x00"):
-                      try:
-                          obj = lzma.LZMADecompressor()
-                          decoded = obj.decompress(
-                              chunk, max_length=MAX_OUTPUT + 1
-                          )
-
-                          if obj.eof:
-                              add(
-                                  f"xz_offset_{offset}",
-                                  decoded
-                              )
-                      except (lzma.LZMAError, EOFError):
-                          pass
-
-              # Some game resources use a small custom
-              # header in front of a raw DEFLATE stream.
-              if important:
-                  for offset in (0, 2, 4, 8, 12, 16):
-                      if offset >= len(data):
-                          continue
-
-                      candidate = safe_zlib(
-                          data[offset:], -15
-                      )
-
-                      if candidate is None:
-                          continue
-
-                      text, _ = decode_text(candidate)
-
-                      if text is not None:
-                          add(
-                              f"deflate_offset_{offset}",
-                              candidate
-                          )
-
-              # Test a constant XOR key only when
-              # the result resembles actual XML.
-              if important:
-                  for offset in (0, 4, 8, 12, 16):
-                      if offset >= len(data):
-                          continue
-
-                      key = data[offset] ^ ord("<")
-                      candidate = bytes(
-                          byte ^ key
-                          for byte in data[offset:]
-                      )
-
-                      if not candidate.startswith(b"<?xml"):
-                          continue
-
-                      text, _ = decode_text(candidate)
-
-                      if text is not None:
-                          add(
-                              f"xor_{key:02x}_offset_{offset}",
-                              candidate
-                          )
-
-              return variants
-
-          # -------------------------------------------
-          # Enumerate indexed and directly stored files
-          # -------------------------------------------
-
-          candidates = []
-
-          for row in records:
-              if row["valid"].lower() != "true":
-                  continue
-
-              name = row["file"].replace("\\", "/")
-              basename = name.split("/")[-1]
-              ext = Path(basename).suffix.lower()
-
-              if (
-                  ext not in CONFIG_EXT
-                  and basename.lower() not in IMPORTANT
-                  and not NAME_HINT.search(basename)
-              ):
-                  continue
-
-              if ext in (".spr", ".spx", ".sp2"):
-                  if basename.lower() not in IMPORTANT:
-                      continue
-
-              if int(row["bytes"]) > MAX_INPUT:
-                  continue
-
-              old = Path(row["pak"])
-
-              if not old.parts or old.parts[0] != "outer":
-                  continue
-
-              pak = CLIENT.joinpath(*old.parts[1:])
-
-              if not pak.is_file():
-                  continue
-
-              candidates.append({
-                  "source": row["pak"] + ":" + name,
-                  "path": pak,
-                  "name": basename,
-                  "offset": int(row["offset"]),
-                  "size": int(row["bytes"])
               })
 
-          for p in CLIENT.rglob("*"):
-              if not p.is_file() or p.is_symlink():
-                  continue
-
-              if p.stat().st_size > MAX_INPUT:
-                  continue
-
-              if (
-                  p.suffix.lower() not in CONFIG_EXT
-                  and p.name.lower() not in IMPORTANT
-              ):
-                  continue
-
-              candidates.append({
-                  "source": str(p.relative_to(ROOT)),
-                  "path": p,
-                  "name": p.name,
-                  "offset": 0,
-                  "size": p.stat().st_size
-              })
-
-          candidates.sort(
-              key=lambda x: (
-                  x["name"].lower() not in IMPORTANT,
-                  x["name"].lower(),
-                  x["source"]
-              )
+          csv_write(
+              "01_encoded_xml_fingerprints.csv",
+              xml_rows,
+              [
+                  "file", "bytes",
+                  "first_4_hex", "first_4_ascii",
+                  "first_64_hex", "sha256",
+                  "entropy",
+                  "starts_X_question_xm",
+                  "starts_standard_xml",
+                  "payload_mod_16"
+              ]
           )
 
-          # -------------------------------------------
-          # Analyze candidates and preserve evidence
-          # -------------------------------------------
+          a = raw_results["Actions.xml"]
+          b = raw_results["QMotionInfo.xml"]
 
-          binary_results = []
-          decode_results = []
-          xml_references = []
-          errors = []
+          common_prefix = 0
 
-          saved_raw_bytes = 0
-          unique_raw = set()
-          readable_sources = 0
-          parsed_xml = 0
+          for left, right in zip(a, b):
+              if left != right:
+                  break
 
-          for i, item in enumerate(candidates):
-              try:
-                  with item["path"].open("rb") as f:
-                      f.seek(item["offset"])
-                      raw = f.read(item["size"])
+              common_prefix += 1
 
-                  if len(raw) != item["size"]:
-                      raise IOError("Incomplete indexed read")
+          # --------------------------------------------
+          # Part 2: Find actual client loaders and DLLs
+          # --------------------------------------------
 
-                  digest = hashlib.sha256(
-                      raw
-                  ).hexdigest()
-
-                  important = (
-                      item["name"].lower() in IMPORTANT
-                      or bool(NAME_HINT.search(item["name"]))
-                  )
-
-                  raw_export = ""
-
+          binaries = sorted(
+              [
+                  p for p in CLIENT.rglob("*")
                   if (
-                      digest not in unique_raw
-                      and saved_raw_bytes + len(raw)
-                      <= MAX_SAVED_RAW
-                      and (
-                          important
-                          or item["name"].lower().endswith(".xml")
-                      )
-                  ):
-                      safe = re.sub(
-                          r"[^A-Za-z0-9_.-]",
-                          "_",
-                          item["name"]
-                      )[:100]
+                      p.is_file()
+                      and not p.is_symlink()
+                      and p.suffix.lower()
+                      in EXEC_EXTENSIONS
+                  )
+              ],
+              key=lambda p: str(p).lower()
+          )
 
-                      target = RAW / (
-                          f"{i:06d}_{safe}"
-                      )
+          scripts = sorted(
+              [
+                  p for p in CLIENT.rglob("*")
+                  if (
+                      p.is_file()
+                      and not p.is_symlink()
+                      and p.suffix.lower()
+                      in SCRIPT_EXTENSIONS
+                  )
+              ],
+              key=lambda p: str(p).lower()
+          )
 
-                      target.write_bytes(raw)
+          scan_files = binaries + scripts
 
-                      raw_export = str(
-                          target.relative_to(REPORT)
-                      )
+          binary_inventory = []
+          string_hits = []
+          magic_hits = []
 
-                      unique_raw.add(digest)
-                      saved_raw_bytes += len(raw)
+          total_scanned = 0
+          skipped_large = 0
 
-                  binary_results.append({
-                      "source": item["source"],
-                      "name": item["name"],
-                      "bytes": len(raw),
-                      "format": signature(raw),
-                      "sha256": digest,
-                      "first_64_hex": raw[:64].hex(" "),
-                      "entropy": round(entropy(raw), 4),
-                      "ascii_strings": json.dumps(
-                          ascii_strings(raw)[:15],
-                          ensure_ascii=False
-                      ),
-                      "raw_export": raw_export
+          def pe_machine(data):
+              if len(data) < 64:
+                  return ""
+
+              if data[:2] != b"MZ":
+                  return ""
+
+              offset = struct.unpack_from(
+                  "<I", data, 0x3C
+              )[0]
+
+              if offset + 6 > len(data):
+                  return "INVALID_PE_HEADER"
+
+              if data[offset:offset + 4] != b"PE\x00\x00":
+                  return "MZ_WITHOUT_PE"
+
+              machine = struct.unpack_from(
+                  "<H", data, offset + 4
+              )[0]
+
+              return {
+                  0x014c: "x86",
+                  0x8664: "x64",
+                  0x01c0: "ARM",
+                  0xaa64: "ARM64"
+              }.get(machine, f"UNKNOWN_{machine:04X}")
+
+          for path in scan_files:
+              relative = str(
+                  path.relative_to(CLIENT)
+              ).replace("\\", "/")
+
+              size = path.stat().st_size
+
+              if size == 0 or size > MAX_BINARY:
+                  skipped_large += 1
+
+                  binary_inventory.append({
+                      "file": relative,
+                      "bytes": size,
+                      "status": "SKIPPED_SIZE",
+                      "pe_architecture": "",
+                      "sha256": "",
+                      "reference_hits": 0,
+                      "magic_hits": 0
                   })
 
-                  variants = try_unpack(raw, important)
+                  continue
 
-                  for method, content in variants:
-                      text, encoding = decode_text(content)
+              data = path.read_bytes()
+              total_scanned += 1
 
-                      if text is None:
+              local_hits = 0
+
+              # Search exact encoded XML signature in code.
+              position = 0
+              local_magic = 0
+
+              while True:
+                  position = data.find(
+                      b"X?xm", position
+                  )
+
+                  if position < 0:
+                      break
+
+                  local_magic += 1
+
+                  magic_hits.append({
+                      "file": relative,
+                      "offset": position,
+                      "signature": "X?xm"
+                  })
+
+                  position += 4
+
+              # Search plain ASCII and UTF-16LE strings.
+              for encoding, pattern in (
+                  ("ascii", ASCII_PATTERN),
+                  ("utf16le", WIDE_PATTERN)
+              ):
+                  for match in pattern.finditer(data):
+                      if (
+                          local_hits >= MAX_FILE_HITS
+                          or len(string_hits)
+                          >= MAX_TOTAL_HITS
+                      ):
+                          break
+
+                      raw = match.group()
+
+                      if encoding == "utf16le":
+                          decoded = raw[::2].decode(
+                              "ascii", errors="replace"
+                          )
+                      else:
+                          decoded = raw.decode(
+                              "ascii", errors="replace"
+                          )
+
+                      found = REFERENCE_PATTERN.search(
+                          decoded
+                      )
+
+                      if not found:
                           continue
 
-                      readable_sources += 1
-
-                      safe = re.sub(
-                          r"[^A-Za-z0-9_.-]",
-                          "_",
-                          item["name"]
-                      )[:80]
-
-                      output = DECODED / (
-                          f"{i:06d}_{method}_{safe}.txt"
-                      )
-
-                      output.write_text(
-                          text,
-                          encoding="utf-8"
-                      )
-
-                      xml_status = "NOT_XML"
-                      root = None
-
-                      if text.lstrip().startswith("<"):
-                          try:
-                              root = ET.fromstring(
-                                  text.lstrip("\ufeff")
-                              )
-                              parsed_xml += 1
-                              xml_status = "PARSED"
-                          except ET.ParseError:
-                              xml_status = "INVALID_XML"
-
-                      decode_results.append({
-                          "source": item["source"],
-                          "method": method,
+                      string_hits.append({
+                          "file": relative,
+                          "offset": match.start(),
                           "encoding": encoding,
-                          "decoded_bytes": len(content),
-                          "xml_status": xml_status,
-                          "output": str(
-                              output.relative_to(REPORT)
-                          )
+                          "matched_keyword": found.group(),
+                          "string": decoded[:220]
                       })
 
-                      if root is None:
-                          continue
+                      local_hits += 1
 
-                      for element in root.iter():
-                          if not isinstance(
-                              element.tag, str
-                          ):
-                              continue
-
-                          tag = element.tag.split("}")[-1]
-
-                          attrs = {
-                              k.split("}")[-1]: v
-                              for k, v
-                              in element.attrib.items()
-                          }
-
-                          action_fields = {
-                              k: v
-                              for k, v in attrs.items()
-                              if ACTION_FIELD.search(k)
-                          }
-
-                          pairs = list(attrs.items())
-
-                          if element.text:
-                              pairs.append(
-                                  (tag, element.text.strip())
-                              )
-
-                          for key, value in pairs:
-                              if not SPRITE_FIELD.search(key):
-                                  continue
-
-                              if not re.fullmatch(
-                                  r"\d{1,8}", value
-                              ):
-                                  continue
-
-                              sprite_id = int(value)
-
-                              xml_references.append({
-                                  "source": item["source"],
-                                  "method": method,
-                                  "xml_tag": tag,
-                                  "field": key,
-                                  "sprite_id": sprite_id,
-                                  "in_v2": (
-                                      sprite_id in sprite_groups
-                                  ),
-                                  "v2_sprite_files": (
-                                      sprite_groups.get(sprite_id, 0)
-                                  ),
-                                  "action_fields": json.dumps(
-                                      action_fields,
-                                      ensure_ascii=False
-                                  ),
-                                  "attributes": json.dumps(
-                                      attrs,
-                                      ensure_ascii=False
-                                  )[:2000],
-                                  "status": (
-                                      "EXPLICIT_REFERENCE_"
-                                      "TYPE_UNVERIFIED"
-                                  )
-                              })
-
-              except Exception as ex:
-                  errors.append({
-                      "source": item["source"],
-                      "error": str(ex)
-                  })
-
-          # -------------------------------------------
-          # Export all verification tables
-          # -------------------------------------------
-
-          save_csv(
-              "01_binary_headers.csv",
-              binary_results,
-              [
-                  "source", "name", "bytes",
-                  "format", "sha256",
-                  "first_64_hex", "entropy",
-                  "ascii_strings", "raw_export"
-              ]
-          )
-
-          save_csv(
-              "02_decoded_metadata.csv",
-              decode_results,
-              [
-                  "source", "method", "encoding",
-                  "decoded_bytes", "xml_status",
-                  "output"
-              ]
-          )
-
-          save_csv(
-              "03_explicit_sprite_links.csv",
-              xml_references,
-              [
-                  "source", "method", "xml_tag",
-                  "field", "sprite_id", "in_v2",
-                  "v2_sprite_files", "action_fields",
-                  "attributes", "status"
-              ]
-          )
-
-          verified_id_candidates = [
-              row for row in xml_references
-              if row["in_v2"]
-          ]
-
-          save_csv(
-              "04_links_matching_v2_ids.csv",
-              verified_id_candidates,
-              [
-                  "source", "method", "xml_tag",
-                  "field", "sprite_id", "in_v2",
-                  "v2_sprite_files", "action_fields",
-                  "attributes", "status"
-              ]
-          )
-
-          save_csv(
-              "05_read_errors.csv",
-              errors,
-              ["source", "error"]
-          )
-
-          important_results = [
-              row for row in binary_results
-              if row["name"].lower() in IMPORTANT
-          ]
-
-          save_csv(
-              "06_known_animation_files.csv",
-              important_results,
-              [
-                  "source", "name", "bytes",
-                  "format", "sha256",
-                  "first_64_hex", "entropy",
-                  "ascii_strings", "raw_export"
-              ]
-          )
-
-          # Same-name files may be present both directly
-          # and inside PAK. Compare actual SHA256 values.
-
-          by_name = defaultdict(set)
-
-          for row in binary_results:
-              by_name[row["name"].lower()].add(
-                  row["sha256"]
-              )
-
-          duplicate_checks = []
-
-          for name in sorted(IMPORTANT):
-              hashes = by_name.get(name, set())
-
-              duplicate_checks.append({
-                  "file": name,
-                  "unique_hashes": len(hashes),
-                  "identical_when_duplicated": (
-                      len(hashes) == 1
-                  )
+              binary_inventory.append({
+                  "file": relative,
+                  "bytes": size,
+                  "status": "SCANNED",
+                  "pe_architecture": pe_machine(data),
+                  "sha256": sha256(data),
+                  "reference_hits": local_hits,
+                  "magic_hits": local_magic
               })
 
-          save_csv(
-              "07_original_vs_pak_checks.csv",
-              duplicate_checks,
+              del data
+
+          csv_write(
+              "02_client_loader_inventory.csv",
+              binary_inventory,
               [
-                  "file", "unique_hashes",
-                  "identical_when_duplicated"
+                  "file", "bytes", "status",
+                  "pe_architecture", "sha256",
+                  "reference_hits", "magic_hits"
               ]
           )
 
+          csv_write(
+              "03_loader_string_references.csv",
+              string_hits,
+              [
+                  "file", "offset", "encoding",
+                  "matched_keyword", "string"
+              ]
+          )
+
+          csv_write(
+              "04_encoded_xml_magic_references.csv",
+              magic_hits,
+              [
+                  "file", "offset", "signature"
+              ]
+          )
+
+          # --------------------------------------------
+          # Part 3: Prioritize real evidence
+          # --------------------------------------------
+
+          STRONG_MARKERS = re.compile(
+              r"X\?xm|QMotionInfo|Actions\.xml|"
+              r"CryptDecrypt|BCryptDecrypt|"
+              r"CryptEncrypt|BCryptEncrypt|"
+              r"RtlDecompressBuffer",
+              re.I
+          )
+
+          strong_hits = [
+              row for row in string_hits
+              if STRONG_MARKERS.search(
+                  row["string"]
+              )
+          ]
+
+          csv_write(
+              "05_high_priority_loader_evidence.csv",
+              strong_hits,
+              [
+                  "file", "offset", "encoding",
+                  "matched_keyword", "string"
+              ]
+          )
+
+          file_hit_counts = Counter(
+              row["file"] for row in string_hits
+          )
+
+          ranked_files = sorted(
+              binary_inventory,
+              key=lambda row: (
+                  -sum(
+                      x["file"] == row["file"]
+                      for x in strong_hits
+                  ),
+                  -row["reference_hits"],
+                  row["file"]
+              )
+          )
+
+          csv_write(
+              "06_priority_binary_targets.csv",
+              [
+                  {
+                      "file": row["file"],
+                      "reference_hits": (
+                          file_hit_counts[row["file"]]
+                      ),
+                      "strong_hits": sum(
+                          x["file"] == row["file"]
+                          for x in strong_hits
+                      ),
+                      "magic_hits": row["magic_hits"],
+                      "bytes": row["bytes"],
+                      "pe_architecture": (
+                          row["pe_architecture"]
+                      )
+                  }
+                  for row in ranked_files
+              ],
+              [
+                  "file", "reference_hits",
+                  "strong_hits", "magic_hits",
+                  "bytes", "pe_architecture"
+              ]
+          )
+
+          # --------------------------------------------
+          # Part 4: Final results and next investigation
+          # --------------------------------------------
+
           summary = {
-              "phase": "BINARY_FORMAT_INVESTIGATION",
-              "v1_indexed_records": len(records),
-              "v2_sprite_id_groups": len(sprite_groups),
-              "metadata_candidates": len(candidates),
-              "inspected_files": len(binary_results),
-              "readable_variants": readable_sources,
-              "parsed_xml_variants": parsed_xml,
-              "explicit_sprite_references": len(
-                  xml_references
+              "phase": "STATIC_ANIMATION_LOADER_ANALYSIS",
+              "v4_run_id": 38828891785,
+              "original_xml_files_verified": len(
+                  raw_results
               ),
-              "references_matching_v2": len(
-                  verified_id_candidates
+              "shared_xml_prefix_bytes": common_prefix,
+              "both_have_X_question_xm": all(
+                  row["starts_X_question_xm"]
+                  for row in xml_rows
               ),
-              "unique_referenced_sprite_ids": len({
-                  row["sprite_id"]
-                  for row in verified_id_candidates
+              "client_executables_and_libraries": len(
+                  binaries
+              ),
+              "script_candidates": len(scripts),
+              "files_scanned": total_scanned,
+              "files_skipped_due_to_size": skipped_large,
+              "total_reference_hits": len(string_hits),
+              "high_priority_string_hits": len(
+                  strong_hits
+              ),
+              "encoded_header_occurrences": len(
+                  magic_hits
+              ),
+              "candidate_loader_files": len({
+                  row["file"]
+                  for row in strong_hits
               }),
-              "saved_raw_metadata_bytes": saved_raw_bytes,
-              "read_errors": len(errors),
+              "decoder_algorithm_verified": False,
               "monster_identity_verified": False,
-              "animation_frame_order_verified": False
+              "animation_sequences_verified": False
           }
 
-          (REPORT / "08_summary_v4.json").write_text(
+          (REPORT / "07_summary_v5.json").write_text(
               json.dumps(
                   summary,
                   ensure_ascii=False,
@@ -884,74 +611,93 @@ jobs:
               encoding="utf-8"
           )
 
-          lines = [
-              "# Sanctuary of Aden V4 Binary Analysis",
+          report_lines = [
+              "# Sanctuary of Aden V5 Loader Analysis",
               "",
-              f"Metadata candidates: {len(candidates)}",
-              f"Inspected files: {len(binary_results)}",
-              f"Readable variants: {readable_sources}",
-              f"Parsed XML variants: {parsed_xml}",
-              f"Explicit sprite references: {len(xml_references)}",
-              f"References matching V2: {len(verified_id_candidates)}",
-              f"Read errors: {len(errors)}",
+              "## Binary XML evidence",
               "",
-              "## Verification status",
+              f"Shared header bytes: {common_prefix}",
+              f"EXE/DLL candidates: {len(binaries)}",
+              f"Scripts: {len(scripts)}",
+              f"Scanned files: {total_scanned}",
+              f"Matching strings: {len(string_hits)}",
+              f"Strong references: {len(strong_hits)}",
+              f"Encoded header occurrences: {len(magic_hits)}",
               "",
-              "Raw binary files were preserved.",
-              "Compression and simple encoding were probed.",
-              "Sprite references require manual interpretation.",
-              "Monster identity is not yet verified.",
-              "Animation frame order is not yet verified."
+              "## Interpretation",
+              "",
+              "X?xm is an observed signature,",
+              "not yet a confirmed encryption algorithm.",
+              "",
+              "Static strings are investigative evidence.",
+              "They do not prove that a function is called.",
+              "",
+              "No client executable was run.",
+              "No unknown decryption key was assumed.",
+              "Monster identity remains unverified.",
+              "Animation frame order remains unverified.",
+              "",
+              "## Next step",
+              "",
+              "Examine strong references and related PE code.",
+              "Verify the file loader and decoding algorithm.",
+              "Only then parse actual actor and motion data."
           ]
 
           (REPORT / "REPORT.md").write_text(
-              "\n".join(lines),
+              "\n".join(report_lines),
               encoding="utf-8"
           )
 
-          print("=== V4 SUMMARY ===")
+          print("=== V5 SUMMARY ===")
           print(json.dumps(
               summary,
               ensure_ascii=False,
               indent=2
           ))
 
-          print("=== IMPORTANT BINARY HEADERS ===")
-
-          for row in important_results:
+          print("=== ENCODED XML HEADERS ===")
+          for row in xml_rows:
               print(json.dumps(
-                  row,
-                  ensure_ascii=False
+                  row, ensure_ascii=False
               ))
 
-          print("=== EXPLICIT MATCHES ===")
-
-          for row in verified_id_candidates[:30]:
+          print("=== HIGH PRIORITY REFERENCES ===")
+          for row in strong_hits[:100]:
               print(json.dumps(
-                  row,
-                  ensure_ascii=False
+                  row, ensure_ascii=False
+              ))
+
+          print("=== FIRST 40 CANDIDATE FILES ===")
+          for row in ranked_files[:40]:
+              print(json.dumps(
+                  row, ensure_ascii=False
               ))
 
           if "GITHUB_STEP_SUMMARY" in os.environ:
               with open(
                   os.environ["GITHUB_STEP_SUMMARY"],
-                  "a",
-                  encoding="utf-8"
+                  "a", encoding="utf-8"
               ) as f:
-                  f.write("\n".join(lines))
+                  f.write("\n".join(report_lines))
 
-          if not binary_results:
+          if len(raw_results) != 2:
               raise SystemExit(
-                  "No metadata files were inspected"
+                  "Missing required original XML samples"
+              )
+
+          if total_scanned == 0:
+              raise SystemExit(
+                  "No client executable or script inspected"
               )
 
           PY
 
-      - name: Upload binary format analysis and originals
+      - name: Upload V5 loader analysis
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V4-Binary-Animation-Analysis
+          name: Sanctuary-V5-Animation-Loader-Evidence
           path: reports/
           if-no-files-found: error
           retention-days: 30
