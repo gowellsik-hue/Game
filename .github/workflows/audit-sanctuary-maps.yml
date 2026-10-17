@@ -1,5 +1,5 @@
 
-name: V3.4 | TI Dungeon Preview Recovery and Floor TIL Audit
+name: V3.5 | TI Dungeon 577-byte Floor Tile Fix
 on:
   workflow_dispatch:
   push:
@@ -9,116 +9,77 @@ permissions:
   contents: read
   actions: read
 jobs:
-  audit:
+  render:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - name: V3.4 Restore rendered maps
+      - name: Restore V2 maps and V3.2 comparison images
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p reports source
-          gh run download 39050553149 --repo "$GITHUB_REPOSITORY" --name Sanctuary-TI-Dungeon-V3.3-Diagnostics --dir reports
-          test -s reports/preview/index.html
-          test -s reports/summary.json
+          mkdir -p previous/v2 previous/v3-2 source reports
+          gh run download 39045175890 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 -D previous/v2
+          gh run download 39049871058 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V3.2-Verified-Partial-Terrain -D previous/v3-2
+          test -s previous/v2/extracted/map/1/7ffe8000.s32
+          test -s previous/v3-2/summary.json
 
-      - name: V3.4 Retrieve original tile sources
+      - name: Download original tiles and pinned V3.3 renderer
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           for part in zip z32 z33 z34 z35; do
-            gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern "Sanctuary.of.Aden.-.Copy.$part" --dir source --clobber
+            gh release download v1.0.0 -R "$GITHUB_REPOSITORY" -p "Sanctuary.of.Aden.-.Copy.$part" -D source --clobber
           done
-          gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/audit-sanctuary-maps.yml?ref=f31b3ebb3197820186cb5db752bed62ba8c9c131" --jq .content | base64 -d > /tmp/v3-3.yml
-          python3 -m venv /tmp/ti-v3-4
-          /tmp/ti-v3-4/bin/pip -q install Pillow==11.3.0
+          gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/audit-sanctuary-maps.yml?ref=f31b3ebb3197820186cb5db752bed62ba8c9c131" --jq .content | base64 -d > /tmp/v3.3.yml
+          python3 -m venv /tmp/ti-v3-5
+          /tmp/ti-v3-5/bin/pip -q install Pillow==11.3.0
 
-      - name: V3.4 Validate maps and inspect missing floor frames
+      - name: V3.5 Fix 577-byte diamond and render both dungeon floors
         run: |
           set -euo pipefail
-          /tmp/ti-v3-4/bin/python - <<'PY'
-          import bisect, collections, json, re, runpy, textwrap
+          python3 - <<'PY'
+          import re, textwrap
           from pathlib import Path
-          from PIL import Image
-
-          root=Path('reports')
-          preview=root/'preview'
-          source=Path('/tmp/v3-3.yml').read_text()
-          m=re.search(r"(?ms)^ *cat > /tmp/ti-map-v3-3\.py <<'PY_V33'\n(.*?)^ *PY_V33\s*$",source)
-          if not m: raise RuntimeError('Cannot locate pinned V3.3 decoder')
-          script=Path('/tmp/pinned-v3-3.py')
-          script.write_text(textwrap.dedent(m.group(1)))
-          funcs=runpy.run_path(str(script))
-          entries,last=funcs['directory']()
-          records={}
-          for name in ('Tile.idx','Tile.pak'):
-              key='Sanctuary of Aden - Copy/'+name
-              records[name]=funcs['extract'](key,entries[key],last)
-          idx=funcs['load_index'](records['Tile.idx'],len(records['Tile.pak']))
-          pak=memoryview(records['Tile.pak'])
-          tiles=root/'floor-til-samples'
-          tiles.mkdir(exist_ok=True)
-          audit={}
-
-          for tid in (2503,2504,2505,2506,2510,2511,16):
-              row=idx.get(str(tid)+'.til')
-              if row is None:
-                  audit[str(tid)]={'error':'Missing tile ID'}
-                  continue
-              start,size=row
-              raw=bytes(pak[start:start+size])
-              (tiles/f'{tid}.til').write_bytes(raw)
-              try:
-                  head,offsets,ends=funcs['frame_offsets'](raw)
-              except Exception as exc:
-                  audit[str(tid)]={'error':str(exc),'bytes':size}
-                  continue
-              frames=[]
-              hist=collections.Counter()
-              for i in range(len(offsets)):
-                  a=int(offsets[i])
-                  k=bisect.bisect_right(ends,a)
-                  b=ends[k] if k<len(ends) else len(raw)-head
-                  block=raw[head+a:head+b]
-                  kind=block[0] if block else None
-                  hist[(kind,len(block))]+=1
-                  if i in (0,1,2,58,59,156,157,248,249):
-                      try:
-                          pic=funcs['decode_frame'](block)
-                          status='decoded' if pic else 'empty'
-                      except Exception as exc:
-                          status=type(exc).__name__+': '+str(exc)
-                      frames.append(dict(index=i,kind=kind,length=len(block),hex=block[:24].hex(),result=status))
-              audit[str(tid)]=dict(bytes=size,header=head,frameCount=len(offsets),frequentBlockTypesAndLengths=[list(x)+[n] for x,n in hist.most_common(12)],samples=frames)
-
-          old=json.loads((root/'summary.json').read_text())
-          index=json.loads((preview/'map-index.json').read_text())
-          for floor,n in [('1',12),('2',16)]:
-              assert len(index[floor]['blocks'])==n
-              for block in index[floor]['blocks']:
-                  for prefix in ('','baseline/'):
-                      with Image.open(preview/prefix/block['src']) as im:
-                          im.verify()
-                          assert im.size==(1536,768)
-
-          assert old['counts']['floor']==229376
-          html=(preview/'index.html').read_text().replace('V3.3','V3.4')
-          html=html.replace('</header>','</header><p style="margin:3px 9px;font-size:12px;color:#ffcc82">Floor texture decoding is still incomplete. V3.4 includes original TIL frame diagnostics.</p>',1)
-          (preview/'index.html').write_text(html)
-          report=dict(version='V3.4',sourceRun=39050553149,terrainBlocks=28,floorDrawn=old['counts']['floorDrawn'],objectDrawn=old['counts']['objectDrawn'],floorStatus='UNRESOLVED',tileSamples=audit)
-          (root/'floor-diagnostics-v3.4.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
-          print('V3.4 PREVIEW VERIFIED; FLOOR STILL UNRESOLVED')
-          for tid,entry in audit.items():
-              print('TIL',tid,'types',entry.get('frequentBlockTypesAndLengths',[])[:5],'samples',entry.get('samples',[])[:3],'error',entry.get('error'))
+          source=Path('/tmp/v3.3.yml').read_text()
+          match=re.search(r"(?ms)^ *cat > /tmp/ti-map-v3-3\.py <<'PY_V33'\n(.*?)^ *PY_V33\s*$",source)
+          if not match: raise SystemExit('Pinned renderer not found')
+          code=textwrap.dedent(match.group(1))
+          old='count=2*(y+1 if y<dim//2 else dim-y)'
+          new='count=(2*min(y,dim-1-y)+1 if dim==24 and len(blob)==577 else 2*(y+1 if y<dim//2 else dim-y))'
+          if code.count(old)!=1: raise SystemExit('TIL decoder signature changed')
+          code=code.replace(old,new).replace('V3.3','V3.5').replace('V3_3_DONE','V3_5_DONE')
+          Path('/tmp/render-v3.5.py').write_text(code)
+          PY
+          python3 -m py_compile /tmp/render-v3.5.py
+          /tmp/ti-v3-5/bin/python /tmp/render-v3.5.py
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('reports/summary.json').read_text())
+          n=d['counts']['floorDrawn'];total=d['counts']['floor']
+          print('V3.5 FLOOR RENDERED:',n,'/',total)
+          assert total==229376 and n>=210000, 'Original floor texture restoration incomplete'
+          assert len(list(Path('reports/preview/tiles/1').glob('*.png')))==12
+          assert len(list(Path('reports/preview/tiles/2').glob('*.png')))==16
+          Path('reports/floor-check-v3.5.json').write_text(json.dumps({'version':'V3.5','floorDrawn':n,'floorTotal':total,'floorCoverage':round(n/total,5),'monsterSpawnsVerified':False},indent=2))
           PY
 
-      - name: V3.4 Upload comparison and floor diagnostics
-        if: always()
+      - name: Upload V3.5 original dungeon preview
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3.4-Preview-and-Floor-Diagnostics
+          name: Sanctuary-TI-Dungeon-V3.5-Floor-Restored
           path: reports/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload V3.5 diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sanctuary-TI-Dungeon-V3.5-Failure
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
