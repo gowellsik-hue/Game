@@ -1,14 +1,8 @@
 
-name: Sanctuary of Aden Monster Motion Identification V17
+name: Sanctuary of Aden Original Monster GIF V18
 
 on:
   workflow_dispatch:
-    inputs:
-      sprite_id:
-        description: Monster sprite ID, blank for automatic selection
-        required: false
-        type: string
-        default: ""
   push:
     paths:
       - ".github/workflows/audit-sanctuary-monsters.yml"
@@ -17,1689 +11,218 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: sanctuary-monster-audit
-  cancel-in-progress: false
-
 jobs:
-  identify:
+  gif-extract:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
-
+    timeout-minutes: 30
     steps:
-      - name: Prepare original SPR analysis
-        shell: bash
+      - name: Install Pillow
         run: |
-          set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full python3-pil
-          mkdir -p previous/v2 previous/v12
-          mkdir -p downloads client reports/site/sheets
-          python3 -c "from PIL import Image; print('PIL READY')"
+          sudo apt-get install -y -qq python3-pil
 
-      - name: Restore verified SPR and NPC indexes
-        shell: bash
+      - name: Restore original Orc SPR images from successful V17
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          mkdir -p previous/v17 reports
+          gh run download 39027677273 --repo "$GITHUB_REPOSITORY" --name Sanctuary-V17-Monster-Motion-Identification --dir previous/v17
+          test -s previous/v17/manifest_v17.json
+          test -d previous/v17/site/sheets
 
-          gh run download 38784834277 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V2-Reports \
-            --dir previous/v2
-
-          gh run download 38872552732 \
-            --repo "$GITHUB_REPOSITORY" \
-            --name Sanctuary-V12-External-Action-and-NPC-Crosscheck \
-            --dir previous/v12
-
-          test -n "$(find previous/v2 -name all_sprite_candidates.csv -print -quit)"
-          test -n "$(find previous/v2 -name exported_sprite_manifest.csv -print -quit)"
-          test -s previous/v12/03_external_npc_gfx_candidates.csv
-          test -s previous/v12/04_external_action_crosscheck.csv
-
-      - name: Select actual monster candidate instead of graphics ID zero
-        shell: bash
-        env:
-          REQUESTED_ID: ${{ inputs.sprite_id }}
+      - name: Convert 40 original sprite animations into transparent GIFs and standalone HTML
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import csv
-          import json
-          import os
-          import re
-          from collections import defaultdict
-          from pathlib import Path
-
-          ROOT=Path.cwd()
-          REPORT=ROOT/"reports"
-
-          def load(root,name):
-              paths=list(root.rglob(name))
-              if len(paths)!=1:
-                  raise RuntimeError("Missing or ambiguous "+name)
-              with paths[0].open(
-                  encoding="utf-8-sig",newline=""
-              ) as f:
-                  return list(csv.DictReader(f))
-
-          spr=load(
-              ROOT/"previous/v2",
-              "all_sprite_candidates.csv"
-          )
-          hashes=load(
-              ROOT/"previous/v2",
-              "exported_sprite_manifest.csv"
-          )
-          npcs=load(
-              ROOT/"previous/v12",
-              "03_external_npc_gfx_candidates.csv"
-          )
-          actions=load(
-              ROOT/"previous/v12",
-              "04_external_action_crosscheck.csv"
-          )
-
-          sha={
-              (
-                  row["pak"],
-                  row["sprite_file"].lower(),
-                  int(row["bytes"])
-              ):row["sha256"]
-              for row in hashes
-          }
-
-          npc_by_id=defaultdict(list)
-
-          for row in npcs:
-              try:
-                  gfx=int(row["gfx_id"])
-              except ValueError:
-                  continue
-
-              if gfx<=0:
-                  continue
-
-              if "monster" not in row["implementation"].lower():
-                  continue
-
-              npc_by_id[gfx].append(row)
-
-          actions_by_id=defaultdict(list)
-
-          for row in actions:
-              try:
-                  gfx=int(row["sprite_id"])
-              except ValueError:
-                  continue
-
-              actions_by_id[gfx].append({
-                  "action_id":int(row["action_id"]),
-                  "hint":row["action_hint"],
-                  "sources":row["reference_sources"],
-                  "values":row["reference_values"]
-              })
-
-          filename=re.compile(
-              r"^(\d+)-(\d+)\.spr$",re.I
-          )
-
-          indexed=defaultdict(list)
-          groups=defaultdict(lambda:defaultdict(set))
-
-          for row in spr:
-              name=row["file"].replace(
-                  "\\","/"
-              ).split("/")[-1]
-
-              match=filename.fullmatch(name)
-              if not match:
-                  continue
-
-              actor=int(match.group(1))
-              sub=int(match.group(2))
-              pak=row["pak"]
-
-              if not Path(pak).name.lower().startswith("sprite"):
-                  continue
-
-              size=int(row["bytes"])
-              digest=sha.get(
-                  (pak,name.lower(),size),""
-              )
-
-              if not digest:
-                  continue
-
-              indexed[(actor,pak)].append({
-                  "sprite_id":actor,
-                  "sub":sub,
-                  "file":name,
-                  "pak":pak,
-                  "offset":int(row["offset"]),
-                  "bytes":size,
-                  "sha256":digest
-              })
-
-              groups[(actor,pak)][sub//8*8].add(sub)
-
-          requested=os.environ.get(
-              "REQUESTED_ID",""
-          ).strip()
-
-          if requested and not requested.isdigit():
-              raise RuntimeError(
-                  "sprite_id must contain digits only"
-              )
-
-          requested_id=(
-              int(requested) if requested else None
-          )
-
-          candidates=[]
-
-          for (actor,pak),records in indexed.items():
-              if actor==0:
-                  continue
-
-              if requested_id is not None:
-                  if actor!=requested_id:
-                      continue
-              elif actor not in npc_by_id:
-                  continue
-
-              names={
-                  row["npc_name"].strip()
-                  for row in npc_by_id[actor]
-                  if row["npc_name"].strip()
-              }
-
-              regions={
-                  row["reference"]
-                  for row in npc_by_id[actor]
-              }
-
-              banks=groups[(actor,pak)]
-              complete=sum(
-                  len(subs)==8
-                  for subs in banks.values()
-              )
-
-              if complete<2:
-                  continue
-
-              if requested_id is None and (
-                  not names or len(names)>5
-              ):
-                  continue
-
-              score=(
-                  int(actor==56 and complete>=4),
-                  int(len(names)<=2 and len(names)>0),
-                  int(complete>=4),
-                  len(regions),
-                  min(complete,20),
-                  -len(names),
-                  len(records),
-                  -actor
-              )
-
-              candidates.append((
-                  score,actor,pak,
-                  complete,sorted(names)
-              ))
-
-          if not candidates:
-              raise RuntimeError(
-                  "No monster candidate with usable SPR groups"
-              )
-
-          candidates.sort(reverse=True)
-          _,actor,pak,complete,names=candidates[0]
-
-          banks=groups[(actor,pak)]
-
-          full=sorted(
-              base
-              for base,subs in banks.items()
-              if len(subs)==8
-          )
-
-          partial=sorted(
-              (
-                  base for base,subs in banks.items()
-                  if len(subs)<8
-              ),
-              key=lambda base:(
-                  -len(banks[base]),base
-              )
-          )
-
-          chosen=(full[:16]+partial[:4])
-          wanted={
-              sub
-              for base in chosen
-              for sub in range(base,base+8)
-          }
-
-          by_sub=defaultdict(list)
-
-          for row in indexed[(actor,pak)]:
-              if row["sub"] in wanted:
-                  by_sub[row["sub"]].append(row)
-
-          selected=[]
-          conflicting=[]
-
-          for sub,rows in sorted(by_sub.items()):
-              rows.sort(
-                  key=lambda r:(
-                      r["offset"],r["sha256"]
-                  )
-              )
-
-              selected.append(rows[0])
-
-              if len({
-                  row["sha256"] for row in rows
-              })>1:
-                  conflicting.append(sub)
-
-          source=Path(pak)
-
-          if (
-              not source.parts
-              or source.parts[0]!="outer"
-          ):
-              raise RuntimeError(
-                  "Unexpected original package path"
-              )
-
-          archive_path=source.relative_to(
-              "outer"
-          ).as_posix()
-
-          selection={
-              "version":"V17",
-              "sprite_id":actor,
-              "external_name_candidates":names,
-              "name_source":"L1J_380C_EXTERNAL_REFERENCE",
-              "monster_identity_verified":False,
-              "source_pak":pak,
-              "archive_path":archive_path,
-              "package_priority_verified":False,
-              "available_full_banks":complete,
-              "selected_banks":chosen,
-              "conflicting_duplicate_subids":conflicting,
-              "external_actions":actions_by_id[actor],
-              "source_files":selected
-          }
-
-          (REPORT/"selection_v17.json").write_text(
-              json.dumps(
-                  selection,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-
-          (REPORT/"package_path.txt").write_text(
-              archive_path+"\n",
-              encoding="utf-8"
-          )
-
-          print("=== V17 SELECTED MONSTER ===")
-          print(json.dumps({
-              key:value
-              for key,value in selection.items()
-              if key!="source_files"
-          },ensure_ascii=False,indent=2))
-          print("SOURCE_FILES",len(selected))
-          PY
-
-      - name: Download verified original client archive
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          gh release download v1.0.0 \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "Sanctuary.of.Aden.-.Copy.*" \
-            --dir downloads
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          root=Path("downloads")
-          base="Sanctuary.of.Aden.-.Copy"
-
-          expected=[
-              f"{base}.z{i:02d}"
-              for i in range(1,46)
-          ]+[base+".zip"]
-
-          missing=[
-              name for name in expected
-              if not (root/name).is_file()
-          ]
-
-          if missing:
-              raise RuntimeError(
-                  "Missing archive parts "+str(missing)
-              )
-
-          print("ARCHIVE_PARTS",len(expected))
-          PY
-
-      - name: Extract selected original sprite package
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          archive="downloads/Sanctuary.of.Aden.-.Copy.zip"
-          package="$(cat reports/package_path.txt)"
-
-          7z x "$archive" "$package" \
-            "-o${PWD}/client" -y \
-            > reports/extraction.log 2>&1
-
-          test -s "client/$package"
-
-          rm -rf downloads
-
-      - name: Decode all selected monster animation frames
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import csv
-          import hashlib
-          import json
-          import math
-          import struct
-          from pathlib import Path
           from PIL import Image
-
-          ROOT=Path.cwd()
-          OUT=ROOT/"reports"
-          SITE=OUT/"site"
-          SHEETS=SITE/"sheets"
-
-          selection=json.loads(
-              (OUT/"selection_v17.json").read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          actor=selection["sprite_id"]
-          pak=ROOT/"client"/selection["archive_path"]
-
-          MAX_FRAMES=240
-          MAX_DIM=1000
-          MAX_ATLAS=12000000
-
-          class Reader:
-              def __init__(self,data):
-                  self.data=data
-                  self.pos=0
-
-              def read(self,fmt):
-                  size=struct.calcsize(fmt)
-                  if self.pos+size>len(self.data):
-                      raise ValueError(
-                          "Truncated sprite structure"
-                      )
-
-                  values=struct.unpack_from(
-                      fmt,self.data,self.pos
-                  )
-
-                  self.pos+=size
-
-                  return (
-                      values[0]
-                      if len(values)==1
-                      else values
-                  )
-
-              def decode(self):
-                  count=self.read("<B")
-                  palette=None
-
-                  if count==255:
-                      n=self.read("<B") or 256
-                      palette=[
-                          self.read("<H")
-                          for _ in range(n)
-                      ]
-                      count=self.read("<B")
-
-                  if not 1<=count<=MAX_FRAMES:
-                      raise ValueError(
-                          "Unsupported frame count"
-                      )
-
-                  descriptions=[]
-
-                  for _ in range(count):
-                      self.read("<hhhh")
-                      self.read("<HH")
-                      n=self.read("<H")
-
-                      if n>1500:
-                          raise ValueError(
-                              "Excessive sprite blocks"
-                          )
-
-                      blocks=[
-                          self.read("<bbBH")
-                          for _ in range(n)
-                      ]
-
-                      descriptions.append(blocks)
-
-                  nblocks=self.read("<i")
-
-                  if not 0<=nblocks<=20000:
-                      raise ValueError(
-                          "Invalid block table"
-                      )
-
-                  offsets=[
-                      self.read("<i")
-                      for _ in range(nblocks)
-                  ]
-
-                  self.read("<i")
-                  start=self.pos
-
-                  used={
-                      block[3]
-                      for frame in descriptions
-                      for block in frame
-                  }
-
-                  if any(
-                      i>=nblocks
-                      for i in used
-                  ):
-                      raise ValueError(
-                          "Invalid sprite block reference"
-                      )
-
-                  decoded={}
-
-                  for block_id in sorted(used):
-                      position=start+offsets[block_id]
-
-                      if (
-                          position<start
-                          or position+4>len(self.data)
-                      ):
-                          raise ValueError(
-                              "Invalid block offset"
-                          )
-
-                      def byte():
-                          nonlocal position
-
-                          if position>=len(self.data):
-                              raise ValueError(
-                                  "Truncated pixel data"
-                              )
-
-                          value=self.data[position]
-                          position+=1
-                          return value
-
-                      sx=byte()
-                      sy=byte()
-                      byte()
-                      lines=byte()
-
-                      pixels=[]
-
-                      for y in range(lines):
-                          x=sx
-
-                          for _ in range(byte()):
-                              x+=byte()//2
-
-                              for _ in range(byte()):
-                                  if palette is None:
-                                      color=(
-                                          byte()|
-                                          (byte()<<8)
-                                      )
-                                  else:
-                                      index=byte()
-
-                                      if index>=len(palette):
-                                          raise ValueError(
-                                              "Invalid palette index"
-                                          )
-
-                                      color=palette[index]
-
-                                  if (
-                                      x>=24
-                                      or sy+y>=24
-                                  ):
-                                      raise ValueError(
-                                          "Invalid block position"
-                                      )
-
-                                  if color!=32768:
-                                      pixels.append((
-                                          x,sy+y,color
-                                      ))
-
-                                  x+=1
-
-                      decoded[block_id]=pixels
-
-                  images=[]
-
-                  for blocks in descriptions:
-                      if not blocks:
-                          images.append(None)
-                          continue
-
-                      positions=[]
-
-                      for a,b,kind,block_id in blocks:
-                          adjusted=(
-                              a-1 if a<0 else a
-                          )
-                          half=int(adjusted/2)
-
-                          positions.append((
-                              24*(b+a-half),
-                              12*(b-half),
-                              block_id
-                          ))
-
-                      minx=min(
-                          x for x,y,i in positions
-                      )
-                      miny=min(
-                          y for x,y,i in positions
-                      )
-                      maxx=max(
-                          x+24 for x,y,i in positions
-                      )
-                      maxy=max(
-                          y+24 for x,y,i in positions
-                      )
-
-                      width=maxx-minx
-                      height=maxy-miny
-
-                      if not (
-                          1<=width<=MAX_DIM
-                          and 1<=height<=MAX_DIM
-                      ):
-                          raise ValueError(
-                              "Sprite dimensions out of range"
-                          )
-
-                      image=Image.new(
-                          "RGBA",
-                          (width,height),
-                          (0,0,0,0)
-                      )
-
-                      pixels=image.load()
-
-                      for x,y,block_id in positions:
-                          for px,py,color in decoded[block_id]:
-                              pixels[
-                                  x+px-minx,
-                                  y+py-miny
-                              ]=(
-                                  ((color>>10)&31)*255//31,
-                                  ((color>>5)&31)*255//31,
-                                  (color&31)*255//31,
-                                  255
-                              )
-
-                      images.append(image)
-
-                  return images
-
-          def atlas(images,path):
-              visible=[
-                  image for image in images
-                  if image is not None
-                  and image.getbbox() is not None
-              ]
-
-              if not visible:
-                  raise ValueError(
-                      "Sprite contains no visible frames"
-                  )
-
-              cw=max(
-                  image.width
-                  for image in visible
-              )
-              ch=max(
-                  image.height
-                  for image in visible
-              )
-
-              cols=min(4,len(images))
-              rows=math.ceil(len(images)/cols)
-
-              if (
-                  cw*ch*cols*rows
-                  >MAX_ATLAS
-              ):
-                  raise ValueError(
-                      "Sprite atlas exceeds pixel limit"
-                  )
-
-              output=Image.new(
-                  "RGBA",
-                  (cw*cols,ch*rows),
-                  (0,0,0,0)
-              )
-
-              playable=[]
-
-              for index,image in enumerate(images):
-                  if image is None:
-                      continue
-
-                  if image.getbbox() is None:
-                      continue
-
-                  playable.append(index)
-
-                  x=(
-                      (index%cols)*cw+
-                      (cw-image.width)//2
-                  )
-                  y=(
-                      (index//cols)*ch+
-                      (ch-image.height)//2
-                  )
-
-                  output.alpha_composite(
-                      image,(x,y)
-                  )
-
-              path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              output.save(
-                  path,optimize=True
-              )
-
-              return {
-                  "frames":len(images),
-                  "cols":cols,
-                  "cellW":cw,
-                  "cellH":ch,
-                  "path":path.relative_to(
-                      SITE
-                  ).as_posix(),
-                  "playableFrames":playable,
-                  "transparentFrames":(
-                      len(images)-len(playable)
-                  )
-              }
-
-          exported=[]
-          failures=[]
-
-          with pak.open("rb") as file:
-              for item in selection["source_files"]:
-                  sub=item["sub"]
-
-                  try:
-                      length=item["bytes"]
-
-                      if not 0<length<=4194304:
-                          raise ValueError(
-                              "Invalid SPR byte length"
-                          )
-
-                      file.seek(item["offset"])
-                      data=file.read(length)
-
-                      if len(data)!=length:
-                          raise ValueError(
-                              "Short original PAK read"
-                          )
-
-                      digest=hashlib.sha256(
-                          data
-                      ).hexdigest()
-
-                      if digest!=item["sha256"]:
-                          raise ValueError(
-                              "Original SPR SHA256 mismatch"
-                          )
-
-                      frames=Reader(data).decode()
-
-                      path=SHEETS/(
-                          f"{actor}-{sub}_"
-                          f"{digest[:12]}.png"
-                      )
-
-                      info=atlas(frames,path)
-
-                      exported.append({
-                          "spriteId":actor,
-                          "sub":sub,
-                          "package":Path(
-                              selection["source_pak"]
-                          ).name,
-                          "sha256":digest,
-                          **info
-                      })
-
-                  except Exception as exc:
-                      failures.append({
-                          "sprite_id":actor,
-                          "sub_id":sub,
-                          "reason":str(exc)
-                      })
-
-          available={
-              row["sub"]
-              for row in exported
-          }
-
-          groups=[]
-
-          for base in selection["selected_banks"]:
-              present=[
-                  base+i
-                  for i in range(8)
-                  if base+i in available
-              ]
-
-              groups.append({
-                  "base":base,
-                  "present":len(present),
-                  "complete":len(present)==8,
-                  "missing":[
-                      base+i
-                      for i in range(8)
-                      if base+i not in available
-                  ]
-              })
-
-          manifest={
-              "version":"V17",
-              "spriteId":actor,
-              "externalNames":selection[
-                  "external_name_candidates"
-              ],
-              "sourcePak":selection["source_pak"],
-              "sourceVerifiedBySHA256":True,
-              "monsterIdentityVerified":False,
-              "originalActionMappingVerified":False,
-              "originalDirectionVerified":False,
-              "originalTimingVerified":False,
-              "groups":groups,
-              "sprites":sorted(
-                  exported,
-                  key=lambda r:r["sub"]
-              ),
-              "referenceActions":selection[
-                  "external_actions"
-              ]
-          }
-
-          (OUT/"manifest_v17.json").write_text(
-              json.dumps(
-                  manifest,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-
-          with (
-              OUT/"extraction_errors_v17.csv"
-          ).open(
-              "w",
-              encoding="utf-8-sig",
-              newline=""
-          ) as file:
-              writer=csv.DictWriter(
-                  file,
-                  fieldnames=[
-                      "sprite_id","sub_id","reason"
-                  ]
-              )
-              writer.writeheader()
-              writer.writerows(failures)
-
-          print("=== V17 SPR RESULT ===")
-          print(json.dumps({
-              "sprite_id":actor,
-              "decoded_sprites":len(exported),
-              "errors":len(failures),
-              "complete_banks":sum(
-                  g["complete"]
-                  for g in groups
-              ),
-              "available_banks":len(groups)
-          },indent=2))
-
-          if len(exported)<16:
-              raise SystemExit(
-                  "Insufficient original monster sprites"
-              )
-          PY
-
-      - name: Generate monster four-motion HTML
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import base64
-          import json
-          import os
           from pathlib import Path
+          import base64, json, hashlib
 
-          ROOT=Path.cwd()
-          REPORT=ROOT/"reports"
-          SITE=REPORT/"site"
+          SRC = Path('previous/v17')
+          OUT = Path('reports')
+          manifest = json.loads((SRC/'manifest_v17.json').read_text(encoding='utf-8'))
+          assert manifest['spriteId'] == 56, 'V18 uses the visually reviewed Orc ID 56'
+          rows = {int(x['sub']): x for x in manifest['sprites']}
+          assert len(rows) == 40
+          ACTIONS = {'wait':(32,220,True),'walk':(0,145,True),'attack':(8,135,False),'death':(24,170,False),'hit':(16,220,False)}
+          LABELS = {'wait':'정지 WAIT','walk':'이동 WALK','attack':'공격 ATTACK','death':'사망 DEATH','hit':'피격 HIT'}
+          OUT.mkdir(exist_ok=True)
+          (OUT/'gifs').mkdir(exist_ok=True)
 
-          data=json.loads(
-              (REPORT/"manifest_v17.json").read_text(
-                  encoding="utf-8"
-              )
-          )
+          def gif_palette(rgba):
+              rgb = rgba.convert('RGB')
+              indexed = rgb.quantize(colors=255, method=Image.Quantize.MEDIANCUT)
+              transparent = rgba.getchannel('A').point(lambda v:255 if v<128 else 0)
+              indexed.paste(255, mask=transparent)
+              palette = indexed.getpalette() or []
+              if len(palette)<768: indexed.putpalette(palette + [0]*(768-len(palette)))
+              return indexed
 
-          complete=[
-              group["base"]
-              for group in data["groups"]
-              if group["complete"]
-          ]
+          def extract_frames(row):
+              with Image.open(SRC/'site'/row['path']) as img:
+                  sheet=img.convert('RGBA')
+                  frames=[]
+                  for i in row['playableFrames']:
+                      x=(i%row['cols'])*row['cellW']
+                      y=(i//row['cols'])*row['cellH']
+                      frames.append(sheet.crop((x,y,x+row['cellW'],y+row['cellH'])))
+                  return frames
 
-          defaults={
-              "wait":complete[0]
-                  if len(complete)>0 else None,
-              "walk":complete[1]
-                  if len(complete)>1 else None,
-              "attack":complete[2]
-                  if len(complete)>2 else None,
-              "death":complete[3]
-                  if len(complete)>3 else None
-          }
+          mapping={'version':'V18','actorId':56,'candidateNames':manifest['externalNames'],
+                   'originalSpriteHashesVerified':True,'actionDefinitionsVerified':False,
+                   'directionOrientationVerified':False,'frameDurationsVerified':False,
+                   'classificationMethod':'visual examination of original V17 SPR frame progression',
+                   'actions':{}}
+          embedded={}
+          for action,(base,delay,loop) in ACTIONS.items():
+              mapping['actions'][action]={'base':base,'delayMs':delay,'loop':loop,'directions':[],'visualClassification':'reviewed_candidate'}
+              embedded[action]=[]
+              for direction in range(8):
+                  sub=base+direction
+                  row=rows[sub]
+                  frames=extract_frames(row)
+                  assert len(frames)==row['frames'],(sub,len(frames),row['frames'])
+                  gif_frames=[gif_palette(frame) for frame in frames]
+                  path=OUT/'gifs'/f'orc56_{action}_dir{direction}.gif'
+                  options=dict(format='GIF', save_all=True, append_images=gif_frames[1:],
+                               duration=[delay]*len(gif_frames), transparency=255,
+                               disposal=([2]*(len(gif_frames)-1)+[1] if len(gif_frames)>1 else 1), optimize=False)
+                  if loop: options['loop']=0
+                  gif_frames[0].save(path,**options)
+                  with Image.open(path) as check:
+                      assert check.n_frames == len(frames), (action,direction,check.n_frames,len(frames))
+                      assert check.info.get('loop')==(0 if loop else None),(action,direction,check.info)
+                      assert 'transparency' in check.info
+                  blob=path.read_bytes()
+                  embedded[action].append(base64.b64encode(blob).decode('ascii'))
+                  mapping['actions'][action]['directions'].append({
+                      'directionSlot':direction,'sourceSubId':sub,'sourceSHA256':row['sha256'],
+                      'frames':len(frames),'gif':path.relative_to(OUT).as_posix(),
+                      'gifSHA256':hashlib.sha256(blob).hexdigest()})
 
-          html=r'''<!doctype html>
-          <html lang="ko">
-          <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>Sanctuary V17 Monster Motion Lab</title>
-          <style>
-          :root{font-family:system-ui,sans-serif;color-scheme:dark;background:#101722;color:#edf3fb}
-          *{box-sizing:border-box}
-          body{max-width:1150px;margin:auto;padding:12px}
-          h1{font-size:1.35rem}
-          h2{font-size:1rem;margin:16px 0 8px}
-          p{font-size:.81rem;color:#b6cade;line-height:1.5}
-          .warning{color:#ffd197}
-          select,input,button{font:inherit;background:#26394e;color:white;border:1px solid #526b86;border-radius:8px;padding:9px;min-width:0}
-          button{cursor:pointer}
-          label{display:flex;flex-direction:column;gap:5px;font-size:.78rem}
-          .toolbar{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin:12px 0}
-          .motions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
-          .panel{background:#192737;border:1px solid #38506b;border-radius:9px;padding:9px;min-width:0}
-          .panel h2{margin:0 0 8px}
-          canvas{display:block;width:100%;aspect-ratio:1;background:#27394c;image-rendering:pixelated;border-radius:6px}
-          .controls{display:flex;gap:7px;flex-wrap:wrap;margin:8px 0}
-          .controls>*{flex:1}
-          .meta{font-size:.72rem;color:#bdd0e3;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
-          .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}
-          .gallery .card{padding:6px;background:#1c2d40;border:1px solid #3b5873;border-radius:8px;cursor:pointer}
-          .card .caption{font-size:.72rem;color:#c3d6ea;margin:5px 0}
-          .directions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
-          .directions .card{padding:5px;background:#1c2c3d;border-radius:7px}
-          .row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
-          .row>*{flex:1}
-          .notice{white-space:pre-wrap;color:#c3d7e9;font-size:.78rem;line-height:1.6}
-          @media(max-width:550px){.panel{padding:6px}.motions{gap:6px}.gallery{grid-template-columns:repeat(3,minmax(0,1fr))}}
-          </style>
-          </head>
-          <body>
-          <h1>Sanctuary V17 · 몬스터 4대 모션</h1>
-          <p id="identity"></p>
-          <p class="warning">정지·이동·공격·사망은 실제 SPR에서 찾는 중인 동작입니다. 최초 배정은 번호순 미검증 후보이며 확정된 원본 모션이 아닙니다.</p>
-          <div class="toolbar">
-          <label>방향<select id="direction"></select></label>
-          <label>방향 시작<select id="rotation"></select></label>
-          <label>순서<select id="reverse"><option value="0">기본</option><option value="1">역방향</option></select></label>
-          <label>투명 프레임<select id="empty"><option value="skip">재생 시 건너뛰기</option><option value="raw">원본 순서 유지</option></select></label>
-          </div>
-          <div class="motions" id="motions"></div>
-          <h2>원본 SPR 모션 묶음 전체 보기</h2>
-          <div class="toolbar">
-          <label>선택한 묶음을 적용할 동작<select id="target"><option value="wait">정지</option><option value="walk">이동</option><option value="attack">공격</option><option value="death">사망</option></select></label>
-          </div>
-          <p>아래 원본 그룹을 누르면 선택한 동작에 바로 적용합니다. 다른 그룹도 비교해 주세요.</p>
-          <div class="gallery" id="gallery"></div>
-          <h2>8방향 원본 확인</h2>
-          <label>검사 동작<select id="inspect"><option value="wait">정지</option><option value="walk">이동</option><option value="attack">공격</option><option value="death">사망</option></select></label>
-          <div class="directions" id="directions"></div>
-          <div class="row">
-          <button id="export">검토 결과 JSON 저장</button>
-          </div>
-          <div class="panel notice" id="summary"></div>
-          <script type="application/json" id="inventory">__INVENTORY__</script>
-          <script>__SCRIPT__</script>
-          </body>
-          </html>'''
-
-          script=r'''
+          css='''
+          :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101a26;color:#eef5ff}*{box-sizing:border-box}
+          body{max-width:1100px;margin:auto;padding:12px}h1{font-size:1.35rem;margin:6px 0}h2{font-size:1rem;margin:8px 0 3px}
+          p{font-size:.85rem;line-height:1.5;color:#bdd0e2}button,select{font:inherit;color:#edf7ff;background:#263d53;border:1px solid #54718b;border-radius:7px;padding:10px;cursor:pointer}
+          .head{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}.head label{display:flex;gap:8px;align-items:center}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+          .panel,.slot{background:#1b2b3d;border:1px solid #3a516a;border-radius:10px;padding:9px;min-width:0}
+          .stage{height:185px;display:flex;justify-content:center;align-items:flex-end;background:#283a4b;border-radius:7px;overflow:hidden;padding:6px}
+          .stage img{display:block;width:auto;height:auto;max-width:98%;max-height:175px;image-rendering:pixelated;object-fit:contain}
+          .meta{font-size:.76rem;color:#b1cbdd;margin:5px 0}.buttons{display:flex;justify-content:space-between;gap:6px;align-items:center;margin-top:7px}.buttons button{padding:7px 10px}
+          .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}.slot{padding:5px}.slot img{width:100%;height:110px;object-fit:contain;image-rendering:pixelated}
+          .slot b{font-size:.76rem}.slot small{display:block;font-size:.71rem;color:#afc6d9}.warn{color:#ffd6a3}.ok{color:#8ee1c0}
+          @media(max-width:490px){.actions{gap:6px}.panel{padding:6px}.stage{height:145px}.stage img{max-height:135px}.grid{gap:5px}.slot img{height:88px}}
+          '''
+          js=r'''
           'use strict';
-
-          const DB=JSON.parse(
-            document.getElementById('inventory').textContent
-          );
-
-          const $=id=>document.getElementById(id);
+          const SOURCE=JSON.parse(document.getElementById('encoded').textContent);
           const ACTIONS=['wait','walk','attack','death'];
-          const LABELS={
-            wait:'정지',
-            walk:'이동',
-            attack:'공격',
-            death:'사망'
-          };
-
-          const INDEX=new Map(
-            DB.sprites.map(row=>[row.sub,row])
-          );
-
-          const CACHE=new Map();
-          const PANELS={};
-          const STATE={};
-          let lastDraw=0;
-
-          function option(parent,value,title){
-            const element=document.createElement('option');
-            element.value=String(value);
-            element.textContent=title;
-            parent.append(element);
+          const TXT={wait:'정지',walk:'이동',attack:'공격',death:'사망',hit:'피격'};
+          const DATA=SOURCE.gif;
+          const pick=id=>document.getElementById(id);
+          let direction=0;
+          function gifUrl(action,dir){
+           const base64=DATA[action][dir];
+           const raw=atob(base64),u=new Uint8Array(raw.length);
+           for(let i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);
+           return URL.createObjectURL(new Blob([u],{type:'image/gif'}));
           }
-
-          function mappedSub(base,dir){
-            const reverse=$('reverse').value==='1';
-            const rotation=Number($('rotation').value);
-            const physical=reverse?(8-dir)%8:dir;
-            return base+(physical+rotation)%8;
+          function restart(img,action,dir){
+           const old=img.dataset.url;
+           const url=gifUrl(action,dir);
+           img.onload=()=>{if(old) URL.revokeObjectURL(old)};
+           img.src=url;img.dataset.url=url;
           }
-
-          function getSprite(base,dir){
-            if(base===''||base===null)return null;
-            return INDEX.get(
-              mappedSub(Number(base),dir)
-            )||null;
+          function drawPanels(){
+           direction=Number(pick('direction').value);
+           for(const action of ACTIONS){
+            restart(pick('img-'+action),action,direction);
+            pick('sub-'+action).textContent='SPR '+(SOURCE.meta[action].base+direction)+' · '+SOURCE.meta[action].frames[direction]+'프레임';
+           }
+           drawGrid();
           }
-
-          function imageFor(row){
-            if(!row)return null;
-
-            const path=row.path;
-
-            if(!CACHE.has(path)){
-              const image=new Image();
-              image.onload=()=>render(performance.now());
-              image.src=DB.assets?.[path]||path;
-              CACHE.set(path,image);
-            }
-
-            return CACHE.get(path);
+          function drawGrid(){
+           const action=pick('inspect').value;
+           const root=pick('grid');for(const img of root.querySelectorAll('img[data-url]'))URL.revokeObjectURL(img.dataset.url);root.replaceChildren();
+           for(let i=0;i<8;i++){
+            const node=document.createElement('div');node.className='slot';
+            node.innerHTML='<b>방향 슬롯 '+i+'</b><img alt="'+TXT[action]+' 방향'+i+'"><small>SPR '+(SOURCE.meta[action].base+i)+'</small>';
+            const img=node.querySelector('img');restart(img,action,i);
+            node.onclick=()=>{pick('direction').value=i;drawPanels()};
+            root.append(node);
+           }
           }
-
-          function draw(canvas,row,step,loop){
-            const ctx=canvas.getContext('2d');
-            ctx.clearRect(0,0,canvas.width,canvas.height);
-
-            if(!row)return -1;
-
-            const image=imageFor(row);
-
-            const available=(
-              $('empty').value==='skip'
-              ?row.playableFrames
-              :Array.from(
-                {length:row.frames},
-                (_,i)=>i
-              )
-            );
-
-            if(!available.length)return -1;
-
-            let position=Math.max(0,step);
-
-            position=loop
-              ?position%available.length
-              :Math.min(position,available.length-1);
-
-            const frame=available[position];
-
-            if(!image||!image.complete||!image.naturalWidth){
-              return frame;
-            }
-
-            const sx=(frame%row.cols)*row.cellW;
-            const sy=Math.floor(frame/row.cols)*row.cellH;
-
-            const scale=Math.min(
-              3,
-              canvas.width/row.cellW,
-              canvas.height/row.cellH
-            );
-
-            const width=row.cellW*scale;
-            const height=row.cellH*scale;
-
-            ctx.imageSmoothingEnabled=false;
-
-            ctx.drawImage(
-              image,
-              sx,sy,row.cellW,row.cellH,
-              (canvas.width-width)/2,
-              canvas.height-height-8,
-              width,height
-            );
-
-            return frame;
-          }
-
-          function currentStep(action,t){
-            const state=STATE[action];
-            const interval=Number(PANELS[action].interval.value);
-            return Math.floor(
-              Math.max(0,t-state.started)/interval
-            );
-          }
-
-          function setBank(action,base){
-            PANELS[action].bank.value=String(base);
-            PANELS[action].confirmed.checked=false;
-            STATE[action].started=performance.now();
-            updateSummary();
-          }
-
-          function buildPanels(){
-            const root=$('motions');
-
-            for(const action of ACTIONS){
-              const node=document.createElement('section');
-              node.className='panel';
-
-              const title=document.createElement('h2');
-              title.textContent=LABELS[action];
-
-              const canvas=document.createElement('canvas');
-              canvas.width=280;
-              canvas.height=280;
-
-              const controls=document.createElement('div');
-              controls.className='controls';
-
-              const bank=document.createElement('select');
-              option(bank,'','미지정');
-
-              for(const group of DB.groups){
-                option(
-                  bank,
-                  group.base,
-                  group.base+'~'+(group.base+7)+
-                    ' · '+group.present+'/8'
-                );
-              }
-
-              const initial=DB.defaults[action];
-              if(initial!==null&&initial!==undefined){
-                bank.value=String(initial);
-              }
-
-              const interval=document.createElement('select');
-
-              for(const ms of [80,120,160,200,260,350]){
-                option(interval,ms,ms+' ms');
-              }
-
-              interval.value='160';
-
-              const replay=document.createElement('button');
-              replay.textContent='다시 재생';
-
-              controls.append(bank,interval,replay);
-
-              const checkbox=document.createElement('input');
-              checkbox.type='checkbox';
-
-              const label=document.createElement('label');
-              label.textContent='육안으로 동작 확인';
-              label.append(checkbox);
-
-              const meta=document.createElement('div');
-              meta.className='meta';
-
-              node.append(title,canvas,controls,label,meta);
-              root.append(node);
-
-              PANELS[action]={
-                canvas,bank,interval,replay,
-                confirmed:checkbox,meta
-              };
-
-              STATE[action]={
-                started:performance.now()
-              };
-
-              bank.onchange=()=>{
-                checkbox.checked=false;
-                STATE[action].started=performance.now();
-                updateSummary();
-              };
-
-              interval.onchange=()=>{
-                STATE[action].started=performance.now();
-              };
-
-              replay.onclick=()=>{
-                STATE[action].started=performance.now();
-              };
-
-              checkbox.onchange=updateSummary;
-            }
-          }
-
-          function buildGallery(){
-            const root=$('gallery');
-
-            for(const group of DB.groups){
-              const card=document.createElement('div');
-              card.className='card';
-
-              const title=document.createElement('div');
-              title.className='caption';
-              title.textContent=
-                group.base+'~'+(group.base+7)+
-                ' · '+group.present+'/8';
-
-              const canvas=document.createElement('canvas');
-              canvas.width=170;
-              canvas.height=170;
-
-              card.append(title,canvas);
-              root.append(card);
-
-              card.onclick=()=>{
-                setBank(
-                  $('target').value,
-                  group.base
-                );
-              };
-
-              card.dataset.bank=String(group.base);
-              card._canvas=canvas;
-            }
-          }
-
-          function buildDirections(){
-            const root=$('directions');
-
-            for(let dir=0;dir<8;dir++){
-              option($('direction'),dir,'방향 '+dir);
-              option($('rotation'),dir,String(dir));
-
-              const card=document.createElement('div');
-              card.className='card';
-
-              const title=document.createElement('div');
-              title.className='caption';
-              title.textContent='방향 '+dir;
-
-              const canvas=document.createElement('canvas');
-              canvas.width=175;
-              canvas.height=175;
-
-              card.append(title,canvas);
-              root.append(card);
-
-              card.dataset.direction=String(dir);
-              card._canvas=canvas;
-
-              card.onclick=()=>{
-                $('direction').value=String(dir);
-              };
-            }
-
-            $('direction').value='0';
-            $('rotation').value='0';
-          }
-
-          function render(t){
-            const dir=Number($('direction').value);
-
-            for(const action of ACTIONS){
-              const panel=PANELS[action];
-              const row=getSprite(panel.bank.value,dir);
-              const loop=(
-                action==='wait'||action==='walk'
-              );
-
-              const step=currentStep(action,t);
-
-              const frame=draw(
-                panel.canvas,row,step,loop
-              );
-
-              panel.meta.textContent=row
-                ?'서브 ID '+row.sub+
-                 ' · 프레임 '+(frame+1)+'/'+row.frames+
-                 ' · SHA '+row.sha256.slice(0,12)+
-                 ' · '+(loop?'반복':'종료 시 유지')
-                :'모션 미지정 또는 방향 이미지 없음';
-            }
-
-            document.querySelectorAll(
-              '#gallery .card'
-            ).forEach(card=>{
-              const base=Number(card.dataset.bank);
-              const row=getSprite(base,dir);
-
-              draw(
-                card._canvas,
-                row,
-                Math.floor(t/180),
-                true
-              );
-            });
-
-            const action=$('inspect').value;
-            const base=PANELS[action].bank.value;
-            const step=currentStep(action,t);
-            const loop=(
-              action==='wait'||action==='walk'
-            );
-
-            document.querySelectorAll(
-              '#directions .card'
-            ).forEach(card=>{
-              const direction=Number(
-                card.dataset.direction
-              );
-
-              draw(
-                card._canvas,
-                getSprite(base,direction),
-                step,
-                loop
-              );
-            });
-          }
-
-          function updateSummary(){
-            const lines=[
-              'SPR ID '+DB.spriteId,
-              '외부 참고 이름 '+DB.externalNames.join(' / '),
-              '원본 PAK '+DB.sourcePak,
-              '원본 액션 정의 미확정',
-              ''
-            ];
-
-            for(const action of ACTIONS){
-              const panel=PANELS[action];
-              const base=panel.bank.value;
-              const missing=[];
-
-              for(let dir=0;dir<8;dir++){
-                if(!getSprite(base,dir))missing.push(dir);
-              }
-
-              lines.push(
-                LABELS[action]+
-                ' : '+(base||'미지정')+
-                ' · 누락 '+missing.length+
-                '방향 · '+
-                (panel.confirmed.checked
-                  ?'육안 확인'
-                  :'미확인')
-              );
-            }
-
-            $('summary').textContent=lines.join('\n');
-          }
-
-          function exportMapping(){
-            const motions={};
-            const used=[];
-
-            for(const action of ACTIONS){
-              const panel=PANELS[action];
-              const bank=panel.bank.value;
-
-              if(bank!=='')used.push(bank);
-
-              const directions=[];
-
-              for(let dir=0;dir<8;dir++){
-                const sprite=getSprite(bank,dir);
-
-                directions.push({
-                  direction:dir,
-                  subId:sprite?.sub??null,
-                  sha256:sprite?.sha256??null,
-                  frames:sprite?.frames??0,
-                  playableFrames:sprite?.playableFrames??[],
-                  sheet:sprite?.path??null
-                });
-              }
-
-              motions[action]={
-                sourceBank:bank===''?null:Number(bank),
-                frameIntervalMs:Number(
-                  panel.interval.value
-                ),
-                loop:(
-                  action==='wait'||action==='walk'
-                ),
-                holdLastFrame:(
-                  action==='attack'||action==='death'
-                ),
-                userVisualConfirmed:panel.confirmed.checked,
-                directions
-              };
-            }
-
-            const payload={
-              version:'V17',
-              schema:'sanctuary-four-monster-motions',
-              spriteId:DB.spriteId,
-              externalNameCandidates:DB.externalNames,
-              sourcePak:DB.sourcePak,
-              originalSourceSHA256Verified:true,
-              originalMotionMappingVerified:false,
-              originalTimingVerified:false,
-              directionRotation:Number(
-                $('rotation').value
-              ),
-              reverseDirections:$('reverse').value==='1',
-              fourDistinctBanks:(
-                used.length===4 &&
-                new Set(used).size===4
-              ),
-              motions
-            };
-
-            const blob=new Blob(
-              [JSON.stringify(payload,null,2)],
-              {type:'application/json'}
-            );
-
-            const url=URL.createObjectURL(blob);
-            const link=document.createElement('a');
-
-            link.href=url;
-            link.download=
-              'sanctuary-v17-monster-'+DB.spriteId+'.json';
-            link.click();
-
-            setTimeout(()=>URL.revokeObjectURL(url),1000);
-          }
-
           function boot(){
-            $('identity').textContent=
-              '스프라이트 ID '+DB.spriteId+
-              ' · 원본 SPR '+DB.sprites.length+
-              '개 · 외부 참고 이름: '+
-              DB.externalNames.join(' / ');
-
-            buildDirections();
-            buildPanels();
-            buildGallery();
-
-            $('rotation').onchange=()=>{
-              for(const action of ACTIONS){
-                PANELS[action].confirmed.checked=false;
-              }
-              updateSummary();
-            };
-
-            $('reverse').onchange=$('rotation').onchange;
-            $('export').onclick=exportMapping;
-
-            updateSummary();
-
-            function tick(t){
-              if(t-lastDraw>=50){
-                lastDraw=t;
-                render(t);
-              }
-
-              requestAnimationFrame(tick);
-            }
-
-            requestAnimationFrame(tick);
+           const select=pick('direction');
+           for(let d=0;d<8;d++)select.add(new Option('방향 슬롯 '+d,d));
+           select.onchange=drawPanels;
+           pick('inspect').onchange=drawGrid;
+           for(const a of ACTIONS) pick('replay-'+a).onclick=()=>restart(pick('img-'+a),a,direction);
+           pick('replay-hit').onclick=()=>restart(pick('img-hit'),'hit',direction);
+           select.onchange=()=>{drawPanels();restart(pick('img-hit'),'hit',direction)};
+           drawPanels();restart(pick('img-hit'),'hit',0);
           }
-
           boot();
           '''
-
-          def write_page(path,embedded):
-              assets={}
-
-              if embedded:
-                  for sprite in data["sprites"]:
-                      source=SITE/sprite["path"]
-
-                      assets[sprite["path"]]=(
-                          "data:image/png;base64,"
-                          +base64.b64encode(
-                              source.read_bytes()
-                          ).decode("ascii")
-                      )
-
-              inventory={
-                  **data,
-                  "defaults":defaults,
-                  "assets":assets
-              }
-
-              encoded=json.dumps(
-                  inventory,
-                  ensure_ascii=False,
-                  separators=(",",":")
-              ).replace("<","\\u003c")
-
-              output=html.replace(
-                  "__INVENTORY__",encoded
-              ).replace(
-                  "__SCRIPT__",script
-              )
-
-              path.write_text(
-                  output,encoding="utf-8"
-              )
-
-          (SITE/"app.js").write_text(
-              script,encoding="utf-8"
-          )
-
-          write_page(
-              SITE/"index.html",False
-          )
-
-          write_page(
-              REPORT/"V17-Monster-Four-Motions.html",
-              True
-          )
-
-          summary={
-              "version":"V17",
-              "selected_sprite_id":data["spriteId"],
-              "original_spr_sheets":len(data["sprites"]),
-              "candidate_groups":len(data["groups"]),
-              "complete_eight_slot_groups":sum(
-                  group["complete"]
-                  for group in data["groups"]
-              ),
-              "four_simultaneous_motion_panels":True,
-              "all_candidate_banks_in_html":True,
-              "eight_direction_preview":True,
-              "transparent_frame_skip_option":True,
-              "manual_visual_confirmation":True,
-              "json_export":True,
-              "original_monster_identity_verified":False,
-              "original_action_mapping_verified":False,
-              "original_frame_timing_verified":False,
-              "game_build_modified":False
+          js_data={
+            'gif':embedded,
+            'meta':{a:{'base':v[0],'frames':[rows[v[0]+d]['frames'] for d in range(8)]} for a,v in ACTIONS.items()},
           }
+          json_data=json.dumps(js_data,separators=(',',':')).replace('<','\\u003c')
 
-          (REPORT/"summary_v17.json").write_text(
-              json.dumps(
-                  summary,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-
-          print("=== V17 SUMMARY ===")
-          print(json.dumps(
-              summary,
-              ensure_ascii=False,
-              indent=2
-          ))
-
-          with open(
-              os.environ["GITHUB_STEP_SUMMARY"],
-              "a",
-              encoding="utf-8"
-          ) as file:
-              file.write("V17 Monster Motion Identification\n\n")
-              file.write(json.dumps(
-                  summary,
-                  ensure_ascii=False,
-                  indent=2
-              ))
+          panels=[]
+          for a in ['wait','walk','attack','death']:
+              base,delay,loop=ACTIONS[a]
+              how='반복 재생' if loop else ('1회 재생 후 마지막 프레임 유지' if a=='death' else '1회 재생')
+              panels.append(f'<section class="panel"><h2>{LABELS[a]}</h2><div class="stage"><img id="img-{a}" alt="{LABELS[a]} 원본 GIF"></div><div class="buttons"><span class="meta" id="sub-{a}"></span><button id="replay-{a}">다시 재생</button></div><div class="meta">{how} · 검사용 {delay}ms/프레임</div></section>')
+          html=f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orc ID 56 • Original Sprite GIF Motions</title><style>{css}</style></head><body>
+          <h1>오크 ID 56 · 원본 SPR GIF 모션</h1><p>V17의 원본 SPR 해시 검증 이미지에서 추출한 정지·이동·공격·사망 4종, 8방향 애니메이션. GIF 40개가 이 HTML에 내장되어 있어 인터넷·외부 폴더 없이 재생됩니다.</p>
+          <p class="warn">동작은 실제 프레임을 육안으로 판별한 결과이며 원본 액션 정의 파일 및 방향 방위·프레임 타이밍은 미확인입니다. 방향 숫자는 원본 SPR의 슬롯 번호입니다.</p>
+          <div class="head"><label>방향 선택 <select id="direction"></select></label><label>8방향 확대 <select id="inspect"><option value="wait">정지</option><option value="walk">이동</option><option value="attack">공격</option><option value="death">사망</option><option value="hit">피격</option></select></label></div>
+          <div class="actions">{''.join(panels)}</div><h2>추가: 피격 HIT (1프레임)</h2><div class="panel"><div class="stage"><img id="img-hit" alt="피격 원본 GIF"></div><div class="buttons"><span class="meta">SPR 16~23 · 1프레임</span><button id="replay-hit">다시 재생</button></div></div>
+          <h2>8방향 GIF 동시 비교</h2><p>이미지를 누르면 위 4개 동작의 방향도 함께 바뀝니다.</p><div class="grid" id="grid"></div>
+          <p class="ok">원본 SPR 이미지 해시 확인 · 원본 이미지 사용 · 각 GIF 별도 저장 · 단독 HTML</p>
+          <script id="encoded" type="application/json">{json_data}</script><script>{js}</script></body></html>'''
+          (OUT/'Monster-56-Orc-GIF-Motions.html').write_text(html,encoding='utf-8')
+          (OUT/'mapping-v18.json').write_text(json.dumps(mapping,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary={'version':'V18','actor':56,'gifCount':sum(len(x) for x in embedded.values()),'originalSprites':40,'fourActions':['wait','walk','attack','death'],'extraAction':'hit','standaloneHTMLBytes':len(html.encode()),'visualActionClassification':True,'originalActionDefinitionsVerified':False,'gifSourceOriginalShaVerified':True,'originalFrameTimingVerified':False,'browserPlaybackManuallyTested':False}
+          (OUT/'summary-v18.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
           PY
 
-      - name: Validate generated original motion HTML
-        shell: bash
+      - name: Verify standalone HTML and GIF frame counts
         run: |
           set -euo pipefail
-
-          node --check reports/site/app.js
-
           python3 - <<'PY'
-          import json
+          import json, re
           from pathlib import Path
-
-          root=Path("reports")
-
-          manifest=json.loads(
-              (root/"manifest_v17.json").read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          summary=json.loads(
-              (root/"summary_v17.json").read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          required=[
-              root/"site/index.html",
-              root/"site/app.js",
-              root/"V17-Monster-Four-Motions.html",
-              root/"selection_v17.json",
-              root/"manifest_v17.json",
-              root/"summary_v17.json",
-              root/"extraction_errors_v17.csv"
-          ]
-
-          for file in required:
-              if not file.is_file():
-                  raise RuntimeError(
-                      "Missing V17 output "+str(file)
-                  )
-
-          for sprite in manifest["sprites"]:
-              file=root/"site"/sprite["path"]
-
-              if not file.is_file():
-                  raise RuntimeError(
-                      "Missing original SPR PNG "+str(file)
-                  )
-
-              with file.open("rb") as handle:
-                  if handle.read(8)!=b"\x89PNG\r\n\x1a\n":
-                      raise RuntimeError(
-                          "Invalid sprite PNG "+str(file)
-                      )
-
-          standalone=(
-              root/"V17-Monster-Four-Motions.html"
-          ).read_text(encoding="utf-8")
-
-          if (
-              "__SCRIPT__" in standalone
-              or "__INVENTORY__" in standalone
-          ):
-              raise RuntimeError(
-                  "Unresolved V17 HTML template"
-              )
-
-          if manifest["spriteId"]==0:
-              raise RuntimeError(
-                  "Graphics ID zero must not be selected"
-              )
-
-          if not summary[
-              "four_simultaneous_motion_panels"
-          ]:
-              raise RuntimeError(
-                  "Missing four motion panels"
-              )
-
-          print(
-              "V17 VERIFIED SPR PNG:",
-              len(manifest["sprites"])
-          )
-
-          print(
-              "V17 COMPLETE BANKS:",
-              summary["complete_eight_slot_groups"]
-          )
-
-          print("V17 HTML VALIDATION PASSED")
+          from PIL import Image
+          p=Path('reports')
+          manifest=json.loads((p/'mapping-v18.json').read_text())
+          assert manifest['actorId']==56
+          assert len(manifest['actions'])==5
+          for act,info in manifest['actions'].items():
+              assert len(info['directions'])==8
+              for record in info['directions']:
+                  with Image.open(p/record['gif']) as gif:
+                      assert gif.n_frames==record['frames']
+                      assert gif.info.get('loop')==(0 if info['loop'] else None)
+                      assert 'transparency' in gif.info
+          page=(p/'Monster-56-Orc-GIF-Motions.html').read_text()
+          assert page.count('id="img-')>=5
+          assert len(page)>100000
+          match=re.search(r'<script>(.*?)</script>',page,re.S)
+          assert match
+          Path('/tmp/v18-check.js').write_text(match.group(1))
+          print('V18 verified: 40 GIFs, 8 directions, standalone HTML')
           PY
+          node --check /tmp/v18-check.js
 
-      - name: Upload V17 four-motion extraction
-        if: always()
+      - name: Upload Monster GIF motions
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V17-Monster-Motion-Identification
+          name: Sanctuary-V18-Orc-GIF-Motions
           path: reports/
           if-no-files-found: error
           retention-days: 30
-          compression-level: 6
