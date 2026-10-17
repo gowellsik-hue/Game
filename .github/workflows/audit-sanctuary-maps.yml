@@ -1,4 +1,5 @@
-name: Sanctuary of Aden Map Archive Index V1
+
+name: Sanctuary of Aden TI Dungeon Map Extraction V2
 
 on:
   workflow_dispatch:
@@ -10,140 +11,402 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sanctuary-map-extraction-v2
+  cancel-in-progress: false
+
 jobs:
-  inspect:
+  extract:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 70
     steps:
-      - name: Download ZIP directory volume
+      - name: Download original ZIP final volume (directory index)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p source reports
-          gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern 'Sanctuary.of.Aden.-.Copy.zip' --dir source --clobber
-          test -s source/Sanctuary.of.Aden.-.Copy.zip
+          mkdir -p archive reports extracted
+          gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern 'Sanctuary.of.Aden.-.Copy.zip' --dir archive --clobber
+          test -s archive/Sanctuary.of.Aden.-.Copy.zip
 
-      - name: Identify original map and spawn files
+      - name: Restore embedded map extractor and plan volumes
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import csv, json, re, struct
-          from collections import Counter
+          cat > /tmp/mapv2.py <<'PY_SOURCE'
+          #!/usr/bin/env python3
+          """Targeted, read-only extraction of Sanctuary of Aden split-ZIP map 1 and map 2."""
+          import base64
+          import collections
+          import csv
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import struct
+          import sys
+          import zlib
           from pathlib import Path
 
-          src = Path('source/Sanctuary.of.Aden.-.Copy.zip')
-          data = src.read_bytes()
-          sig = b'PK\x01\x02'
-          records = []
-          offset = 0
-          while True:
-              offset = data.find(sig, offset)
-              if offset < 0 or offset + 46 > len(data):
-                  break
-              h = struct.unpack_from('<4s6H3I5H2I', data, offset)
-              flags, packed, unpacked = h[3], h[8], h[9]
-              nlen, xlen, clen, disk = h[10], h[11], h[12], h[13]
-              end = offset + 46 + nlen + xlen + clen
-              if not (0 < nlen <= 4096 and end <= len(data)):
-                  offset += 4
-                  continue
-              raw = data[offset + 46:offset + 46 + nlen]
-              if b'\0' in raw:
-                  offset += 4
-                  continue
-              try:
-                  name = raw.decode('utf-8' if flags & 0x800 else 'cp949')
-              except UnicodeDecodeError:
-                  name = raw.decode('cp437', errors='replace')
-              if not name or any(ord(ch) < 32 for ch in name):
-                  offset += 4
-                  continue
-              records.append({'name': name.replace('\\', '/'), 'packed': packed,
-                              'unpacked': unpacked, 'start_disk': disk})
-              offset = end
-
-          if not records:
-              raise SystemExit('No ZIP central-directory records in final volume')
-          records.sort(key=lambda row: row['name'].lower())
-          eocd = data.rfind(b'PK\x05\x06')
-          total = None
-          last_disk = None
-          if eocd >= 0 and eocd + 22 <= len(data):
-              _, last_disk, _, _, total, _, _, _ = struct.unpack_from('<4s4H2IH', data, eocd)
-              if total == 65535:
-                  z64 = data.rfind(b'PK\x06\x06', 0, eocd)
-                  total = struct.unpack_from('<Q', data, z64 + 32)[0] if z64 >= 0 and z64 + 40 <= len(data) else None
-
-          map_terms = ('map', 'maps', 'terrain', 'tile', 'tiles', 'dungeon', 'world', 'zone')
-          spawn_terms = ('spawn', 'spawns', 'npc', 'npcs', 'monster', 'monsters', 'mob', 'mobs', 'server')
-          map_ext = ('.map', '.til', '.s32', '.wld', '.tmx', '.tmj', '.obj')
-          db_ext = ('.sql', '.sqlite', '.sqlite3', '.db', '.csv')
-          target_terms = ('talking', 'baphomet', '말하는', '말던', '바포', 'tisdungeon', 'tido')
-          candidates = []
-          counts = Counter()
-          extensions = Counter()
-          for rec in records:
-              name = rec['name']
-              low = name.lower()
-              parts = set(filter(None, re.split(r'[/_.\s-]+', low)))
-              tags = []
-              if any(term in parts for term in map_terms) or low.endswith(map_ext):
-                  tags.append('MAP')
-              if any(term in parts for term in spawn_terms) or low.endswith(db_ext):
-                  tags.append('SPAWN_OR_DB')
-              if any(term in low for term in target_terms):
-                  tags.append('TALKING_ISLAND_OR_BAPHOMET')
-              ext = Path(name).suffix.lower() or '(none)'
-              extensions[ext] += 1
-              if tags:
-                  candidates.append({**rec, 'category': '|'.join(tags)})
-                  counts.update(tags)
-
-          out = Path('reports')
-          with (out / 'all-archive-paths.csv').open('w', encoding='utf-8-sig', newline='') as f:
-              w = csv.DictWriter(f, fieldnames=['name', 'packed', 'unpacked', 'start_disk'])
-              w.writeheader()
-              w.writerows(records)
-          with (out / 'map-and-spawn-candidates.csv').open('w', encoding='utf-8-sig', newline='') as f:
-              w = csv.DictWriter(f, fieldnames=['name', 'packed', 'unpacked', 'start_disk', 'category'])
-              w.writeheader()
-              w.writerows(candidates)
-          with (out / 'file-extension-counts.csv').open('w', encoding='utf-8-sig', newline='') as f:
-              w = csv.writer(f)
-              w.writerow(['extension', 'count'])
-              w.writerows(extensions.most_common())
-
-          summary = {
-              'source': src.name,
-              'downloadedFinalVolumeBytes': len(data),
-              'lastDiskNumberZeroBased': last_disk,
-              'totalRecordsFromEndOfCentralDirectory': total,
-              'recordsFoundInFinalVolume': len(records),
-              'completeArchiveIndex': total is not None and total == len(records),
-              'categoryCounts': dict(counts),
-              'candidateCount': len(candidates),
-              'originalMapContentsExtracted': False,
-              'spawnCoordinatesVerified': False,
+          ROOT = Path('archive')
+          REPORT = Path('reports')
+          OUT = Path('extracted')
+          STEM = 'Sanctuary.of.Aden.-.Copy'
+          DIRECTORY_PREFIX = 'Sanctuary of Aden - Copy/'
+          MAP_IDS = (1, 2)
+          EXTRA_FILES = {
+              'xml/map_config.xml', 'xml/MapSystem.xml', 'xml/MapSystem86.xml',
+              'xml/zone3.xml', 'xml/CollisionZone.xml', 'xml/ExtMapAttr.xml'
           }
-          (out / 'map-audit-summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-          print(json.dumps(summary, ensure_ascii=False, indent=2))
-          print('Example candidate paths:')
-          for rec in candidates[:50]:
-              print(rec['category'], rec['name'])
-          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
-              f.write('Original archive paths scanned: ' + str(len(records)) + '\n\n')
-              f.write('Map / spawn candidates: ' + str(len(candidates)) + '\n\n')
-              f.write('Complete index: ' + str(summary['completeArchiveIndex']) + '\n')
-          PY
 
-      - name: Upload map source inventory
+
+          def entry_name(raw, flags):
+              return raw.decode('utf-8' if flags & 0x800 else 'cp949', errors='replace').replace('\\', '/')
+
+
+          def read_directory():
+              path = ROOT / (STEM + '.zip')
+              data = path.read_bytes()
+              pos = data.rfind(b'PK\x05\x06')
+              if pos < 0 or pos + 22 > len(data):
+                  raise RuntimeError('ZIP end-of-central-directory not found')
+              end = struct.unpack_from('<4s4H2IH', data, pos)
+              last_disk, total = end[1], end[4]
+              if total == 65535:
+                  raise RuntimeError('ZIP64 record count not supported by this selected archive')
+              records = []
+              off = 0
+              while True:
+                  off = data.find(b'PK\x01\x02', off)
+                  if off < 0:
+                      break
+                  if off + 46 > len(data):
+                      break
+                  h = struct.unpack_from('<4s6H3I5H2I', data, off)
+                  flags, method, crc, packed, unpacked = h[3], h[4], h[7], h[8], h[9]
+                  name_len, extra_len, comment_len, disk, local_offset = h[10], h[11], h[12], h[13], h[16]
+                  end_offset = off + 46 + name_len + extra_len + comment_len
+                  if name_len == 0 or name_len > 4096 or end_offset > len(data):
+                      off += 4
+                      continue
+                  name = entry_name(data[off+46:off+46+name_len], flags)
+                  records.append({
+                      'name': name, 'method': method, 'flags': flags, 'crc32': crc,
+                      'packed': packed, 'unpacked': unpacked, 'start_disk': disk,
+                      'local_offset': local_offset
+                  })
+                  off = end_offset
+              if len(records) != total or total < 1:
+                  raise RuntimeError(f'Central directory incomplete: {len(records)} of {total}')
+              return last_disk, records
+
+
+          def select_records(records):
+              selected = []
+              for e in records:
+                  name = e['name']
+                  if not name.startswith(DIRECTORY_PREFIX):
+                      continue
+                  rel = name[len(DIRECTORY_PREFIX):]
+                  if re.fullmatch(r'map/(?:1|2)/[0-9a-fA-F]{8}\.(?:s32|seg)', rel):
+                      selected.append(e)
+                  elif rel in EXTRA_FILES:
+                      selected.append(e)
+              targets = [e for e in selected if e['name'].endswith(('.s32', '.seg'))]
+              for mid in MAP_IDS:
+                  if not any(f'/map/{mid}/' in e['name'] for e in targets):
+                      raise RuntimeError('Missing expected map ID ' + str(mid))
+              return sorted(selected, key=lambda e:e['name'])
+
+
+          def plan():
+              REPORT.mkdir(parents=True, exist_ok=True)
+              last_disk, all_records = read_directory()
+              chosen = select_records(all_records)
+              (REPORT/'zip-target-index.json').write_text(json.dumps({'lastDisk': last_disk, 'totalRecords':len(all_records), 'selected':chosen}, indent=2, ensure_ascii=False), encoding='utf-8')
+              disks = sorted({d for e in chosen for d in (e['start_disk'], e['start_disk']+1) if d <= last_disk})
+              (REPORT/'required-volumes.txt').write_text('\n'.join((STEM+'.zip' if d==last_disk else STEM+f'.z{d+1:02d}') for d in disks if d != last_disk)+'\n', encoding='ascii')
+              print('INDEX',len(all_records),'SELECTED',len(chosen),'DISKS',disks)
+              for mid in MAP_IDS:
+                  candidates=[e for e in chosen if f'/map/{mid}/' in e['name']]
+                  print('MAP_ID',mid,'FILES',len(candidates),'SOURCE_DISKS',sorted(set(e['start_disk'] for e in candidates)))
+              for e in chosen:
+                  print('SELECT',e['name'],e['start_disk'],e['unpacked'])
+
+
+          def part_path(disk, last_disk):
+              return ROOT/(STEM+'.zip' if disk==last_disk else STEM+f'.z{disk+1:02d}')
+
+
+          def read_span(disk, offset, size, last_disk):
+              if size > 150_000_000 or size < 0:
+                  raise RuntimeError('Unexpected compressed entry size')
+              result=bytearray()
+              while len(result)<size:
+                  path=part_path(disk,last_disk)
+                  if not path.is_file():
+                      raise RuntimeError('Required volume not present: '+str(path))
+                  length=path.stat().st_size
+                  if offset >= length:
+                      if offset > length:
+                          raise RuntimeError('Invalid volume offset')
+                      disk += 1
+                      offset=0
+                      continue
+                  with path.open('rb') as f:
+                      f.seek(offset)
+                      fragment=f.read(min(size-len(result), length-offset))
+                  if not fragment:
+                      raise RuntimeError('Short ZIP part read: '+str(path))
+                  result.extend(fragment)
+                  offset += len(fragment)
+                  if offset == length and len(result)<size:
+                      disk += 1
+                      offset=0
+                      if disk > last_disk:
+                          raise RuntimeError('Unexpected end of multi-volume ZIP')
+              return bytes(result)
+
+
+          def extract(e, last_disk):
+              h=read_span(e['start_disk'],e['local_offset'],30,last_disk)
+              if h[:4] != b'PK\x03\x04':
+                  raise RuntimeError('Missing local header for '+e['name']+' at '+str(e['local_offset']))
+              v=struct.unpack('<4s5H3I2H',h)
+              flags, method, name_len, extra_len = v[2], v[3], v[9], v[10]
+              if flags & 1:
+                  raise RuntimeError('Encrypted archive entry is unsupported: '+e['name'])
+              if method != e['method']:
+                  raise RuntimeError('ZIP method mismatch: '+e['name'])
+              local=read_span(e['start_disk'],e['local_offset'],30+name_len+extra_len,last_disk)
+              local_name=entry_name(local[30:30+name_len],flags)
+              if local_name != e['name']:
+                  raise RuntimeError('ZIP filename mismatch for '+e['name']+' vs '+local_name)
+              packed=read_span(e['start_disk'],e['local_offset']+30+name_len+extra_len,e['packed'],last_disk)
+              if method==0:
+                  data=packed
+              elif method==8:
+                  data=zlib.decompress(packed,-15)
+              else:
+                  raise RuntimeError('Unsupported ZIP compression method '+str(method))
+              if len(data)!=e['unpacked'] or zlib.crc32(data)&0xffffffff!=e['crc32']:
+                  raise RuntimeError('Uncompressed size or CRC mismatch: '+e['name'])
+              return data
+
+
+          def parse_block(data, rel):
+              """Read S32 and SEG layout using documented community parser; collision bits are provisional."""
+              ext = Path(rel).suffix.lower()
+              chunk = Path(rel).stem
+              bx,by=int(chunk[:4],16),int(chunk[4:8],16)
+              start_x=(bx-0x7fff)*64+0x7fff-63
+              start_y=(by-0x7fff)*64+0x7fff-63
+              pos=0
+              if ext=='.s32':
+                  if len(data)<49158: raise ValueError('S32 too short')
+                  tile_bytes=4*64*128
+                  tiles=collections.Counter(struct.unpack_from('<H',data,i+1)[0] for i in range(0,tile_bytes,4))
+                  pos=tile_bytes
+                  count2=struct.unpack_from('<H',data,pos)[0]
+                  pos+=2+count2*6
+                  stride=4
+              else:
+                  if len(data)<24582: raise ValueError('SEG too short')
+                  tile_bytes=2*64*128
+                  tiles=collections.Counter(data[i+1] for i in range(0,tile_bytes,2))
+                  pos=tile_bytes
+                  count2=struct.unpack_from('<H',data,pos)[0]
+                  pos+=2+count2*4
+                  stride=2
+              if pos+4096*stride+4>len(data):
+                  raise ValueError('Layer3 offset beyond file: '+str(pos))
+              attr_offset=pos
+              attrs=bytearray()
+              attribute_freq=collections.Counter()
+              secondary_freq=collections.Counter()
+              for i in range(4096):
+                  if stride==4:
+                      a,b=struct.unpack_from('<HH',data,pos)
+                  else:
+                      a,b=struct.unpack_from('<BB',data,pos)
+                  attrs.extend(struct.pack('<H',a))
+                  attribute_freq[a]+=1
+                  secondary_freq[b]+=1
+                  pos+=stride
+              raw_group_count=struct.unpack_from('<i',data,pos)[0]
+              pos+=4
+              if not 0<=raw_group_count<10000:
+                  raise ValueError('Invalid Layer4 group count')
+              n_objects=0
+              for i in range(raw_group_count):
+                  if pos+4>len(data): raise ValueError('Short Layer4 header')
+                  group_id, n=struct.unpack_from('<hH',data,pos)
+                  pos+=4
+                  obj_stride=7 if ext=='.s32' else 5
+                  if pos+n*obj_stride>len(data): raise ValueError('Short Layer4 objects')
+                  n_objects+=n
+                  pos+=n*obj_stride
+              portals=[]
+              layer5=layer6=0
+              try:
+                  if ext=='.s32' and pos+4<=len(data):
+                      layer5=struct.unpack_from('<i',data,pos)[0];pos+=4
+                      if not 0<=layer5<=100000 or pos+5*layer5>len(data):raise ValueError('Layer5 invalid')
+                      pos+=5*layer5
+                      if pos+4<=len(data):
+                          layer6=struct.unpack_from('<i',data,pos)[0];pos+=4
+                          if not 0<=layer6<=100000 or pos+4*layer6>len(data):raise ValueError('Layer6 invalid')
+                          pos+=4*layer6
+                          if pos+2<=len(data):
+                              nportal=struct.unpack_from('<H',data,pos)[0];pos+=2
+                              for i in range(nportal):
+                                  if pos+1>len(data):raise ValueError('Short Layer7')
+                                  n=data[pos];pos+=1
+                                  if pos+n+8>len(data):raise ValueError('Short Layer7 record')
+                                  name=data[pos:pos+n].decode('cp949','replace');pos+=n
+                                  x,y,target_map,portal_id=struct.unpack_from('<BBHI',data,pos);pos+=8
+                                  portals.append({'name':name,'localX':x,'localY':y,'estimatedGameX':start_x+x//2,'estimatedGameY':start_y+y,'targetMapId':target_map,'portalId':portal_id})
+              except (ValueError,struct.error) as error:
+                  portals=[]
+                  # Keep validated Layer1/2/3/4 even if optional extended layout differs.
+              return {
+                  'file':rel,'extension':ext,'startX':start_x,'startY':start_y,'blockX':bx,'blockY':by,
+                  'layer1Tiles':sum(tiles.values()),'layer1TopTileIds':tiles.most_common(10),
+                  'layer2Count':count2,'layer3Offset':attr_offset,'layer3Count':4096,
+                  'provisionalBlockedBit0Count':sum(v for k,v in attribute_freq.items() if k&1),
+                  'attribute1MostCommon':attribute_freq.most_common(16),
+                  'attribute2MostCommon':secondary_freq.most_common(8),
+                  'layer4Groups':raw_group_count,'layer4Objects':n_objects,
+                  'layer5Entries':layer5,'layer6Entries':layer6,'layer7PortalsUnverified':portals,
+                  'layer3Attribute1Base64':base64.b64encode(attrs).decode('ascii'),
+                  'note':'Layer3 bit0 is an unverified passability indicator; edge rules and original rendering are not implemented.'
+              }
+
+
+          def generate_html(maps):
+              datas={str(k):{'mapId':k,'blocks':[{'x':b['startX'],'y':b['startY'],'att':b['layer3Attribute1Base64'],'file':b['file']} for b in v]} for k,v in maps.items()}
+              embedded=json.dumps(datas,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')
+              page=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sanctuary Original TI Dungeon Map Layer3 V2</title>
+          <style>body{margin:0;background:#101925;color:#eef6ff;font-family:system-ui,sans-serif;padding:14px}main{max-width:960px;margin:auto}h1{font-size:1.2rem}p{font-size:.83rem;line-height:1.55;color:#b8c9da}select{font:inherit;background:#283c54;color:white;padding:8px;border-radius:7px}canvas{image-rendering:pixelated;background:#101622;display:block;width:100%;max-width:850px;margin:auto;border:1px solid #526477;touch-action:manipulation}#stat{padding:8px;font-size:.9rem;color:#cce5ff}footer{font-size:.75rem;color:#bbc9d6}</style></head>
+          <body><main><h1>말하는 섬 던전 · 원본 S32 이동속성 조사 V2</h1><p>원본 ZIP의 map/1·map/2 Layer3를 좌표에 맞춰 배치했습니다. 바닥 타일 이미지는 아직 표시하지 않습니다. 남색은 bit0=1, 밝은 영역은 bit0=0입니다. 이 비트는 임시 통행 후보 지표이며 벽 충돌의 확정 판정이 아닙니다.</p><label>맵 선택 <select id="mid"><option value="1">말던 1층 후보 (map/1)</option><option value="2">말던 2층 후보 (map/2)</option></select></label><p id="stat"></p><canvas id="map"></canvas><p id="hit">칸을 누르면 게임 좌표와 속성값을 확인할 수 있습니다.</p><footer>검증 범위: 원본 압축 체크섬, Layer3 바이트, 블록 좌표. 몬스터 배치 및 바포메트 방 위치는 아직 미확인입니다.</footer></main>
+          <script id="pack" type="application/json">__DATA__</script><script>
+          'use strict';const all=JSON.parse(document.getElementById('pack').textContent);const mid=document.getElementById('mid'),cv=document.getElementById('map'),ctx=cv.getContext('2d'),stat=document.getElementById('stat'),hit=document.getElementById('hit');let origin={x:0,y:0},lookup=new Map();
+          function draw(){const data=all[mid.value],blocks=data.blocks;const minX=Math.min(...blocks.map(b=>b.x)),maxX=Math.max(...blocks.map(b=>b.x+63)),minY=Math.min(...blocks.map(b=>b.y)),maxY=Math.max(...blocks.map(b=>b.y+63));origin={x:minX,y:minY};const w=maxX-minX+1,h=maxY-minY+1;cv.width=w;cv.height=h;lookup=new Map();ctx.fillStyle='#11151f';ctx.fillRect(0,0,w,h);let blocked=0,free=0;const img=ctx.createImageData(w,h);for(let i=0;i<img.data.length;i+=4){img.data[i]=17;img.data[i+1]=21;img.data[i+2]=31;img.data[i+3]=255;}for(const b of blocks){const raw=atob(b.att),x0=b.x-minX,y0=b.y-minY;for(let y=0;y<64;y++)for(let x=0;x<64;x++){const k=2*(y*64+x),v=raw.charCodeAt(k)|(raw.charCodeAt(k+1)<<8),idx=4*((y+y0)*w+x+x0);if(v&1){img.data[idx]=45;img.data[idx+1]=77;img.data[idx+2]=111;blocked++;}else {img.data[idx]=163;img.data[idx+1]=187;img.data[idx+2]=169;free++;}lookup.set((y+y0)*w+x+x0,v)}}ctx.putImageData(img,0,0);stat.textContent='블록 '+blocks.length+'개 / '+w+'×'+h+'칸 / bit0=1 '+blocked+'칸 / bit0=0 '+free+'칸';hit.textContent='맵에서 칸을 누르면 좌표를 확인할 수 있습니다.'}
+          mid.onchange=draw;cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect();const x=Math.floor((e.clientX-r.left)/r.width*cv.width),y=Math.floor((e.clientY-r.top)/r.height*cv.height);const v=lookup.get(y*cv.width+x);hit.textContent='맵 '+mid.value+' / 게임 좌표 ('+(origin.x+x)+', '+(origin.y+y)+') / '+(v===undefined?'데이터 없음':'Layer3 값 '+v+' (0x'+v.toString(16)+')')});draw();
+          </script></body></html>'''
+              (REPORT/'TI-Dungeon-Layer3-Preview-V2.html').write_text(page.replace('__DATA__',embedded),encoding='utf-8')
+
+
+          def run_extract():
+              meta=json.loads((REPORT/'zip-target-index.json').read_text(encoding='utf-8'))
+              last_disk=meta['lastDisk']
+              results=[]; parsed={1:{},2:{}}
+              for e in meta['selected']:
+                  full=e['name']
+                  rel=full[len(DIRECTORY_PREFIX):]
+                  raw=extract(e,last_disk)
+                  dest=OUT/rel
+                  dest.parent.mkdir(parents=True,exist_ok=True)
+                  dest.write_bytes(raw)
+                  record={'path':rel,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'crc32Verified':True,'zipMethod':e['method']}
+                  if rel.startswith('map/'):
+                      try:
+                          block=parse_block(raw,rel)
+                          record.update({'blockParseOk':True,'layer3Start':block['layer3Offset'],'provisionalBlockedBit0Count':block['provisionalBlockedBit0Count'],'portalCandidateCount':len(block['layer7PortalsUnverified'])})
+                          mid=int(rel.split('/')[1]);name=Path(rel).stem
+                          if name not in parsed[mid] or block['extension']=='.s32':
+                              parsed[mid][name]=block
+                      except (ValueError,struct.error) as error:
+                          record['blockParseOk']=False
+                          record['blockParseError']=str(error)
+                  elif rel.lower().endswith('.xml'):
+                      record['headerText']=raw[:160].decode('utf-8','replace')
+                  results.append(record)
+                  print('EXTRACTED',rel,len(raw),'CRC_OK',record.get('blockParseOk','XML'))
+              maps={}
+              for mid in MAP_IDS:
+                  blocks=sorted(parsed[mid].values(),key=lambda x:(x['blockX'],x['blockY']))
+                  maps[mid]=blocks
+                  if not blocks:
+                      raise RuntimeError('No parsed map data for '+str(mid))
+                  (REPORT/f'map-{mid}-layers.json').write_text(json.dumps({'mapId':mid,'blocks':blocks},ensure_ascii=False,indent=2),encoding='utf-8')
+              generate_html(maps)
+              summary={
+                  'status':'source-extraction-and-provisional-layer3-preview',
+                  'sourceArchive':STEM,'sourceRunInventory':39043861671,
+                  'mapIdsExamined':list(MAP_IDS),'filesExtracted':len(results),
+                  'extractedBytes':sum(x['bytes'] for x in results),
+                  'mapResults':{str(mid):{'selectedBlocks':len(b),'boundingCoordinates':{'minX':min(x['startX'] for x in b),'minY':min(x['startY'] for x in b),'maxX':max(x['startX']+63 for x in b),'maxY':max(x['startY']+63 for x in b)},'provisionalPortalCandidates':sum(len(x['layer7PortalsUnverified']) for x in b)} for mid,b in maps.items()},
+                  'allCrcVerified':all(x['crc32Verified'] for x in results),
+                  'mobSpawnCoordinatesVerified':False,
+                  'collisionRoutingVerified':False,
+                  'tileVisualRenderingImplemented':False,
+              }
+              (REPORT/'extraction-manifest.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+              (REPORT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('V2 SUCCESS SUMMARY:',json.dumps(summary,ensure_ascii=False))
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+                      f.write('TI Dungeon original map extraction completed.\n\n')
+                      f.write('Map/1 blocks: '+str(summary['mapResults']['1']['selectedBlocks'])+'\n\n')
+                      f.write('Map/2 blocks: '+str(summary['mapResults']['2']['selectedBlocks'])+'\n\n')
+                      f.write('Collision bit0 is only provisional; monster spawns absent.\n')
+
+
+          if __name__=='__main__':
+              if len(sys.argv)!=2 or sys.argv[1] not in ('plan','extract'):
+                  raise SystemExit('Usage: mapv2.py plan|extract')
+              if sys.argv[1]=='plan': plan()
+              else: run_extract()
+          PY_SOURCE
+          python3 -m py_compile /tmp/mapv2.py
+          python3 /tmp/mapv2.py plan
+          test -s reports/zip-target-index.json
+          test -s reports/required-volumes.txt
+
+      - name: Download only required source data volumes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r part; do
+            if test -z "$part"; then continue; fi
+            echo "Downloading required split ZIP volume: $part"
+            gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern "$part" --dir archive --clobber
+            test -s "archive/$part"
+          done < reports/required-volumes.txt
+
+      - name: Extract and verify TI dungeon map 1 and 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/mapv2.py extract
+          test -s reports/map-1-layers.json
+          test -s reports/map-2-layers.json
+          test -s reports/TI-Dungeon-Layer3-Preview-V2.html
+          test -s extracted/map/1/7ffe8000.s32
+          test -s extracted/map/2/7fff8000.s32
+
+      - name: Upload original map sources and inspection preview
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-Source-Index-V1
-          path: reports/
+          name: Sanctuary-TI-Dungeon-V2-Raw-and-Layer3
+          path: |
+            extracted/
+            reports/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 6
+
+      - name: Upload diagnostic files if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sanctuary-TI-Dungeon-V2-Failure
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
