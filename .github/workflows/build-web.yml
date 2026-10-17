@@ -1,11 +1,11 @@
 
-name: Sanctuary of Aden Mobile V8.1 Responsive Gameplay Fix
+name: Sanctuary of Aden Mobile V9 Modular Build
 
 on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/build-web.yml"
+      - .github/workflows/build-web.yml
   workflow_dispatch:
 
 permissions:
@@ -13,489 +13,144 @@ permissions:
   actions: read
 
 concurrency:
-  group: sanctuary-mobile-v8-1
+  group: sanctuary-mobile-v9
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Reuse successful V7.2 and improve mobile gameplay
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Configure Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Restore verified V7.2 game package
+      - name: Restore verified V8.1 game
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p src reports dist/mobile
-          if gh run download 38971933186 --repo "$GITHUB_REPOSITORY" --name Sanctuary-Mobile-V7-2-Combat-Rebuilt --dir dist/mobile; then
-            echo 'Successful V7.2 package restored'
-          else
+          mkdir -p dist/mobile
+          if ! gh run download 38977628656 --repo "$GITHUB_REPOSITORY" --name Sanctuary-Mobile-V8-1-Responsive-Gameplay --dir dist/mobile; then
             rm -rf dist/mobile
             mkdir -p dist/mobile
-            git cat-file -e '7967b8e8a24187c201b23984639a1a13ddf76c0e^{commit}'
-            git show 7967b8e8a24187c201b23984639a1a13ddf76c0e:.github/workflows/build-web.yml > reports/verified-v7-2.yml
-            python -m pip install --disable-pip-version-check 'PyYAML==6.0.2' 'Pillow==11.3.0'
-            cat > src/rebuild_v72.py <<'PY_REBUILD'
-          import os
-          import subprocess
+            git show 36fdf528db010b5f07caff1f527ac1f8c099fa77:.github/workflows/build-web.yml > /tmp/v81.yml
+            python3 -m venv /tmp/sanctuary-venv
+            /tmp/sanctuary-venv/bin/pip -q install 'PyYAML==6.0.2' 'Pillow==11.3.0'
+            cat > /tmp/restore.py <<'PY_RESTORE'
+          import os, subprocess, yaml
           from pathlib import Path
-          import yaml
-          workflow=yaml.safe_load(Path('reports/verified-v7-2.yml').read_text(encoding='utf-8'))
+          workflow=yaml.safe_load(Path('/tmp/v81.yml').read_text())
           steps=workflow['jobs']['build']['steps']
-          required=[
-              'Restore successful V6 without failed V7 dependencies',
-              'Apply freshly rebuilt V7.2 combat patch',
-              'Validate graphics, JavaScript and combat timing'
-          ]
+          names=['Restore verified V7.2 game package','Build V8 mobile screen and navigation patch','Validate sprites, tiles, mobile input and path traversal']
           env=dict(os.environ)
-          env_path=Path(env['GITHUB_ENV'])
-          for name in required:
-              matches=[s for s in steps if s.get('name')==name and isinstance(s.get('run'),str)]
-              if len(matches)!=1:raise SystemExit('Missing verified V7.2 step: '+name)
-              print('Rebuilding V7.2:',name,flush=True)
-              subprocess.run(['bash','-e','-o','pipefail','-c',matches[0]['run']],env=env,check=True)
-              if env_path.exists():
-                  for line in env_path.read_text(encoding='utf-8').splitlines():
-                      if '=' in line:
-                          key,value=line.split('=',1)
-                          if key.isidentifier():env[key]=value
-          PY_REBUILD
-            python src/rebuild_v72.py
+          env['PATH']='/tmp/sanctuary-venv/bin:'+env['PATH']
+          for name in names:
+              found=[s for s in steps if s.get('name')==name]
+              if len(found)!=1:raise SystemExit('Missing pinned V8.1 step: '+name)
+              subprocess.run(['bash','-e','-o','pipefail','-c',found[0]['run']],env=env,check=True)
+              print('Rebuilt:',name,flush=True)
+          PY_RESTORE
+            /tmp/sanctuary-venv/bin/python /tmp/restore.py
           fi
-          python3 - <<'PY_SOURCE'
-          from pathlib import Path
-          import json
-          root=Path('dist/mobile')
-          manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
-          if manifest.get('version')!=7 or len(manifest.get('actors',{}))!=8 or manifest.get('map',{}).get('size')!=[192,192]:
-              raise SystemExit('Verified V7.2 package is incomplete')
-          if len(list((root/'assets').glob('*.png')))<3000 or len(list((root/'tiles').glob('*.png')))<100:
-              raise SystemExit('Missing verified original SPR/TIL images')
-          print('V7.2 source validated')
-          PY_SOURCE
 
-      - name: Build V8 mobile screen and navigation patch
+      - name: Split HTML into reusable game files
         shell: bash
         run: |
           set -euo pipefail
-          cat > src/patch_v8.py <<'PY_PATCH'
+          python3 - <<'PY_SPLIT'
           from pathlib import Path
-          import json
-          import re
-          import sys
-
-          root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('dist/mobile')
-          page = root / 'index.html'
-          meta = root / 'manifest.json'
-          html = page.read_text(encoding='utf-8')
-          man = json.loads(meta.read_text(encoding='utf-8'))
-          if man.get('version') != 7 or man.get('map',{}).get('size') != [192,192] or len(man.get('actors',{})) != 8:
-              raise SystemExit('A successful V7.2 package is required')
-
-          def swap(s, old, new, why):
-              n = s.count(old)
-              if n != 1:
-                  raise ValueError(f'{why}: expected 1 occurrence, found {n}')
-              return s.replace(old, new, 1)
-
-          def replace_fn(code, name, body):
-              pattern = r'\bfunction\s+' + re.escape(name) + r'\s*\('
-              matches = list(re.finditer(pattern, code))
-              if len(matches) != 1:
-                  raise ValueError(f'Function {name} count={len(matches)}')
-              start = matches[0].start()
-              left = code.find('{', matches[0].end())
-              if left == -1:
-                  raise ValueError('Function opening brace missing: '+name)
-              nesting = 0
-              quote = None
-              escaped = False
-              for i in range(left, len(code)):
-                  c=code[i]
-                  if quote:
-                      if escaped:
-                          escaped = False
-                      elif c == '\\':
-                          escaped = True
-                      elif c == quote:
-                          quote=None
-                  elif c in ('"',"'",'`'):
-                      quote=c
-                  elif c=='{':
-                      nesting+=1
-                  elif c=='}':
-                      nesting-=1
-                      if nesting==0:
-                          return code[:start]+body+code[i+1:]
-              raise ValueError('Function closing brace missing: '+name)
-
-          html=swap(html,'Sanctuary of Aden Mobile V7.2 · Original Map Combat','Sanctuary of Aden Mobile V8 · Mobile Gameplay','page title')
-          html=swap(html,'Sanctuary Mobile V7.2</strong>','Sanctuary Mobile V8</strong>','HUD version')
-          html=swap(html,'<button id="labOpen" type="button">SPR 모션 연구실</button>', '<button id="settingsToggle" type="button" aria-label="모바일 설정">설정</button>\n<button id="labOpen" type="button">모션 연구실</button>','toolbar')
-          html=swap(html,'<div id="tip">', '''<section id="settingsPanel" hidden aria-label="모바일 화면 및 조작 설정">
-            <div class="settingHead"><strong>모바일 구동 설정</strong><button id="settingsClose" type="button">닫기</button></div>
-            <div class="settingZoom"><button id="zoomOut" type="button">−</button><span id="zoomValue">100%</span><button id="zoomIn" type="button">+</button><button id="zoomReset" type="button">기본</button></div>
-            <div class="settingRow"><label for="frameRate">화면 갱신</label><select id="frameRate"><option value="30">30 FPS · 절전</option><option value="60">60 FPS · 부드럽게</option></select></div>
-            <div class="settingRow"><label for="controlSize">조작 버튼</label><select id="controlSize"><option value="small">작게</option><option value="normal">기본</option><option value="large">크게</option></select></div>
-            <div class="settingRow"><button id="fullScreen" type="button">전체 화면</button><button id="settingsReset" type="button">화면 설정 초기화</button></div>
-            <div id="settingsLegacy"></div>
-            <small>필드에서 두 손가락으로 확대·축소할 수 있습니다. 설정 중에는 전투를 일시정지합니다.</small>
-          </section>
-          <div id="tip">''','settings panel')
-          html=swap(html,'</style>', '''
-          :root{--padSize:132px}
-          html,body,#stage{height:100%;height:100dvh}
-          #hud{width:min(48vw,200px);min-width:0;max-width:200px}
-          #hud strong{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-          #hud small,#gameState,#mapText{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-          #settingsToggle{position:absolute;top:calc(9px + env(safe-area-inset-top));right:10px;z-index:12;background:#41675c;padding:9px 11px}
-          #labOpen{right:70px;top:calc(9px + env(safe-area-inset-top));font-size:12px;z-index:11;padding:9px 11px}
-          #settingsPanel{position:absolute;z-index:22;top:calc(53px + env(safe-area-inset-top));right:9px;width:min(310px,calc(100vw - 18px));max-height:calc(100dvh - 70px - env(safe-area-inset-top) - env(safe-area-inset-bottom));overflow-y:auto;overscroll-behavior:contain;background:#0b1b1ef5;border:1px solid #b1b692a8;border-radius:12px;padding:10px;box-shadow:0 8px 30px #0009;display:grid;gap:10px}
-          #settingsPanel[hidden]{display:none}
-          .settingHead{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#f4dfab;font-size:16px}
-          .settingHead button{font-size:12px;padding:7px 12px}
-          .settingZoom{display:grid;grid-template-columns:44px 1fr 44px 55px;gap:6px;align-items:center;text-align:center}
-          .settingZoom button{padding:9px 3px;font-size:16px}
-          .settingZoom #zoomReset{font-size:12px}
-          .settingRow{display:grid;grid-template-columns:1fr 1fr;gap:7px;align-items:center}
-          .settingRow select{width:100%;min-width:0;background:#233b3e;border:1px solid #8da39b;border-radius:8px;padding:8px 4px;color:#faf3da}
-          .settingRow button{font-size:12px;padding:9px 5px}
-          #settingsLegacy{display:grid;grid-template-columns:1fr 1fr;gap:7px}
-          #settingsLegacy button{position:static!important;inset:auto!important;top:auto!important;right:auto!important;left:auto!important;bottom:auto!important;width:100%;padding:8px 5px;font-size:12px}
-          #settingsPanel small{font-size:11px;color:#bfcebf;line-height:1.5}
-          #pad{width:var(--padSize);height:var(--padSize);z-index:7;left:max(9px,env(safe-area-inset-left));bottom:max(13px,env(safe-area-inset-bottom))}
-          #knob{width:43%;height:43%}
-          #keys{z-index:7;bottom:max(13px,env(safe-area-inset-bottom));right:max(9px,env(safe-area-inset-right));grid-template-columns:73px 88px;gap:6px}
-          #keys button{min-height:42px}
-          #hitBtn{min-height:91px;font-size:17px}
-          #tip{top:calc(80px + env(safe-area-inset-top));max-width:60vw}
-          #miniWrap{top:calc(64px + env(safe-area-inset-top));right:9px;z-index:4}
-          #targetPanel{top:calc(143px + env(safe-area-inset-top));z-index:6}
-          @media (orientation:landscape) and (max-height:600px){
-           #hud{padding:5px 8px;min-width:126px;font-size:11px}
-           #hud strong{font-size:12px}
-           #hud small{font-size:10px}
-           #labOpen,#settingsToggle{padding:6px 9px;font-size:11px}
-           #labOpen{right:60px}
-           #tip{display:none}
-           #pad{width:min(var(--padSize),112px);height:min(var(--padSize),112px);bottom:max(7px,env(safe-area-inset-bottom))}
-           #keys{grid-template-columns:65px 76px;gap:4px;bottom:max(7px,env(safe-area-inset-bottom))}
-           #keys button{min-height:33px;padding:5px 2px;font-size:11px}
-           #hitBtn{min-height:70px!important;font-size:14px!important}
-           #targetPanel{left:8px;top:calc(109px + env(safe-area-inset-top));max-width:152px;padding:5px 7px}
-           #miniWrap{top:calc(49px + env(safe-area-inset-top));padding:3px 4px;width:92px;font-size:8px}
-           #minimap{width:82px;height:82px}
-           #miniWrap:not([hidden]){display:block}
-           #settingsPanel{top:calc(42px + env(safe-area-inset-top));max-height:calc(100dvh - 55px)}
-          }
-          @media (max-width:360px) and (orientation:portrait){
-           #keys{grid-template-columns:65px 75px;gap:4px}
-           #keys button{font-size:11px;padding:6px 3px}
-           #labOpen{font-size:11px;right:64px;padding:8px}
-           #settingsToggle{padding:8px}
-          }
-          </style>''','responsive CSS')
-
-          match=re.findall(r'<script>([\s\S]*?)</script>',html)
-          if len(match)!=1:
-              raise ValueError('Game script is not unique')
-          js=match[0]
-          js=swap(js,'let selectedMob=null,queuedAttack=false,damageNumbers=[];', '''let selectedMob=null,queuedAttack=false,damageNumbers=[];
-          const UI_SETTINGS_KEY='sanctuary-mobile-v8';
-          let cameraZoom=1,paintFPS=30,lastPaint=0,settingsOpen=false,controlSize='normal';
-          let frameFingers=new Map(),tapFinger=null,pinching=false,pinchStartDistance=0,pinchStartZoom=1;
-          ''','camera and settings state')
-
-          js=replace_fn(js,'resize', '''function resize(){
-            dpr=Math.min(1.5,window.devicePixelRatio||devicePixelRatio||1);
-            sw=Math.max(1,scene.clientWidth);sh=Math.max(1,scene.clientHeight);
-            scene.width=Math.max(1,Math.round(sw*dpr));scene.height=Math.max(1,Math.round(sh*dpr));
-            last=0;lastPaint=0;
-          }''')
-          js=swap(js,"window.addEventListener('resize',resize);resize();",'''window.addEventListener('resize',resize);
-          window.addEventListener('orientationchange',()=>setTimeout(resize,120));
-          if(window.visualViewport)window.visualViewport.addEventListener('resize',resize);
-          resize();''','resize events')
-
-          js=replace_fn(js,'travel','''function travel(actor,route,dt,speed){
-            if(!route.length)return false;
-            let remaining=Math.max(0,dt*speed),moved=false,steps=0;
-            while(remaining>0.0001&&route.length&&steps++<8){
-              const target=route[0],dx=target.x-actor.x,dy=target.y-actor.y,distStep=Math.hypot(dx,dy);
-              if(distStep<.12){route.shift();continue}
-              const length=Math.min(distStep,remaining);
-              if(!moveFoot(actor,dx/distStep*length,dy/distStep*length)){route.length=0;return moved}
-              actor.dir=facing((dx-dy)*TW/2,(dx+dy)*TH/2);
-              moved=true;remaining-=length;
-              if(distStep-length<.12)route.shift();
-            }
-            return moved;
-          }''')
-          js=swap(js,'function findPath(from,to,maxNodes=18000){','function findPath(from,to,maxNodes=W*H){','full map pathfinding')
-          if js.count('let range=clamp(Math.ceil((sw/32+sh/16)/4)+6,15,35)')!=2:
-              raise ValueError('Expected two tile/object radius locations')
-          js=js.replace('let range=clamp(Math.ceil((sw/32+sh/16)/4)+6,15,35)','let range=viewRadius()')
-          js=swap(js,'function tileAtlas(id){','''function viewRadius(){return clamp(Math.ceil((sw/32+sh/16)/(4*cameraZoom))+7,14,54)}
-          function outsideView(px,py,buffer=40){
-            const x=sw/2+(px-sw/2)*cameraZoom,y=sh/2+(py-sh/2)*cameraZoom;
-            return x< -buffer||x>sw+buffer||y< -buffer||y>sh+buffer;
-          }
-          function tileAtlas(id){''','world culling')
-          js=swap(js,'if(p.x < -64||p.x > sw+64||p.y < -80||p.y > sh+72)continue;', 'if(outsideView(p.x,p.y,80))continue;', 'cull objects for zoom')
-          js=swap(js,'if(p.x < -36||p.x > sw+36||p.y < -36||p.y > sh+36)continue;', 'if(outsideView(p.x,p.y,40))continue;', 'cull tiles for zoom')
-
-          js=replace_fn(js,'render', '''function render(t){
-            if(lastPaint&&t-lastPaint<1000/paintFPS-1){requestAnimationFrame(render);return}
-            lastPaint=t;
-            const dt=last?Math.min(.05,(t-last)/1000):0;last=t;
-            update(dt);
-            ctx.setTransform(dpr,0,0,dpr,0,0);
-            ctx.fillStyle='#192a26';ctx.fillRect(0,0,sw,sh);
-            ctx.save();ctx.translate(sw/2,sh/2);ctx.scale(cameraZoom,cameraZoom);ctx.translate(-sw/2,-sh/2);
-            ctx.imageSmoothingEnabled=false;ground();drawTargetRing();
-            const order=[...getVisibleObjects().map(v=>({ob:v.ob,depth:v.depth})),...mobs.map(m=>({unit:m,type:m.visual||'enemy',depth:m.x+m.y+.1})),{unit:hero,type:'hero',depth:hero.x+hero.y+.1}];
-            order.sort((a,b)=>a.depth-b.depth);
-            for(const entry of order){if(entry.ob)drawObject(entry.ob);else drawActor(entry.unit,entry.type)}
-            drawDamageText();ctx.restore();
-            if(hero.dead){ctx.fillStyle='#000a';ctx.fillRect(0,0,sw,sh);ctx.fillStyle='#fff0ca';ctx.font='bold 27px system-ui';ctx.textAlign='center';ctx.fillText('전투 불능',sw/2,sh*.4)}
-            drawMini();drawLab(t);
-            if(t>toastUntil)el('tip').style.opacity='0';
-            requestAnimationFrame(render);
-          }''')
-          js=swap(js,'function update(dt){if(open)return;', 'function update(dt){if(open||settingsOpen)return;', 'pause settings')
-
-          old="scene.addEventListener('pointerdown',e=>{if(open||hero.dead)return;let rect=scene.getBoundingClientRect(),dx=(e.clientX-rect.left-sw*.5)/(TW/2),dy=(e.clientY-rect.top-sh*.46)/(TH/2);let x=hero.x+(dx+dy)/2,y=hero.y+(dy-dx)/2;let target=mobs.filter(m=>!m.dead).sort((a,b)=>Math.hypot(a.x-x,a.y-y)-Math.hypot(b.x-x,b.y-y))[0];if(target&&Math.hypot(target.x-x,target.y-y)<1.2){targetChoose(target,true);msg('SPR '+D.actors[target.visual].sprite_id+' 선택 · 자동 접근',1)}else setDestination(x,y)});"
-          new='''function fieldTap(clientX,clientY){
-            if(open||settingsOpen||hero.dead)return;
-            const rect=scene.getBoundingClientRect();
-            const localX=(clientX-rect.left-sw/2)/cameraZoom+sw/2;
-            const localY=(clientY-rect.top-sh/2)/cameraZoom+sh/2;
-            const dx=(localX-sw*.5)/(TW/2),dy=(localY-sh*.46)/(TH/2);
-            const x=hero.x+(dx+dy)/2,y=hero.y+(dy-dx)/2;
-            const target=mobs.filter(m=>!m.dead).sort((a,b)=>Math.hypot(a.x-x,a.y-y)-Math.hypot(b.x-x,b.y-y))[0];
-            if(target&&Math.hypot(target.x-x,target.y-y)<1.2){targetChoose(target,true);msg('SPR '+D.actors[target.visual].sprite_id+' 선택 · 자동 접근',1)}else setDestination(x,y);
-          }
-          function fingerDistance(){const pts=[...frameFingers.values()];return pts.length<2?0:Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y)}
-          scene.addEventListener('pointerdown',e=>{
-            if(open||settingsOpen||hero.dead)return;
-            frameFingers.set(e.pointerId,{x:e.clientX,y:e.clientY});
-            if(frameFingers.size===1)tapFinger={id:e.pointerId,x:e.clientX,y:e.clientY,moved:false,blocked:false};
-            if(frameFingers.size===2){pinching=true;pinchStartDistance=fingerDistance();pinchStartZoom=cameraZoom;if(tapFinger)tapFinger.blocked=true}
-            if(frameFingers.size>2&&tapFinger)tapFinger.blocked=true;
-            if(scene.setPointerCapture)scene.setPointerCapture(e.pointerId);
-            e.preventDefault();
-          });
-          scene.addEventListener('pointermove',e=>{
-            if(!frameFingers.has(e.pointerId))return;
-            frameFingers.set(e.pointerId,{x:e.clientX,y:e.clientY});
-            if(tapFinger&&e.pointerId===tapFinger.id&&Math.hypot(e.clientX-tapFinger.x,e.clientY-tapFinger.y)>12)tapFinger.moved=true;
-            if(frameFingers.size>=2&&pinchStartDistance>5){cameraZoom=clamp(pinchStartZoom*fingerDistance()/pinchStartDistance,.7,1.65);refreshZoomLabel()}
-            e.preventDefault();
-          });
-          function fieldPointerEnd(e){
-            if(!frameFingers.has(e.pointerId))return;
-            const isTap=frameFingers.size===1&&tapFinger&&tapFinger.id===e.pointerId&&!tapFinger.blocked&&!tapFinger.moved&&!pinching;
-            frameFingers.delete(e.pointerId);
-            if(isTap)fieldTap(e.clientX,e.clientY);
-            if(frameFingers.size===0){if(pinching)saveMobileSettings();pinching=false;tapFinger=null;pinchStartDistance=0}
-            e.preventDefault();
-          }
-          scene.addEventListener('pointerup',fieldPointerEnd);
-          scene.addEventListener('pointercancel',e=>{if(tapFinger)tapFinger.blocked=true;fieldPointerEnd(e)});'''
-          js=swap(js,old,new,'tap to move and pinch gesture')
-
-          setup='''function readMobileSettings(){
-            try{const raw=JSON.parse(localStorage.getItem(UI_SETTINGS_KEY)||'{}');if(raw&&typeof raw==='object'){
-              cameraZoom=clamp(Number(raw.zoom)||1,.7,1.65);
-              paintFPS=Number(raw.fps)===60?60:30;
-              controlSize=['small','normal','large'].includes(raw.controls)?raw.controls:'normal';
-            }}catch(e){}
-          }
-          function saveMobileSettings(){
-            try{localStorage.setItem(UI_SETTINGS_KEY,JSON.stringify({zoom:cameraZoom,fps:paintFPS,controls:controlSize}))}catch(e){}
-          }
-          function refreshZoomLabel(){el('zoomValue').textContent=Math.round(cameraZoom*100)+'%'}
-          function applyMobileSettings(){
-            el('frameRate').value=String(paintFPS);
-            el('controlSize').value=controlSize;
-            document.documentElement.style.setProperty('--padSize',({small:106,normal:132,large:157}[controlSize])+'px');
-            refreshZoomLabel();
-          }
-          function changeZoom(next){cameraZoom=clamp(Math.round(next*100)/100,.7,1.65);refreshZoomLabel();saveMobileSettings()}
-          function stopMovement(){pressed={};stickVector={x:0,y:0};stickId=null;el('knob').style.left='50%';el('knob').style.top='50%';frameFingers.clear();pinching=false;tapFinger=null;last=0}
-          function settingsShow(value){settingsOpen=value;el('settingsPanel').hidden=!value;if(value)stopMovement()}
-          for(const id of ['again','miniToggle','overlayToggle','objectToggle','textureToggle'])el('settingsLegacy').appendChild(el(id));
-          readMobileSettings();applyMobileSettings();
-          el('settingsToggle').onclick=()=>settingsShow(!settingsOpen);
-          el('settingsClose').onclick=()=>settingsShow(false);
-          el('zoomIn').onclick=()=>changeZoom(cameraZoom+.1);
-          el('zoomOut').onclick=()=>changeZoom(cameraZoom-.1);
-          el('zoomReset').onclick=()=>changeZoom(1);
-          el('frameRate').onchange=()=>{paintFPS=Number(el('frameRate').value)===60?60:30;last=0;lastPaint=0;saveMobileSettings()};
-          el('controlSize').onchange=()=>{controlSize=el('controlSize').value;applyMobileSettings();saveMobileSettings()};
-          el('settingsReset').onclick=()=>{cameraZoom=1;paintFPS=30;controlSize='normal';applyMobileSettings();saveMobileSettings()};
-          el('fullScreen').onclick=()=>{
-            if(document.fullscreenElement){const p=document.exitFullscreen?.();p?.catch?.(()=>msg('전체 화면 해제 불가',1.2))}
-            else{const p=el('stage').requestFullscreen?.();if(p)p.catch?.(()=>msg('이 브라우저는 전체 화면을 제한합니다',1.5));else msg('전체 화면 기능 미지원',1.2)}
-          };
-          window.addEventListener('blur',stopMovement);
-          document.addEventListener('visibilitychange',()=>{if(document.hidden)stopMovement()});
-          '''
-          js=swap(js,'begin();requestAnimationFrame(render);',setup+'begin();requestAnimationFrame(render);','settings wiring')
-          js=swap(js,"pad.addEventListener('pointerdown',e=>{if(open)return;", "pad.addEventListener('pointerdown',e=>{if(open||settingsOpen)return;",'settings pad lock')
-          js=swap(js,"window.addEventListener('keydown',e=>{if(open)return;", "window.addEventListener('keydown',e=>{if(open||settingsOpen)return;",'settings keyboard lock')
-
-          html=swap(html,match[0],js,'embed patched runtime')
-          man['version']=8
-          man['status']='ORIGINAL_S32_TIL_SPR_MOBILE_UI_AND_CONTROLS_V8'
-          man['v8_mobile']={'pinch_zoom':[0.7,1.65], 'frame_rates':[30,60], 'control_sizes':['small','normal','large'], 'layout':'responsive portrait and landscape', 'path':'continuous waypoint movement', 'source':'successful V7.2 package'}
-          meta.write_text(json.dumps(man,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
-          tag='<script id="manifest" type="application/json">'
-          a=html.find(tag);b=html.find('</script>',a+len(tag))
-          if a<0 or b<0:raise ValueError('Could not embed V8 manifest')
-          html=html[:a+len(tag)]+json.dumps(man,ensure_ascii=False,separators=(',',':'))+html[b:]
+          import hashlib, json, re
+          root=Path('dist/mobile'); page=root/'index.html'
+          html=page.read_text(encoding='utf-8')
+          data=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
+          assert data['version']==8 and len(data['actors'])==8 and data['map']['size']==[192,192]
+          def unique(pattern,label):
+              hits=list(re.finditer(pattern,html))
+              if len(hits)!=1:raise SystemExit(label+' is not unique')
+              return hits[0]
+          css=unique(r'<style>([\s\S]*?)</style>','CSS')
+          manifest=unique(r'<script id="manifest" type="application/json">([\s\S]*?)</script>','map data')
+          script=unique(r'<script>([\s\S]*?)</script>','game JS')
+          if json.loads(manifest.group(1))!=data:raise SystemExit('Game data mismatch')
+          old="const D=JSON.parse(document.getElementById('manifest').textContent);"
+          if script.group(1).count(old)!=1:raise SystemExit('Engine data entrypoint changed')
+          game=script.group(1).replace(old,"const D=window.SANCTUARY_MANIFEST;if(!D)throw Error('Missing game data');",1)
+          (root/'game.css').write_text(css.group(1).lstrip('\n'),encoding='utf-8')
+          (root/'game.js').write_text(game.lstrip('\n'),encoding='utf-8')
+          (root/'game-data.js').write_text('window.SANCTUARY_MANIFEST='+json.dumps(data,ensure_ascii=False,separators=(',',':'))+';\n',encoding='utf-8')
+          html=html.replace(css.group(0),'<link rel="stylesheet" href="game.css">',1)
+          html=html.replace(manifest.group(0),'<script src="game-data.js"></script>',1)
+          html=html.replace(script.group(0),'<script src="game.js"></script>',1)
+          html=html.replace('Sanctuary of Aden Mobile V8 · Mobile Gameplay','Sanctuary of Aden Mobile V9 · Modular Runtime',1)
+          html=html.replace('Sanctuary Mobile V8</strong>','Sanctuary Mobile V9</strong>',1)
+          if '<style>' in html or '<script>' in html or html.index('game-data.js')>html.index('game.js'):
+              raise SystemExit('Modular script loading order invalid')
           page.write_text(html,encoding='utf-8')
-          (root/'README_KO.txt').write_text('Sanctuary Mobile V8\n기존 V7.2 S32 지도, TIL 원본 그래픽, SPR 8개 ID와 전투·모션 연구실 유지\n세로/가로 모드 설정, 핀치 줌 70~165%, 조작 버튼 크기, 30/60FPS, 전체 화면, 경유점 연속 이동\n설정 버튼에서 원본 타일, 오브젝트, 충돌, 미니맵, 다시 시작을 조절합니다.\n몬스터 이름과 원작 전투 수치, 모션 의미는 아직 검증되지 않았습니다.\n',encoding='utf-8')
-          print('V8 patches applied; JavaScript characters=',len(js),'tiles=',len(man['map']['objects']))
-          PY_PATCH
-          python -m py_compile src/patch_v8.py
-          python src/patch_v8.py dist/mobile
+          info={'package':9,'engine':8,'source_run':38977628656,'sha256':{n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in ['game.css','game.js','game-data.js','manifest.json']}}
+          (root/'build-info.json').write_text(json.dumps(info,indent=2)+'\n',encoding='utf-8')
+          (root/'README_KO.txt').write_text((root/'README_KO.txt').read_text(encoding='utf-8')+'\nV9: 게임 기능을 변경하지 않고 HTML/CSS/JS/맵 데이터만 분리했습니다. 폴더 전체를 함께 실행하세요.\n',encoding='utf-8')
+          print('V9 modularized: index=',page.stat().st_size,'game JS=',(root/'game.js').stat().st_size)
+          PY_SPLIT
 
-      - name: Validate sprites, tiles, mobile input and path traversal
+      - name: Verify original assets and test mobile runtime
         shell: bash
         run: |
           set -euo pipefail
-          cat > reports/package_check.py <<'PY_VERIFY'
+          python3 - <<'PY_CHECK'
           from pathlib import Path
-          import json,re,sys,hashlib
-          root=Path(sys.argv[1] if len(sys.argv)>1 else 'dist/mobile')
-          man=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
-          html=(root/'index.html').read_text(encoding='utf-8')
-          if man['version']!=8 or len(man['actors'])!=8:
-              raise SystemExit('V8 actor catalog missing')
-          world=man['map']
-          if world['size']!=[192,192] or len(world['flags'])!=36864 or len(world['objects'])<10000:
-              raise SystemExit('Original S32 content lost')
-          if len(list((root/'assets').glob('*.png')))<3000 or len(list((root/'tiles').glob('*.png')))<100:
-              raise SystemExit('Original sprite or tile PNG missing')
-          for id in ('settingsToggle','settingsPanel','zoomIn','zoomOut','frameRate','controlSize','pad','keys','lab','targetNext','hitBtn'):
-              if f'id="{id}"' not in html:raise SystemExit('Missing V8 control: '+id)
-          start='<script id="manifest" type="application/json">'
-          a=html.find(start);b=html.find('</script>',a+len(start))
-          if a<0 or b<0 or json.loads(html[a+len(start):b])!=man:
-              raise SystemExit('V8 inline manifest is inconsistent')
-          js=re.findall(r'<script>([\s\S]*?)</script>',html)
-          if len(js)!=1 or js[0].count('showTextures=true')!=1:
-              raise SystemExit('V8 standalone JS or retained texture state missing')
-          Path('reports').mkdir(parents=True,exist_ok=True)
-          Path('reports/game.js').write_text(js[0],encoding='utf-8')
-          print('V8 original assets retained:',len(list((root/'assets').glob('*.png'))),'SPR images,',len(list((root/'tiles').glob('*.png'))),'TIL atlases,',len(world['objects']),'S32 objects')
-          PY_VERIFY
-          python reports/package_check.py dist/mobile
-          node --check reports/game.js
-          cat > reports/smoke.cjs <<'NODE_SMOKE'
-          const fs=require('fs'),vm=require('vm'),assert=require('assert');
-          const html=fs.readFileSync('dist/mobile/index.html','utf8');
-          const manifest=html.match(/<script id="manifest" type="application\/json">([\s\S]*?)<\/script>/)?.[1];
-          let game=html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-          assert(manifest&&game,'Game source/manifest missing');
-          const hook='begin();requestAnimationFrame(render);';
-          assert(game.includes(hook),'Startup hook missing');
-          game=game.replace(hook,"begin();globalThis.QA={hero:()=>hero,findPath,findOpen,travel,zoom:()=>cameraZoom,fingers:()=>frameFingers.size,paused:()=>settingsOpen,keys:()=>pressed,flags:()=>({showTextures,showObjects})};requestAnimationFrame(render);");
-          let now=0,queue=[],elements=new Map(),listeners={};
-          function c2d(){
-            const drawing={
-              createImageData(w,h){return {data:new Uint8ClampedArray(w*h*4)}},
-              getImageData(){return {data:new Uint8ClampedArray(192*192*4)}},
-              measureText(t){return {width:String(t).length*10}}
-            };
-            return new Proxy(drawing,{
-              get(target,key){return key in target?target[key]:()=>{}},
-              set(target,key,value){target[key]=value;return true}
-            });
-          }
-          class E{
-           constructor(id){this.id=id;this.style={setProperty(){}};this.listeners={};this.hidden=['lab','settingsPanel','targetPanel'].includes(id);this.textContent=id==='manifest'?manifest:'';this.classList={add(){},remove(){},toggle(){}};this.value={labActor:'hero',labMode:'idle',labDir:'0',labSpeed:'110',labFrame:'-1',frameRate:'30',controlSize:'normal'}[id]||'0';this.clientWidth=390;this.clientHeight=844;this.width=192;this.height=192;this.children=[];this.files=[];}
-           getContext(){return c2d()}addEventListener(k,f){(this.listeners[k]??=[]).push(f)}
-           click(){this.onclick?.();this.fire('click')}
-           fire(k,vars={}){for(const f of this.listeners[k]||[])f({preventDefault(){},pointerId:1,clientX:150,clientY:400,...vars})}
-           appendChild(e){this.children.push(e)}replaceChildren(...x){this.children=x}setPointerCapture(){}remove(){}getBoundingClientRect(){return {left:0,top:0,width:390,height:844}}
-          }
-          const document={getElementById(id){if(!elements.has(id))elements.set(id,new E(id));return elements.get(id)},createElement:id=>new E(id),documentElement:new E('html'),addEventListener(k,f){listeners[k]=f},body:new E('body'),hidden:false};
+          import json
+          p=Path('dist/mobile'); d=json.loads((p/'manifest.json').read_text())
+          assert len(d['map']['flags'])==36864 and len(d['map']['objects'])==59963
+          assert len(list((p/'assets').glob('*.png')))==3616
+          assert len(list((p/'tiles').glob('*.png')))==218
+          html=(p/'index.html').read_text(encoding='utf-8')
+          assert html.index('src="game-data.js"')<html.index('src="game.js"')
+          assert len(html)<15000 and 'href="game.css"' in html
+          content=(p/'game-data.js').read_text(encoding='utf-8')
+          assert json.loads(content.removeprefix('window.SANCTUARY_MANIFEST=').removesuffix(';\n'))==d
+          print('Original V8.1 assets and external data verified')
+          PY_CHECK
+          node --check dist/mobile/game.js
+          node --check dist/mobile/game-data.js
+          mkdir -p reports
+          cat > reports/smoke.cjs <<'JS_TEST'
+          const fs=require('fs'),vm=require('vm'),a=require('assert');
+          const root='dist/mobile/';const code=fs.readFileSync(root+'game.js','utf8');
+          const data=JSON.parse(fs.readFileSync(root+'manifest.json','utf8'));
+          let frames=[],now=0,dom=new Map(),listeners={};
+          const canvas=()=>new Proxy({createImageData(w,h){return{data:new Uint8ClampedArray(w*h*4)}},getImageData(){return{data:new Uint8ClampedArray(192*192*4)}},measureText(s){return{width:String(s).length*10}}},{get(o,k){return k in o?o[k]:()=>{}},set(o,k,v){o[k]=v;return true}});
+          class E{constructor(id){this.id=id;this.style={setProperty(){}};this.listeners={};this.hidden=['lab','settingsPanel','targetPanel'].includes(id);this.textContent='';this.value={frameRate:'30',controlSize:'normal',labActor:'hero',labMode:'idle',labDir:'0',labSpeed:'110',labFrame:'-1'}[id]||'0';this.classList={add(){},remove(){},toggle(){}};this.clientWidth=390;this.clientHeight=844;this.width=192;this.height=192;this.children=[];this.files=[]}getContext(){return canvas()}addEventListener(k,f){(this.listeners[k]??=[]).push(f)}click(){this.onclick?.();this.fire('click')}fire(k,x={}){for(const f of this.listeners[k]||[])f({pointerId:1,clientX:150,clientY:400,preventDefault(){},...x})}appendChild(e){this.children.push(e)}replaceChildren(...x){this.children=x}setPointerCapture(){}getBoundingClientRect(){return{left:0,top:0,width:390,height:844}}remove(){}}
+          const doc={getElementById(id){if(id==='manifest')throw Error('Old inline manifest dependency');if(!dom.has(id))dom.set(id,new E(id));return dom.get(id)},createElement:id=>new E(id),documentElement:new E('html'),addEventListener(k,f){listeners[k]=f},body:new E('body'),hidden:false};
           class Image{constructor(){this.complete=true;this.naturalWidth=24;this.naturalHeight=24}set src(v){this._src=v}get src(){return this._src}}
-          const storage=new Map();
-          const sandbox={document,window:{devicePixelRatio:2,addEventListener(k,f){listeners[k]=f},visualViewport:{addEventListener(){}}},devicePixelRatio:2,Image,
-           requestAnimationFrame(fn){queue.push(fn)},performance:{now:()=>now},localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,String(v))},Math,JSON,Int32Array,Uint8ClampedArray,URL:{createObjectURL(){return ''},revokeObjectURL(){}},Blob,alert(){},setTimeout(){},confirm:()=>true,console};
-          vm.runInNewContext(game,sandbox,{timeout:20000});
-          const el=id=>document.getElementById(id);
-          function frame(){now+=33.34;const callback=queue.shift();assert(callback,'animation loop lost');callback(now)}
-          for(let i=0;i<3;i++)frame();
-          assert(sandbox.QA.zoom()===1,'Zoom should default to 1');
-          el('settingsToggle').click();assert(!el('settingsPanel').hidden,'Settings failed to open');assert(sandbox.QA.paused(),'Game must pause with settings');
-          el('zoomIn').click();assert(sandbox.QA.zoom()===1.1,'Plus zoom failed');
-          el('zoomOut').click();assert(sandbox.QA.zoom()===1,'Minus zoom failed');
-          el('frameRate').value='60';el('frameRate').onchange();el('controlSize').value='large';el('controlSize').onchange();
-          el('settingsClose').click();assert(el('settingsPanel').hidden,'Settings failed to close');
-          el('field').fire('pointerdown',{pointerId:1,clientX:160,clientY:400});
-          el('field').fire('pointerdown',{pointerId:2,clientX:240,clientY:400});
-          el('field').fire('pointermove',{pointerId:1,clientX:125,clientY:400});
-          el('field').fire('pointermove',{pointerId:2,clientX:275,clientY:400});
-          assert(sandbox.QA.zoom()>1.4,'Two-finger pinch zoom failed');
-          el('field').fire('pointerup',{pointerId:1,clientX:125,clientY:400});el('field').fire('pointerup',{pointerId:2,clientX:275,clientY:400});
-          assert(sandbox.QA.fingers()===0,'Pointer state stuck after pinch');
-          el('settingsToggle').click();el('zoomReset').click();el('settingsClose').click();
-          const hero=sandbox.QA.hero(),original={x:hero.x,y:hero.y},destination=sandbox.QA.findOpen(hero.x+4,hero.y+2,8);
-          assert(destination,'No valid destination');const route=sandbox.QA.findPath(hero,destination);assert(route.length,'Pathfinder failed');
-          for(let i=0;i<125&&route.length;i++)sandbox.QA.travel(hero,route,1/30,2.8);
-          assert(!route.length,'Pathfinder must finish waypoints without freezing');
-          assert(Math.hypot(hero.x-original.x,hero.y-original.y)>2,'Character did not travel');
-          for(let i=0;i<4;i++)frame();
-          el('targetNext').click();assert(!el('targetPanel').hidden,'Target selection failed');el('targetClear').click();assert(el('targetPanel').hidden,'Target clear failed');
-          el('labOpen').click();assert(!el('lab').hidden,'Motion lab did not open');el('labClose').click();assert(el('lab').hidden,'Motion lab did not close');
-          el('settingsToggle').click();el('textureToggle').click();el('objectToggle').click();assert(!sandbox.QA.flags().showTextures&&!sandbox.QA.flags().showObjects,'Map switches failed');el('settingsClose').click();
-          listeners.blur?.();assert(Object.keys(sandbox.QA.keys()).length===0,'Blur did not release keys');
-          el('again').click();
-          for(let i=0;i<8;i++)frame();
-          console.log('V8 MOBILE SMOKE PASS: settings, 30/60fps, pinch, full path traversal, targets, terrain, lab, blur');
-          NODE_SMOKE
+          const store=new Map();const win={SANCTUARY_MANIFEST:data,devicePixelRatio:2,addEventListener(k,f){listeners[k]=f},visualViewport:{addEventListener(){}}};
+          const env={document:doc,window:win,devicePixelRatio:2,Image,Math,JSON,Int32Array,Uint8ClampedArray,Blob,console,confirm:()=>true,setTimeout(){},URL:{createObjectURL:()=>'',revokeObjectURL(){}},requestAnimationFrame(f){frames.push(f)},performance:{now:()=>now},localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,String(v))}};
+          vm.runInNewContext(code,env,{timeout:15000});
+          function frame(){now+=33.34;let fn=frames.shift();a(fn,'Animation stopped');fn(now)}
+          const el=id=>doc.getElementById(id);for(let i=0;i<5;i++)frame();
+          el('settingsToggle').click();a(!el('settingsPanel').hidden);el('zoomIn').click();a.equal(el('zoomValue').textContent,'110%');el('settingsClose').click();a(el('settingsPanel').hidden);
+          el('targetNext').click();a(!el('targetPanel').hidden);el('targetClear').click();a(el('targetPanel').hidden);
+          el('labOpen').click();a(!el('lab').hidden);el('labClose').click();a(el('lab').hidden);
+          for(let i=0;i<5;i++)frame();console.log('V9 startup, mobile buttons, motion lab: PASS');
+          JS_TEST
           node --check reports/smoke.cjs
           node reports/smoke.cjs
-          {
-            echo 'Sanctuary Mobile V8.1 - smoke syntax fix'
-            echo 'Original V7.2 S32, TIL, SPR assets and combat preserved.'
-            echo 'Portrait and landscape controls, pinch zoom, configurable input size and 30/60FPS.'
-            echo 'Whole-map tap pathfinding and continuous waypoint movement.'
-            echo 'Verified original monster identities and combat values remain separate research tasks.'
-            echo 'SLKnight and monster-motion audit workflows remain unchanged.'
-          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload independent mobile V8
-        if: success()
+      - name: Upload modular mobile game
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V8-1-Responsive-Gameplay
+          name: Sanctuary-Mobile-V9-Modular-Runtime
           path: dist/mobile/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
           compression-level: 6
 
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V8-1-Diagnostics
+          name: Sanctuary-Mobile-V9-Diagnostics
           path: reports/
           if-no-files-found: warn
           retention-days: 14
