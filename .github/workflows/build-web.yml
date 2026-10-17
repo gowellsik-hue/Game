@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden Mobile V9 Modular Build
+name: Sanctuary of Aden Mobile V10 Runtime Stability
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: sanctuary-mobile-v9
+  group: sanctuary-mobile-v10
   cancel-in-progress: false
 
 jobs:
@@ -25,122 +25,164 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore verified V8.1 game
+      - name: Restore verified V9 game
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p dist/mobile
-          if ! gh run download 38977628656 --repo "$GITHUB_REPOSITORY" --name Sanctuary-Mobile-V8-1-Responsive-Gameplay --dir dist/mobile; then
+          mkdir -p dist/mobile reports
+          if gh run download 38988976341 --repo "$GITHUB_REPOSITORY" --name Sanctuary-Mobile-V9-Modular-Runtime --dir dist/mobile; then
+            echo 'Verified V9 package restored'
+          else
             rm -rf dist/mobile
             mkdir -p dist/mobile
-            git show 36fdf528db010b5f07caff1f527ac1f8c099fa77:.github/workflows/build-web.yml > /tmp/v81.yml
+            git show 781715dcb3ee7fa60fcde32f20cf11ac31561ec7:.github/workflows/build-web.yml > /tmp/v9.yml
             python3 -m venv /tmp/sanctuary-venv
             /tmp/sanctuary-venv/bin/pip -q install 'PyYAML==6.0.2' 'Pillow==11.3.0'
-            cat > /tmp/restore.py <<'PY_RESTORE'
-          import os, subprocess, yaml
+            cat > /tmp/rebuild_v9.py <<'PY_RESTORE'
+          import os,subprocess,yaml
           from pathlib import Path
-          workflow=yaml.safe_load(Path('/tmp/v81.yml').read_text())
-          steps=workflow['jobs']['build']['steps']
-          names=['Restore verified V7.2 game package','Build V8 mobile screen and navigation patch','Validate sprites, tiles, mobile input and path traversal']
+          steps=yaml.safe_load(Path('/tmp/v9.yml').read_text(encoding='utf-8'))['jobs']['build']['steps']
+          names=['Restore verified V8.1 game','Split HTML into reusable game files','Verify original assets and test mobile runtime']
           env=dict(os.environ)
           env['PATH']='/tmp/sanctuary-venv/bin:'+env['PATH']
           for name in names:
-              found=[s for s in steps if s.get('name')==name]
-              if len(found)!=1:raise SystemExit('Missing pinned V8.1 step: '+name)
-              subprocess.run(['bash','-e','-o','pipefail','-c',found[0]['run']],env=env,check=True)
-              print('Rebuilt:',name,flush=True)
+              matches=[s for s in steps if s.get('name')==name and 'run' in s]
+              if len(matches)!=1:raise SystemExit('Pinned V9 step unavailable: '+name)
+              subprocess.run(['bash','-e','-o','pipefail','-c',matches[0]['run']],env=env,check=True)
+              print('Rebuilt V9:',name,flush=True)
           PY_RESTORE
-            /tmp/sanctuary-venv/bin/python /tmp/restore.py
+            /tmp/sanctuary-venv/bin/python /tmp/rebuild_v9.py
           fi
 
-      - name: Split HTML into reusable game files
+      - name: Install V10 mobile stability changes
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_SPLIT'
+          mkdir -p reports
+          cat > reports/patch_v10.py <<'PY_PATCH'
           from pathlib import Path
-          import hashlib, json, re
-          root=Path('dist/mobile'); page=root/'index.html'
-          html=page.read_text(encoding='utf-8')
-          data=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
-          assert data['version']==8 and len(data['actors'])==8 and data['map']['size']==[192,192]
-          def unique(pattern,label):
-              hits=list(re.finditer(pattern,html))
-              if len(hits)!=1:raise SystemExit(label+' is not unique')
-              return hits[0]
-          css=unique(r'<style>([\s\S]*?)</style>','CSS')
-          manifest=unique(r'<script id="manifest" type="application/json">([\s\S]*?)</script>','map data')
-          script=unique(r'<script>([\s\S]*?)</script>','game JS')
-          if json.loads(manifest.group(1))!=data:raise SystemExit('Game data mismatch')
-          old="const D=JSON.parse(document.getElementById('manifest').textContent);"
-          if script.group(1).count(old)!=1:raise SystemExit('Engine data entrypoint changed')
-          game=script.group(1).replace(old,"const D=window.SANCTUARY_MANIFEST;if(!D)throw Error('Missing game data');",1)
-          (root/'game.css').write_text(css.group(1).lstrip('\n'),encoding='utf-8')
-          (root/'game.js').write_text(game.lstrip('\n'),encoding='utf-8')
-          (root/'game-data.js').write_text('window.SANCTUARY_MANIFEST='+json.dumps(data,ensure_ascii=False,separators=(',',':'))+';\n',encoding='utf-8')
-          html=html.replace(css.group(0),'<link rel="stylesheet" href="game.css">',1)
-          html=html.replace(manifest.group(0),'<script src="game-data.js"></script>',1)
-          html=html.replace(script.group(0),'<script src="game.js"></script>',1)
-          html=html.replace('Sanctuary of Aden Mobile V8 · Mobile Gameplay','Sanctuary of Aden Mobile V9 · Modular Runtime',1)
-          html=html.replace('Sanctuary Mobile V8</strong>','Sanctuary Mobile V9</strong>',1)
-          if '<style>' in html or '<script>' in html or html.index('game-data.js')>html.index('game.js'):
-              raise SystemExit('Modular script loading order invalid')
-          page.write_text(html,encoding='utf-8')
-          info={'package':9,'engine':8,'source_run':38977628656,'sha256':{n:hashlib.sha256((root/n).read_bytes()).hexdigest() for n in ['game.css','game.js','game-data.js','manifest.json']}}
-          (root/'build-info.json').write_text(json.dumps(info,indent=2)+'\n',encoding='utf-8')
-          (root/'README_KO.txt').write_text((root/'README_KO.txt').read_text(encoding='utf-8')+'\nV9: 게임 기능을 변경하지 않고 HTML/CSS/JS/맵 데이터만 분리했습니다. 폴더 전체를 함께 실행하세요.\n',encoding='utf-8')
-          print('V9 modularized: index=',page.stat().st_size,'game JS=',(root/'game.js').stat().st_size)
-          PY_SPLIT
+          import hashlib, json, sys
+          root=Path(sys.argv[1] if len(sys.argv)>1 else 'dist/mobile')
+          htmlfile=root/'index.html'; jsfile=root/'game.js'; cssfile=root/'game.css'
+          html=htmlfile.read_text(encoding='utf-8'); js=jsfile.read_text(encoding='utf-8'); css=cssfile.read_text(encoding='utf-8')
+          manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
+          if len(manifest['actors'])!=8 or manifest['map']['size']!=[192,192]:raise SystemExit('V9 asset source changed')
+          def swap(s,a,b,name):
+           n=s.count(a)
+           if n!=1:raise SystemExit(f'{name}: expected 1 occurrence, got {n}')
+           return s.replace(a,b,1)
+          js=swap(js,"const TW=64, TH=32, KEYS=['idle','walk','attack','hit','death'],imgCache=new Map();",
+          "const TW=64, TH=32, KEYS=['idle','walk','attack','hit','death'],imgCache=new Map();\nconst assetStats={requested:0,loaded:0},assetFailed=new Set();let lastAssetUpdate=0,lastMiniPaint=0;",'asset counters')
+          js=swap(js,"function img(url){if(!imgCache.has(url)){const image=new Image();image.src=url;imgCache.set(url,image)}return imgCache.get(url)}",
+          '''function loadImage(url){const im=new Image();im.decoding='async';assetStats.requested++;im.onload=()=>{assetStats.loaded++;assetFailed.delete(url)};im.onerror=()=>{assetFailed.add(url)};im.src=url;return im}
+          function img(url){if(imgCache.has(url)){let im=imgCache.get(url);imgCache.delete(url);imgCache.set(url,im);return im}let im=loadImage(url);imgCache.set(url,im);if(imgCache.size>420)imgCache.delete(imgCache.keys().next().value);return im}
+          function refreshAssetStatus(){const status=el('assetStatus');status.textContent='원본 이미지 로딩 '+assetStats.loaded+' / '+assetStats.requested+' · 실패 '+assetFailed.size+' · 캐시 '+imgCache.size;status.style.color=assetFailed.size?'#ffb1aa':'#bce8c7'}
+          function retryFailedImages(){let count=assetFailed.size;for(const url of assetFailed){imgCache.delete(url);if(url.startsWith('tiles/')&&url.endsWith('.png'))atlases.delete(Number(url.slice(6,-4)))}assetFailed.clear();refreshAssetStatus();if(count)msg('실패 이미지 '+count+'개 재시도 준비',1.2);else msg('실패한 이미지가 없습니다',.8)}''','tracked image loading')
+          js=swap(js,"function tileAtlas(id){if(!atlases.has(id)){let image=new Image();image.src='tiles/'+id+'.png';atlases.set(id,image)}return atlases.get(id)}",
+          "function tileAtlas(id){let im=atlases.get(id);if(im){atlases.delete(id);atlases.set(id,im);return im}im=loadImage('tiles/'+id+'.png');atlases.set(id,im);if(atlases.size>128)atlases.delete(atlases.keys().next().value);return im}",'tracked tile atlas')
+          js=swap(js,'function drawMini(){if(!mapShown)return;', 'function drawMini(t){if(!mapShown||(lastMiniPaint&&t-lastMiniPaint<180))return;lastMiniPaint=t;', 'minimap refresh')
+          js=swap(js,'drawMini();drawLab(t);', 'drawMini(t);drawLab(t);if(t-lastAssetUpdate>600){lastAssetUpdate=t;refreshAssetStatus()}', 'minimap and status paint')
+          js=swap(js,"el('miniToggle').onclick=()=>{mapShown=!mapShown;el('miniWrap').hidden=!mapShown};",
+          "el('miniToggle').onclick=()=>{mapShown=!mapShown;lastMiniPaint=0;el('miniWrap').hidden=!mapShown};",'mini toggle')
+          js=swap(js,"function stopMovement(){pressed={};stickVector={x:0,y:0};stickId=null;el('knob').style.left='50%';el('knob').style.top='50%';frameFingers.clear();pinching=false;tapFinger=null;last=0}",
+          "function stopMovement(){pressed={};stickVector={x:0,y:0};stickId=null;el('knob').style.left='50%';el('knob').style.top='50%';frameFingers.clear();pinching=false;tapFinger=null;last=0;lastPaint=0;lastMiniPaint=0}", 'release input')
+          js=swap(js,"window.addEventListener('resize',resize);", "window.addEventListener('resize',()=>{stopMovement();resize()});",'resize reset input')
+          js=swap(js,"window.addEventListener('orientationchange',()=>setTimeout(resize,120));", "window.addEventListener('orientationchange',()=>{stopMovement();setTimeout(resize,120)});",'rotation reset input')
+          js=swap(js,"if(window.visualViewport)window.visualViewport.addEventListener('resize',resize);", "if(window.visualViewport)window.visualViewport.addEventListener('resize',()=>{stopMovement();resize()});",'visual viewport reset input')
+          js=swap(js,'function update(dt){if(open||settingsOpen)return;', 'function update(dt){if(open||settingsOpen||document.hidden)return;', 'background simulation pause')
+          js=swap(js,"el('settingsReset').onclick=()=>{cameraZoom=1;paintFPS=30;controlSize='normal';applyMobileSettings();saveMobileSettings()};",
+          "el('settingsReset').onclick=()=>{cameraZoom=1;paintFPS=30;controlSize='normal';applyMobileSettings();saveMobileSettings()};\nel('assetRetry').onclick=retryFailedImages;",'retry button')
+          js=swap(js,'begin();requestAnimationFrame(render);', "begin();refreshAssetStatus();window.SANCTUARY_GAME_READY=true;el('bootNotice').hidden=true;requestAnimationFrame(render);",'ready signal')
+          html=swap(html,'Sanctuary of Aden Mobile V9 · Modular Runtime','Sanctuary of Aden Mobile V10 · Runtime Stability','HTML version')
+          html=swap(html,'Sanctuary Mobile V9</strong>','Sanctuary Mobile V10</strong>','HUD version')
+          html=swap(html,'<div id="stage">','<div id="bootNotice" role="status">원본 맵·SPR 리소스 초기화 중…</div>\n<div id="stage">','boot status')
+          html=swap(html,'<div id="settingsLegacy"></div>', '<div id="settingsLegacy"></div>\n<div id="assetStatus" aria-live="polite">원본 이미지 확인 중…</div>\n<button id="assetRetry" type="button">실패 이미지 다시 불러오기</button>', 'asset panel')
+          html=swap(html,'<script src="game-data.js"></script>', '''<script>
+          window.addEventListener('error',function(e){const target=e.target;let note=document.getElementById('bootNotice');if(!window.SANCTUARY_GAME_READY&&note){note.hidden=false;note.textContent=target&&(target.tagName==='SCRIPT'||target.tagName==='LINK')?'실행 파일 누락: '+(target.src||target.href):'게임 초기화 오류 · 파일을 모두 같은 폴더에 두세요';}},true);
+          </script>
+          <script src="game-data.js"></script>''','bootstrap error listener')
+          css+='''
+          #bootNotice{position:fixed;z-index:100;left:50%;top:40%;transform:translate(-50%,-50%);width:min(86vw,340px);padding:18px 15px;text-align:center;background:#12292bf7;color:#ffe7af;border:1px solid #b5ad81;border-radius:13px;box-shadow:0 5px 24px #0009;pointer-events:none;font-weight:700;white-space:normal;overflow-wrap:anywhere}
+          #bootNotice[hidden]{display:none}
+          #assetStatus{font-size:11px;line-height:1.5;border:1px solid #60786c;border-radius:7px;padding:6px 8px;background:#102625;overflow-wrap:anywhere}
+          #assetRetry{font-size:12px;padding:8px 6px}
+          '''
+          htmlfile.write_text(html,encoding='utf-8');jsfile.write_text(js,encoding='utf-8');cssfile.write_text(css,encoding='utf-8')
+          info=json.loads((root/'build-info.json').read_text(encoding='utf-8'));info.update(package=10,runtime=10,source_run=38988976341);info['sha256']={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ['index.html','game.css','game.js','game-data.js','manifest.json']};(root/'build-info.json').write_text(json.dumps(info,indent=2)+'\n',encoding='utf-8')
+          (root/'README_KO.txt').write_text((root/'README_KO.txt').read_text(encoding='utf-8')+'\nV10: 원본 이미지 로딩 상태 및 재시도, 미니맵 180ms 갱신, 화면 회전 시 입력 해제, 백그라운드 일시정지. 몬스터 모션과 전투 수치는 변경하지 않았습니다.\n',encoding='utf-8')
+          print('V10 patch complete',len(js),'game js chars, 8 SPR actor IDs')
+          PY_PATCH
+          python3 -m py_compile reports/patch_v10.py
+          python3 reports/patch_v10.py dist/mobile
 
-      - name: Verify original assets and test mobile runtime
+      - name: Validate V10 graphics and runtime
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_CHECK'
+          cat > reports/verify_package.py <<'PY_VERIFY'
           from pathlib import Path
-          import json
-          p=Path('dist/mobile'); d=json.loads((p/'manifest.json').read_text())
-          assert len(d['map']['flags'])==36864 and len(d['map']['objects'])==59963
-          assert len(list((p/'assets').glob('*.png')))==3616
-          assert len(list((p/'tiles').glob('*.png')))==218
-          html=(p/'index.html').read_text(encoding='utf-8')
-          assert html.index('src="game-data.js"')<html.index('src="game.js"')
-          assert len(html)<15000 and 'href="game.css"' in html
-          content=(p/'game-data.js').read_text(encoding='utf-8')
-          assert json.loads(content.removeprefix('window.SANCTUARY_MANIFEST=').removesuffix(';\n'))==d
-          print('Original V8.1 assets and external data verified')
-          PY_CHECK
+          import hashlib,json,re
+          root=Path('dist/mobile')
+          info=json.loads((root/'build-info.json').read_text(encoding='utf-8'))
+          manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
+          assert info['package']==10 and info['source_run']==38988976341
+          assert len(manifest['actors'])==8 and manifest['map']['size']==[192,192]
+          assert len(manifest['map']['flags'])==36864 and len(manifest['map']['objects'])==59963
+          assert len(list((root/'assets').glob('*.png')))==3616
+          assert len(list((root/'tiles').glob('*.png')))==218
+          for name,expected in info['sha256'].items():
+           actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
+           assert actual==expected,(name,'hash mismatch')
+          assert info['sha256']['game-data.js']=='1a50224f083c193c33eab137798bfb6ddccf1b1dea54f3d9055e601c0fbabf57'
+          html=(root/'index.html').read_text(encoding='utf-8')
+          assert html.index('<script src="game-data.js">')<html.index('<script src="game.js">')
+          for name in ['bootNotice','assetStatus','assetRetry','lab','targetNext','settingsToggle','pad','hitBtn']:
+           assert f'id="{name}"' in html,name
+          assert 'SANCTUARY_GAME_READY=true' in (root/'game.js').read_text(encoding='utf-8')
+          print('V10 ORIGINAL FILES VERIFIED: 3616 sprites, 218 atlases, 59963 S32 objects')
+          PY_VERIFY
+          python3 reports/verify_package.py
           node --check dist/mobile/game.js
           node --check dist/mobile/game-data.js
-          mkdir -p reports
-          cat > reports/smoke.cjs <<'JS_TEST'
-          const fs=require('fs'),vm=require('vm'),a=require('assert');
-          const root='dist/mobile/';const code=fs.readFileSync(root+'game.js','utf8');
-          const data=JSON.parse(fs.readFileSync(root+'manifest.json','utf8'));
-          let frames=[],now=0,dom=new Map(),listeners={};
-          const canvas=()=>new Proxy({createImageData(w,h){return{data:new Uint8ClampedArray(w*h*4)}},getImageData(){return{data:new Uint8ClampedArray(192*192*4)}},measureText(s){return{width:String(s).length*10}}},{get(o,k){return k in o?o[k]:()=>{}},set(o,k,v){o[k]=v;return true}});
-          class E{constructor(id){this.id=id;this.style={setProperty(){}};this.listeners={};this.hidden=['lab','settingsPanel','targetPanel'].includes(id);this.textContent='';this.value={frameRate:'30',controlSize:'normal',labActor:'hero',labMode:'idle',labDir:'0',labSpeed:'110',labFrame:'-1'}[id]||'0';this.classList={add(){},remove(){},toggle(){}};this.clientWidth=390;this.clientHeight=844;this.width=192;this.height=192;this.children=[];this.files=[]}getContext(){return canvas()}addEventListener(k,f){(this.listeners[k]??=[]).push(f)}click(){this.onclick?.();this.fire('click')}fire(k,x={}){for(const f of this.listeners[k]||[])f({pointerId:1,clientX:150,clientY:400,preventDefault(){},...x})}appendChild(e){this.children.push(e)}replaceChildren(...x){this.children=x}setPointerCapture(){}getBoundingClientRect(){return{left:0,top:0,width:390,height:844}}remove(){}}
-          const doc={getElementById(id){if(id==='manifest')throw Error('Old inline manifest dependency');if(!dom.has(id))dom.set(id,new E(id));return dom.get(id)},createElement:id=>new E(id),documentElement:new E('html'),addEventListener(k,f){listeners[k]=f},body:new E('body'),hidden:false};
-          class Image{constructor(){this.complete=true;this.naturalWidth=24;this.naturalHeight=24}set src(v){this._src=v}get src(){return this._src}}
-          const store=new Map();const win={SANCTUARY_MANIFEST:data,devicePixelRatio:2,addEventListener(k,f){listeners[k]=f},visualViewport:{addEventListener(){}}};
-          const env={document:doc,window:win,devicePixelRatio:2,Image,Math,JSON,Int32Array,Uint8ClampedArray,Blob,console,confirm:()=>true,setTimeout(){},URL:{createObjectURL:()=>'',revokeObjectURL(){}},requestAnimationFrame(f){frames.push(f)},performance:{now:()=>now},localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,String(v))}};
-          vm.runInNewContext(code,env,{timeout:15000});
-          function frame(){now+=33.34;let fn=frames.shift();a(fn,'Animation stopped');fn(now)}
-          const el=id=>doc.getElementById(id);for(let i=0;i<5;i++)frame();
-          el('settingsToggle').click();a(!el('settingsPanel').hidden);el('zoomIn').click();a.equal(el('zoomValue').textContent,'110%');el('settingsClose').click();a(el('settingsPanel').hidden);
-          el('targetNext').click();a(!el('targetPanel').hidden);el('targetClear').click();a(el('targetPanel').hidden);
-          el('labOpen').click();a(!el('lab').hidden);el('labClose').click();a(el('lab').hidden);
-          for(let i=0;i<5;i++)frame();console.log('V9 startup, mobile buttons, motion lab: PASS');
-          JS_TEST
+          cat > reports/smoke.cjs <<'JS_SMOKE'
+          const fs=require('fs'),vm=require('vm'),assert=require('assert');
+          const root='dist/mobile/',D=JSON.parse(fs.readFileSync(root+'manifest.json','utf8'));
+          let js=fs.readFileSync(root+'game.js','utf8'),now=0,frames=[],nodes=new Map(),listeners={},failedOnce=false;
+          const ready="begin();refreshAssetStatus();window.SANCTUARY_GAME_READY=true;el('bootNotice').hidden=true;requestAnimationFrame(render);";
+          assert(js.includes(ready));js=js.replace(ready,"window.QA={img,tileAtlas,clock:()=>clock,stick:()=>stickId,atlas:()=>atlases.size,cache:()=>imgCache.size,failed:()=>assetFailed.size,mini:()=>lastMiniPaint};"+ready);
+          function ctx(){return new Proxy({createImageData(w,h){return{data:new Uint8ClampedArray(w*h*4)}},getImageData(){return{data:new Uint8ClampedArray(192*192*4)}},measureText(s){return{width:String(s).length*10}}},{get(o,k){return k in o?o[k]:()=>{}},set(o,k,v){o[k]=v;return true}})}
+          class E{constructor(id){this.id=id;this.style={setProperty(){}};this.listeners={};this.hidden=['lab','settingsPanel','targetPanel'].includes(id);this.textContent=id==='autoBtn'?'자동 ON':'';this.classList={add(){},remove(){},toggle(){}};this.value={labActor:'hero',labMode:'idle',labDir:'0',labFrame:'-1',labSpeed:'110',frameRate:'30',controlSize:'normal'}[id]||'0';this.clientWidth=390;this.clientHeight=844;this.width=192;this.height=192;this.children=[];this.files=[]}getContext(){return ctx()}addEventListener(k,f){(this.listeners[k]??=[]).push(f)}click(){this.onclick?.();this.fire('click')}fire(k,v={}){for(const f of this.listeners[k]||[])f({pointerId:7,clientX:85,clientY:700,preventDefault(){},...v})}appendChild(x){this.children.push(x)}replaceChildren(...x){this.children=x}setPointerCapture(){}getBoundingClientRect(){return{left:0,top:0,width:140,height:140}}remove(){}}
+          const document={getElementById(id){if(!nodes.has(id))nodes.set(id,new E(id));return nodes.get(id)},createElement:id=>new E(id),documentElement:new E('html'),addEventListener(k,f){listeners[k]=f},body:new E('body'),hidden:false};
+          class Image{constructor(){this.complete=true;this.naturalWidth=24;this.naturalHeight=24}set src(v){this._src=v;if(v==='assets/forced-fail.png'&&!failedOnce){failedOnce=true;this.onerror?.()}else this.onload?.()}get src(){return this._src}}
+          const data=new Map();const window={SANCTUARY_MANIFEST:D,devicePixelRatio:2,addEventListener(k,f){listeners[k]=f},visualViewport:{addEventListener(){}}};
+          const env={window,document,devicePixelRatio:2,Image,Math,JSON,Int32Array,Uint8ClampedArray,Blob,console,confirm:()=>true,setTimeout(){},URL:{createObjectURL:()=>'',revokeObjectURL(){}},requestAnimationFrame(fn){frames.push(fn)},performance:{now:()=>now},localStorage:{getItem:k=>data.get(k)||null,setItem:(k,v)=>data.set(k,String(v))}};
+          vm.runInNewContext(js,env,{timeout:12000});
+          function tick(){now+=33.34;let fn=frames.shift();assert(fn,'Render loop stopped');fn(now)}
+          const el=id=>document.getElementById(id);for(let i=0;i<4;i++)tick();
+          assert(window.SANCTUARY_GAME_READY&&el('bootNotice').hidden);
+          el('settingsToggle').click();assert(!el('settingsPanel').hidden);el('zoomIn').click();assert.equal(el('zoomValue').textContent,'110%');el('settingsClose').click();
+          el('targetNext').click();assert(!el('targetPanel').hidden);el('targetClear').click();assert(el('targetPanel').hidden);
+          el('labOpen').click();assert(!el('lab').hidden);el('labClose').click();assert(el('lab').hidden);
+          window.QA.img('assets/forced-fail.png');assert.equal(window.QA.failed(),1);
+          el('assetRetry').click();assert.equal(window.QA.failed(),0);window.QA.img('assets/forced-fail.png');assert.equal(window.QA.failed(),0);
+          for(let i=0;i<450;i++)window.QA.img('assets/test-'+i+'.png');assert(window.QA.cache()<=420);
+          for(let i=0;i<155;i++)window.QA.tileAtlas(i);assert(window.QA.atlas()<=128);
+          el('pad').fire('pointerdown');assert.equal(window.QA.stick(),7);listeners.orientationchange();assert.equal(window.QA.stick(),null);
+          const miniTimes=new Set();for(let i=0;i<35;i++){tick();miniTimes.add(window.QA.mini())}assert(miniTimes.size<=10,'Mini-map render not throttled');
+          const before=window.QA.clock();document.hidden=true;listeners.visibilitychange();for(let i=0;i<6;i++)tick();assert.equal(window.QA.clock(),before);
+          console.log('V10 SMOKE PASS: startup, controls, retry, LRU, rotate, minimap throttle, background pause');
+          JS_SMOKE
           node --check reports/smoke.cjs
           node reports/smoke.cjs
+          echo 'V10 mobile runtime: original Map 4, TIL, SPR, combat, target, motion lab retained. New asset retry, LRU and orientation stability tests passed.' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload modular mobile game
+      - name: Upload V10 mobile game
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V9-Modular-Runtime
+          name: Sanctuary-Mobile-V10-Runtime-Stability
           path: dist/mobile/
           if-no-files-found: error
           retention-days: 90
@@ -150,7 +192,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V9-Diagnostics
+          name: Sanctuary-Mobile-V10-Diagnostics
           path: reports/
           if-no-files-found: warn
           retention-days: 14
