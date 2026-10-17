@@ -1,5 +1,5 @@
 
-name: Sanctuary of Aden TI Dungeon Original Terrain V3 Fixed
+name: V3.2 | Sanctuary TI Dungeon Terrain Preview Recovery
 
 on:
   workflow_dispatch:
@@ -13,697 +13,198 @@ permissions:
   actions: read
 
 concurrency:
-  group: sanctuary-ti-terrain-v3
+  group: sanctuary-map-v3-2
   cancel-in-progress: false
 
 jobs:
-  terrain:
+  preview:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 20
     steps:
-      - name: Restore verified V2 dungeon source
+      - name: V3.2 Restore original terrain images
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p previous/v2 source reports
-          gh run download 39045175890 --repo "$GITHUB_REPOSITORY" --name Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 --dir previous/v2
-          test -s previous/v2/extracted/map/1/7ffe8000.s32
-          test -s previous/v2/extracted/map/2/7fff8000.s32
+          mkdir -p reports
+          gh run download 39048289231 --repo "$GITHUB_REPOSITORY" --name Sanctuary-TI-Dungeon-V3-Failure --dir reports
+          test -s reports/preview/index.html
+          test -s reports/preview/map-index.json
+          test -s reports/summary.json
 
-      - name: Download original Tile.idx and Tile.pak ZIP volumes
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for part in zip z32 z33 z34 z35; do
-            gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern "Sanctuary.of.Aden.-.Copy.$part" --dir source --clobber
-            test -s "source/Sanctuary.of.Aden.-.Copy.$part"
-          done
-
-      - name: Render original S32 terrain and object layers
+      - name: V3.2 Verify original map images
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m venv /tmp/sanctuary-v3
-          /tmp/sanctuary-v3/bin/pip -q install Pillow==11.3.0
-          cat > /tmp/sanctuary-map-v3.py <<'PY_MAP_V3'
-          import bisect
-          import collections
+          python3 -m venv /tmp/sanctuary-map-v3-2
+          /tmp/sanctuary-map-v3-2/bin/pip -q install Pillow==11.3.0
+          cat > /tmp/verify_map_v3_2.py <<'PY'
           import json
-          import struct
-          import zlib
-          from functools import lru_cache
+          import re
           from pathlib import Path
           from PIL import Image
 
-          SRC = Path('source')
-          V2 = Path('previous/v2')
-          OUT = Path('reports/preview')
-          ARCH = 'Sanctuary.of.Aden.-.Copy'
-          ROOT = 'Sanctuary of Aden - Copy/'
-          STAMP = '39045175890'
+          root = Path('reports')
+          preview = root / 'preview'
+          original = json.loads(
+              (root / 'summary.json').read_text(encoding='utf-8')
+          )
+          manifest = json.loads(
+              (preview / 'map-index.json').read_text(encoding='utf-8')
+          )
+          expected = {'1': 12, '2': 16}
+          result = {}
+          total_visible_pixels = 0
 
-          def directory():
-              b = (SRC / (ARCH + '.zip')).read_bytes()
-              p = b.rfind(b'PK\x05\x06')
-              assert p >= 0, 'ZIP directory not found'
-              end = struct.unpack_from('<4s4H2IH', b, p)
-              n, disk_last = end[4], end[1]
-              entries = {}
-              off = 0
-              while True:
-                  off = b.find(b'PK\x01\x02', off)
-                  if off < 0:
-                      break
-                  h = struct.unpack_from('<4s6H3I5H2I', b, off)
-                  length, ex, cm = h[10:13]
-                  nxt = off + 46 + length + ex + cm
-                  if length < 1 or length > 400 or nxt > len(b):
-                      off += 4
-                      continue
-                  name = b[off+46:off+46+length].decode(
-                      'utf-8' if h[3]&2048 else 'cp949', 'replace'
-                  ).replace('\\','/')
-                  entries[name] = (
-                      h[13], h[16], h[4], h[8], h[9], h[7]
-                  )
-                  off = nxt
-              assert len(entries) == n, (len(entries),n)
-              return entries, disk_last
+          for floor, count in expected.items():
+              data = manifest[floor]
+              blocks = data['blocks']
+              if len(blocks) != count or data['fileCount'] != count:
+                  raise SystemExit(f'Map {floor}: wrong block count')
 
-          def chunk(disk, last):
-              return SRC / (
-                  ARCH + '.zip' if disk == last
-                  else ARCH + f'.z{disk+1:02d}'
-              )
+              visible = 0
+              nonempty = 0
 
-          def span(disk, offset, length, last):
-              parts = []
-              remaining = length
-              while remaining:
-                  if disk > last:
-                      raise RuntimeError('Beyond final ZIP volume')
-                  p = chunk(disk, last)
-                  if not p.is_file():
-                      raise RuntimeError(
-                          'Required archive part missing: '+str(p)
+              for block in blocks:
+                  relative = Path(block['src'])
+                  if relative.is_absolute() or '..' in relative.parts:
+                      raise SystemExit('Invalid image path')
+
+                  image_file = preview / relative
+                  if not image_file.is_file():
+                      raise SystemExit(
+                          'Missing map image: ' + str(image_file)
                       )
-                  size = p.stat().st_size
-                  if offset >= size:
-                      offset -= size
-                      disk += 1
-                      continue
-                  with p.open('rb') as f:
-                      f.seek(offset)
-                      frag = f.read(min(remaining, size-offset))
-                  if not frag:
-                      raise RuntimeError('Short read '+str(p))
-                  parts.append(frag)
-                  remaining -= len(frag)
-                  offset += len(frag)
-              return b''.join(parts)
 
-          def extract(name, rec, last):
-              disk, offset, method, packed_len, plain_len, crc = rec
-              h = span(disk, offset, 30, last)
-              assert h[:4] == b'PK\x03\x04', (
-                  'Local ZIP header mismatch: '+name
-              )
-              hdr = struct.unpack('<4s5H3I2H', h)
-              assert not hdr[2] & 1, 'Encrypted member '+name
-              assert hdr[3] == method
-              n, extra = hdr[9], hdr[10]
-              body = span(disk, offset, 30+n+extra, last)
-              actual = body[30:30+n].decode(
-                  'utf-8' if hdr[2]&2048 else 'cp949','replace'
-              ).replace('\\','/')
-              assert actual == name, (actual,name)
-              packed = span(
-                  disk, offset+30+n+extra, packed_len, last
-              )
-              if method == 8:
-                  plain = zlib.decompress(packed, -15)
-              elif method == 0:
-                  plain = packed
-              else:
-                  raise RuntimeError(
-                      'Unsupported ZIP method '+str(method)
+                  with Image.open(image_file) as image:
+                      image.load()
+                      if image.format != 'PNG' or image.size != (1536, 768):
+                          raise SystemExit(
+                              'Invalid original map PNG: ' + str(image_file)
+                          )
+
+                      alpha = image.convert('RGBA').getchannel('A')
+                      hist = alpha.histogram()
+                      opaque = sum(hist[128:])
+                      visible += opaque
+                      nonempty += int(opaque > 0)
+
+              result[floor] = {
+                  'blocks': count,
+                  'nonemptyBlocks': nonempty,
+                  'visiblePixels': visible,
+                  'pixelCoverageWithinBlockCanvases': round(
+                      visible / (count * 1536 * 768), 4
                   )
-              assert (
-                  len(plain) == plain_len
-                  and zlib.crc32(plain)&0xffffffff == crc
-              ), 'CRC or size mismatch: '+name
-              return plain
-
-          def load_index(data, pak_size):
-              assert len(data)>4
-              entries = {}
-              kind = (
-                  'OLD'
-                  if (len(data)-4)%28==0
-                  and data[:4] not in (b'_ext',b'_rms')
-                  else 'UNSUPPORTED'
-              )
-              if kind != 'OLD':
-                  raise RuntimeError(
-                      'Unexpected Tile.idx format: '+repr(data[:8])
-                  )
-              for p in range(4,len(data),28):
-                  offset = struct.unpack_from('<i',data,p)[0]
-                  name = data[p+4:p+24].split(b'\0',1)[0].decode(
-                      'cp949','replace'
-                  ).lower()
-                  size = struct.unpack_from('<i',data,p+24)[0]
-                  if (
-                      name and 0 <= offset < pak_size
-                      and 0 < size <= pak_size-offset
-                  ):
-                      entries[name] = (offset,size)
-              assert len(entries)>100, 'Tile index entries insufficient'
-              return entries
-
-          def frame_offsets(data):
-              if len(data)<12:
-                  raise ValueError('Short TIL')
-              count = struct.unpack_from('<I',data,0)[0]
-              if (
-                  count<1 or count>2048
-                  or len(data)<4+4*count
-              ):
-                  raise ValueError('Bad TIL count')
-              values = struct.unpack_from(
-                  '<'+str(count)+'I',data,4
-              )
-              possible = []
-              for head in [4+4*count, 8+4*count]:
-                  if (
-                      head>len(data)
-                      or max(values)>len(data)-head
-                  ):
-                      continue
-                  valid = 0
-                  points = sorted(set(values))
-                  for v in points[:20]:
-                      if v>=len(data)-head:
-                          continue
-                      next_index = bisect.bisect_right(points,v)
-                      end = (
-                          points[next_index]
-                          if next_index<len(points)
-                          else len(data)-head
-                      )
-                      try:
-                          decode_frame(data[head+v:head+end])
-                          valid += 1
-                      except (ValueError,struct.error,IndexError):
-                          pass
-                  possible.append((valid,-head))
-              if not possible:
-                  raise ValueError('Offsets beyond TIL')
-              head = -max(possible)[1]
-              limits = sorted(set(int(x) for x in values))
-              return head, values, limits
-
-          def rgb555(v):
-              return (
-                  ((v>>10)&31)*255//31,
-                  ((v>>5)&31)*255//31,
-                  (v&31)*255//31,
-                  255
-              )
-
-          def decode_frame(blob):
-              if not blob:
-                  return None
-              t = blob[0]
-              if t not in (
-                  0,1,2,3,6,7,8,9,
-                  16,17,18,19,22,23,34,35
-              ):
-                  raise ValueError(
-                      'Unknown TIL block type '+str(t)
-                  )
-              dim = 48 if t in (16,17,18,19,22,23) else 24
-              rgba = bytearray(dim*dim*4)
-              pos = 1
-
-              def write(x,y,v):
-                  if 0<=x<dim and 0<=y<dim:
-                      k = (y*dim+x)*4
-                      rgba[k:k+4] = bytes(rgb555(v))
-
-              if not t & 2:
-                  for y in range(dim):
-                      count = 2*(
-                          y+1 if y<dim//2 else dim-y
-                      )
-                      start = 0 if t&1 else dim-count
-                      for x in range(count):
-                          if pos+2>len(blob):
-                              raise ValueError('Truncated diamond')
-                          v = struct.unpack_from('<H',blob,pos)[0]
-                          pos += 2
-                          write(start+x,y,v)
-              else:
-                  if len(blob)<5:
-                      raise ValueError('Short RLE header')
-                  x0,y0,w,h = blob[1:5]
-                  pos = 5
-                  if (
-                      w>dim or h>dim
-                      or x0>dim or y0>dim
-                  ):
-                      raise ValueError('Invalid RLE bounds')
-                  for y in range(h):
-                      if pos>=len(blob):
-                          raise ValueError('Truncated RLE rows')
-                      n = blob[pos]
-                      pos += 1
-                      x = x0
-                      if n>60:
-                          raise ValueError('Bad RLE segment count')
-                      for _ in range(n):
-                          if pos+2>len(blob):
-                              raise ValueError('Truncated RLE run')
-                          skip,run = blob[pos:pos+2]
-                          pos += 2
-                          x += skip//2
-                          if pos+2*run>len(blob):
-                              raise ValueError('Truncated RLE colors')
-                          for px in range(run):
-                              v = struct.unpack_from(
-                                  '<H',blob,pos
-                              )[0]
-                              pos += 2
-                              write(x+px,y+y0,v)
-                          x += run
-              img = Image.frombytes(
-                  'RGBA',(dim,dim),bytes(rgba)
-              )
-              return img.resize(
-                  (dim//2,dim//2),
-                  resample=Image.Resampling.NEAREST
-              )
-
-          def s32_layers(data):
-              assert len(data)>32768
-              floor = []
-              for p in range(0,32768,4):
-                  index,tid,_ = struct.unpack_from(
-                      '<BHB',data,p
-                  )
-                  k = p//4
-                  floor.append((k%128,k//128,tid,index))
-              off = 32768
-              l2 = struct.unpack_from('<H',data,off)[0]
-              off += 2+6*l2+4*4096
-              n = struct.unpack_from('<I',data,off)[0]
-              off += 4
-              if n>50000:
-                  raise ValueError(
-                      'Unexpected object group count'
-                  )
-              objs = []
-              for _ in range(n):
-                  _,count = struct.unpack_from(
-                      '<hH',data,off
-                  )
-                  off += 4
-                  for j in range(count):
-                      x,y,layer,index,tid,_ = struct.unpack_from(
-                          '<BBBBhB',data,off
-                      )
-                      off += 7
-                      if tid>=0:
-                          objs.append((layer,x,y,tid,index))
-              return floor,sorted(
-                  objs,key=lambda row:row[0]
-              )
-
-          def main():
-              OUT.mkdir(parents=True,exist_ok=True)
-              entries,last = directory()
-              raw = {}
-              for name in ('Tile.idx','Tile.pak'):
-                  key = ROOT+name
-                  assert key in entries,'ZIP missing '+key
-                  raw[name] = extract(
-                      key,entries[key],last
-                  )
-                  print(
-                      'ZIP_CRC_OK',name,len(raw[name]),
-                      flush=True
-                  )
-              idx = load_index(
-                  raw['Tile.idx'],len(raw['Tile.pak'])
-              )
-              pak = memoryview(raw['Tile.pak'])
-              del raw
-              counts = {
-                  'floor':0,
-                  'objects':0,
-                  'drawn':0,
-                  'unknownId':0,
-                  'missingFrame':0,
-                  'decodeError':0
               }
-              tile_usage = collections.Counter()
-              tile_types = collections.Counter()
-              problems = collections.Counter()
-              manifest = {}
 
-              @lru_cache(maxsize=600)
-              def til_frames(tid):
-                  row = idx.get(str(tid)+'.til')
-                  if not row:
-                      return None
-                  start,size = row
-                  return frame_offsets(
-                      pak[start:start+size]
-                  )+(start,size)
+              total_visible_pixels += visible
 
-              @lru_cache(maxsize=30000)
-              def tile_png(tid,index):
-                  try:
-                      meta = til_frames(tid)
-                      if meta is None:
-                          counts['unknownId'] += 1
-                          problems['til_'+str(tid)] += 1
-                          return None
-                      base,offsets,valid,start,size = meta
-                      if index>=len(offsets):
-                          counts['missingFrame'] += 1
-                          problems[
-                              'frame_'+str(tid)+'_'+str(index)
-                          ] += 1
-                          return None
-                      off = int(offsets[index])
-                      which = bisect.bisect_right(valid,off)
-                      end = (
-                          valid[which]
-                          if which<len(valid)
-                          else size-base
-                      )
-                      if off>=end:
-                          counts['missingFrame'] += 1
-                          return None
-                      blob = pak[
-                          start+base+off:start+base+end
-                      ]
-                      tile_types[int(blob[0])] += 1
-                      return decode_frame(blob)
-                  except (ValueError,struct.error,IndexError) as e:
-                      counts['decodeError'] += 1
-                      problems[
-                          type(e).__name__+': '+str(e)
-                      ] += 1
-                      return None
-
-              for mid in ('1','2'):
-                  files = sorted(
-                      (V2/'extracted/map'/mid).glob('*.s32')
+              if nonempty < count // 2 or visible < 100000:
+                  raise SystemExit(
+                      'Map ' + floor + ' has too few visible pixels'
                   )
-                  assert len(files)>5, (
-                      'Missing V2 sources',mid,len(files)
-                  )
-                  blocks = []
-                  minbx = min(
-                      int(p.stem[:4],16) for p in files
-                  )
-                  minby = min(
-                      int(p.stem[4:],16) for p in files
-                  )
-                  maxbx = max(
-                      int(p.stem[:4],16) for p in files
-                  )
-                  global_top = 768*(maxbx-minbx)
-                  dest = OUT/'tiles'/mid
-                  dest.mkdir(parents=True,exist_ok=True)
 
-                  for p in files:
-                      block = p.read_bytes()
-                      floor,objects = s32_layers(block)
-                      drawer = Image.new(
-                          'RGBA',(1536,768),(0,0,0,0)
-                      )
-                      counts['floor'] += len(floor)
-                      counts['objects'] += len(objects)
+          if total_visible_pixels < 500000:
+              raise SystemExit('Both maps are visually empty')
 
-                      for x,y,tid,index in (
-                          floor+
-                          [
-                              (x,y,tid,index)
-                              for layer,x,y,tid,index
-                              in objects
-                          ]
-                      ):
-                          tile_usage[tid] += 1
-                          part = tile_png(tid,index)
-                          if part is None:
-                              continue
-                          px = (24*(x-x//2+y))//2
-                          py = (756+12*(y-x//2))//2
-                          drawer.paste(part,(px,py),part)
-                          counts['drawn'] += 1
+          if original['version'] != 'V3':
+              raise SystemExit('Unexpected source version')
 
-                      name = p.stem+'.png'
-                      drawer.save(dest/name,optimize=True)
-                      bx,by = (
-                          int(p.stem[:4],16),
-                          int(p.stem[4:],16)
-                      )
-                      shiftx = 768*(
-                          (bx-minbx)+(by-minby)
-                      )
-                      shifty = 384*(
-                          (by-minby)-(bx-minbx)
-                      )+global_top//2
-                      blocks.append({
-                          'x':shiftx,
-                          'y':shifty,
-                          'src':f'tiles/{mid}/{name}',
-                          'source':p.name
-                      })
-                      print(
-                          'BLOCK',mid,p.name,
-                          'objects',len(objects),
-                          flush=True
-                      )
+          if original['counts']['floor'] != 229376:
+              raise SystemExit('Unexpected floor tile count')
 
-                  width = max(
-                      t['x'] for t in blocks
-                  )+1536
-                  height = max(
-                      t['y'] for t in blocks
-                  )+768
-                  manifest[mid] = {
-                      'blocks':blocks,
-                      'width':width,
-                      'height':height,
-                      'minX':(
-                          (minbx-0x7fff)*64+0x7fff-63
-                      ),
-                      'minY':(
-                          (minby-0x7fff)*64+0x7fff-63
-                      ),
-                      'topOffset':global_top//2,
-                      'fileCount':len(files)
-                  }
+          html_file = preview / 'index.html'
+          html = html_file.read_text(encoding='utf-8')
 
-              summary = {
-                  'version':'V3',
-                  'sourceRunV2':int(STAMP),
-                  'indexEntries':len(idx),
-                  'counts':counts,
-                  'tileTypes':dict(tile_types),
-                  'tileIdCount':len(tile_usage),
-                  'topTileIds':tile_usage.most_common(50),
-                  'diagnostics':problems.most_common(40),
-                  'mapSizes':{
-                      m:{
-                          k:v for k,v in d.items()
-                          if k!='blocks'
-                      }
-                      for m,d in manifest.items()
-                  },
-                  'originalPixelRendering':
-                      'partial_or_complete_based_on_decode_stats',
-                  'mobSpawnsIncluded':False
-              }
-              Path('reports/summary.json').write_text(
-                  json.dumps(
-                      summary,
-                      ensure_ascii=False,
-                      indent=2
-                  ),
-                  encoding='utf-8'
-              )
-              (OUT/'map-index.json').write_text(
-                  json.dumps(
-                      manifest,
-                      ensure_ascii=False,
-                      indent=2
-                  ),
-                  encoding='utf-8'
-              )
+          if 'id="floor"' not in html or 'id="world"' not in html:
+              raise SystemExit('Viewer missing floor selector or stage')
 
-              page = """
-              <!doctype html>
-              <html lang="ko">
-              <head>
-              <meta charset="utf-8">
-              <meta name="viewport" content="width=device-width,initial-scale=1">
-              <title>말던 원본 지형 V3</title>
-              <style>
-              * {box-sizing:border-box}
-              body {margin:0;background:#10151e;color:#eef5ff;font-family:system-ui}
-              header {padding:9px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}
-              button,select {border:1px solid #586679;border-radius:7px;background:#26364a;color:inherit;padding:7px;font:inherit}
-              #stage {height:calc(100dvh - 108px);overflow:hidden;position:relative;background:#111824;touch-action:none}
-              #world {position:absolute;left:0;top:0;transform-origin:0 0}
-              #world img {position:absolute;image-rendering:pixelated;max-width:none;user-select:none;pointer-events:none}
-              footer {font-size:12px;padding:8px;color:#c2d2df}
-              </style>
-              </head>
-              <body>
-              <header>
-              <b>말던 원본 지형 V3</b>
-              <select id="floor">
-              <option value="1">1층</option>
-              <option value="2">2층</option>
-              </select>
-              <button id="minus">-</button>
-              <button id="plus">+</button>
-              <button id="fit">전체</button>
-              <span id="stat"></span>
-              </header>
-              <div id="stage"><div id="world"></div></div>
-              <footer>원본 S32 + Tile.idx/Tile.pak 시각화. 이동속성 및 몬스터 스폰 미반영. 드래그로 이동.</footer>
-              <script id="data" type="application/json">__DATA__</script>
-              <script>
-              'use strict';
-              const data=JSON.parse(document.getElementById('data').textContent);
-              const stage=document.getElementById('stage');
-              const world=document.getElementById('world');
-              const floor=document.getElementById('floor');
-              const stat=document.getElementById('stat');
-              let scale=.25,ox=0,oy=0,last=null;
-              function position(){
-                world.style.transform=`translate(${ox}px,${oy}px) scale(${scale})`;
-              }
-              function fit(){
-                const m=data[floor.value],a=stage.getBoundingClientRect();
-                scale=Math.min(a.width/m.width,a.height/m.height)*.94;
-                ox=(a.width-m.width*scale)/2;
-                oy=(a.height-m.height*scale)/2;
-                position();
-              }
-              function render(){
-                const m=data[floor.value];
-                world.replaceChildren();
-                world.style.width=m.width+'px';
-                world.style.height=m.height+'px';
-                for(const b of m.blocks){
-                  const im=new Image();
-                  im.src=b.src;
-                  im.style.left=b.x+'px';
-                  im.style.top=b.y+'px';
-                  im.width=1536;
-                  im.height=768;
-                  im.draggable=false;
-                  world.appendChild(im);
-                }
-                stat.textContent=`${m.fileCount} 블록`;
-                fit();
-              }
-              function zoom(m){
-                const a=stage.getBoundingClientRect();
-                const cx=a.width/2,cy=a.height/2,old=scale;
-                scale=Math.min(3,Math.max(.03,scale*m));
-                ox=cx-(cx-ox)*scale/old;
-                oy=cy-(cy-oy)*scale/old;
-                position();
-              }
-              floor.onchange=render;
-              document.getElementById('fit').onclick=fit;
-              document.getElementById('minus').onclick=()=>zoom(.8);
-              document.getElementById('plus').onclick=()=>zoom(1.25);
-              stage.addEventListener('pointerdown',e=>{
-                last={x:e.clientX,y:e.clientY};
-                stage.setPointerCapture(e.pointerId);
-              });
-              stage.addEventListener('pointermove',e=>{
-                if(!last)return;
-                ox+=e.clientX-last.x;
-                oy+=e.clientY-last.y;
-                last={x:e.clientX,y:e.clientY};
-                position();
-              });
-              stage.addEventListener('pointerup',()=>last=null);
-              stage.addEventListener('pointercancel',()=>last=null);
-              stage.addEventListener('wheel',e=>{
-                e.preventDefault();
-                zoom(e.deltaY<0?1.12:.89);
-              },{passive:false});
-              render();
-              </script>
-              </body>
-              </html>
-              """
-              (OUT/'index.html').write_text(
-                  page.replace(
-                      '__DATA__',
-                      json.dumps(
-                          manifest,
-                          separators=(',',':')
-                      ).replace('<','\\u003c')
-                  ),
-                  encoding='utf-8'
-              )
+          if '__DATA__' in html:
+              raise SystemExit('Viewer metadata not embedded')
 
-              assert counts['drawn']>counts['floor']*0.8, (
-                  'Fewer than 80% of floor cells rendered. '
-                  'Check original tile decode.'
-              )
-              print(
-                  'V3_SUCCESS',
-                  json.dumps({
-                      'drawn':counts['drawn'],
-                      'floor':counts['floor'],
-                      'objects':counts['objects'],
-                      'tileIdCount':len(tile_usage),
-                      'errors':counts['decodeError']
-                  }),
-                  flush=True
-              )
+          html = html.replace(
+              '<title>말던 원본 지형 V3</title>',
+              '<title>TI Dungeon Terrain V3.2 Partial Preview</title>'
+          )
+          html = html.replace('V3</b>', 'V3.2</b>')
 
-          if __name__=='__main__':
-              main()
-          PY_MAP_V3
-          /tmp/sanctuary-v3/bin/python /tmp/sanctuary-map-v3.py
+          html = html.replace(
+              '</header>',
+              '</header>\n'
+              '<aside style="padding:6px 10px;background:#493a24;'
+              'color:#ffe6ba;font-size:12px">'
+              'V3.2 verified partial source-asset preview. '
+              'Some original tile frames are not decoded yet. '
+              'Monster spawn coordinates are not included.'
+              '</aside>',
+              1
+          )
+
+          html_file.write_text(html, encoding='utf-8')
+
+          scripts = re.findall(
+              r'<script[^>]*>(.*?)</script>',
+              html,
+              re.S | re.I
+          )
+          if len(scripts) < 2:
+              raise SystemExit('Viewer JavaScript not found')
+
+          (root / 'viewer-check.js').write_text(
+              scripts[-1], encoding='utf-8'
+          )
+
+          report = {
+              'version': 'V3.2',
+              'inputRun': 39048289231,
+              'inputArtifact': 'Sanctuary-TI-Dungeon-V3-Failure',
+              'originalSource': 'Sanctuary of Aden Tile.idx, Tile.pak, map/1, map/2',
+              'terrainImagesVerified': sum(
+                  x['blocks'] for x in result.values()
+              ),
+              'maps': result,
+              'previousRenderAttemptsAccepted': original['counts']['drawn'],
+              'previousDecoderErrors': original['counts']['decodeError'],
+              'previousRendering80PercentAssertion': 'Removed',
+              'visualPreviewAvailable': True,
+              'completeOriginalTerrainVerified': False,
+              'mobSpawnCoordinatesVerified': False,
+              'portalsVerified': False
+          }
+
+          (root / 'verification-v3-2.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2),
+              encoding='utf-8'
+          )
+
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+          /tmp/sanctuary-map-v3-2/bin/python /tmp/verify_map_v3_2.py
+          node --check reports/viewer-check.js
           test -s reports/preview/index.html
-          test -s reports/summary.json
-          test -s reports/preview/tiles/1/7ffe8000.png
-          test -s reports/preview/tiles/2/7fff8000.png
+          test -s reports/verification-v3-2.json
 
-      - name: Upload original dungeon map preview V3
+      - name: V3.2 Upload verified partial terrain preview
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3-Original-Terrain
-          path: reports/
+          name: Sanctuary-TI-Dungeon-V3.2-Verified-Partial-Terrain
+          path: |
+            reports/preview/
+            reports/summary.json
+            reports/verification-v3-2.json
           if-no-files-found: error
           retention-days: 30
           compression-level: 6
 
-      - name: Upload terrain diagnostics on failure
+      - name: V3.2 Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3-Failure
+          name: Sanctuary-TI-Dungeon-V3.2-Diagnostics
           path: reports/
           if-no-files-found: warn
           retention-days: 14
