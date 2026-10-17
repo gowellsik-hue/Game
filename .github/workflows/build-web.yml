@@ -1,11 +1,10 @@
 
-name: Sanctuary of Aden Mobile V10 Runtime Stability
+name: Sanctuary of Aden Mobile V11 Render Optimization
 
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/build-web.yml
+    paths: [.github/workflows/build-web.yml]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +12,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: sanctuary-mobile-v10
+  group: sanctuary-mobile-v11
   cancel-in-progress: false
 
 jobs:
@@ -25,174 +24,225 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore verified V9 game
+      - name: Restore verified V10 mobile runtime
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p dist/mobile reports
-          if gh run download 38988976341 --repo "$GITHUB_REPOSITORY" --name Sanctuary-Mobile-V9-Modular-Runtime --dir dist/mobile; then
-            echo 'Verified V9 package restored'
+          if gh run download 39030488973 --repo "$GITHUB_REPOSITORY" --name Sanctuary-Mobile-V10-Runtime-Stability --dir dist/mobile; then
+            echo 'Verified V10 artifact restored'
           else
             rm -rf dist/mobile
             mkdir -p dist/mobile
-            git show 781715dcb3ee7fa60fcde32f20cf11ac31561ec7:.github/workflows/build-web.yml > /tmp/v9.yml
-            python3 -m venv /tmp/sanctuary-venv
-            /tmp/sanctuary-venv/bin/pip -q install 'PyYAML==6.0.2' 'Pillow==11.3.0'
-            cat > /tmp/rebuild_v9.py <<'PY_RESTORE'
+            git show 4db9b15c44b1fe1f206c29bd72f4a6ea0a0018b0:.github/workflows/build-web.yml > reports/pinned-v10.yml
+            python3 -m venv /tmp/sanctuary-build
+            /tmp/sanctuary-build/bin/pip -q install 'PyYAML==6.0.2' 'Pillow==11.3.0'
+            cat > reports/restore_v10.py <<'PY_RESTORE'
           import os,subprocess,yaml
           from pathlib import Path
-          steps=yaml.safe_load(Path('/tmp/v9.yml').read_text(encoding='utf-8'))['jobs']['build']['steps']
-          names=['Restore verified V8.1 game','Split HTML into reusable game files','Verify original assets and test mobile runtime']
-          env=dict(os.environ)
-          env['PATH']='/tmp/sanctuary-venv/bin:'+env['PATH']
-          for name in names:
-              matches=[s for s in steps if s.get('name')==name and 'run' in s]
-              if len(matches)!=1:raise SystemExit('Pinned V9 step unavailable: '+name)
-              subprocess.run(['bash','-e','-o','pipefail','-c',matches[0]['run']],env=env,check=True)
-              print('Rebuilt V9:',name,flush=True)
+          steps=yaml.safe_load(Path('reports/pinned-v10.yml').read_text(encoding='utf-8'))['jobs']['build']['steps']
+          env=dict(os.environ);env['PATH']='/tmp/sanctuary-build/bin:'+env['PATH']
+          for name in ('Restore verified V9 game','Install V10 mobile stability changes','Validate V10 graphics and runtime'):
+              hits=[step for step in steps if step.get('name')==name and 'run' in step]
+              if len(hits)!=1:raise SystemExit('Missing V10 rebuild step: '+name)
+              subprocess.run(['bash','-e','-o','pipefail','-c',hits[0]['run']],env=env,check=True)
+              print('V10 restored:',name,flush=True)
           PY_RESTORE
-            /tmp/sanctuary-venv/bin/python /tmp/rebuild_v9.py
+            /tmp/sanctuary-build/bin/python reports/restore_v10.py
           fi
 
-      - name: Install V10 mobile stability changes
+      - name: Optimize visible terrain and sprite loading
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p reports
-          cat > reports/patch_v10.py <<'PY_PATCH'
+          cat > reports/patch_v11.py <<'PY_PATCH'
           from pathlib import Path
-          import hashlib, json, sys
-          root=Path(sys.argv[1] if len(sys.argv)>1 else 'dist/mobile')
-          htmlfile=root/'index.html'; jsfile=root/'game.js'; cssfile=root/'game.css'
-          html=htmlfile.read_text(encoding='utf-8'); js=jsfile.read_text(encoding='utf-8'); css=cssfile.read_text(encoding='utf-8')
-          manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
-          if len(manifest['actors'])!=8 or manifest['map']['size']!=[192,192]:raise SystemExit('V9 asset source changed')
-          def swap(s,a,b,name):
-           n=s.count(a)
-           if n!=1:raise SystemExit(f'{name}: expected 1 occurrence, got {n}')
-           return s.replace(a,b,1)
-          js=swap(js,"const TW=64, TH=32, KEYS=['idle','walk','attack','hit','death'],imgCache=new Map();",
-          "const TW=64, TH=32, KEYS=['idle','walk','attack','hit','death'],imgCache=new Map();\nconst assetStats={requested:0,loaded:0},assetFailed=new Set();let lastAssetUpdate=0,lastMiniPaint=0;",'asset counters')
-          js=swap(js,"function img(url){if(!imgCache.has(url)){const image=new Image();image.src=url;imgCache.set(url,image)}return imgCache.get(url)}",
-          '''function loadImage(url){const im=new Image();im.decoding='async';assetStats.requested++;im.onload=()=>{assetStats.loaded++;assetFailed.delete(url)};im.onerror=()=>{assetFailed.add(url)};im.src=url;return im}
-          function img(url){if(imgCache.has(url)){let im=imgCache.get(url);imgCache.delete(url);imgCache.set(url,im);return im}let im=loadImage(url);imgCache.set(url,im);if(imgCache.size>420)imgCache.delete(imgCache.keys().next().value);return im}
-          function refreshAssetStatus(){const status=el('assetStatus');status.textContent='원본 이미지 로딩 '+assetStats.loaded+' / '+assetStats.requested+' · 실패 '+assetFailed.size+' · 캐시 '+imgCache.size;status.style.color=assetFailed.size?'#ffb1aa':'#bce8c7'}
-          function retryFailedImages(){let count=assetFailed.size;for(const url of assetFailed){imgCache.delete(url);if(url.startsWith('tiles/')&&url.endsWith('.png'))atlases.delete(Number(url.slice(6,-4)))}assetFailed.clear();refreshAssetStatus();if(count)msg('실패 이미지 '+count+'개 재시도 준비',1.2);else msg('실패한 이미지가 없습니다',.8)}''','tracked image loading')
-          js=swap(js,"function tileAtlas(id){if(!atlases.has(id)){let image=new Image();image.src='tiles/'+id+'.png';atlases.set(id,image)}return atlases.get(id)}",
-          "function tileAtlas(id){let im=atlases.get(id);if(im){atlases.delete(id);atlases.set(id,im);return im}im=loadImage('tiles/'+id+'.png');atlases.set(id,im);if(atlases.size>128)atlases.delete(atlases.keys().next().value);return im}",'tracked tile atlas')
-          js=swap(js,'function drawMini(){if(!mapShown)return;', 'function drawMini(t){if(!mapShown||(lastMiniPaint&&t-lastMiniPaint<180))return;lastMiniPaint=t;', 'minimap refresh')
-          js=swap(js,'drawMini();drawLab(t);', 'drawMini(t);drawLab(t);if(t-lastAssetUpdate>600){lastAssetUpdate=t;refreshAssetStatus()}', 'minimap and status paint')
-          js=swap(js,"el('miniToggle').onclick=()=>{mapShown=!mapShown;el('miniWrap').hidden=!mapShown};",
-          "el('miniToggle').onclick=()=>{mapShown=!mapShown;lastMiniPaint=0;el('miniWrap').hidden=!mapShown};",'mini toggle')
-          js=swap(js,"function stopMovement(){pressed={};stickVector={x:0,y:0};stickId=null;el('knob').style.left='50%';el('knob').style.top='50%';frameFingers.clear();pinching=false;tapFinger=null;last=0}",
-          "function stopMovement(){pressed={};stickVector={x:0,y:0};stickId=null;el('knob').style.left='50%';el('knob').style.top='50%';frameFingers.clear();pinching=false;tapFinger=null;last=0;lastPaint=0;lastMiniPaint=0}", 'release input')
-          js=swap(js,"window.addEventListener('resize',resize);", "window.addEventListener('resize',()=>{stopMovement();resize()});",'resize reset input')
-          js=swap(js,"window.addEventListener('orientationchange',()=>setTimeout(resize,120));", "window.addEventListener('orientationchange',()=>{stopMovement();setTimeout(resize,120)});",'rotation reset input')
-          js=swap(js,"if(window.visualViewport)window.visualViewport.addEventListener('resize',resize);", "if(window.visualViewport)window.visualViewport.addEventListener('resize',()=>{stopMovement();resize()});",'visual viewport reset input')
-          js=swap(js,'function update(dt){if(open||settingsOpen)return;', 'function update(dt){if(open||settingsOpen||document.hidden)return;', 'background simulation pause')
-          js=swap(js,"el('settingsReset').onclick=()=>{cameraZoom=1;paintFPS=30;controlSize='normal';applyMobileSettings();saveMobileSettings()};",
-          "el('settingsReset').onclick=()=>{cameraZoom=1;paintFPS=30;controlSize='normal';applyMobileSettings();saveMobileSettings()};\nel('assetRetry').onclick=retryFailedImages;",'retry button')
-          js=swap(js,'begin();requestAnimationFrame(render);', "begin();refreshAssetStatus();window.SANCTUARY_GAME_READY=true;el('bootNotice').hidden=true;requestAnimationFrame(render);",'ready signal')
-          html=swap(html,'Sanctuary of Aden Mobile V9 · Modular Runtime','Sanctuary of Aden Mobile V10 · Runtime Stability','HTML version')
-          html=swap(html,'Sanctuary Mobile V9</strong>','Sanctuary Mobile V10</strong>','HUD version')
-          html=swap(html,'<div id="stage">','<div id="bootNotice" role="status">원본 맵·SPR 리소스 초기화 중…</div>\n<div id="stage">','boot status')
-          html=swap(html,'<div id="settingsLegacy"></div>', '<div id="settingsLegacy"></div>\n<div id="assetStatus" aria-live="polite">원본 이미지 확인 중…</div>\n<button id="assetRetry" type="button">실패 이미지 다시 불러오기</button>', 'asset panel')
-          html=swap(html,'<script src="game-data.js"></script>', '''<script>
-          window.addEventListener('error',function(e){const target=e.target;let note=document.getElementById('bootNotice');if(!window.SANCTUARY_GAME_READY&&note){note.hidden=false;note.textContent=target&&(target.tagName==='SCRIPT'||target.tagName==='LINK')?'실행 파일 누락: '+(target.src||target.href):'게임 초기화 오류 · 파일을 모두 같은 폴더에 두세요';}},true);
-          </script>
-          <script src="game-data.js"></script>''','bootstrap error listener')
-          css+='''
-          #bootNotice{position:fixed;z-index:100;left:50%;top:40%;transform:translate(-50%,-50%);width:min(86vw,340px);padding:18px 15px;text-align:center;background:#12292bf7;color:#ffe7af;border:1px solid #b5ad81;border-radius:13px;box-shadow:0 5px 24px #0009;pointer-events:none;font-weight:700;white-space:normal;overflow-wrap:anywhere}
-          #bootNotice[hidden]{display:none}
-          #assetStatus{font-size:11px;line-height:1.5;border:1px solid #60786c;border-radius:7px;padding:6px 8px;background:#102625;overflow-wrap:anywhere}
-          #assetRetry{font-size:12px;padding:8px 6px}
-          '''
-          htmlfile.write_text(html,encoding='utf-8');jsfile.write_text(js,encoding='utf-8');cssfile.write_text(css,encoding='utf-8')
-          info=json.loads((root/'build-info.json').read_text(encoding='utf-8'));info.update(package=10,runtime=10,source_run=38988976341);info['sha256']={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ['index.html','game.css','game.js','game-data.js','manifest.json']};(root/'build-info.json').write_text(json.dumps(info,indent=2)+'\n',encoding='utf-8')
-          (root/'README_KO.txt').write_text((root/'README_KO.txt').read_text(encoding='utf-8')+'\nV10: 원본 이미지 로딩 상태 및 재시도, 미니맵 180ms 갱신, 화면 회전 시 입력 해제, 백그라운드 일시정지. 몬스터 모션과 전투 수치는 변경하지 않았습니다.\n',encoding='utf-8')
-          print('V10 patch complete',len(js),'game js chars, 8 SPR actor IDs')
+          import json, hashlib, sys
+          root = Path(sys.argv[1]) if len(sys.argv)>1 else Path('dist/mobile')
+          jsfile=root/'game.js'; htmlfile=root/'index.html'; cssfile=root/'game.css'; infofile=root/'build-info.json'
+          js=jsfile.read_text(encoding='utf-8'); html=htmlfile.read_text(encoding='utf-8'); css=cssfile.read_text(encoding='utf-8')
+          info=json.loads(infofile.read_text(encoding='utf-8'))
+          assert info['package']==10, 'V10 artifact required'
+          assert len(json.loads((root/'manifest.json').read_text())['actors']) ==8
+          for filename in ('game-data.js','manifest.json'):
+              assert hashlib.sha256((root/filename).read_bytes()).hexdigest() == info['sha256'][filename], 'data mutated before patch'
+          def once(s,a,b,label):
+              count=s.count(a)
+              if count!=1:raise SystemExit(f'{label}: found {count} occurrences')
+              return s.replace(a,b,1)
+          def section(s,start,end,body,label):
+              if s.count(start)!=1 or s.count(end)!=1:raise SystemExit(f'{label}: invalid boundaries')
+              a=s.index(start); b=s.index(end,a+len(start))
+              return s[:a]+body+'\n'+s[b:]
+          js=once(js,"const assetStats={requested:0,loaded:0},assetFailed=new Set();let lastAssetUpdate=0,lastMiniPaint=0;", "const assetStats={requested:0,loaded:0},assetFailed=new Set();let lastAssetUpdate=0,lastMiniPaint=0;\nlet perfGround=0,perfGroundVisible=0,perfObjCells=0,perfFrames=0,perfSince=0,lastHudStamp=-1,prefetchBudget=0;",'performance state')
+          js=once(js,'function tileAtlas(id){', '''function rowClip(worldY,minX,maxX,padding){
+            const zoom=cameraZoom,dx=hero.x-hero.y,dy=hero.x+hero.y;
+            const ux0=(-padding-sw/2)/(zoom*32),ux1=(sw+padding-sw/2)/(zoom*32);
+            const vyOffset=sh/2-sh*.46;
+            const vy0=((-padding-sh/2)/zoom+vyOffset)/16;
+            const vy1=((sh+padding-sh/2)/zoom+vyOffset)/16;
+            const lo=Math.ceil(Math.max(minX,ux0+dx+worldY,vy0+dy-worldY-1)-1e-6);
+            const hi=Math.floor(Math.min(maxX,ux1+dx+worldY,vy1+dy-worldY-1)+1e-6);
+            return [lo,hi];
+          }
+          function tileAtlas(id){''','clipped viewport helper')
+          js=section(js,'function getVisibleObjects(){','function ground(){', '''function getVisibleObjects(){
+            if(!showObjects||!showTextures){perfObjCells=0;return []}
+            const range=viewRadius(),cx=Math.floor(hero.x-OX),cy=Math.floor(hero.y-OY),out=[];
+            perfObjCells=0;
+            for(let iy=Math.max(0,cy-range);iy<=Math.min(H-1,cy+range);iy++){
+              const worldY=OY+iy;
+              const bounds=rowClip(worldY,OX+Math.max(0,cx-range),OX+Math.min(W-1,cx+range),88);
+              let left=Math.max(0,bounds[0]-OX),right=Math.min(W-1,bounds[1]-OX);
+              if(left>right)continue;
+              let px=sw*.5+((OX+left-worldY)-(hero.x-hero.y))*TW/2;
+              let py=sh*.46+((OX+left+worldY+1)-(hero.x+hero.y))*TH/2;
+              for(let ix=left;ix<=right;ix++,px+=TW/2,py+=TH/2){
+                perfObjCells++;
+                const list=objectCells[iy*W+ix];
+                if(!list||outsideView(px,py,80))continue;
+                const wx=OX+ix+.5,wy=worldY+.5;
+                for(const ob of list)out.push({ob,depth:wx+wy+ob[3]/2048});
+              }
+            }
+            return out;
+          }''', 'visible original objects')
+          js=section(js,'function ground(){','function drawActor(unit,type){', '''function ground(){
+            ctx.fillStyle='#192a26';ctx.fillRect(0,0,sw,sh);
+            const range=viewRadius(),fx=Math.floor(hero.x),fy=Math.floor(hero.y);
+            perfGround=0;perfGroundVisible=0;
+            for(let y=Math.max(OY,fy-range);y<=Math.min(OY+H-1,fy+range);y++){
+              const [lo,hi]=rowClip(y,Math.max(OX,fx-range),Math.min(OX+W-1,fx+range),48);
+              if(lo>hi)continue;
+              let idx=(y-OY)*W+(lo-OX);
+              let px=sw*.5+((lo-y)-(hero.x-hero.y))*TW/2;
+              let py=sh*.46+((lo+y+1)-(hero.x+hero.y))*TH/2;
+              for(let x=lo;x<=hi;x++,idx++,px+=TW/2,py+=TH/2){
+                perfGround++;
+                if(outsideView(px,py,40))continue;
+                perfGroundVisible++;
+                const a=M.floorA[idx],b=M.floorB[idx],c1=M.tileColors[a]||'#345247',c2=M.tileColors[b]||c1;
+                if(!tileHalf(a,px-32,py-16)){
+                  ctx.fillStyle=c1;ctx.beginPath();ctx.moveTo(px,py-16);ctx.lineTo(px-32,py);ctx.lineTo(px,py+16);ctx.fill();
+                }
+                if(!tileHalf(b,px,py-16)){
+                  ctx.fillStyle=c2;ctx.beginPath();ctx.moveTo(px,py-16);ctx.lineTo(px+32,py);ctx.lineTo(px,py+16);ctx.fill();
+                }
+                if(M.overlayA[idx]>=0)tileHalf(M.overlayA[idx],px-32,py-16);
+                if(M.overlayB[idx]>=0)tileHalf(M.overlayB[idx],px,py-16);
+                if(showBlocked){
+                  let bits=M.flags[idx];if(bits&1)ctx.fillStyle='#e24f4b8c';else if(bits&4)ctx.fillStyle='#5ba9e33c';else continue;
+                  ctx.beginPath();ctx.moveTo(px,py-16);ctx.lineTo(px+32,py);ctx.lineTo(px,py+16);ctx.lineTo(px-32,py);ctx.closePath();ctx.fill();
+                }
+              }
+            }
+          }''', 'clipped map rendering')
+          js=once(js,"else {ctx.fillStyle=type==='hero'?'#e2c992':'#c98478';ctx.fillRect(p.x-13,foot-32,26,32)}", "else {ctx.fillStyle=type==='hero'?'#e2c992':'#c98478';ctx.fillRect(p.x-13,foot-32,26,32)}\nif(seq.length>1&&(type==='hero'||prefetchBudget>0)){const next=seq[(fi+1)%seq.length];if(next&&!imgCache.has(next)){img(next);if(type!=='hero')prefetchBudget--}}", 'next sprite frame prefetch')
+          js=once(js,"function begin(){clock=0;score=0;potions=10;", "function begin(){clock=0;lastHudStamp=-1;score=0;potions=10;", 'reset performance throttling after restart')
+          js=once(js,'if(auto&&!hero.goalMob&&hero.attackCd<=0&&targetInRange(1.7))tryAttack(false);targetHUD();refresh()}',"if(auto&&!hero.goalMob&&hero.attackCd<=0&&targetInRange(1.7))tryAttack(false);if(lastHudStamp<0||clock-lastHudStamp>=.14){lastHudStamp=clock;targetHUD();refresh()}}", 'throttle HUD DOM writes')
+          js=once(js,'ctx.imageSmoothingEnabled=false;ground();drawTargetRing();', 'ctx.imageSmoothingEnabled=false;prefetchBudget=3;ground();drawTargetRing();', 'sprite warmup budget')
+          js=once(js,"drawMini(t);drawLab(t);if(t-lastAssetUpdate>600){lastAssetUpdate=t;refreshAssetStatus()}","drawMini(t);drawLab(t);perfFrames++;if(!perfSince)perfSince=t;if(t-perfSince>=1000){let fps=Math.round(perfFrames*1000/(t-perfSince));el('perfStatus').textContent='화면 '+fps+' FPS · 지형 검사 '+perfGround+'칸 / 표시 '+perfGroundVisible+'칸 · 오브젝트 검사 '+perfObjCells+'칸';perfFrames=0;perfSince=t}if(t-lastAssetUpdate>600){lastAssetUpdate=t;refreshAssetStatus()}", 'device performance diagnostics')
+          html=once(html,'Sanctuary of Aden Mobile V10 · Runtime Stability','Sanctuary of Aden Mobile V11 · Render Optimization','page version')
+          html=once(html,'Sanctuary Mobile V10</strong>','Sanctuary Mobile V11</strong>','HUD version')
+          html=once(html,'<div id="assetStatus" aria-live="polite">', '<div id="perfStatus" aria-live="off">화면 최적화 준비 중…</div>\n<div id="assetStatus" aria-live="polite">', 'performance UI')
+          css+='\n#perfStatus{border:1px solid #61756b;border-radius:7px;background:#13292a;padding:6px 8px;color:#bbdeb6;font-size:11px;line-height:1.5}\n'
+          jsfile.write_text(js,encoding='utf-8');htmlfile.write_text(html,encoding='utf-8');cssfile.write_text(css,encoding='utf-8')
+          info.update(package=11,runtime=11,source_run=39030488973)
+          info['sha256']={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('index.html','game.css','game.js','game-data.js','manifest.json')}
+          infofile.write_text(json.dumps(info,indent=2)+'\n',encoding='utf-8')
+          (root/'README_KO.txt').write_text((root/'README_KO.txt').read_text(encoding='utf-8')+'\nV11: 화면 밖 타일/오브젝트 행별 제거, 좌표 계산 감소, 다음 SPR 프레임 선로딩, 0.14초 상태창 갱신 간격. 전투 규칙/맵/모션 매핑 변경 없음.\n',encoding='utf-8')
+          print('V11 PATCH SUCCESS',len(js),'characters, 8 SPR IDs')
           PY_PATCH
-          python3 -m py_compile reports/patch_v10.py
-          python3 reports/patch_v10.py dist/mobile
+          python3 -m py_compile reports/patch_v11.py
+          python3 reports/patch_v11.py dist/mobile
 
-      - name: Validate V10 graphics and runtime
+      - name: Validate complete original assets and V11 mobile gameplay
         shell: bash
         run: |
           set -euo pipefail
-          cat > reports/verify_package.py <<'PY_VERIFY'
+          cat > reports/verify_v11.py <<'PY_VALIDATE'
           from pathlib import Path
-          import hashlib,json,re
-          root=Path('dist/mobile')
-          info=json.loads((root/'build-info.json').read_text(encoding='utf-8'))
-          manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
-          assert info['package']==10 and info['source_run']==38988976341
-          assert len(manifest['actors'])==8 and manifest['map']['size']==[192,192]
-          assert len(manifest['map']['flags'])==36864 and len(manifest['map']['objects'])==59963
+          import hashlib,json
+          root=Path('dist/mobile');info=json.loads((root/'build-info.json').read_text());data=json.loads((root/'manifest.json').read_text())
+          assert info['package']==11 and info['runtime']==11 and info['source_run']==39030488973
+          assert len(data['actors'])==8 and data['map']['size']==[192,192]
+          assert len(data['map']['flags'])==36864 and len(data['map']['objects'])==59963
           assert len(list((root/'assets').glob('*.png')))==3616
           assert len(list((root/'tiles').glob('*.png')))==218
-          for name,expected in info['sha256'].items():
-           actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
-           assert actual==expected,(name,'hash mismatch')
+          for name,digest in info['sha256'].items():assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest,name
           assert info['sha256']['game-data.js']=='1a50224f083c193c33eab137798bfb6ddccf1b1dea54f3d9055e601c0fbabf57'
-          html=(root/'index.html').read_text(encoding='utf-8')
-          assert html.index('<script src="game-data.js">')<html.index('<script src="game.js">')
-          for name in ['bootNotice','assetStatus','assetRetry','lab','targetNext','settingsToggle','pad','hitBtn']:
-           assert f'id="{name}"' in html,name
-          assert 'SANCTUARY_GAME_READY=true' in (root/'game.js').read_text(encoding='utf-8')
-          print('V10 ORIGINAL FILES VERIFIED: 3616 sprites, 218 atlases, 59963 S32 objects')
-          PY_VERIFY
-          python3 reports/verify_package.py
+          assert info['sha256']['manifest.json']=='3f1cdb0f22376e763888628465b6601f5e9c72eeda8a9194a356dcba2c205c95'
+          html=(root/'index.html').read_text();game=(root/'game.js').read_text()
+          assert 'id="perfStatus"' in html and 'function rowClip(' in game
+          assert all(key in game for key in ['function tryAttack(', 'function findPath(', 'function drawLab(', 'function targetChoose(', 'function retryFailedImages('])
+          print('V11 VERIFIED: original 3616 SPR, 218 tile atlases, 59963 objects, unchanged combat functions')
+          PY_VALIDATE
+          python3 reports/verify_v11.py
           node --check dist/mobile/game.js
           node --check dist/mobile/game-data.js
           cat > reports/smoke.cjs <<'JS_SMOKE'
           const fs=require('fs'),vm=require('vm'),assert=require('assert');
           const root='dist/mobile/',D=JSON.parse(fs.readFileSync(root+'manifest.json','utf8'));
-          let js=fs.readFileSync(root+'game.js','utf8'),now=0,frames=[],nodes=new Map(),listeners={},failedOnce=false;
-          const ready="begin();refreshAssetStatus();window.SANCTUARY_GAME_READY=true;el('bootNotice').hidden=true;requestAnimationFrame(render);";
-          assert(js.includes(ready));js=js.replace(ready,"window.QA={img,tileAtlas,clock:()=>clock,stick:()=>stickId,atlas:()=>atlases.size,cache:()=>imgCache.size,failed:()=>assetFailed.size,mini:()=>lastMiniPaint};"+ready);
-          function ctx(){return new Proxy({createImageData(w,h){return{data:new Uint8ClampedArray(w*h*4)}},getImageData(){return{data:new Uint8ClampedArray(192*192*4)}},measureText(s){return{width:String(s).length*10}}},{get(o,k){return k in o?o[k]:()=>{}},set(o,k,v){o[k]=v;return true}})}
-          class E{constructor(id){this.id=id;this.style={setProperty(){}};this.listeners={};this.hidden=['lab','settingsPanel','targetPanel'].includes(id);this.textContent=id==='autoBtn'?'자동 ON':'';this.classList={add(){},remove(){},toggle(){}};this.value={labActor:'hero',labMode:'idle',labDir:'0',labFrame:'-1',labSpeed:'110',frameRate:'30',controlSize:'normal'}[id]||'0';this.clientWidth=390;this.clientHeight=844;this.width=192;this.height=192;this.children=[];this.files=[]}getContext(){return ctx()}addEventListener(k,f){(this.listeners[k]??=[]).push(f)}click(){this.onclick?.();this.fire('click')}fire(k,v={}){for(const f of this.listeners[k]||[])f({pointerId:7,clientX:85,clientY:700,preventDefault(){},...v})}appendChild(x){this.children.push(x)}replaceChildren(...x){this.children=x}setPointerCapture(){}getBoundingClientRect(){return{left:0,top:0,width:140,height:140}}remove(){}}
-          const document={getElementById(id){if(!nodes.has(id))nodes.set(id,new E(id));return nodes.get(id)},createElement:id=>new E(id),documentElement:new E('html'),addEventListener(k,f){listeners[k]=f},body:new E('body'),hidden:false};
-          class Image{constructor(){this.complete=true;this.naturalWidth=24;this.naturalHeight=24}set src(v){this._src=v;if(v==='assets/forced-fail.png'&&!failedOnce){failedOnce=true;this.onerror?.()}else this.onload?.()}get src(){return this._src}}
-          const data=new Map();const window={SANCTUARY_MANIFEST:D,devicePixelRatio:2,addEventListener(k,f){listeners[k]=f},visualViewport:{addEventListener(){}}};
-          const env={window,document,devicePixelRatio:2,Image,Math,JSON,Int32Array,Uint8ClampedArray,Blob,console,confirm:()=>true,setTimeout(){},URL:{createObjectURL:()=>'',revokeObjectURL(){}},requestAnimationFrame(fn){frames.push(fn)},performance:{now:()=>now},localStorage:{getItem:k=>data.get(k)||null,setItem:(k,v)=>data.set(k,String(v))}};
-          vm.runInNewContext(js,env,{timeout:12000});
-          function tick(){now+=33.34;let fn=frames.shift();assert(fn,'Render loop stopped');fn(now)}
-          const el=id=>document.getElementById(id);for(let i=0;i<4;i++)tick();
-          assert(window.SANCTUARY_GAME_READY&&el('bootNotice').hidden);
-          el('settingsToggle').click();assert(!el('settingsPanel').hidden);el('zoomIn').click();assert.equal(el('zoomValue').textContent,'110%');el('settingsClose').click();
+          let code=fs.readFileSync(root+'game.js','utf8');
+          const boot="begin();refreshAssetStatus();window.SANCTUARY_GAME_READY=true;el('bootNotice').hidden=true;requestAnimationFrame(render);";
+          assert(code.includes(boot),'Verified V10 startup was modified');
+          code=code.replace(boot,"begin();window.QA={hero:()=>hero,findPath,findOpen,travel,zoom:()=>cameraZoom,stats:()=>({ground:perfGround,visible:perfGroundVisible,objects:perfObjCells}),rows:rowClip};refreshAssetStatus();window.SANCTUARY_GAME_READY=true;el('bootNotice').hidden=true;requestAnimationFrame(render);");
+          let now=0,frames=[],nodes=new Map(),listeners={};
+          function surface(){return new Proxy({createImageData(w,h){return {data:new Uint8ClampedArray(w*h*4)}},getImageData(){return {data:new Uint8ClampedArray(192*192*4)}},measureText(s){return {width:String(s).length*8}}},{get(t,k){return k in t?t[k]:()=>{}},set(t,k,v){t[k]=v;return true}})}
+          class Element{
+           constructor(id){this.id=id;this.style={setProperty(){}};this.listeners={};this.hidden=['lab','settingsPanel','targetPanel'].includes(id);this.textContent=id==='autoBtn'?'자동 ON':'';this.value={labActor:'hero',labMode:'idle',labDir:'0',labSpeed:'110',labFrame:'-1',frameRate:'30',controlSize:'normal'}[id]||'0';this.classList={add(){},remove(){},toggle(){}};this.clientWidth=390;this.clientHeight=844;this.width=192;this.height=192;this.children=[];this.files=[];}
+           getContext(){return surface()}addEventListener(k,f){(this.listeners[k]??=[]).push(f)}
+           click(){this.onclick?.();this.fire('click')}
+           fire(k,props={}){for(const fn of this.listeners[k]||[])fn({pointerId:1,clientX:120,clientY:200,preventDefault(){},...props})}
+           appendChild(x){this.children.push(x)}replaceChildren(...a){this.children=a}setPointerCapture(){}
+           getBoundingClientRect(){return {left:0,top:0,width:390,height:844}}remove(){}
+          }
+          const document={getElementById(id){if(!nodes.has(id))nodes.set(id,new Element(id));return nodes.get(id)},createElement:id=>new Element(id),documentElement:new Element('html'),addEventListener(k,f){listeners[k]=f},body:new Element('body'),hidden:false};
+          class Image{constructor(){this.complete=true;this.naturalWidth=24;this.naturalHeight=24}set src(v){this._src=v;this.onload?.()}get src(){return this._src}}
+          const store=new Map(),window={SANCTUARY_MANIFEST:D,devicePixelRatio:1,addEventListener(k,f){listeners[k]=f},visualViewport:{addEventListener(){}}};
+          const env={document,window,devicePixelRatio:1,Image,Math,JSON,Int32Array,Uint8ClampedArray,console,Blob,confirm:()=>true,setTimeout(){},URL:{createObjectURL(){return ''},revokeObjectURL(){}},requestAnimationFrame(f){frames.push(f)},performance:{now:()=>now},localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,String(v))}};
+          vm.runInNewContext(code,env,{timeout:15000});
+          const el=id=>document.getElementById(id);
+          function frame(){now+=34;const cb=frames.shift();assert(cb,'Render loop stopped');cb(now)}
+          for(let i=0;i<40;i++)frame();
+          assert.equal(window.SANCTUARY_GAME_READY,true);
+          assert(el('perfStatus').textContent.includes('FPS'),'Live performance HUD did not update');
+          let perf=window.QA.stats();assert(perf.ground>0&&perf.visible>0&&perf.visible<=perf.ground,'Ground culling counters invalid');
+          assert(perf.ground<841,'Ground culling did not reduce candidate cells at 390x844');
+          el('settingsToggle').click();assert(!el('settingsPanel').hidden,'Settings not opened');
+          el('zoomIn').click();assert.equal(el('zoomValue').textContent,'110%');el('settingsClose').click();
           el('targetNext').click();assert(!el('targetPanel').hidden);el('targetClear').click();assert(el('targetPanel').hidden);
           el('labOpen').click();assert(!el('lab').hidden);el('labClose').click();assert(el('lab').hidden);
-          window.QA.img('assets/forced-fail.png');assert.equal(window.QA.failed(),1);
-          el('assetRetry').click();assert.equal(window.QA.failed(),0);window.QA.img('assets/forced-fail.png');assert.equal(window.QA.failed(),0);
-          for(let i=0;i<450;i++)window.QA.img('assets/test-'+i+'.png');assert(window.QA.cache()<=420);
-          for(let i=0;i<155;i++)window.QA.tileAtlas(i);assert(window.QA.atlas()<=128);
-          el('pad').fire('pointerdown');assert.equal(window.QA.stick(),7);listeners.orientationchange();assert.equal(window.QA.stick(),null);
-          const miniTimes=new Set();for(let i=0;i<35;i++){tick();miniTimes.add(window.QA.mini())}assert(miniTimes.size<=10,'Mini-map render not throttled');
-          const before=window.QA.clock();document.hidden=true;listeners.visibilitychange();for(let i=0;i<6;i++)tick();assert.equal(window.QA.clock(),before);
-          console.log('V10 SMOKE PASS: startup, controls, retry, LRU, rotate, minimap throttle, background pause');
+          const hero=window.QA.hero(),point=window.QA.findOpen(hero.x+3,hero.y+2,8);
+          assert(point,'No passable map destination');const route=window.QA.findPath(hero,point);assert(route.length>0,'Movement path not found');
+          for(let i=0;i<130&&route.length;i++)window.QA.travel(hero,route,1/30,2.8);
+          assert(!route.length,'Route was interrupted');
+          for(let i=0;i<10;i++)frame();
+          assert(window.QA.stats().ground>0,'Rendering stopped after movement');
+          el('again').click();for(let i=0;i<7;i++)frame();assert(el('gameState').textContent.includes('Map 4'),'Restart did not update HUD');
+          console.log('V11 SMOKE PASS: original map, viewport clipping, settings, target, lab, path, FPS');
           JS_SMOKE
           node --check reports/smoke.cjs
           node reports/smoke.cjs
-          echo 'V10 mobile runtime: original Map 4, TIL, SPR, combat, target, motion lab retained. New asset retry, LRU and orientation stability tests passed.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'V11 render culling and sprite prefetch verified. Original S32/TIL/SPR, targeting, movement and lab retained.' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload V10 mobile game
+      - name: Upload V11 mobile build
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V10-Runtime-Stability
+          name: Sanctuary-Mobile-V11-Render-Optimized
           path: dist/mobile/
           if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
-      - name: Upload diagnostics on failure
+      - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V10-Diagnostics
+          name: Sanctuary-Mobile-V11-Diagnostics
           path: reports/
           if-no-files-found: warn
           retention-days: 14
