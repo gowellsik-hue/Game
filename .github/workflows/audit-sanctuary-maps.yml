@@ -1,0 +1,149 @@
+name: Sanctuary of Aden Map Archive Index V1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/audit-sanctuary-maps.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download ZIP directory volume
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p source reports
+          gh release download v1.0.0 --repo "$GITHUB_REPOSITORY" --pattern 'Sanctuary.of.Aden.-.Copy.zip' --dir source --clobber
+          test -s source/Sanctuary.of.Aden.-.Copy.zip
+
+      - name: Identify original map and spawn files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, json, re, struct
+          from collections import Counter
+          from pathlib import Path
+
+          src = Path('source/Sanctuary.of.Aden.-.Copy.zip')
+          data = src.read_bytes()
+          sig = b'PK\x01\x02'
+          records = []
+          offset = 0
+          while True:
+              offset = data.find(sig, offset)
+              if offset < 0 or offset + 46 > len(data):
+                  break
+              h = struct.unpack_from('<4s6H3I5H2I', data, offset)
+              flags, packed, unpacked = h[3], h[8], h[9]
+              nlen, xlen, clen, disk = h[10], h[11], h[12], h[13]
+              end = offset + 46 + nlen + xlen + clen
+              if not (0 < nlen <= 4096 and end <= len(data)):
+                  offset += 4
+                  continue
+              raw = data[offset + 46:offset + 46 + nlen]
+              if b'\0' in raw:
+                  offset += 4
+                  continue
+              try:
+                  name = raw.decode('utf-8' if flags & 0x800 else 'cp949')
+              except UnicodeDecodeError:
+                  name = raw.decode('cp437', errors='replace')
+              if not name or any(ord(ch) < 32 for ch in name):
+                  offset += 4
+                  continue
+              records.append({'name': name.replace('\\', '/'), 'packed': packed,
+                              'unpacked': unpacked, 'start_disk': disk})
+              offset = end
+
+          if not records:
+              raise SystemExit('No ZIP central-directory records in final volume')
+          records.sort(key=lambda row: row['name'].lower())
+          eocd = data.rfind(b'PK\x05\x06')
+          total = None
+          last_disk = None
+          if eocd >= 0 and eocd + 22 <= len(data):
+              _, last_disk, _, _, total, _, _, _ = struct.unpack_from('<4s4H2IH', data, eocd)
+              if total == 65535:
+                  z64 = data.rfind(b'PK\x06\x06', 0, eocd)
+                  total = struct.unpack_from('<Q', data, z64 + 32)[0] if z64 >= 0 and z64 + 40 <= len(data) else None
+
+          map_terms = ('map', 'maps', 'terrain', 'tile', 'tiles', 'dungeon', 'world', 'zone')
+          spawn_terms = ('spawn', 'spawns', 'npc', 'npcs', 'monster', 'monsters', 'mob', 'mobs', 'server')
+          map_ext = ('.map', '.til', '.s32', '.wld', '.tmx', '.tmj', '.obj')
+          db_ext = ('.sql', '.sqlite', '.sqlite3', '.db', '.csv')
+          target_terms = ('talking', 'baphomet', '말하는', '말던', '바포', 'tisdungeon', 'tido')
+          candidates = []
+          counts = Counter()
+          extensions = Counter()
+          for rec in records:
+              name = rec['name']
+              low = name.lower()
+              parts = set(filter(None, re.split(r'[/_.\s-]+', low)))
+              tags = []
+              if any(term in parts for term in map_terms) or low.endswith(map_ext):
+                  tags.append('MAP')
+              if any(term in parts for term in spawn_terms) or low.endswith(db_ext):
+                  tags.append('SPAWN_OR_DB')
+              if any(term in low for term in target_terms):
+                  tags.append('TALKING_ISLAND_OR_BAPHOMET')
+              ext = Path(name).suffix.lower() or '(none)'
+              extensions[ext] += 1
+              if tags:
+                  candidates.append({**rec, 'category': '|'.join(tags)})
+                  counts.update(tags)
+
+          out = Path('reports')
+          with (out / 'all-archive-paths.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              w = csv.DictWriter(f, fieldnames=['name', 'packed', 'unpacked', 'start_disk'])
+              w.writeheader()
+              w.writerows(records)
+          with (out / 'map-and-spawn-candidates.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              w = csv.DictWriter(f, fieldnames=['name', 'packed', 'unpacked', 'start_disk', 'category'])
+              w.writeheader()
+              w.writerows(candidates)
+          with (out / 'file-extension-counts.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              w = csv.writer(f)
+              w.writerow(['extension', 'count'])
+              w.writerows(extensions.most_common())
+
+          summary = {
+              'source': src.name,
+              'downloadedFinalVolumeBytes': len(data),
+              'lastDiskNumberZeroBased': last_disk,
+              'totalRecordsFromEndOfCentralDirectory': total,
+              'recordsFoundInFinalVolume': len(records),
+              'completeArchiveIndex': total is not None and total == len(records),
+              'categoryCounts': dict(counts),
+              'candidateCount': len(candidates),
+              'originalMapContentsExtracted': False,
+              'spawnCoordinatesVerified': False,
+          }
+          (out / 'map-audit-summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          print('Example candidate paths:')
+          for rec in candidates[:50]:
+              print(rec['category'], rec['name'])
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('Original archive paths scanned: ' + str(len(records)) + '\n\n')
+              f.write('Map / spawn candidates: ' + str(len(candidates)) + '\n\n')
+              f.write('Complete index: ' + str(summary['completeArchiveIndex']) + '\n')
+          PY
+
+      - name: Upload map source inventory
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sanctuary-Map-Source-Index-V1
+          path: reports/
+          if-no-files-found: error
+          retention-days: 30
