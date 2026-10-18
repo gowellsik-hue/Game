@@ -1,7 +1,7 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V5.4 / Native respawn command evidence and 35 boss overrides
-name: audit-sanctuary-maps.yml | V5.4 | Monster Respawn and Boss Override Evidence
+# VERSION: V5.5 / 44-map terrain + collision + native spawn handoff
+name: audit-sanctuary-maps.yml | V5.5 | 44 Map Spawn Handoff
 
 on:
   workflow_dispatch:
@@ -10,195 +10,116 @@ on:
     paths: [.github/workflows/audit-sanctuary-maps.yml]
 
 permissions:
-  contents: read
   actions: read
+  contents: read
 
 jobs:
-  spawn-evidence:
+  handoff:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
-      - name: V5.4 Restore V5.3 maps and V229R9 native event scripts
+      - name: V5.5 Restore verified V5.4 source without modifying it
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p reports previous source
-          gh run download 39124623935 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.3-Classified-Monster-Spawns -D reports
-          gh run download 39100666926 -R "$GITHUB_REPOSITORY" -n github-pages -D previous
-          test -s reports/spawn-event-pages-v5.3.json
-          test -s reports/spawn-integration-v5.3.json
-          test -s previous/artifact.tar
-          tar -xf previous/artifact.tar -C source --wildcards \
-            './knight/gameasync/Data/Scripts.rxdata' \
-            './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap*.rxdata'
-          test -s source/knight/gameasync/Data/Scripts.rxdata
-          test -s source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap044.rxdata
+          mkdir -p source handoff
+          gh run download 39125584203 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.4-Spawn-Lifecycle-and-Boss-Overrides -D source
+          for f in native-maps-v5.1.json collision-index-v5.2.json spawn-integration-v5.3.json lifecycle-evidence-v5.4.json boss-spawn-overrides-v5.4.json; do
+            test -s "source/$f"
+          done
 
-      - name: V5.4 Extract self-switch A and boss defeat command evidence
+      - name: V5.5 Package 44 original maps and classified spawn records
         run: |
           set -euo pipefail
-          cat > /tmp/extract-v5.4.rb <<'RUBY_V54'
-          require 'json'
-          require 'zlib'
-          module RPG
-            class AudioFile;end
-            class Map;end
-            class Event
-              class Page
-                class Condition;end
-                class Graphic;end
-              end
-            end
-            class EventCommand;end
-            class MoveRoute;end
-            class MoveCommand;end
-          end
-          class Table;def self._load(s);allocate;end;end
-          class Tone;def self._load(s);s;end;end
-          class Color;def self._load(s);s;end;end
-          base='source/knight/gameasync/Data/'
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          refs=JSON.parse(File.read('reports/spawn-event-pages-v5.3.json'))
-          raise 'Expected 500 events' unless refs.size==500
-          script=Marshal.load(File.binread(base+'Scripts.rxdata'))
-          boss=Zlib::Inflate.inflate(script[134][2])
-          waitcode=Zlib::Inflate.inflate(script[71][2])
-          main=Zlib::Inflate.inflate(script[136][2])
-          raise 'Original script version changed' unless boss.include?('module SLV230BossRespawn') && boss.include?('@slv230_defeated')
-          raise 'Wait command changed' unless waitcode.match?(/@wait_count\s*=\s*@parameters\[0\]\s*\*\s*2/)
-          raise 'Frame rate changed' unless main.match?(/Graphics\.frame_rate\s*=\s*50/)
-          line=boss.lines.find{|s|s.lstrip.start_with?('TARGETS=')}
-          raise 'No boss targets literal' unless line && line.include?('=>')
-          File.write('reports/v54-targets.txt',line.strip.split('=',2)[1])
-          records=[]
-          refs.group_by{|e|e['mapId']}.sort.each do |id,events|
-            map=Marshal.load(File.binread(base+("#{prefix}Map%03d.rxdata" % id)))
-            originals=map.instance_variable_get('@events')
-            events.each do |ref|
-              event=originals.fetch(ref['eventId'])
-              raise 'Initial coordinate mismatch' unless ref['initialX']==event.instance_variable_get('@x') && ref['initialY']==event.instance_variable_get('@y')
-              ps=[];writes=[];marks=[]
-              event.instance_variable_get('@pages').each_with_index do |pg,page_i|
-                commands=pg.instance_variable_get('@list')||[]
-                cond=pg.instance_variable_get('@condition')
-                a=cond.instance_variable_get('@self_switch_valid') && cond.instance_variable_get('@self_switch_ch')=='A'
-                important=[]
-                commands.each_with_index do |cmd,ci|
-                  op=cmd.instance_variable_get('@code')
-                  par=cmd.instance_variable_get('@parameters')
-                  if op==123 && par.is_a?(Array) && par[0]=='A'
-                    writes<<{'page'=>page_i,'index'=>ci,'on'=>par[1]==0,'inSelfSwitchAPage'=>a}
-                  end
-                  if op==355 && par.to_s.include?('@slv230_defeated')
-                    marks<<{'page'=>page_i,'index'=>ci}
-                  end
-                  next unless a
-                  next unless [106,111,411,412,202,122,123,121,117,112,413].include?(op)
-                  next unless par.is_a?(Array)
-                  important<<{'index'=>ci,'code'=>op,'indent'=>cmd.instance_variable_get('@indent'),'params'=>par}
-                end
-                if a
-                  ps<<{'index'=>page_i,'trigger'=>pg.instance_variable_get('@trigger'),
-                    'condition'=>ref['pages'][page_i]['conditions'],'commands'=>important}
-                end
-              end
-              records<<{'mapId'=>id,'eventId'=>ref['eventId'],'monsterName'=>ref['monsterName'],
-                'evidence'=>ref['evidence'],'initial'=>[ref['initialX'],ref['initialY']],
-                'selfSwitchAPages'=>ps,'selfSwitchAWrites'=>writes,'bossDefeatedMarkers'=>marks}
-            end
-          end
-          raise "Event coverage #{records.size}" unless records.size==500
-          File.write('reports/lifecycle-evidence-v5.4.json',JSON.generate({'version'=>'V5.4','frameRate'=>50,'interpreterWaitFramesPerUnit'=>2,'events'=>records}))
-          puts "V5.4 evidence #{records.size} monster events, #{records.sum{|x|x['selfSwitchAPages'].size}} self A pages, #{records.sum{|x|x['bossDefeatedMarkers'].size}} defeated markers"
-          RUBY_V54
-          ruby -c /tmp/extract-v5.4.rb
-          ruby /tmp/extract-v5.4.rb
-
-      - name: V5.4 Build integration summaries and 35 boss rules
-        run: |
-          set -euo pipefail
-          cat > /tmp/spawn-v5.4.py <<'PY_V54'
-          import ast,collections,csv,json
+          python3 - <<'PY_V55'
+          import csv,hashlib,json,shutil,struct
+          from collections import Counter
           from pathlib import Path
-          root=Path('reports')
-          d=json.loads((root/'lifecycle-evidence-v5.4.json').read_text())
-          source=json.loads((root/'spawn-integration-v5.3.json').read_text())
-          targets=ast.literal_eval((root/'v54-targets.txt').read_text().replace('=>',':').replace('nil','None'))
-          by={(e['mapId'],e['eventId']):e for e in d['events']}
-          original={(e['mapId'],e['eventId']):e for m in source['maps'].values() for e in m['events']}
-          assert len(by)==len(original)==500
-          counts=collections.Counter()
-          rows=[];boss=[]
-          for event in d['events']:
-              key=(event['mapId'],event['eventId'])
-              a=event['selfSwitchAPages']; wait=[];turnoff=[];moves=[]
-              for p in a:
-                  for c in p['commands']:
-                      if c['code']==106:wait.append({'page':p['index'],'index':c['index'],'waitUnits':c['params'][0],'nominalSeconds':c['params'][0]*2/50})
-                      if c['code']==123 and c['params']==['A',1]:turnoff.append([p['index'],c['index']])
-                      if c['code']==202 and len(c['params'])>=4 and c['params'][:2]==[0,0]:
-                          moves.append([p['index'],c['index'],c['params'][2],c['params'][3]])
-              counts['events']+=1
-              counts['A_pages']+=len(a)
-              counts['A_pages_with_wait']+=sum(any(c['code']==106 for c in p['commands']) for p in a)
-              counts['A_pages_with_reset']+=sum(any(c['code']==123 and c['params']==['A',1] for c in p['commands']) for p in a)
-              counts['wait_commands']+=len(wait)
-              counts['A_off_writes']+=len(turnoff)
-              counts['A_on_writes']+=sum(z['on'] for z in event['selfSwitchAWrites'])
-              counts['boss_marker_events']+=bool(event['bossDefeatedMarkers'])
-              runtime=original[key]
-              roles=len(runtime['setupRelocations'])+len(runtime['selfSwitchARelocations'])+1
-              counts['coordinate_rows']+=roles
-              rows.append({'mapId':key[0],'eventId':key[1],'monsterName':event['monsterName'],
-                'initialX':event['initial'][0],'initialY':event['initial'][1],
-                'selfSwitchAPages':len(a),'AWaitUnits':';'.join(str(x['waitUnits']) for x in wait),
-                'AWaitNominalSeconds':';'.join(str(x['nominalSeconds']) for x in wait),
-                'selfSwitchAOnWrites':sum(z['on'] for z in event['selfSwitchAWrites']),
-                'selfSwitchAOffWrites':len(turnoff),'selfAPageMoveOperations':len(moves),
-                'bossOverride':key[0] in targets and key[1] in targets[key[0]],
-                'respawnConditionVerified':False})
-              event['waitEvidence']=wait
-              event['selfSwitchAOffEvidence']=turnoff
-              event['pageRelocationsWithCommandIndex']=moves
-          for mid,entries in targets.items():
-              for eid,(sw,switch_id,condition_b,coords) in entries.items():
-                  key=(mid,eid)
-                  assert key in by,('Boss event missing',key)
-                  assert by[key]['bossDefeatedMarkers'],('Boss defeated marker missing',key)
-                  assert sw in ('A','B') and isinstance(coords,list)
-                  boss.append({'mapId':mid,'eventId':eid,'monsterName':by[key]['monsterName'],
-                    'defeatedSwitch':sw,'globalSwitchRestore':switch_id,'useSelfSwitchB':bool(condition_b),
-                    'placementCandidates':coords,'placementMethod':'rand(positions.length)' if coords else 'no forced coordinate',
-                    'respawnTrigger':'map entry or map update after defeated marker set','timingSecondsVerified':False})
-          assert len(boss)==35 and counts['boss_marker_events']==35
-          assert counts['events']==500 and counts['coordinate_rows']==1708
-          out={'version':'V5.4','source':'V229R9 native event commands + V230 boss respawn script','frameRate':50,
-           'interpreterWaitFramesPerUnit':2,'nominalWaitSecondsFormula':'waitUnits * 2 / 50',
-           'waitsAreConditional':True,'bossOverrideCount':len(boss),
-           'normalMonsterRespawnTimingFullyVerified':False,
-           'separateSanctuaryS32CoordinateSpace':True,
-           'allSpawnPositionsAreCandidates':True,
-           'counts':dict(counts)}
-          (root/'spawn-runtime-summary-v5.4.json').write_text(json.dumps(out,ensure_ascii=False,indent=2))
-          (root/'boss-spawn-overrides-v5.4.json').write_text(json.dumps({'version':'V5.4','sourceScript':'Scripts.rxdata[134]','bosses':boss,'timersVerified':False},ensure_ascii=False,indent=2))
-          (root/'lifecycle-evidence-v5.4.json').write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')))
-          with (root/'spawn-runtime-evidence-v5.4.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
-          (root/'v54-targets.txt').unlink()
-          print('V5.4 SUCCESS',json.dumps(out,ensure_ascii=False))
-          PY_V54
-          python3 -m py_compile /tmp/spawn-v5.4.py
-          python3 /tmp/spawn-v5.4.py
-          test -s reports/spawn-runtime-summary-v5.4.json
-          test -s reports/boss-spawn-overrides-v5.4.json
-          test -s reports/spawn-runtime-evidence-v5.4.csv
-          test -s reports/lifecycle-evidence-v5.4.json
+          src=Path('source');out=Path('handoff')
+          def read(name):return json.loads((src/name).read_text(encoding='utf-8'))
+          native=read('native-maps-v5.1.json')
+          coll=read('collision-index-v5.2.json')['maps']
+          spawns=read('spawn-integration-v5.3.json')['maps']
+          lifecycle=read('lifecycle-evidence-v5.4.json')['events']
+          boss=read('boss-spawn-overrides-v5.4.json')['bosses']
+          evidence={(e['mapId'],e['eventId']):e for e in lifecycle}
+          overrides={(e['mapId'],e['eventId']):e for e in boss}
+          assert len(native)==len(coll)==len(spawns)==44
+          assert len(evidence)==500 and len(overrides)==35
+          (out/'maps').mkdir(parents=True,exist_ok=True)
+          (out/'collision').mkdir(exist_ok=True)
+          (out/'data').mkdir(exist_ok=True)
+          totals=Counter();maplist=[];reviews=[];bossrows=[]
+          for m in native:
+              mid=m['mapId'];key=str(mid);c=coll[key];s=spawns[key]
+              w=m['width'];h=m['height']
+              assert (w,h)==(c['width'],c['height'])==(s['width'],s['height'])
+              png=src/m['terrainPng'];maskfile=src/c['collisionFile']
+              mask=maskfile.read_bytes()
+              header=png.open('rb').read(24)
+              assert header[:8]==b'\x89PNG\r\n\x1a\n'
+              assert struct.unpack('>II',header[16:24])==(w*16,h*16)
+              assert len(mask)==w*h
+              shutil.copy2(png,out/m['terrainPng'])
+              shutil.copy2(maskfile,out/c['collisionFile'])
+              events=[]
+              for e in s['events']:
+                  eid=e['eventId'];ident=(mid,eid)
+                  assert ident in evidence
+                  positions=[e['initial']]+e['setupRelocations']+e['selfSwitchARelocations']
+                  for p in positions:
+                      x,y=p['x'],p['y']
+                      flag=mask[y*w+x] if 0<=x<w and 0<=y<h else 255
+                      state='UNKNOWN_TILE' if flag==255 else 'BLOCKED' if flag==15 else 'PASSABLE' if flag==0 else 'DIRECTION_LIMITED'
+                      assert state==p['collision'] and flag==p['collisionMask'],ident
+                      totals['coordinateCandidates']+=1
+                      if state not in ('PASSABLE','DIRECTION_LIMITED'):
+                          reviews.append(dict(mapId=mid,eventId=eid,monster=e['monsterName'],role=p['role'],x=x,y=y,collision=state))
+                  b=overrides.get(ident)
+                  if b:
+                      totals['bossOverrides']+=1
+                      for x,y in b['placementCandidates']:
+                          assert 0<=x<w and 0<=y<h
+                          flag=mask[y*w+x]
+                          bossrows.append(dict(mapId=mid,eventId=eid,monster=e['monsterName'],x=x,y=y,collisionFlag=flag))
+                  events.append(dict(eventId=eid,monsterName=e['monsterName'],evidence=e['evidence'],arenaOrSpecial=e['arenaOrSpecial'],
+                      initial=e['initial'],setupRelocations=e['setupRelocations'],selfSwitchARelocations=e['selfSwitchARelocations'],
+                      pagesWithoutRelocation=e['conditionPagesWithoutRelocation'],lifecycleEvidence=evidence[ident],bossOverride=b))
+                  totals['monsterEvents']+=1
+              filename=f'data/map-{mid:03d}.json'
+              packaged=dict(version='V5.5',mapId=mid,mapName=m['mapName'],width=w,height=h,
+                  coordinateSystem='SLKnight_RPG_Maker',terrainPng=m['terrainPng'],collisionFile=c['collisionFile'],
+                  directionalCollision='bit0=down; bit1=left; bit2=right; bit3=up; 255=unknown',
+                  collisionIsStaticOnly=True,monsterEvents=events,portalsNotImplemented=True)
+              (out/filename).write_text(json.dumps(packaged,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+              maplist.append(dict(mapId=mid,name=m['mapName'],data=filename,terrain=m['terrainPng'],collision=c['collisionFile'],
+                  terrainSha256=hashlib.sha256(png.read_bytes()).hexdigest(),collisionSha256=hashlib.sha256(mask).hexdigest(),monsterEvents=len(events)))
+              totals['maps']+=1
+          assert totals['maps']==44 and totals['monsterEvents']==500 and totals['coordinateCandidates']==1708
+          assert totals['bossOverrides']==35 and len(bossrows)==21 and len(reviews)==37
+          assert sum(r['collision']=='BLOCKED' for r in reviews)==35
+          assert sum(r['collision']=='UNKNOWN_TILE' for r in reviews)==2
+          assert all(row['collisionFlag']==0 for row in bossrows)
+          for name,rows,fields in [('spawn-review-v5.5.csv',reviews,['mapId','eventId','monster','role','x','y','collision']),
+                                   ('boss-fixed-positions-v5.5.csv',bossrows,['mapId','eventId','monster','x','y','collisionFlag'])]:
+              with (out/name).open('w',encoding='utf-8-sig',newline='') as f:
+                  writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(rows)
+          manifest=dict(version='V5.5',status='INTEGRATION_INPUT_NOT_APPLIED',sourceRun=39125584203,
+              coordinateSystem='SLKnight_RPG_Maker_not_Sanctuary_S32',sourceAssetsUnchanged=True,
+              staticCollisionOnly=True,respawnExecutionNotFullyVerified=True,
+              forcedBossCoordinatesAreCandidates=True,portalWarpImplementationExcluded=True,
+              totals=dict(totals),bossForcedPositionCandidates=len(bossrows),spawnPositionsNeedingReview=len(reviews),maps=maplist)
+          (out/'manifest-v5.5.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('V5.5 HANDOFF VERIFIED',dict(totals),'review',len(reviews),'boss positions',len(bossrows))
+          PY_V55
+          test -s handoff/manifest-v5.5.json
+          test -s handoff/data/map-044.json
 
-      - name: V5.4 Upload 44-map spawn lifecycle evidence
+      - name: V5.5 Upload separate integration handoff only
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V5.4-Spawn-Lifecycle-and-Boss-Overrides
-          path: reports/
+          name: Sanctuary-Map-V5.5-44-Map-Integration-Handoff
+          path: handoff/
           if-no-files-found: error
           retention-days: 30
