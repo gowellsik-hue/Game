@@ -1,7 +1,7 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R18 / Native Sanctuary S32 terrain in original RGSS engine
-name: build-slknight-web.yml | V229R18 | Native Sanctuary TI Dungeon
+# VERSION: V229R20 / Original S32 map, native 32px movement
+name: build-slknight-web.yml | V229R20 | Original Map Swap Native Movement
 
 on:
   workflow_dispatch:
@@ -22,9 +22,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 110
     steps:
-      - name: V229R18 Restore last working native game V229R16 without iframe
+      - name: V229R20 Restore clean V229R16 original game engine
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -33,7 +33,7 @@ jobs:
           github-token: ${{ github.token }}
           path: previous
 
-      - name: V229R18 Restore original Sanctuary S32 map tile blocks
+      - name: V229R20 Restore original Sanctuary S32 terrain
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -42,213 +42,269 @@ jobs:
           github-token: ${{ github.token }}
           path: original-ti
 
-      - name: V229R18 Check two source artifacts and 5354 original files
+      - name: V229R20 Verify baseline and preserve game
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p original site build
           test -s previous/artifact.tar
           test -s original-ti/preview/terrain-walk-v4.1.html
-          mkdir -p site
-          tar -xf previous/artifact.tar -C site
-          python3 - <<'PY_BASE'
+          tar -xf previous/artifact.tar -C original
+          cp -a original/. site/
+          python3 - <<'PY_R20_BASE'
           from pathlib import Path
           import hashlib
-          r=Path('site')
-          hashes={str(f.relative_to(r)):hashlib.sha256(f.read_bytes()).hexdigest() for f in r.rglob('*') if f.is_file()}
-          assert len(hashes)==5354,('Wrong R16 asset count',len(hashes))
-          reference={
-            'knight/gameasync/Data/Scripts.rxdata':'ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c',
-            'knight/gameasync/mapping.js':'53ef0647a4c39ea15cb603adbb71fe4bc726b0cb4b5ec864c7473c4bd628d5c1',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata':'2b99c87f691fece863c850f2217e538e3f6f76787b290507c8212b621beaf305',
-            'knight/index.html':'94dbbad46625685fe5e9f3aaa660b53c3221b1a7ebaa016a4241b96cea490f27',
-            'index.html':'a6a2c3f52bfe87e1e5821a383effae83074fdb54725f80e23454d17aa6f8f220'
+          base=Path('original')
+          files=[p for p in base.rglob('*') if p.is_file()]
+          assert len(files)==5354,('Expected 5354 native game files',len(files))
+          checks={
+          'knight/gameasync/Data/Scripts.rxdata':'ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c',
+          'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata':'2b99c87f691fece863c850f2217e538e3f6f76787b290507c8212b621beaf305',
+          'knight/gameasync/mapping.js':'53ef0647a4c39ea15cb603adbb71fe4bc726b0cb4b5ec864c7473c4bd628d5c1'
           }
-          for n,h in reference.items():assert hashes[n]==h,('Unverified source',n)
-          for id in (45,46):assert not list((r/'knight/gameasync/Data').glob('*Map%03d.rxdata'%id))
-          print('V229R18 BASELINE: verified R16, no S32 overlay, 5354 assets')
-          PY_BASE
+          for p,expected in checks.items():
+           assert hashlib.sha256((base/p).read_bytes()).hexdigest()==expected,('Wrong baseline',p)
+          Path('build/source-scripts-r16.rxdata').write_bytes((base/'knight/gameasync/Data/Scripts.rxdata').read_bytes())
+          print('CLEAN_V229R16_NATIVE_ENGINE_VERIFIED_5354_FILES')
+          PY_R20_BASE
 
-      - name: V229R18 Convert original S32 maps to native map metadata
+      - name: V229R20 Prepare original texture converter
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/slti-prep-r18.py <<'PY_PREP'
-          import base64, json, re, shutil, struct, sys
+          if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-pil
+          fi
+          python3 -c 'from PIL import Image; print("S32 converter ready")'
+
+      - name: V229R20 Convert original S32 art to native 32px map textures
+        shell: bash
+        run: |
+          cat > /tmp/slti-r20-convert.py <<'PY_R20_CONVERT'
+          import base64, json, re, struct, sys
           from pathlib import Path
+          from PIL import Image
 
-          site=Path(sys.argv[1]); origin=Path(sys.argv[2]); native=site/'knight/gameasync'; data=native/'Data'; pics=native/'Graphics/Pictures'
-          source=(origin/'preview/terrain-walk-v4.1.html').read_text(encoding='utf-8')
-          mt=re.search(r'<script id="data" type="application/json">(.*?)</script>',source,re.S)
-          assert mt, 'Cannot locate S32 original data'
-          floors=json.loads(mt.group(1)); assert set(floors)=={'1','2'}
-          config={}
-          for oldid,newid in (('1',45),('2',46)):
-              obj=floors[oldid]; w,h=obj['width'],obj['height']; assert w==256 if oldid=='1' else w==320
-              assert h==256
-              mask=base64.b64decode(obj['collisionBase64']);assert len(mask)==w*h
-              print('mask',oldid,'passable',mask.count(0),'blocked',len(mask)-mask.count(0))
-              tiles=[];constants=set()
-              for t in obj['tiles']:
-                  fn=t['src'].split('/')[-1];name='SLTI'+oldid+'_'+fn[:-4]
-                  img=origin/'preview'/t['src'];assert img.is_file(),str(img)
-                  header=img.read_bytes()[:24]
-                  assert header[:8]==b'\x89PNG\r\n\x1a\n' and struct.unpack('>II',header[16:24])==(1536,768)
-                  shutil.copyfile(img,pics/(name+'.png'))
-                  bx=int(fn[:4],16);by=int(fn[4:8],16)
-                  sx=32704+(bx-32767)*64;sy=32704+(by-32767)*64
-                  constants.add((t['x']-12*(sx+sy),t['y']+378-6*(sy-sx)))
-                  tiles.append([name,t['x'],t['y']])
-              assert len(constants)==1,constants
-              cx,cy=constants.pop()
-              assert len(tiles)==(12 if newid==45 else 16)
-              config[str(newid)]={'sourceMap':int(oldid),'originX':obj['originX'],'originY':obj['originY'],'width':w,'height':h,'constX':cx,'constY':cy,'tiles':tiles,'maskBase64':base64.b64encode(mask).decode('ascii')}
-              def get(x,y):
-                  nx=x-obj['originX'];ny=y-obj['originY'];assert 0<=nx<w and 0<=ny<h
-                  return mask[ny*w+nx]
-              for x,y in ((32670,32802),(32737,32877)) if newid==45 else ((32665,32789),):
-                  assert get(x,y)==0,('portal landing blocked',newid,x,y,get(x,y))
-              print('floor',newid,'original image tiles',len(tiles),'iso',(cx,cy))
-          # Source menu native map marker.
-          config['45']['entry']=[32670-32576,32802-32704]
-          config['45']['stairs']=[32737-32576,32877-32704]
-          config['46']['entry']=[32665-32576,32789-32704]
-          config['46']['stairs']=config['46']['entry']
-          Path('/tmp/slti-native-r18.json').write_text(json.dumps(config,separators=(',',':')))
-          assert (pics/'SLTI1_7ffe8000.png').is_file()
-          PY_PREP
-          python3 /tmp/slti-prep-r18.py site original-ti
+          site=Path(sys.argv[1])
+          original=Path(sys.argv[2])
+          build=Path(sys.argv[3])
+          build.mkdir(parents=True,exist_ok=True)
+          html=(original/'preview/terrain-walk-v4.1.html').read_text(encoding='utf-8')
+          match=re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S)
+          assert match,'Sanctuary S32 data absent'
+          floors=json.loads(match.group(1))
+          assert set(floors)=={'1','2'}
+          root=site/'knight/gameasync/Graphics/Pictures'
+          root.mkdir(parents=True,exist_ok=True)
+          reports={}
+          all_chunks={}
 
-      - name: V229R18 Stage native RGSS renderer (not an HTML viewer)
+          for floor,mid,expected_w,expected_tiles in [
+              ('1',45,256,12),('2',46,320,16)
+          ]:
+              m=floors[floor]
+              w=m['width']
+              h=m['height']
+              assert (w,h,len(m['tiles']))==(expected_w,256,expected_tiles)
+              mask=base64.b64decode(m['collisionBase64'])
+              assert len(mask)==w*h
+              assert all(v in (0,1,65,255) for v in mask)
+              assert mask.count(0)==(4946 if floor=='1' else 10431)
+              (build/f'map{mid}.mask').write_bytes(mask)
+
+              constants=set()
+              for tile in m['tiles']:
+                  filename=Path(tile['src']).stem
+                  bx=int(filename[:4],16)
+                  by=int(filename[4:8],16)
+                  gx=32704+(bx-32767)*64
+                  gy=32704+(by-32767)*64
+                  constants.add((
+                      tile['x']-12*(gx+gy),
+                      tile['y']+378-6*(gy-gx)
+                  ))
+              assert len(constants)==1,('S32 projection changed',constants)
+              constx,consty=constants.pop()
+
+              xmin=min(t['x'] for t in m['tiles'])
+              ymin=min(t['y'] for t in m['tiles'])
+              xmax=max(t['x'] for t in m['tiles'])+1536
+              ymax=max(t['y'] for t in m['tiles'])+768
+              canvas=Image.new('RGBA',(xmax-xmin,ymax-ymin),(0,0,0,0))
+
+              for t in m['tiles']:
+                  path=original/'preview'/t['src']
+                  assert path.is_file(),str(path)
+                  tile=Image.open(path).convert('RGBA')
+                  assert tile.size==(1536,768)
+                  canvas.alpha_composite(tile,(t['x']-xmin,t['y']-ymin))
+                  tile.close()
+
+              # Convert the ORIGINAL S32 12/6 isometric coordinates
+              # into the game's EXISTING 32x32 tile coordinate system.
+              # Conversion happens at build time, not at game runtime.
+              a=b=12.0/32.0
+              d=-6.0/32.0
+              e=6.0/32.0
+              c=constx+12*(m['originX']+m['originY'])-a*16-b*32
+              f=consty+6*(m['originY']-m['originX'])-d*16-e*32
+
+              chunks=set()
+              for y in range(h):
+                  for x in range(w):
+                      if mask[y*w+x]!=0:
+                          continue
+                      bx=x//16
+                      by=y//16
+                      for ey in range(max(0,by-1),min(h//16,by+2)):
+                          for ex in range(max(0,bx-1),min(w//16,bx+2)):
+                              chunks.add((ex,ey))
+
+              layer=[]
+              for cx,cy in sorted(chunks,key=lambda p:(p[1],p[0])):
+                  x0=cx*512
+                  y0=cy*512
+                  coeff=(
+                      a,b,c+a*x0+b*y0-xmin,
+                      d,e,f+d*x0+e*y0-ymin
+                  )
+                  warped=canvas.transform(
+                      (512,512),
+                      Image.Transform.AFFINE,
+                      coeff,
+                      resample=Image.Resampling.BILINEAR
+                  )
+                  opaque=Image.new('RGBA',(512,512),(10,9,8,255))
+                  opaque.alpha_composite(warped)
+                  name=f'SLTI{mid}_{cx:02d}_{cy:02d}.jpg'
+                  opaque.convert('RGB').save(
+                      root/name,'JPEG',
+                      quality=86,subsampling=0,optimize=True
+                  )
+                  layer.append([cx,cy,Path(name).stem])
+                  warped.close()
+                  opaque.close()
+
+              canvas.close()
+              reports[str(mid)]={
+                  'width':w,'height':h,
+                  'passable':mask.count(0),
+                  'blocked':w*h-mask.count(0),
+                  'chunks':len(layer),
+                  'originalBlocks':expected_tiles,
+                  'coordsAre32PxNative':True
+              }
+              all_chunks[str(mid)]=layer
+              print('ORIGINAL_S32_TO_NATIVE_GRID',mid,
+                    'chunks',len(layer),'walkable',mask.count(0),flush=True)
+
+          assert len(all_chunks['45'])>=60
+          assert len(all_chunks['46'])>=100
+          assert all(
+              (root/(item[2]+'.jpg')).is_file()
+              for r in all_chunks.values() for item in r
+          )
+          (build/'chunks.json').write_text(json.dumps(all_chunks,separators=(',',':')))
+          (build/'report.json').write_text(json.dumps(reports,indent=2))
+          PY_R20_CONVERT
+          python3 /tmp/slti-r20-convert.py site original-ti build
+
+      - name: V229R20 Prepare native map-only background renderer
         shell: bash
         run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-runtime-template.rb <<'RUBY_RUNTIME'
-          # SLTI_NATIVE_R18: RGSS native dungeon rendering, passability, character sprites.
-          # This executes inside the existing Scene_Map, not inside HTML or an iframe.
-          module SLTINative
-            META = __SLTI_META__
-            def self.active?
-              $game_map && META.has_key?($game_map.map_id.to_s)
-            end
-            def self.meta
-              META[$game_map.map_id.to_s]
-            end
-            def self.world(real_x, real_y)
-              m=meta
-              gx=m['originX']+real_x.to_f/128.0
-              gy=m['originY']+real_y.to_f/128.0
-              [m['constX']+12.0*(gx+gy),m['constY']+6.0*(gy-gx)]
-            end
-            def self.player_world
-              world($game_player.real_x,$game_player.real_y)
-            end
-            def self.screen(real_x,real_y)
-              x,y=world(real_x,real_y)
-              px,py=player_world
-              [(400+x-px).round,(230+y-py).round]
-            end
-          end
-
-          class Game_Map
-            alias slti_r18_old_passable? passable?
-            def passable?(x,y,d,self_event=nil)
-              return slti_r18_old_passable?(x,y,d,self_event) unless SLTINative.active?
-              return false unless valid?(x,y)
-              source=@map.instance_variable_get(:@slti_collision)
-              return false if source.nil?
-              source.getbyte(y*width+x)==0
-            end
-          end
-
-          class Game_Character
-            alias slti_r18_old_screen_x screen_x
-            alias slti_r18_old_screen_y screen_y
-            alias slti_r18_old_screen_z screen_z
-            def screen_x
-              return slti_r18_old_screen_x unless SLTINative.active?
-              SLTINative.screen(@real_x,@real_y)[0]
-            end
-            def screen_y
-              return slti_r18_old_screen_y unless SLTINative.active?
-              SLTINative.screen(@real_x,@real_y)[1]
-            end
-            def screen_z(height=0)
-              return slti_r18_old_screen_z(height) unless SLTINative.active?
-              @always_on_top ? 999 : (screen_y + (height>32 ? 31 : 0))
-            end
+          cat > /tmp/slti-r20-background.rb <<'RUBY_R20_BACKGROUND'
+          # V229R20: original S32 texture backgrounds in native map viewport.
+          # Original movement, camera, player and collision methods are untouched.
+          module SLTIMapBackground
+            CHUNK=512
+            DATA=__CHUNK_DATA__
           end
 
           class Spriteset_Map
-            alias slti_r18_old_initialize initialize
-            alias slti_r18_old_update update
-            alias slti_r18_old_dispose dispose
+            alias slti_r20_native_initialize initialize
+            alias slti_r20_native_update update
+            alias slti_r20_native_dispose dispose
+
             def initialize
-              @slti_native_sprites=[]
-              slti_r18_old_initialize
+              @slti_r20_sprites={}
+              @slti_r20_map=nil
+              slti_r20_native_initialize
             end
+
+            def slti_r20_free(key)
+              sprite=@slti_r20_sprites.delete(key)
+              return if sprite.nil?
+              bitmap=sprite.bitmap
+              sprite.bitmap=nil
+              sprite.dispose
+              bitmap.dispose if bitmap && !bitmap.disposed?
+            end
+
             def update
-              slti_r18_old_update
-              return unless SLTINative.active?
-              m=SLTINative.meta
-              if @slti_native_sprites.empty?
-                m['tiles'].each_with_index do |item,i|
-                  layer=Sprite.new(@viewport1)
-                  layer.bitmap=RPG::Cache.picture(item[0])
-                  layer.z=-500+i
-                  @slti_native_sprites.push(layer)
+              slti_r20_native_update
+              current=$game_map.map_id
+              if @slti_r20_map!=current
+                @slti_r20_sprites.keys.each{|k|slti_r20_free(k)}
+                @slti_r20_map=current
+              end
+
+              layer=SLTIMapBackground::DATA[current]
+              return if layer.nil?
+
+              # Read the existing engine's camera offset. Do not move it.
+              ox=$game_map.display_x/4
+              oy=$game_map.display_y/4
+              wanted={}
+
+              layer.each do |cx,cy,filename|
+                x=cx*SLTIMapBackground::CHUNK-ox
+                y=cy*SLTIMapBackground::CHUNK-oy
+                next if x>=800 || y>=600 || x+512<=0 || y+512<=0
+
+                key=[cx,cy]
+                wanted[key]=true
+                sprite=@slti_r20_sprites[key]
+
+                if sprite.nil?
+                  sprite=Sprite.new(@viewport1)
+                  begin
+                    sprite.bitmap=Bitmap.new('Graphics/Pictures/'+filename)
+                    sprite.z=-500
+                    @slti_r20_sprites[key]=sprite
+                  rescue
+                    sprite.dispose
+                    raise
+                  end
                 end
+                sprite.x=x
+                sprite.y=y
               end
-              px,py=SLTINative.player_world
-              m['tiles'].each_with_index do |t,i|
-                layer=@slti_native_sprites[i]
-                layer.x=(400 + t[1] - px).round
-                layer.y=(230 + t[2] - py).round
-              end
+
+              (@slti_r20_sprites.keys-wanted.keys).each{|k|slti_r20_free(k)}
             end
+
             def dispose
-              @slti_native_sprites.each{|layer|layer.dispose} if @slti_native_sprites
-              @slti_native_sprites=[]
-              slti_r18_old_dispose
+              if @slti_r20_sprites
+                @slti_r20_sprites.keys.each{|k|slti_r20_free(k)}
+              end
+              slti_r20_native_dispose
             end
           end
-          RUBY_RUNTIME
+          RUBY_R20_BACKGROUND
 
-      - name: V229R18 Generate native RGSS source with string-keyed map IDs
+      - name: V229R20 Create native RPG maps 45 and 46
         shell: bash
         run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-runtime-build.py <<'PY_RUNTIME'
-          from pathlib import Path
-          import json
-          cfg=json.loads(Path('/tmp/slti-native-r18.json').read_text())
-          for o in cfg.values():o.pop('maskBase64')
-          def lit(o):
-              if isinstance(o,dict):return '{'+','.join(lit(k)+'=>'+lit(v) for k,v in o.items())+'}'
-              if isinstance(o,list):return '['+','.join(lit(v) for v in o)+']'
-              if isinstance(o,str):return json.dumps(o,ensure_ascii=True)
-              if isinstance(o,bool):return 'true' if o else 'false'
-              if isinstance(o,(int,float)):return repr(o)
-              raise TypeError(type(o))
-          s=Path('/tmp/slti-r18-runtime-template.rb').read_text()
-          s=s.replace('__SLTI_META__',lit(cfg))
-          assert '__SLTI_META__' not in s
-          Path('/tmp/slti-native-r18-runtime.rb').write_text(s)
-          print('Generated native RGSS runtime',len(s),'bytes, Ruby string hash keys')
-          PY_RUNTIME
-          python3 /tmp/slti-r18-runtime-build.py
-          ruby -c /tmp/slti-native-r18-runtime.rb
-
-      - name: V229R18 Create native Map045 Map046 and NPC transfer 201
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-patch.rb <<'RUBY_PATCH'
+          cat > /tmp/slti-r20-map-patch.rb <<'RUBY_R20_MAP_PATCH'
+          require 'digest'
           require 'json'
           require 'zlib'
-          require 'digest'
+
           module RPG
             class Map;end
             class MapInfo;end
+            class Tileset;end
             class AudioFile;end
             class Event
               class Page
@@ -259,348 +315,830 @@ jobs:
             class EventCommand;end
             class MoveRoute;end
             class MoveCommand;end
-            class Tileset;end
           end
+
           class Table
-            def self._load(s);o=allocate;o.instance_variable_set(:@serialized,s);o;end
-            def _dump(level=0);@serialized;end
-            def self.blank(w,h)
-              data=[3,w,h,3,w*h*3].pack('V5')+"\0"*(w*h*3*2)
-              _load(data)
+            def self._load(bytes)
+              object=allocate
+              object.instance_variable_set(:@bytes,bytes)
+              object
+            end
+            def _dump(level=0);@bytes;end
+
+            def self.native_map(w,h,mask)
+              raise 'Invalid mask' unless mask.bytesize==w*h
+              floor=mask.bytes.map{|v|v==0 ? 384 : 385}
+              bytes=[3,w,h,3,3*w*h].pack('V5')+
+                    floor.pack('v*')+"\0"*(w*h*4)
+              _load(bytes)
+            end
+
+            def set_one(index,value)
+              dim,w,h,z,n=@bytes.unpack('V5')
+              raise 'Wrong tileset table' unless n>index && dim==1 && h==1 && z==1
+              @bytes=@bytes.dup
+              @bytes[20+index*2,2]=[value].pack('v')
+            end
+
+            def get(x,y=0,z=0)
+              dim,w,h,l,n=@bytes.unpack('V5')
+              @bytes.byteslice(20+2*(x+w*y+w*h*z),2).unpack1('v')
             end
           end
+
           class Tone
-            def self._load(s);o=allocate;o.instance_variable_set(:@serialized,s);o;end
-            def _dump(level=0);@serialized;end
+            def self._load(raw)
+              o=allocate
+              o.instance_variable_set(:@raw,raw)
+              o
+            end
+            def _dump(level=0);@raw;end
           end
           class Color<Tone;end
-          site=ARGV.fetch(0)
-          base=site+'/knight/gameasync/Data/'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          config=JSON.parse(File.read('/tmp/slti-native-r18.json'))
-          def cmd(code,indent,args)
-           c=RPG::EventCommand.allocate
-           c.instance_variable_set(:@code,code)
-           c.instance_variable_set(:@indent,indent)
-           c.instance_variable_set(:@parameters,args)
-           c
-          end
-          def v(obj,key);obj.instance_variable_get('@'+key);end
-          def put(obj,key,val);obj.instance_variable_set('@'+key,val);end
-          sourcefile=base+pre+'Map029.rxdata'
-          original=File.binread(sourcefile)
-          town=Marshal.load(original)
-          raise 'Town Marshal round-trip changed' unless Marshal.dump(town)==original
-          npc=v(town,'events').fetch(11)
-          raise 'Wrong town NPC' unless [v(npc,'x'),v(npc,'y')]==[70,48]
-          old_npc=Marshal.dump(npc)
-          npc_list=v(v(npc,'pages')[0],'list')
-          placeholder='\uB9D0\uC12C\uB358\uC804\uC740 \uBCC4\uB3C4 \uB9F5 \uC5F0\uACB0 \uD6C4 \uC774\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.'.gsub(/\\u([0-9A-Fa-f]{4})/){[$1.to_i(16)].pack('U')}
-          idx=npc_list.find_index{|c|v(c,'code')==101 && v(c,'parameters')==[placeholder]}
-          raise 'Missing one NPC placeholder' unless idx && npc_list.count{|c|v(c,'code')==101 && v(c,'parameters')==[placeholder]}==1
-          raise 'Wrong TI selection branch' unless v(npc_list[idx-1],'parameters')==[1,'\uB9D0\uC12C\uB358\uC804'.gsub(/\\u([0-9A-Fa-f]{4})/){[$1.to_i(16)].pack('U')}]
-          put(npc_list[idx],'code',201)
-          put(npc_list[idx],'parameters',[0,45,*config['45']['entry'],0,1])
-          modified=Marshal.dump(town)
-          revert=Marshal.load(modified)
-          v(revert,'events')[11]=Marshal.load(old_npc)
-          raise 'Non-teleporter Town map changed!' unless Marshal.dump(revert)==original
-          File.binwrite(sourcefile,modified)
-          # Construct native RGSS maps, not browser HTML.
-          prototype=Marshal.load(File.binread(base+pre+'Map014.rxdata'))
-          proto_page=v(v(prototype,'events').values.first,'pages').first
 
-          def event(id,x,y,label,targetmap,coords,page_template)
-           e=RPG::Event.allocate
-           put(e,'id',id);put(e,'x',x);put(e,'y',y);put(e,'name',label)
-           page=Marshal.load(Marshal.dump(page_template))
-           cond=v(page,'condition')
-           cond.instance_variables.each{|key|put(cond,key.to_s.delete('@'),false) if key.to_s.end_with?('_valid')}
-           graphic=v(page,'graphic')
-           put(graphic,'character_name','');put(graphic,'tile_id',0)
-           put(graphic,'character_hue',0)
-           put(page,'through',true);put(page,'trigger',1);put(page,'move_type',0)
-           put(page,'always_on_top',false);put(page,'direction_fix',true)
-           put(page,'list',[cmd(201,0,[0,targetmap,*coords,0,1]),cmd(0,0,[])])
-           put(e,'pages',[page]);e
+          def at(o,k);o.instance_variable_get('@'+k);end
+          def assign(o,k,v);o.instance_variable_set('@'+k,v);end
+
+          def event_command(op,indent,args)
+            c=RPG::EventCommand.allocate
+            assign(c,'code',op)
+            assign(c,'indent',indent)
+            assign(c,'parameters',args)
+            c
           end
-          portals={
-           45=>[[1,*config['45']['entry'],'TI_EXIT',29,[70,49]],
-                [2,*config['45']['stairs'],'TI_STAIRS_2F',46,config['46']['entry']]],
-           46=>[[1,*config['46']['stairs'],'TI_STAIRS_1F',45,config['45']['stairs']]]
-          }
-          config.each do |id_s,meta|
-           id=id_s.to_i
-           w=meta.fetch('width');h=meta.fetch('height')
-           image_map=Marshal.load(Marshal.dump(prototype))
-           put(image_map,'width',w);put(image_map,'height',h)
-           put(image_map,'data',Table.blank(w,h))
-           put(image_map,'encounter_list',[]);put(image_map,'encounter_step',100)
-           put(image_map,'slti_collision',meta.fetch('maskBase64').unpack('m0').first)
-           events={}
-           portals.fetch(id).each do |eid,x,y,desc,target,coordinates|
-             n=y*w+x;mask=v(image_map,'slti_collision')
-             raise "Blocked native portal #{id} #{desc}" unless mask.getbyte(n)==0
-             events[eid]=event(eid,x,y,desc,target,coordinates,proto_page)
-           end
-           put(image_map,'events',events)
-           File.binwrite(base+"#{pre}Map%03d.rxdata"%id,Marshal.dump(image_map))
-           puts "NATIVE_MAP #{id} #{w}x#{h} events=#{events.size} passable=#{v(image_map,'slti_collision').count("\0")}"
+
+          def portal_event(id,x,y,name,destination,landing,template)
+            ev=RPG::Event.allocate
+            assign(ev,'id',id)
+            assign(ev,'name',name)
+            assign(ev,'x',x)
+            assign(ev,'y',y)
+
+            page=Marshal.load(Marshal.dump(template))
+            cond=at(page,'condition')
+            cond.instance_variables.each do |v|
+              if v.to_s.end_with?('_valid')
+                assign(cond,v.to_s.delete_prefix('@'),false)
+              end
+            end
+
+            graphic=at(page,'graphic')
+            assign(graphic,'character_name','')
+            assign(graphic,'tile_id',0)
+            assign(page,'through',true)
+            assign(page,'trigger',1)
+            assign(page,'move_type',0)
+            assign(page,'direction_fix',true)
+            assign(page,'always_on_top',false)
+            assign(page,'list',[
+                event_command(201,0,[0,destination,*landing,0,1]),
+                event_command(0,0,[])
+            ])
+            assign(ev,'pages',[page])
+            ev
           end
-          # Add map index metadata for map loads/save listing.
-          infosfile=base+pre+'MapInfos.rxdata'
-          infos=Marshal.load(File.binread(infosfile));raise 'MapIDs already occupied' if infos[45] || infos[46]
-          {45=>'Sanctuary TI Dungeon 1F',46=>'Sanctuary TI Dungeon 2F'}.each do |id,name|
-           ent=Marshal.load(Marshal.dump(infos[44]))
-           put(ent,'name',name);put(ent,'parent_id',0);put(ent,'order',id)
-           infos[id]=ent
+
+          site=ARGV.fetch(0)
+          build=ARGV.fetch(1)
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMEC'+'OINFTBCWIO'
+          base=site+'/knight/gameasync/Data/'
+          mapfile=lambda{|id|base+("#{prefix}Map%03d.rxdata"%id)}
+          chunks=JSON.parse(File.read(build+'/chunks.json'))
+          assert_chunks=chunks.values.sum(&:length)
+          raise 'Missing graphics' unless assert_chunks.between?(160,220)
+
+          map15=Marshal.load(File.binread(mapfile.call(15)))
+          map14=Marshal.load(File.binread(mapfile.call(14)))
+          template_page=at(at(map14,'events').values.first,'pages').first
+
+          # Create a dedicated transparent Tileset.
+          # The original Game_Map passability method reads its flags.
+          sets_file=base+prefix+'Tilesets.rxdata'
+          sets_bytes=File.binread(sets_file)
+          sets=Marshal.load(sets_bytes)
+          unless Marshal.dump(sets)==sets_bytes
+            raise 'Original tileset changed while reading'
+          end
+          original_id=at(map15,'tileset_id')
+          raise 'Expected Gludio Tileset ID 6' unless original_id==6
+
+          new_id=sets.length
+          raise 'Tileset ID collision' unless sets[new_id].nil? && new_id>=20
+          newset=Marshal.load(Marshal.dump(sets[original_id]))
+          assign(newset,'id',new_id)
+          assign(newset,'name','SLTI native collision, original engine')
+          assign(newset,'tileset_name','SLTI_TransparentPassage')
+          assign(newset,'autotile_names',Array.new(7,''))
+
+          passages=at(newset,'passages')
+          priorities=at(newset,'priorities')
+          passages.set_one(384,0)
+          passages.set_one(385,15)
+          priorities.set_one(384,0)
+          priorities.set_one(385,0)
+          sets[new_id]=newset
+          File.binwrite(sets_file,Marshal.dump(sets))
+
+          # No modification to any of the existing 44 map files.
+          {45=>[256,256],46=>[320,256]}.each do |id,(w,h)|
+            raise "Map #{id} already exists" if File.exist?(mapfile.call(id))
+            mask=File.binread(build+"/map#{id}.mask")
+            raise 'Mask invalid' unless mask.size==w*h
+
+            m=Marshal.load(Marshal.dump(map15))
+            assign(m,'width',w)
+            assign(m,'height',h)
+            assign(m,'tileset_id',new_id)
+            assign(m,'data',Table.native_map(w,h,mask))
+            assign(m,'encounter_list',[])
+            assign(m,'encounter_step',100)
+
+            events={}
+            if id==45
+              events[1]=portal_event(
+                  1,94,98,'TI Dungeon Exit',
+                  29,[70,49],template_page
+              )
+              events[2]=portal_event(
+                  2,161,173,'Sanctuary Floor 2',
+                  46,[89,86],template_page
+              )
+            else
+              events[1]=portal_event(
+                  1,89,85,'Sanctuary Floor 1',
+                  45,[162,173],template_page
+              )
+            end
+
+            events.each_value do |ev|
+              x=at(ev,'x')
+              y=at(ev,'y')
+              unless mask.getbyte(y*w+x)==0
+                raise "Portal blocked on map #{id} at #{x},#{y}"
+              end
+            end
+
+            assign(m,'events',events)
+            File.binwrite(mapfile.call(id),Marshal.dump(m))
+            puts "NATIVE_MAP #{id} #{w}x#{h} events=#{events.size}"
+          end
+
+          # Register new map IDs in the original map table.
+          infosfile=base+prefix+'MapInfos.rxdata'
+          infob=File.binread(infosfile)
+          infos=Marshal.load(infob)
+          raise 'MapInfos roundtrip changed' unless Marshal.dump(infos)==infob
+          raise 'Map IDs already registered' if infos[45] || infos[46]
+
+          {
+              45=>'Sanctuary TI Dungeon 1F',
+              46=>'Sanctuary TI Dungeon 2F'
+          }.each do |id,name|
+            info=Marshal.load(Marshal.dump(infos[44]))
+            assign(info,'name',name)
+            assign(info,'parent_id',0)
+            assign(info,'order',id)
+            infos[id]=info
           end
           File.binwrite(infosfile,Marshal.dump(infos))
-          # Append runtime within the actual RGSS engine, before Main.
-          scriptsfile=base+'Scripts.rxdata'
-          scripts=Marshal.load(File.binread(scriptsfile))
-          raise 'Unexpected engine version' unless scripts.size==136 && scripts[134][1]=='V230 Boss Respawn 60s 180s' && scripts[135][1]=='Main'
-          source=File.read('/tmp/slti-native-r18-runtime.rb',encoding:'UTF-8')
-          raise 'Runtime syntax invalid' unless system('ruby','-c','/tmp/slti-native-r18-runtime.rb',out:File::NULL)
-          raise 'Missing native sprite renderer' unless source.include?('class Spriteset_Map') && source.include?('SLTI_NATIVE_R18')
-          scripts.insert(135,[scripts.map{|e|e[0]}.max+1,'SLTI Native Dungeon V229R18',Zlib::Deflate.deflate(source)])
-          File.binwrite(scriptsfile,Marshal.dump(scripts))
-          puts 'NATIVE_SCRIPT',scripts.size,'append-before-Main, source SHAs',Digest::SHA256.hexdigest(source)
-          RUBY_PATCH
-          ruby -c /tmp/slti-r18-patch.rb
-          ruby /tmp/slti-r18-patch.rb site
 
-      - name: V229R18 Register 30 new native assets and visible version
+          # Silver Knight Village NPC 11: change only the placeholder.
+          townfile=mapfile.call(29)
+          townb=File.binread(townfile)
+          town=Marshal.load(townb)
+          raise 'Town map roundtrip issue' unless Marshal.dump(town)==townb
+
+          npc=at(town,'events').fetch(11)
+          raise 'Wrong NPC' unless [at(npc,'x'),at(npc,'y')]==[70,48]
+          pre_npc=Marshal.dump(npc)
+          commands=at(at(npc,'pages').first,'list')
+          placeholder='말섬던전은 별도 맵 연결 후 이용할 수 있습니다.'
+
+          candidates=commands.each_index.select do |i|
+            at(commands[i],'code')==101 &&
+            at(commands[i],'parameters')==[placeholder]
+          end
+          raise 'NPC placeholder not unique' unless candidates.size==1
+          index=candidates.first
+          unless at(commands[index-1],'code')==402 &&
+                 at(commands[index-1],'parameters')==[1,'말섬던전']
+            raise 'Wrong teleporter menu branch'
+          end
+
+          old=commands.select{|c|at(c,'code')==201}
+                      .map{|c|at(c,'parameters')}
+          expected_old=[
+            [0,21,71,58,0,1],
+            [0,17,23,27,0,1],
+            [0,18,114,111,0,1],
+            [0,13,118,55,0,1],
+            [0,29,100,132,0,1],
+            [0,13,73,42,0,1],
+            [0,41,20,55,0,1]
+          ]
+          raise 'Original transfers changed' unless old==expected_old
+
+          assign(commands[index],'code',201)
+          assign(commands[index],'parameters',[0,45,95,98,0,1])
+          town_mod=Marshal.dump(town)
+          restored=Marshal.load(town_mod)
+          at(restored,'events')[11]=Marshal.load(pre_npc)
+          unless Marshal.dump(restored)==townb
+            raise 'Unrelated Silver Knight map data changed'
+          end
+          File.binwrite(townfile,town_mod)
+
+          # Add ONLY a terrain renderer to the existing engine.
+          scriptfile=base+'Scripts.rxdata'
+          scripts=Marshal.load(File.binread(scriptfile))
+          unless scripts.size==136 &&
+                 scripts[-2][1]=='V230 Boss Respawn 60s 180s' &&
+                 scripts[-1][1]=='Main'
+            raise 'Not verified V229R16 baseline'
+          end
+
+          src=File.read(ARGV.fetch(2),encoding:'UTF-8')
+          raise 'Missing metadata placeholder' unless src.scan('__CHUNK_DATA__').size==1
+          metadata='{'+[45,46].map{|id|
+            "#{id}=>#{chunks.fetch(id.to_s).inspect}"
+          }.join(',')+'}'
+          source=src.sub('__CHUNK_DATA__',metadata)
+
+          if source.match?(/class\s+(?:Game_Map|Game_Player|Game_Character|Scene_Map)\b/)
+            raise 'Movement or camera override found'
+          end
+          unless source.include?('class Spriteset_Map')
+            raise 'Native terrain renderer missing'
+          end
+
+          File.binwrite('/tmp/slti-r20-render.rb',source)
+          unless system('ruby','-c','/tmp/slti-r20-render.rb',out:File::NULL)
+            raise 'Ruby terrain renderer syntax error'
+          end
+
+          new_script=[
+            scripts.map{|s|s[0]}.max+1,
+            'SLTI Original S32 Texture Map V229R20',
+            Zlib::Deflate.deflate(source)
+          ]
+          scripts.insert(-2,new_script)
+          File.binwrite(scriptfile,Marshal.dump(scripts))
+          raise 'Unexpected script count' unless Marshal.load(
+              File.binread(scriptfile)
+          ).size==137
+
+          File.write(build+'/patch-report.json',JSON.pretty_generate({
+            version:'V229R20',
+            rendererClass:'Spriteset_Map',
+            movementOverrides:false,
+            nativeTilePixels:32,
+            sourceMapIds:[1,2],
+            gameMapIds:[45,46],
+            nativeTilesetId:new_id,
+            terrainChunks:assert_chunks,
+            originalNpcTransfers:7,
+            newNpcTransfer:1,
+            originalMapsModified:[]
+          }))
+
+          puts "V229R20 NATIVE MAP PATCH SUCCESS"
+          puts "Transparent Tileset ID: #{new_id}"
+          puts "Original S32 terrain chunks: #{assert_chunks}"
+          puts "Original movement/input/gameplay preserved"
+          RUBY_R20_MAP_PATCH
+          ruby -c /tmp/slti-r20-map-patch.rb
+          ruby /tmp/slti-r20-map-patch.rb site build /tmp/slti-r20-background.rb
+
+      - name: V229R20 Register new graphics and update visible version
         shell: bash
         run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-index.py <<'PY_INDEX'
+          cat > /tmp/slti-r20-index.py <<'PY_R20_INDEX'
           import hashlib,json,re,sys
           from pathlib import Path
-          site=Path(sys.argv[1]);root=site/'knight';data=root/'gameasync';mp=data/'mapping.js'
-          mapping=mp.read_text(encoding='utf-8');assert mapping.count('var mappingArray = [')==1
-          assert mapping.count('\n];\n\nvar mapping')==1
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          changed=[f'Data/{prefix}Map029.rxdata',f'Data/{prefix}MapInfos.rxdata','Data/Scripts.rxdata']
-          new=[f'Data/{prefix}Map045.rxdata',f'Data/{prefix}Map046.rxdata']
-          new += [str(f.relative_to(data)) for f in (data/'Graphics/Pictures').glob('SLTI*.png')]
-          assert len(new)==30 and len(changed)==3
-          for rel in changed:
-              md5=hashlib.md5((data/rel).read_bytes()).hexdigest()
-              pattern=re.escape(rel)+r'\?h=[0-9a-f]{32}'
-              mapping,n=re.subn(pattern,lambda m:rel+'?h='+md5,mapping)
-              assert n==1,('Index update failed',rel,n)
-          entries=[]
-          for rel in new:
-              f=data/rel;assert f.is_file()
-              stem=rel.rsplit('.',1)[0]
-              key=stem.lower()
-              value=rel+'?h='+hashlib.md5(f.read_bytes()).hexdigest()
-              assert not re.search(r'\["'+re.escape(key)+r'",',mapping),('Key exists',key)
-              entries.append([key,value])
-          entries.sort()
-          array=''.join('['+json.dumps(k,ensure_ascii=False)+', '+json.dumps(v,ensure_ascii=False)+'],\n' for k,v in entries)
-          mapping=mapping.replace('\n];\n\nvar mapping','\n'+array+'];\n\nvar mapping',1)
-          mp.write_text(mapping,encoding='utf-8')
-          assert all(k in mp.read_text() for k,v in entries)
-          knight_index=root/'index.html';content=knight_index.read_text(encoding='utf-8')
-          assert content.count('V229R16')==3,('Unexpected version refs',content.count('V229R16'))
-          assert content.count('v229r16')==2
-          content=content.replace('V229R16','V229R18').replace('v229r16','v229r18')
-          assert 'slti-layer' not in content and 'slOpenSanctuary' not in content and '<iframe' not in content
-          knight_index.write_text(content,encoding='utf-8')
-          home=site/'index.html';src=home.read_text(encoding='utf-8')
-          assert src.count('V229R16')==2
-          home.write_text(src.replace('V229R16','V229R18'),encoding='utf-8')
-          manifest={'version':'V229R18','nativeMapIDs':[45,46],'source':'Sanctuary S32 original 28 terrain blocks','preservesOriginalGameMaps':list(range(1,45)),'portalPairs':[{'from':29,'event':11,'to':45},{'from':45,'event':2,'to':46},{'from':46,'event':1,'to':45},{'from':45,'event':1,'to':29}],'candidateLandingPoints':True,'noMonsterSpawnsInvented':True,'noSeparateHtmlViewer':True}
-          # Store manifest only in build workspace, not game deployment.
-          Path('/tmp/slti-native-r18-manifest.json').write_text(json.dumps(manifest,indent=2))
-          print('INDEX VERIFIED',len(entries),'new assets, three modified mappings')
-          PY_INDEX
-          python3 /tmp/slti-r18-index.py site
+          from PIL import Image
 
-      - name: V229R18 Verify native map commands collision and script source
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-check.rb <<'RUBY_VERIFY'
-          require 'digest';require 'json';require 'zlib'
-          module RPG
-           class Map;end;class MapInfo;end;class AudioFile;end;class Tileset;end
-           class Event
-            class Page
-             class Graphic;end;class Condition;end
-            end
-           end
-           class EventCommand;end;class MoveRoute;end;class MoveCommand;end
-          end
-          class Table
-           def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
-           def _dump(level=0);@raw;end
-           def hdr;@raw.unpack('V5');end
-           def get(x,y,z)
-            dim,w,h,n,c=hdr;raise 'wrong type' unless dim==3&&n==3
-            @raw.byteslice(20+2*(x+y*w+z*w*h),2).unpack1('v')
-           end
-          end
-          class Tone;def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end;def _dump(level=0);@raw;end;end
-          class Color<Tone;end
-          site=ARGV.fetch(0)
-          base=site+'/knight/gameasync/Data/'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          {45=>[[94,98,29,[70,49]],[161,173,46,[89,85]]],46=>[[89,85,45,[161,173]]]}.each do |id,expect|
-           m=Marshal.load(File.binread(base+"#{pre}Map%03d.rxdata"%id))
-           d=m.instance_variable_get(:@data);mask=m.instance_variable_get(:@slti_collision)
-           w=m.instance_variable_get(:@width);h=m.instance_variable_get(:@height)
-           raise 'table size' unless d.hdr==[3,w,h,3,w*h*3]
-           raise 'mask size' unless mask.bytesize==w*h
-           raise 'not blank' unless d.get(0,0,0)==0&&d.get(w-1,h-1,2)==0
-           es=m.instance_variable_get(:@events).values.sort_by{|e|e.instance_variable_get(:@id)}
-           raise 'event count' unless es.size==expect.size
-           expect.each_with_index do |(x,y,target,landing),i|
-            e=es[i];p=e.instance_variable_get(:@pages).first
-            raise 'coordinate mismatch' unless [e.instance_variable_get(:@x),e.instance_variable_get(:@y)]==[x,y]
-            raise 'blocked target' unless mask.getbyte(y*w+x)==0
-            raise 'trigger issue' unless [p.instance_variable_get(:@trigger),p.instance_variable_get(:@through)]==[1,true]
-            cs=p.instance_variable_get(:@list)
-            raise 'transfer mismatch' unless cs.first.instance_variable_get(:@code)==201&&cs.first.instance_variable_get(:@parameters)==[0,target,*landing,0,1]
-           end
-           puts "VERIFIED Native Map #{id}: #{w}x#{h} passable=#{mask.count("\0")} native transfers=#{es.size}"
-          end
-          town=Marshal.load(File.binread(base+pre+'Map029.rxdata'))
-          e=town.instance_variable_get(:@events).fetch(11)
-          cs=e.instance_variable_get(:@pages).first.instance_variable_get(:@list)
-          raise 'teleporter did not enter native Map045' unless cs.any?{|c|c.instance_variable_get(:@code)==201 && c.instance_variable_get(:@parameters)==[0,45,94,98,0,1]}
-          transfers=cs.select{|c|c.instance_variable_get(:@code)==201}.map{|c|c.instance_variable_get(:@parameters)}
-          raise 'original transfers changed' unless transfers.size==8
-          raise 'old placeholder survived' if cs.any?{|c|c.instance_variable_get(:@code)==101 && c.instance_variable_get(:@parameters).inspect.include?('map')}
-          puts "VERIFIED NPC: #{transfers.size} native transfers, 7 original and one Sanctuary entrance"
-          scripts=Marshal.load(File.binread(base+'Scripts.rxdata'))
-          raise 'wrong script count' unless scripts.size==137 && scripts[-2][1]=='SLTI Native Dungeon V229R18' && scripts[-1][1]=='Main'
-          program=Zlib::Inflate.inflate(scripts[-2][2]);File.binwrite('/tmp/slti-r18-verified.rb',program)
-          raise 'script syntax error' unless system('ruby','-c','/tmp/slti-r18-verified.rb',out:File::NULL)
-          puts 'VERIFIED source no iframe and native script source hash '+Digest::SHA256.hexdigest(program)
-          RUBY_VERIFY
-          ruby /tmp/slti-r18-check.rb site
+          site=Path(sys.argv[1])
+          root=site/'knight'
+          game=root/'gameasync'
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          Image.new('RGBA',(256,32),(0,0,0,0)).save(
+              game/'Graphics/Tilesets/SLTI_TransparentPassage.png'
+          )
+
+          modified=[
+              f'Data/{prefix}Map029.rxdata',
+              f'Data/{prefix}MapInfos.rxdata',
+              f'Data/{prefix}Tilesets.rxdata',
+              'Data/Scripts.rxdata'
+          ]
+          added=[
+              f'Data/{prefix}Map045.rxdata',
+              f'Data/{prefix}Map046.rxdata',
+              'Graphics/Tilesets/SLTI_TransparentPassage.png'
+          ]
+          added+=sorted(
+              str(f.relative_to(game))
+              for f in (game/'Graphics/Pictures').glob('SLTI*.jpg')
+          )
+          assert len(added)==174,('Wrong added asset count',len(added))
+
+          mp=game/'mapping.js'
+          text=mp.read_text(encoding='utf-8')
+
+          for rel in modified:
+              digest=hashlib.md5((game/rel).read_bytes()).hexdigest()
+              text,n=re.subn(
+                  re.escape(rel+'?h=')+r'[a-f0-9]{32}',
+                  lambda _m:rel+'?h='+digest,text
+              )
+              assert n==1,(rel,n)
+
+          entries=[]
+          for rel in added:
+              assert (game/rel).is_file(),rel
+              key=rel.rsplit('.',1)[0].lower()
+              assert ('["'+key+'",') not in text,('Duplicate asset',key)
+              val=rel+'?h='+hashlib.md5((game/rel).read_bytes()).hexdigest()
+              entries.append([key,val])
+
+          assert text.count('\n];\n\nvar mapping')==1
+          insert=''.join(
+              '['+json.dumps(k,ensure_ascii=False)+', '+
+              json.dumps(v,ensure_ascii=False)+'],\n'
+              for k,v in sorted(entries)
+          )
+          text=text.replace(
+              '\n];\n\nvar mapping',
+              '\n'+insert+'];\n\nvar mapping',1
+          )
+          mp.write_text(text,encoding='utf-8')
+
+          for f in [site/'index.html',site/'knight/index.html']:
+              src=f.read_text(encoding='utf-8')
+              assert 'V229R16' in src and 'V229R20' not in src
+              if f==site/'knight/index.html':
+                  assert src.count('V229R16')==3
+                  assert src.count('v229r16')==2
+              else:
+                  assert src.count('V229R16')==2
+              f.write_text(
+                  src.replace('V229R16','V229R20')
+                     .replace('v229r16','v229r20'),
+                  encoding='utf-8'
+              )
+
+          manifest={
+              'version':'V229R20',
+              'baseline':'V229R16',
+              'maps':[45,46],
+              'nativeMoveMethodsChanged':False,
+              'nativePassabilityMethodsChanged':False,
+              'native32pxTilemap':True,
+              'offlineConvertedOriginalS32':True,
+              'original44MapsIntact':True,
+              'originalGraphicsJpegChunks':171,
+              'layoutSource':'Sanctuary S32 1F-2F',
+              'engine':'unchanged Game_Player and Game_Character',
+              'portalDestinationPositionsVerified':False,
+              'monsterSpawnPositionsVerified':False
+          }
+          Path(sys.argv[2],'manifest-r20.json').write_text(
+              json.dumps(manifest,indent=2,ensure_ascii=False)
+          )
+          print('V229R20 ASSET MAPPING VERIFIED',len(added))
+          PY_R20_INDEX
+          python3 /tmp/slti-r20-index.py site build
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/dpad.js
 
-      - name: V229R18 Verify exact 5354 original assets retained
+      - name: V229R20 Verify original native Game_Map collision and transfers
         shell: bash
         run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-integrity.py <<'PY_INTEGRITY'
-          import hashlib,tarfile,sys
-          from pathlib import Path
-          root=Path(sys.argv[1]);tarfile_path=Path(sys.argv[2]);
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          expected_changed={'index.html','knight/index.html','knight/gameasync/mapping.js',f'knight/gameasync/Data/{pre}Map029.rxdata',f'knight/gameasync/Data/{pre}MapInfos.rxdata','knight/gameasync/Data/Scripts.rxdata'}
-          expected_new={f'knight/gameasync/Data/{pre}Map045.rxdata',f'knight/gameasync/Data/{pre}Map046.rxdata'}
-          expected_new.update(str(p.relative_to(root)) for p in (root/'knight/gameasync/Graphics/Pictures').glob('SLTI*.png'))
-          assert len(expected_new)==30
-          count=0;changed=set();observed=set();missing=[]
-          with tarfile.open(tarfile_path) as tar:
-              for member in tar:
-                  if not member.isfile():continue
-                  name=member.name.removeprefix('./')
-                  observed.add(name)
-                  original=hashlib.sha256(tar.extractfile(member).read()).digest()
-                  path=root/name
-                  if not path.is_file():missing.append(name);continue
-                  current=hashlib.sha256(path.read_bytes()).digest()
-                  if original!=current:changed.add(name)
-                  count+=1
-          assert count==5354 and not missing,(count,missing[:3])
-          assert changed==expected_changed,(changed^expected_changed)
-          files={str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
-          assert len(files)==5384 and files-observed==expected_new, (len(files),len(files-observed),len(expected_new))
-          assert not (root/'knight/sanctuary').exists(),'Separate HTML overlay should be absent'
-          print('VERIFIED exact diff: 6 existing files changed, 30 new native map/image assets, original 44 maps unchanged, 5354 old assets accounted')
-          PY_INTEGRITY
-          python3 /tmp/slti-r18-integrity.py site previous/artifact.tar
+          cat > /tmp/slti-r20-verify.rb <<'RUBY_R20_VERIFY'
+          require 'zlib'
+          require 'json'
 
-      - name: V229R18 Smoke-test native Ruby isometric positions and original fallback
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/slti-r18-test-runtime.rb <<'RUBY_TEST'
-          class Game_Map
-            attr_accessor :map_id
-            attr_accessor :data
-            def initialize
-              @map_id=45
-              @map=Struct.new(:stuff).new('')
-              @map.instance_variable_set(:@slti_collision,"\0"*65536)
-            end
-            def valid?(x,y);x>=0 && y>=0 && x<256 && y<256;end
-            def width;256;end
-            def passable?(x,y,d,e=nil);:old_pass;end
-          end
-          class Game_Character
-           attr_accessor :real_x,:real_y
-           def initialize(x=94,y=98);@real_x=x*128;@real_y=y*128;@always_on_top=false;end
-           def screen_x;:old_x;end
-           def screen_y;:old_y;end
-           def screen_z(h=0);:old_z;end
-          end
-          class Sprite
-           attr_accessor :bitmap,:z,:x,:y
-           def initialize(v);@view=v;end
-           def dispose;@disposed=true;end
-          end
-          class Spriteset_Map
-           def initialize
-             @viewport1=Object.new
-             update
-           end
-           def update;end
-           def dispose;end
-          end
           module RPG
-           module Cache
-            def self.picture(name)
-             raise 'Picture name invalid' unless name.start_with?('SLTI')
-             return name
+            class Map;end
+            class MapInfo;end
+            class Tileset;end
+            class AudioFile;end
+            class Event
+              class Page
+                class Condition;end
+                class Graphic;end
+              end
             end
-           end
+            class EventCommand;end
+            class MoveRoute;end
+            class MoveCommand;end
           end
-          load '/tmp/slti-native-r18-runtime.rb'
-          raise 'Meta keys type error' unless SLTINative::META.keys.sort==['45','46']
-          $game_map=Game_Map.new
-          $game_player=Game_Character.new
-          raise 'Player x incorrect' unless $game_player.screen_x==400 && $game_player.screen_y==230
-          neighbor=Game_Character.new(95,98)
-          raise 'Iso neighbor x wrong' unless neighbor.screen_x==412 && neighbor.screen_y==224
-          neighbor=Game_Character.new(94,99)
-          raise 'Iso neighbor y wrong' unless neighbor.screen_x==412 && neighbor.screen_y==236
-          raise 'Collision empty failed' unless $game_map.passable?(94,98,0)
-          $game_map.instance_variable_get(:@map).instance_variable_get(:@slti_collision).setbyte(98*256+94,1)
-          raise 'Collision blocked failed' if $game_map.passable?(94,98,0)
-          render=Spriteset_Map.new
-          sprites=render.instance_variable_get(:@slti_native_sprites)
-          raise 'Missing RGSS terrain sprites' unless sprites.size==12
-          px,py=SLTINative.player_world
-          meta=SLTINative::META['45'];first=meta['tiles'][0]
-          raise 'Tile iso placement wrong' unless sprites[0].x==(400+first[1]-px).round && sprites[0].y==(230+first[2]-py).round
-          $game_map.map_id=46
-          raise 'Native 2F meta missing' unless SLTINative.active? && SLTINative.meta['tiles'].size==16
-          $game_map.map_id=29
-          raise 'Original map changed' unless $game_map.passable?(0,0,0)==:old_pass && $game_player.screen_x==:old_x && $game_player.screen_y==:old_y
-          puts 'VERIFIED NATIVE RGSS map IDs, player iso screen coordinates, collision, sprite counts, original-engine fallback'
-          RUBY_TEST
-          ruby /tmp/slti-r18-test-runtime.rb
-          mkdir -p reports
-          cp /tmp/slti-native-r18-manifest.json reports/manifest-v229r18.json
 
-      - name: V229R18 Upload native engine source verification report
+          class Table
+            def self._load(b)
+              x=allocate
+              x.instance_variable_set(:@b,b)
+              x
+            end
+            def _dump(v=0);@b;end
+            def [](x,y=0,z=0)
+              dim,w,h,depth,n=@b.unpack('V5')
+              return nil if x<0 || y<0 || z<0 ||
+                            x>=w || y>=h || z>=depth
+              @b.byteslice(
+                  20+2*(x+y*w+z*w*h),2
+              ).unpack1('v')
+            end
+            def values;@b.byteslice(20..).unpack('v*');end
+            def header;@b.unpack('V5');end
+          end
+
+          class Tone
+            def self._load(s)
+              o=allocate
+              o.instance_variable_set(:@raw,s)
+              o
+            end
+            def _dump(v=0);@raw;end
+          end
+          class Color<Tone;end
+
+          def a(obj,k);obj.instance_variable_get('@'+k);end
+
+          site=ARGV.fetch(0)
+          base=site+'/knight/gameasync/Data/'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          scripts=Marshal.load(File.binread(base+'Scripts.rxdata'))
+
+          unless scripts.size==137 &&
+                 scripts[-2][1]=='SLTI Original S32 Texture Map V229R20' &&
+                 scripts[-1][1]=='Main'
+            raise 'Original engine or new renderer missing'
+          end
+
+          original=Marshal.load(File.binread(ARGV.fetch(1)))
+          unless scripts[0,135]==original[0,135] &&
+                 scripts[-1]==original[-1]
+            raise 'Original movement, input or gameplay scripts changed'
+          end
+
+          source=Zlib::Inflate.inflate(scripts[-2][2])
+          if source.match?(/class\s+(?:Game_Map|Game_Player|Game_Character|Scene_Map)\b/)
+            raise 'Movement override present'
+          end
+          unless source.scan(/class\s+\w+/)==['class Spriteset_Map']
+            raise 'Unexpected runtime class changes'
+          end
+
+          File.write('/tmp/slti-r20-check-render.rb',source)
+          unless system('ruby','-c','/tmp/slti-r20-check-render.rb',out:File::NULL)
+            raise 'Native renderer syntax failure'
+          end
+
+          sets=Marshal.load(File.binread(base+pre+'Tilesets.rxdata'))
+          custom=sets[-1]
+          unless a(custom,'tileset_name')=='SLTI_TransparentPassage'
+            raise 'Transparent tileset missing'
+          end
+
+          passages=a(custom,'passages').values
+          priorities=a(custom,'priorities').values
+          unless (passages[384]&15)==0 &&
+                 (passages[385]&15)==15 &&
+                 priorities[384]==0 && priorities[385]==0
+            raise 'Original-engine collision flag mismatch'
+          end
+
+          infos=Marshal.load(File.binread(base+pre+'MapInfos.rxdata'))
+          raise 'Map index incomplete' unless infos[45] && infos[46]
+
+          # Execute Game_Map.passable? from the ORIGINAL game script.
+          eval(
+              Zlib::Inflate.inflate(scripts[21][2]),
+              TOPLEVEL_BINDING,
+              'original_Game_Map'
+          )
+          class RPG::Map
+            attr_reader :width,:height,:data
+          end
+
+          {
+              45=>[256,256,4946,2],
+              46=>[320,256,10431,1]
+          }.each do |id,(w,h,count,portal_count)|
+            m=Marshal.load(File.binread(
+                base+("#{pre}Map%03d.rxdata"%id)
+            ))
+            table=a(m,'data')
+            unless [a(m,'width'),a(m,'height')]==[w,h] &&
+                   table.header==[3,w,h,3,3*w*h]
+              raise 'Map dimensions wrong'
+            end
+            unless a(m,'tileset_id')==a(custom,'id')
+              raise 'Map native tileset wrong'
+            end
+            unless a(m,'events').size==portal_count
+              raise 'Native transfer count wrong'
+            end
+
+            native=Game_Map.allocate
+            native.instance_variable_set(:@map,m)
+            native.instance_variable_set(:@passages,passages)
+            native.instance_variable_set(:@priorities,priorities)
+            native.instance_variable_set(:@events,{})
+
+            mask=File.binread(ARGV.fetch(2)+"/map#{id}.mask")
+            unless mask.size==w*h && mask.count("\0")==count
+              raise 'Original S32 mask differs'
+            end
+
+            samples=(0...w*h).step([w*h/500,1].max)
+                              .map{|i|[i%w,i/w]}
+            samples.concat(
+                id==45 ?
+                  [[94,98],[95,98],[161,173],[93,98]] :
+                  [[89,85],[89,86],[89,84]]
+            )
+
+            samples.each do |x,y|
+              walkable=mask.getbyte(y*w+x)==0
+              unless (table[x,y,0]==384)==walkable
+                raise "Wrong tile #{id}:#{x},#{y}"
+              end
+              unless [2,4,6,8].all?{|d|
+                native.passable?(x,y,d)==walkable
+              }
+                raise "Original passable? mismatch #{id}:#{x},#{y}"
+              end
+            end
+
+            events=a(m,'events').sort.map do |_,ev|
+              page=a(ev,'pages')[0]
+              command=a(page,'list')[0]
+              [a(ev,'x'),a(ev,'y'),a(command,'parameters')]
+            end
+
+            expected=id==45 ?
+              [
+                [94,98,[0,29,70,49,0,1]],
+                [161,173,[0,46,89,86,0,1]]
+              ] :
+              [
+                [89,85,[0,45,162,173,0,1]]
+              ]
+            raise 'Wrong native portal command' unless events==expected
+            puts "MAP #{id}: PASS native collision and transfer"
+          end
+
+          npc=Marshal.load(
+              File.binread(base+pre+'Map029.rxdata')
+          ).instance_variable_get(:@events).fetch(11)
+          commands=a(a(npc,'pages')[0],'list')
+          transfers=commands.select{|c|a(c,'code')==201}
+                            .map{|c|a(c,'parameters')}
+
+          original_transfers=[
+              [0,21,71,58,0,1],
+              [0,17,23,27,0,1],
+              [0,18,114,111,0,1],
+              [0,13,118,55,0,1],
+              [0,29,100,132,0,1],
+              [0,13,73,42,0,1],
+              [0,41,20,55,0,1]
+          ]
+
+          unless transfers.size==8 &&
+                 transfers[0,7]==original_transfers &&
+                 transfers.last==[0,45,95,98,0,1]
+            raise 'NPC original transfers damaged'
+          end
+
+          puts 'V229R20 ORIGINAL MOVEMENT SCRIPTS IDENTICAL'
+          puts 'V229R20 NATIVE MAP COLLISION AND NPC TRANSFER PASS'
+          RUBY_R20_VERIFY
+          ruby /tmp/slti-r20-verify.rb site build/source-scripts-r16.rxdata build
+
+      - name: V229R20 Verify existing 32px camera scrolling
+        shell: bash
+        run: |
+          cat > /tmp/slti-r20-render-check.rb <<'RUBY_R20_RENDER_CHECK'
+          require 'zlib'
+
+          class Bitmap
+            @@all=[]
+            def self.all;@@all;end
+            attr_reader :path
+
+            def initialize(path)
+              @path=path
+              @disposed=false
+              prefix='Graphics/Pictures/'
+              raise 'Wrong bitmap path' unless path.start_with?(prefix)
+              file=ARGV.fetch(0)+'/knight/gameasync/'+path+'.jpg'
+              raise 'Missing original texture' unless File.file?(file)
+              unless File.binread(file,3)=="\xFF\xD8\xFF".b
+                raise 'Not a JPEG texture'
+              end
+              @@all<<self
+            end
+
+            def dispose;@disposed=true;end
+            def disposed?;@disposed;end
+          end
+
+          class Sprite
+            attr_accessor :bitmap,:x,:y,:z
+            def initialize(v);@disposed=false;end
+            def dispose;@disposed=true;end
+            def disposed?;@disposed;end
+          end
+
+          class Game_MapFake
+            attr_accessor :map_id,:display_x,:display_y
+            def initialize(id,x,y)
+              @map_id=id
+              @display_x=x
+              @display_y=y
+            end
+          end
+
+          class Spriteset_Map
+            def initialize
+              @viewport1=Object.new
+              update
+            end
+            def update;end
+            def dispose;end
+          end
+
+          scripts=Marshal.load(File.binread(
+              ARGV.fetch(0)+'/knight/gameasync/Data/Scripts.rxdata'
+          ))
+          source=Zlib::Inflate.inflate(scripts[-2][2])
+          File.write('/tmp/slti-r20-runtime-smoke.rb',source)
+          load '/tmp/slti-r20-runtime-smoke.rb'
+
+          unless SLTIMapBackground::DATA.keys.sort==[45,46]
+            raise 'Wrong map backgrounds'
+          end
+
+          $game_map=Game_MapFake.new(45,95*128-1536,98*128-664)
+          scene=Spriteset_Map.new
+          sprites=scene.instance_variable_get(:@slti_r20_sprites)
+          unless sprites.size.between?(3,8)
+            raise 'Wrong 1F visible image count'
+          end
+          unless sprites.values.all?{|s|s.bitmap.path.include?('SLTI45_')}
+            raise 'Wrong 1F images'
+          end
+
+          before=sprites.transform_values{|s|s.x}
+          $game_map.display_x+=128
+          scene.update
+          after=scene.instance_variable_get(:@slti_r20_sprites)
+          common=before.keys & after.keys
+
+          raise 'No overlapping camera sprites' if common.empty?
+          common.each do |k|
+            unless after[k].x==before[k]-32
+              raise 'Original 32px camera scrolling changed'
+            end
+          end
+
+          first=Bitmap.all.dup
+          $game_map=Game_MapFake.new(46,89*128-1536,86*128-664)
+          scene.update
+          unless first.all?(&:disposed?)
+            raise 'Old 1F graphics not freed'
+          end
+
+          images=scene.instance_variable_get(:@slti_r20_sprites).values
+          unless images.size.between?(3,8) &&
+                 images.all?{|s|s.bitmap.path.include?('SLTI46_')}
+            raise 'Wrong 2F graphics'
+          end
+
+          $game_map.map_id=29
+          scene.update
+          unless scene.instance_variable_get(:@slti_r20_sprites).empty?
+            raise 'Graphics not removed on village return'
+          end
+          raise 'Bitmap leak' unless Bitmap.all.all?(&:disposed?)
+          scene.dispose
+
+          puts 'V229R20 PASS: native camera 32px horizontal scroll'
+          puts 'V229R20 PASS: original movement and 1F/2F/return graphics'
+          RUBY_R20_RENDER_CHECK
+          ruby /tmp/slti-r20-render-check.rb site
+
+      - name: V229R20 Verify exact asset changes and versions
+        shell: bash
+        run: |
+          cat > /tmp/slti-r20-integrity.py <<'PY_R20_INTEGRITY'
+          from pathlib import Path
+          import hashlib,json,sys
+          from PIL import Image
+
+          base=Path(sys.argv[1])
+          now=Path(sys.argv[2])
+          build=Path(sys.argv[3])
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          def catalog(path):
+              return {
+                  str(p.relative_to(path)):hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in path.rglob('*') if p.is_file()
+              }
+
+          old=catalog(base)
+          new=catalog(now)
+          assert len(old)==5354,len(old)
+
+          expected_changed={
+              'index.html',
+              'knight/index.html',
+              'knight/gameasync/mapping.js',
+              f'knight/gameasync/Data/{prefix}Map029.rxdata',
+              f'knight/gameasync/Data/{prefix}MapInfos.rxdata',
+              f'knight/gameasync/Data/{prefix}Tilesets.rxdata',
+              'knight/gameasync/Data/Scripts.rxdata'
+          }
+
+          changed={p for p in old if new.get(p)!=old[p]}
+          assert changed==expected_changed,(
+              'Unexpected modified files',changed^expected_changed
+          )
+
+          added=set(new)-set(old)
+          assert len(new)==5528 and len(added)==174,(
+              len(new),len(added)
+          )
+
+          expected_added={
+              f'knight/gameasync/Data/{prefix}Map045.rxdata',
+              f'knight/gameasync/Data/{prefix}Map046.rxdata',
+              'knight/gameasync/Graphics/Tilesets/SLTI_TransparentPassage.png'
+          }
+          expected_added|={
+              str(f.relative_to(now))
+              for f in (now/'knight/gameasync/Graphics/Pictures').glob('SLTI*.jpg')
+          }
+          assert len(expected_added)==174
+          assert expected_added==added
+
+          Image.open(
+              now/'knight/gameasync/Graphics/Tilesets/SLTI_TransparentPassage.png'
+          ).verify()
+
+          for mid,count in ((45,64),(46,107)):
+              files=sorted(
+                  (now/'knight/gameasync/Graphics/Pictures')
+                  .glob(f'SLTI{mid}_*.jpg')
+              )
+              assert len(files)==count,(mid,len(files))
+              for f in files[::max(1,len(files)//10)]:
+                  with Image.open(f) as im:
+                      assert im.size==(512,512)
+                      assert im.format=='JPEG'
+
+          mapping=(now/'knight/gameasync/mapping.js').read_text(encoding='utf-8')
+          for filename in expected_added:
+              rel=filename.removeprefix('knight/gameasync/')
+              key=rel.rsplit('.',1)[0].lower()
+              assert mapping.count('["'+key+'",')==1,key
+              digest=hashlib.md5((now/filename).read_bytes()).hexdigest()
+              assert rel+'?h='+digest in mapping,rel
+
+          html=(now/'knight/index.html').read_text(encoding='utf-8')
+          home=(now/'index.html').read_text(encoding='utf-8')
+          assert 'V229R20' in html and 'V229R20' in home
+          assert "var namespace = 'slknight_v14_engine'" in html
+          assert 'slti-layer' not in html
+          assert not (now/'knight/sanctuary').exists()
+
+          manifest=json.loads((build/'manifest-r20.json').read_text())
+          assert manifest['nativeMoveMethodsChanged'] is False
+          assert manifest['nativePassabilityMethodsChanged'] is False
+
+          print('V229R20 PASS: 7 modified, 174 new files')
+          print('V229R20 PASS: original 44 maps and native movement preserved')
+          print('V229R20 PASS: no iframe, no separate movement, no old viewer')
+          PY_R20_INTEGRITY
+          python3 /tmp/slti-r20-integrity.py original site build
+
+      - name: V229R20 Upload native map verification report
         uses: actions/upload-artifact@v4
         with:
-          name: SLKnight-V229R18-Native-Sanctuary-Verification
-          path: reports/
+          name: SLKnight-V229R20-Native-Map-Swap-Verification
+          path: |
+            build/report.json
+            build/patch-report.json
+            build/manifest-r20.json
           if-no-files-found: error
           retention-days: 30
 
-      - name: V229R18 Upload full 5384-file game with native maps
+      - name: V229R20 Upload complete original-engine game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
