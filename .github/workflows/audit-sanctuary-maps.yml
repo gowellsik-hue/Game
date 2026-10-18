@@ -1,189 +1,204 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V5.3 / Original monster spawn, setup relocation, self-switch A relocation
-name: audit-sanctuary-maps.yml | V5.3 | Monster Spawn Branch Audit
+# VERSION: V5.4 / Native respawn command evidence and 35 boss overrides
+name: audit-sanctuary-maps.yml | V5.4 | Monster Respawn and Boss Override Evidence
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: [.github/workflows/audit-sanctuary-maps.yml]
+
 permissions:
   contents: read
   actions: read
+
 jobs:
-  classify-spawns:
+  spawn-evidence:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - name: V5.3 Restore V5.2 collision masks and game event pages
+      - name: V5.4 Restore V5.3 maps and V229R9 native event scripts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p reports previous source
-          gh run download 39123602635 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.2-44-Collision-Spawn-Audit -D reports
+          gh run download 39124623935 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.3-Classified-Monster-Spawns -D reports
           gh run download 39100666926 -R "$GITHUB_REPOSITORY" -n github-pages -D previous
-          test -s reports/collision-index-v5.2.json
-          test -s reports/monster-spawn-index-v5.0.json
+          test -s reports/spawn-event-pages-v5.3.json
+          test -s reports/spawn-integration-v5.3.json
           test -s previous/artifact.tar
           tar -xf previous/artifact.tar -C source --wildcards \
+            './knight/gameasync/Data/Scripts.rxdata' \
             './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap*.rxdata'
-          command -v ruby >/dev/null || (sudo apt-get update -qq && sudo apt-get install -qq -y ruby)
+          test -s source/knight/gameasync/Data/Scripts.rxdata
+          test -s source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap044.rxdata
 
-      - name: V5.3 Decode original event-page conditions and relocations
+      - name: V5.4 Extract self-switch A and boss defeat command evidence
         run: |
           set -euo pipefail
-          cat > /tmp/spawn-v5.3.rb <<'RUBY_V53'
+          cat > /tmp/extract-v5.4.rb <<'RUBY_V54'
           require 'json'
+          require 'zlib'
           module RPG
-            class AudioFile;end; class Map;end
+            class AudioFile;end
+            class Map;end
             class Event
               class Page
-                class Condition;end; class Graphic;end
+                class Condition;end
+                class Graphic;end
               end
             end
-            class EventCommand;end; class MoveRoute;end; class MoveCommand;end
+            class EventCommand;end
+            class MoveRoute;end
+            class MoveCommand;end
           end
           class Table;def self._load(s);allocate;end;end
           class Tone;def self._load(s);s;end;end
           class Color;def self._load(s);s;end;end
-          def at(o,k);o.instance_variable_get('@'+k);end
-          def utf(s);s.to_s.dup.force_encoding('UTF-8').scrub;end
-          source=JSON.parse(File.read('reports/monster-spawn-index-v5.0.json'))
-          original=source['monsterEvents']+source['unverifiedBossEvents']
-          by_map=original.group_by{|e|e['mapId']}
-          base='source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          base='source/knight/gameasync/Data/'
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          refs=JSON.parse(File.read('reports/spawn-event-pages-v5.3.json'))
+          raise 'Expected 500 events' unless refs.size==500
+          script=Marshal.load(File.binread(base+'Scripts.rxdata'))
+          boss=Zlib::Inflate.inflate(script[134][2])
+          waitcode=Zlib::Inflate.inflate(script[71][2])
+          main=Zlib::Inflate.inflate(script[136][2])
+          raise 'Original script version changed' unless boss.include?('module SLV230BossRespawn') && boss.include?('@slv230_defeated')
+          raise 'Wait command changed' unless waitcode.match?(/@wait_count\s*=\s*@parameters\[0\]\s*\*\s*2/)
+          raise 'Frame rate changed' unless main.match?(/Graphics\.frame_rate\s*=\s*50/)
+          line=boss.lines.find{|s|s.lstrip.start_with?('TARGETS=')}
+          raise 'No boss targets literal' unless line && line.include?('=>')
+          File.write('reports/v54-targets.txt',line.strip.split('=',2)[1])
           records=[]
-          by_map.sort.each do |mid,list|
-            map=Marshal.load(File.binread("#{base}Map%03d.rxdata" % mid))
-            game_events=at(map,'events')||{}
-            list.each do |ref|
-              event=game_events.fetch(ref['eventId'])
-              raise 'Initial event mismatch' unless at(event,'x')==ref['initialX'] && at(event,'y')==ref['initialY']
-              pages=[]
-              (at(event,'pages')||[]).each_with_index do |page,i|
-                con=at(page,'condition'); commands=at(page,'list')||[]
-                selfa=!!at(con,'self_switch_valid') && at(con,'self_switch_ch')=='A'
-                flags={
-                  switch1:(at(con,'switch1_id') if at(con,'switch1_valid')),
-                  switch2:(at(con,'switch2_id') if at(con,'switch2_valid')),
-                  variable:( {id:at(con,'variable_id'),minimum:at(con,'variable_value')} if at(con,'variable_valid')),
-                  selfSwitch:(at(con,'self_switch_ch') if at(con,'self_switch_valid'))
-                }.compact
-                moves=[];seen={}
-                commands.each do |c|
-                  next unless at(c,'code')==202
-                  p=at(c,'parameters')
-                  next unless p.is_a?(Array) && p.size>=5 && p[0]==0 && p[1]==0 && p[2].is_a?(Integer) && p[3].is_a?(Integer)
-                  key=[p[2],p[3]];next if seen[key]
-                  seen[key]=true
-                  moves<<{x:p[2],y:p[3],pageIndex:i,indent:at(c,'indent').to_i,
-                    role:(selfa ? 'SELF_SWITCH_A_RELOCATION' : 'SCRIPTED_SETUP_RELOCATION')}
+          refs.group_by{|e|e['mapId']}.sort.each do |id,events|
+            map=Marshal.load(File.binread(base+("#{prefix}Map%03d.rxdata" % id)))
+            originals=map.instance_variable_get('@events')
+            events.each do |ref|
+              event=originals.fetch(ref['eventId'])
+              raise 'Initial coordinate mismatch' unless ref['initialX']==event.instance_variable_get('@x') && ref['initialY']==event.instance_variable_get('@y')
+              ps=[];writes=[];marks=[]
+              event.instance_variable_get('@pages').each_with_index do |pg,page_i|
+                commands=pg.instance_variable_get('@list')||[]
+                cond=pg.instance_variable_get('@condition')
+                a=cond.instance_variable_get('@self_switch_valid') && cond.instance_variable_get('@self_switch_ch')=='A'
+                important=[]
+                commands.each_with_index do |cmd,ci|
+                  op=cmd.instance_variable_get('@code')
+                  par=cmd.instance_variable_get('@parameters')
+                  if op==123 && par.is_a?(Array) && par[0]=='A'
+                    writes<<{'page'=>page_i,'index'=>ci,'on'=>par[1]==0,'inSelfSwitchAPage'=>a}
+                  end
+                  if op==355 && par.to_s.include?('@slv230_defeated')
+                    marks<<{'page'=>page_i,'index'=>ci}
+                  end
+                  next unless a
+                  next unless [106,111,411,412,202,122,123,121,117,112,413].include?(op)
+                  next unless par.is_a?(Array)
+                  important<<{'index'=>ci,'code'=>op,'indent'=>cmd.instance_variable_get('@indent'),'params'=>par}
                 end
-                pages<<{index:i,trigger:at(page,'trigger'),conditions:flags,
-                  graphic:utf(at(at(page,'graphic'),'character_name')),
-                  combatCall62:commands.any?{|c|at(c,'code')==117 && at(c,'parameters')[0]==62},
-                  hasBranches:commands.any?{|c|at(c,'code')==111},
-                  relocations:moves}
+                if a
+                  ps<<{'index'=>page_i,'trigger'=>pg.instance_variable_get('@trigger'),
+                    'condition'=>ref['pages'][page_i]['conditions'],'commands'=>important}
+                end
               end
-              expected=ref['relocations'].map{|r|[r['page'],r['x'],r['y']]}.sort
-              actual=pages.flat_map{|p|p[:relocations].map{|v|[v[:pageIndex],v[:x],v[:y]]}}.sort
-              raise "Relocation mismatch #{mid}/#{ref['eventId']}" unless expected==actual
-              records<<{mapId:mid,mapName:ref['mapName'],eventId:ref['eventId'],monsterName:ref['monsterName'],
-                initialX:ref['initialX'],initialY:ref['initialY'],evidence:ref['evidence'],
-                arenaOrSpecial:ref['arenaOrSpecial'],pages:pages}
+              records<<{'mapId'=>id,'eventId'=>ref['eventId'],'monsterName'=>ref['monsterName'],
+                'evidence'=>ref['evidence'],'initial'=>[ref['initialX'],ref['initialY']],
+                'selfSwitchAPages'=>ps,'selfSwitchAWrites'=>writes,'bossDefeatedMarkers'=>marks}
             end
           end
-          raise 'Monster event coverage mismatch' unless records.size==500
-          positions=records.sum{|e|1+e[:pages].sum{|p|p[:relocations].size}}
-          raise "Coordinate coverage mismatch #{positions}" unless positions==1708
-          File.write('reports/spawn-event-pages-v5.3.json',JSON.generate(records))
-          puts "V5.3 ORIGINAL PAGES: #{records.size} events / #{positions} positions"
-          RUBY_V53
-          ruby -c /tmp/spawn-v5.3.rb
-          ruby /tmp/spawn-v5.3.rb
+          raise "Event coverage #{records.size}" unless records.size==500
+          File.write('reports/lifecycle-evidence-v5.4.json',JSON.generate({'version'=>'V5.4','frameRate'=>50,'interpreterWaitFramesPerUnit'=>2,'events'=>records}))
+          puts "V5.4 evidence #{records.size} monster events, #{records.sum{|x|x['selfSwitchAPages'].size}} self A pages, #{records.sum{|x|x['bossDefeatedMarkers'].size}} defeated markers"
+          RUBY_V54
+          ruby -c /tmp/extract-v5.4.rb
+          ruby /tmp/extract-v5.4.rb
 
-      - name: V5.3 Classify spawn roles and static-collision exceptions
+      - name: V5.4 Build integration summaries and 35 boss rules
         run: |
           set -euo pipefail
-          cat > /tmp/spawn-v5.3.py <<'PY_V53'
-          import csv,json,collections
+          cat > /tmp/spawn-v5.4.py <<'PY_V54'
+          import ast,collections,csv,json
           from pathlib import Path
           root=Path('reports')
-          events=json.loads((root/'spawn-event-pages-v5.3.json').read_text())
-          maps=json.loads((root/'collision-index-v5.2.json').read_text())['maps']
-          v52=json.loads((root/'audit-summary-v5.2.json').read_text())['totals']
-          masks={mid:(root/m['collisionFile']).read_bytes() for mid,m in maps.items()}
-          counts=collections.Counter();rows=[];issues=[];pack={}
-          def add(e,kind,x,y,page=None):
-              mid=str(e['mapId']);m=maps[mid];w=m['width'];h=m['height']
-              inside=0<=x<w and 0<=y<h
-              v=masks[mid][y*w+x] if inside else 255
-              state='OUT_OF_BOUNDS' if not inside else 'UNKNOWN_TILE' if v==255 else 'BLOCKED' if v==15 else 'PASSABLE' if v==0 else 'DIRECTION_LIMITED'
-              out={k:e[k] for k in ('mapId','mapName','eventId','monsterName','evidence','arenaOrSpecial')}
-              out.update(role=kind,x=x,y=y,pageIndex=page['index'] if page else None,
-                pageTrigger=page['trigger'] if page else None,
-                pageConditions=page['conditions'] if page else {},
-                branchSelectionUnverified=bool(page and page['hasBranches']),
-                collision=state,collisionMask=v,actualSpawnVerified=False)
-              rows.append(out);counts[kind]+=1;counts['collision_'+state]+=1
-              if state not in ('PASSABLE','DIRECTION_LIMITED'):
-                  issues.append(out)
-              return out
-          for mid,m in sorted(maps.items(),key=lambda t:int(t[0])):
-              pack[mid]={'mapId':int(mid),'mapName':m['mapName'],'width':m['width'],'height':m['height'],
-                'terrainPng':m['terrainPng'],'collisionFile':m['collisionFile'],'events':[]}
-          for e in events:
-              entry={k:e[k] for k in ('mapId','eventId','monsterName','evidence','arenaOrSpecial')}
-              entry['initial']=add(e,'INITIAL_EVENT',e['initialX'],e['initialY'])
-              entry['setupRelocations']=[];entry['selfSwitchARelocations']=[]
-              entry['conditionPagesWithoutRelocation']=[]
-              for page in e['pages']:
-                  if page['conditions'].get('selfSwitch')=='A' and not page['relocations']:
-                      entry['conditionPagesWithoutRelocation'].append(page['index'])
-                      counts['selfSwitchAPagesWithoutRelocation']+=1
-                  for p in page['relocations']:
-                      item=add(e,p['role'],p['x'],p['y'],page)
-                      key='selfSwitchARelocations' if p['role']=='SELF_SWITCH_A_RELOCATION' else 'setupRelocations'
-                      entry[key].append(item)
-              pack[str(e['mapId'])]['events'].append(entry)
-          assert len(events)==500 and len(rows)==1708
-          counts['selfSwitchAPages']=sum(p['conditions'].get('selfSwitch')=='A' for e in events for p in e['pages'])
-          counts['selfSwitchAPagesWithRelocation']=sum(p['conditions'].get('selfSwitch')=='A' and bool(p['relocations']) for e in events for p in e['pages'])
-          counts['eventsWithoutSelfSwitchAPage']=sum(not any(p['conditions'].get('selfSwitch')=='A' for p in e['pages']) for e in events)
-          assert counts['selfSwitchAPages']==484 and counts['selfSwitchAPagesWithRelocation']==401
-          assert counts['INITIAL_EVENT']==500
-          assert counts['SCRIPTED_SETUP_RELOCATION']==109
-          assert counts['SELF_SWITCH_A_RELOCATION']==1099
-          assert counts['collision_BLOCKED']==v52['points_BLOCKED']==35
-          assert counts['collision_UNKNOWN_TILE']==v52['points_UNKNOWN_TILE']==2
-          assert len(issues)==37
-          data={'version':'V5.3','source':'SLKnight/RPG Maker native game events','notSanctuaryS32Coordinates':True,
-            'staticCollisionOnly':True,'realSpawnTimersVerified':False,'deathSwitchAIsInferredNotVerified':True,
-            'actualWarpDestinationsIncluded':False,'maps':pack}
-          (root/'spawn-integration-v5.3.json').write_text(json.dumps(data,ensure_ascii=False,separators=(',',':')))
-          (root/'spawn-summary-v5.3.json').write_text(json.dumps({'version':'V5.3','events':len(events),'positions':len(rows),'counts':dict(counts),'unresolvedPositions':len(issues),
-            'interpretation':'Self-switch A page relocation is a possible post-death relocation, not a proven live spawn.'},ensure_ascii=False,indent=2))
-          cols=['mapId','mapName','eventId','monsterName','evidence','arenaOrSpecial','role','x','y','pageIndex','pageTrigger','pageConditions','branchSelectionUnverified','collision','collisionMask','actualSpawnVerified']
-          def writecsv(path,items):
-              with (root/path).open('w',encoding='utf-8-sig',newline='') as f:
-                  w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
-                  for r in items:
-                      val=r.copy();val['pageConditions']=json.dumps(val['pageConditions'],ensure_ascii=False,separators=(',',':'))
-                      w.writerow(val)
-          writecsv('spawn-candidates-v5.3.csv',rows)
-          writecsv('spawn-review-v5.3.csv',issues)
-          print('V5.3 CLASSIFIED',json.dumps(dict(counts),ensure_ascii=False))
-          PY_V53
-          python3 /tmp/spawn-v5.3.py
-          test -s reports/spawn-integration-v5.3.json
-          test -s reports/spawn-candidates-v5.3.csv
-          test -s reports/spawn-review-v5.3.csv
+          d=json.loads((root/'lifecycle-evidence-v5.4.json').read_text())
+          source=json.loads((root/'spawn-integration-v5.3.json').read_text())
+          targets=ast.literal_eval((root/'v54-targets.txt').read_text().replace('=>',':').replace('nil','None'))
+          by={(e['mapId'],e['eventId']):e for e in d['events']}
+          original={(e['mapId'],e['eventId']):e for m in source['maps'].values() for e in m['events']}
+          assert len(by)==len(original)==500
+          counts=collections.Counter()
+          rows=[];boss=[]
+          for event in d['events']:
+              key=(event['mapId'],event['eventId'])
+              a=event['selfSwitchAPages']; wait=[];turnoff=[];moves=[]
+              for p in a:
+                  for c in p['commands']:
+                      if c['code']==106:wait.append({'page':p['index'],'index':c['index'],'waitUnits':c['params'][0],'nominalSeconds':c['params'][0]*2/50})
+                      if c['code']==123 and c['params']==['A',1]:turnoff.append([p['index'],c['index']])
+                      if c['code']==202 and len(c['params'])>=4 and c['params'][:2]==[0,0]:
+                          moves.append([p['index'],c['index'],c['params'][2],c['params'][3]])
+              counts['events']+=1
+              counts['A_pages']+=len(a)
+              counts['A_pages_with_wait']+=sum(any(c['code']==106 for c in p['commands']) for p in a)
+              counts['A_pages_with_reset']+=sum(any(c['code']==123 and c['params']==['A',1] for c in p['commands']) for p in a)
+              counts['wait_commands']+=len(wait)
+              counts['A_off_writes']+=len(turnoff)
+              counts['A_on_writes']+=sum(z['on'] for z in event['selfSwitchAWrites'])
+              counts['boss_marker_events']+=bool(event['bossDefeatedMarkers'])
+              runtime=original[key]
+              roles=len(runtime['setupRelocations'])+len(runtime['selfSwitchARelocations'])+1
+              counts['coordinate_rows']+=roles
+              rows.append({'mapId':key[0],'eventId':key[1],'monsterName':event['monsterName'],
+                'initialX':event['initial'][0],'initialY':event['initial'][1],
+                'selfSwitchAPages':len(a),'AWaitUnits':';'.join(str(x['waitUnits']) for x in wait),
+                'AWaitNominalSeconds':';'.join(str(x['nominalSeconds']) for x in wait),
+                'selfSwitchAOnWrites':sum(z['on'] for z in event['selfSwitchAWrites']),
+                'selfSwitchAOffWrites':len(turnoff),'selfAPageMoveOperations':len(moves),
+                'bossOverride':key[0] in targets and key[1] in targets[key[0]],
+                'respawnConditionVerified':False})
+              event['waitEvidence']=wait
+              event['selfSwitchAOffEvidence']=turnoff
+              event['pageRelocationsWithCommandIndex']=moves
+          for mid,entries in targets.items():
+              for eid,(sw,switch_id,condition_b,coords) in entries.items():
+                  key=(mid,eid)
+                  assert key in by,('Boss event missing',key)
+                  assert by[key]['bossDefeatedMarkers'],('Boss defeated marker missing',key)
+                  assert sw in ('A','B') and isinstance(coords,list)
+                  boss.append({'mapId':mid,'eventId':eid,'monsterName':by[key]['monsterName'],
+                    'defeatedSwitch':sw,'globalSwitchRestore':switch_id,'useSelfSwitchB':bool(condition_b),
+                    'placementCandidates':coords,'placementMethod':'rand(positions.length)' if coords else 'no forced coordinate',
+                    'respawnTrigger':'map entry or map update after defeated marker set','timingSecondsVerified':False})
+          assert len(boss)==35 and counts['boss_marker_events']==35
+          assert counts['events']==500 and counts['coordinate_rows']==1708
+          out={'version':'V5.4','source':'V229R9 native event commands + V230 boss respawn script','frameRate':50,
+           'interpreterWaitFramesPerUnit':2,'nominalWaitSecondsFormula':'waitUnits * 2 / 50',
+           'waitsAreConditional':True,'bossOverrideCount':len(boss),
+           'normalMonsterRespawnTimingFullyVerified':False,
+           'separateSanctuaryS32CoordinateSpace':True,
+           'allSpawnPositionsAreCandidates':True,
+           'counts':dict(counts)}
+          (root/'spawn-runtime-summary-v5.4.json').write_text(json.dumps(out,ensure_ascii=False,indent=2))
+          (root/'boss-spawn-overrides-v5.4.json').write_text(json.dumps({'version':'V5.4','sourceScript':'Scripts.rxdata[134]','bosses':boss,'timersVerified':False},ensure_ascii=False,indent=2))
+          (root/'lifecycle-evidence-v5.4.json').write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')))
+          with (root/'spawn-runtime-evidence-v5.4.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+          (root/'v54-targets.txt').unlink()
+          print('V5.4 SUCCESS',json.dumps(out,ensure_ascii=False))
+          PY_V54
+          python3 -m py_compile /tmp/spawn-v5.4.py
+          python3 /tmp/spawn-v5.4.py
+          test -s reports/spawn-runtime-summary-v5.4.json
+          test -s reports/boss-spawn-overrides-v5.4.json
+          test -s reports/spawn-runtime-evidence-v5.4.csv
+          test -s reports/lifecycle-evidence-v5.4.json
 
-      - name: V5.3 Upload 44-map classified spawn package
+      - name: V5.4 Upload 44-map spawn lifecycle evidence
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V5.3-Classified-Monster-Spawns
+          name: Sanctuary-Map-V5.4-Spawn-Lifecycle-and-Boss-Overrides
           path: reports/
           if-no-files-found: error
           retention-days: 30
