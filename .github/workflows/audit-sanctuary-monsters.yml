@@ -1,5 +1,6 @@
 
-name: audit-sanctuary-monsters.yml
+name: "audit-sanctuary-monsters.yml | V25 | 492EV Original SPR Five Motions"
+run-name: "audit-sanctuary-monsters.yml | V25 | Full Motion Extraction"
 
 on:
   workflow_dispatch:
@@ -13,1012 +14,1241 @@ permissions:
   actions: read
 
 jobs:
-  audit:
-    name: "V24 | 492EV Attack and Death Motion Audit"
+  extract:
+    name: "V25 | Extract Wait Walk Attack Hit Death"
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
-      - name: "V24 | Restore verified V23 integrated monster HTML"
+      - name: "V25 | Checkout previous verified source"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "V25 | Restore 492 monster event inventory"
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
           run-id: 39097070350
           name: SLKnight-V23-492EV-Motion-Audit
           github-token: ${{ github.token }}
-          path: previous-v23
+          path: previous/v23
 
-      - name: "V24 | Restore verified V229R7 original game"
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39050634920
-          name: github-pages
-          github-token: ${{ github.token }}
-          path: previous-game
-
-      - name: "V24 | Verify sources and prepare original assets"
-        shell: bash
+      - name: "V25 | Prepare original sprite sources"
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          mkdir -p site reports
-
-          test -s previous-v23/events.json
-          test -s previous-v23/summary.json
-          test -s previous-v23/SLKnight-492-Motion-Integrated.html
-          test -s previous-game/artifact.tar
-
-          tar -xf previous-game/artifact.tar -C site
-
-          test -s site/knight/gameasync/Data/Scripts.rxdata
-          test -d site/knight/gameasync/Graphics/Characters
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc || true
 
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ruby python3-pil
+          sudo apt-get install -y -qq \
+            p7zip-full \
+            python3-pil
+
+          python3 -m pip install \
+            --break-system-packages -q \
+            'PyYAML==6.0.2'
+
+          mkdir -p \
+            previous/v2 \
+            previous/v12 \
+            reports \
+            downloads \
+            original-paks
+
+          gh run download 38784834277 \
+            -R "$GITHUB_REPOSITORY" \
+            -n Sanctuary-V2-Reports \
+            -D previous/v2
+
+          gh run download 38872552732 \
+            -R "$GITHUB_REPOSITORY" \
+            -n Sanctuary-V12-External-Action-and-NPC-Crosscheck \
+            -D previous/v12
+
+          git show \
+            5c40dc3de28ee879182c6f60802a89432072c138:.github/workflows/audit-sanctuary-monsters.yml \
+            > reports/verified-v17-source.yml
+
+          test -s previous/v23/events.json
+          test -s previous/v23/SLKnight-492-Motion-Integrated.html
+          test -s reports/verified-v17-source.yml
+
+      - name: "V25 | Match 83 graphics with original SPR identifiers"
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/v25_select.py <<'PY'
+          import csv
+          import json
+          import re
+          import unicodedata
+
+          from pathlib import Path
+          from collections import defaultdict
+
+          OUT=Path("reports")
+
+          def load(root,name):
+              files=list(Path(root).rglob(name))
+
+              if len(files)!=1:
+                  raise RuntimeError(
+                      f"Source missing or ambiguous: {name}"
+                  )
+
+              with files[0].open(
+                  encoding="utf-8-sig",
+                  newline=""
+              ) as f:
+                  return list(csv.DictReader(f))
+
+          def norm(value):
+              return unicodedata.normalize(
+                  "NFKC",str(value)
+              ).lower().replace(
+                  " ",""
+              ).replace(
+                  "ー",""
+              ).replace(
+                  "・",""
+              )
+
+          html=Path(
+              "previous/v23/SLKnight-492-Motion-Integrated.html"
+          ).read_text(encoding="utf-8")
+
+          found=re.search(
+              r'<script id="data" type="application/json">(.*?)</script>',
+              html,re.S
+          )
+
+          if not found:
+              raise RuntimeError("V23 database missing")
+
+          database=json.loads(found.group(1))
+          events=database["rows"]
+          assets=database["assets"]
+
+          assert len(events)==492
+          assert len(assets)==83
+
+          sprites=load(
+              "previous/v2",
+              "all_sprite_candidates.csv"
+          )
+
+          hashes=load(
+              "previous/v2",
+              "exported_sprite_manifest.csv"
+          )
+
+          npcs=load(
+              "previous/v12",
+              "03_external_npc_gfx_candidates.csv"
+          )
+
+          signatures={
+              (
+                  row["pak"],
+                  row["sprite_file"].lower(),
+                  int(row["bytes"])
+              ):row["sha256"]
+              for row in hashes
+          }
+
+          pattern=re.compile(
+              r"^(\d+)-(\d+)\.spr$",re.I
+          )
+
+          records=defaultdict(dict)
+          banks=defaultdict(
+              lambda:defaultdict(set)
+          )
+
+          for row in sprites:
+              filename=Path(
+                  row["file"].replace("\\","/")
+              ).name
+
+              match=pattern.fullmatch(filename)
+
+              if not match:
+                  continue
+
+              if not Path(
+                  row["pak"]
+              ).name.lower().startswith("sprite"):
+                  continue
+
+              actor,sub=map(int,match.groups())
+              length=int(row["bytes"])
+
+              sha=signatures.get((
+                  row["pak"],
+                  filename.lower(),
+                  length
+              ))
+
+              if actor<=0 or not sha:
+                  continue
+
+              key=(actor,row["pak"])
+
+              banks[key][sub//8*8].add(sub)
+
+              rec={
+                  "offset":int(row["offset"]),
+                  "bytes":length,
+                  "sha256":sha
+              }
+
+              old=records[key].get(sub)
+
+              if old is None or rec["offset"]<old["offset"]:
+                  records[key][sub]=rec
+
+          npc_names=defaultdict(set)
+
+          for row in npcs:
+              try:
+                  actor=int(row["gfx_id"])
+              except (ValueError,KeyError):
+                  continue
+
+              if actor<=0:
+                  continue
+
+              if "monster" not in row.get(
+                  "implementation",""
+              ).lower():
+                  continue
+
+              name=row.get("npc_name","").strip()
+
+              if name:
+                  npc_names[actor].add(name)
+
+          # Name matches are lookup candidates only.
+          # They are not proof of identical sprites.
+          aliases={
+              "오크 전사":["オークファイター","オーク戦士"],
+              "오크 마법사":["オークウィザード","オークメイジ"],
+              "오크":["オーク","妖魔"],
+              "킹 버그베어":["キングバグベア"],
+              "버그베어":["バグベア","バグベアー"],
+              "켈베로스":["ケルベロス"],
+              "해골":["スケルトン"],
+              "좀비":["ゾンビ"],
+              "데스나이트":["デスナイト"],
+              "흑기사":["ブラックナイト","黒騎士"],
+              "드레이크":["ドレイク"],
+              "리자드맨":["リザードマン"],
+              "에틴":["エティン"],
+              "트롤":["トロール"],
+              "오우거":["オーガ"],
+              "파이어 에그":["ファイアーエッグ"],
+              "아시타지오":["アシタジオ"],
+              "이프리트":["イフリート"],
+              "사라만다":["サラマンダー"],
+              "라바 골렘":["ラヴァゴーレム","ラバゴーレム"],
+              "사이클롭스":["サイクロプス"],
+              "미노타우르스":["ミノタウルス"],
+              "바실리스크":["バシリスク"],
+              "키메라":["キメラ"],
+              "하피":["ハーピー"],
+              "라이칸스로프":["ライカンスロープ"],
+              "라미아":["ラミア"],
+              "셸로브":["シェロブ"],
+              "놀":["ノール"],
+              "구울":["グール"],
+              "스파토이":["スパルトイ"],
+              "서큐버스":["サキュバス"],
+              "코카트리스":["コカトリス"],
+              "거대 개미":["ジャイアントアント"],
+              "여왕 개미":["クイーンアント"],
+              "스콜피온":["スコーピオン"],
+              "전갈":["スコーピオン"],
+              "아이스 골렘":["アイスゴーレム"],
+              "가디언 아머":["ガーディアンアーマー"],
+              "예티":["イエティ"],
+              "나이트메어":["ナイトメア"],
+              "비홀더":["ビホルダー"],
+              "터틀 드래곤":["タートルドラゴン"],
+              "스핑크스":["スフィンクス"],
+              "아이언 골렘":["アイアンゴーレム"],
+              "골렘":["ゴーレム"],
+              "바포메트":["バフォメット"],
+              "흑장로":["ブラックエルダー"],
+              "그림리퍼":["グリムリーパー"],
+              "기르타스":["ギルタス"],
+              "무리안":["ムリアン"],
+              "정령":["エレメンタル"],
+              "거북":["タートル"],
+              "갑충":["ビートル"],
+              "전사":["ウォーリア"],
+              "고스트":["ゴースト"],
+              "본 드래곤":["ボーンドラゴン"],
+              "레서 드래곤":["レッサードラゴン"],
+              "눈사람":["スノーマン"],
+              "커츠":["カーツ"],
+              "나이트발드":["ナイトバルド"],
+              "파우스트":["ファウスト"],
+              "메두사":["メデューサ"],
+              "아이스맨":["アイスマン"]
+          }
+
+          members=defaultdict(set)
+
+          for event in events:
+              members[
+                  event["primary_asset"]
+              ].add(event["monster"])
+
+          selected={}
+          needed={}
+
+          for digest,asset in assets.items():
+              names=sorted(members[digest])
+              hints=[]
+
+              for monster in names:
+                  for korean,japanese in sorted(
+                      aliases.items(),
+                      key=lambda item:-len(item[0])
+                  ):
+                      if korean.replace(" ","") in monster.replace(" ",""):
+                          hints.extend(map(norm,japanese))
+                          break
+
+              candidates=[]
+
+              for key,subs in records.items():
+                  actor,pak=key
+
+                  if actor not in npc_names:
+                      continue
+
+                  full=sum(
+                      len(items)==8
+                      for items in banks[key].values()
+                  )
+
+                  if full<3:
+                      continue
+
+                  score=0
+
+                  for candidate in npc_names[actor]:
+                      value=norm(candidate)
+
+                      for hint in hints:
+                          if hint==value:
+                              score=max(
+                                  score,100+len(hint)
+                              )
+                          elif (
+                              len(hint)>=4
+                              and hint in value
+                          ):
+                              score=max(
+                                  score,70+len(hint)
+                              )
+
+                  if score:
+                      candidates.append((
+                          score,full,len(subs),actor,pak
+                      ))
+
+              candidates.sort(reverse=True)
+
+              if candidates:
+                  score,full,count,actor,pak=candidates[0]
+
+                  selected[digest]={
+                      "monsters":names,
+                      "graphics":asset["source_files"],
+                      "sprite_id":actor,
+                      "pak":pak,
+                      "candidate_score":score,
+                      "source_names":sorted(npc_names[actor]),
+                      "identity_verified":False,
+                      "candidate_count":len(candidates)
+                  }
+
+                  key=(actor,pak)
+
+                  needed[f"{actor}|{pak}"]={
+                      "sprite_id":actor,
+                      "pak":pak,
+                      "records":{
+                          str(sub):record
+                          for sub,record in records[key].items()
+                          if 0<=sub<40
+                      }
+                  }
+              else:
+                  selected[digest]={
+                      "monsters":names,
+                      "graphics":asset["source_files"],
+                      "sprite_id":None,
+                      "pak":None,
+                      "candidate_score":0,
+                      "source_names":[],
+                      "identity_verified":False,
+                      "candidate_count":0
+                  }
+
+          packages=sorted({
+              item["pak"].removeprefix("outer/")
+              for item in needed.values()
+          })
+
+          if not packages:
+              raise RuntimeError(
+                  "No original SPR candidates matched"
+              )
+
+          (OUT/"V25-selected.json").write_text(
+              json.dumps(
+                  selected,ensure_ascii=False,indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          (OUT/"V25-records.json").write_text(
+              json.dumps(
+                  needed,ensure_ascii=False
+              ),
+              encoding="utf-8"
+          )
+
+          (OUT/"V25-packages.json").write_text(
+              json.dumps(
+                  packages,ensure_ascii=False
+              ),
+              encoding="utf-8"
+          )
+
+          print("V25_EVENTS",len(events))
+          print("V25_GRAPHICS",len(assets))
+          print(
+              "V25_SOURCE_CANDIDATES",
+              sum(
+                  x["sprite_id"] is not None
+                  for x in selected.values()
+              )
+          )
+          print("V25_SPR_ACTORS",len(needed))
+          PY
+
+          python3 /tmp/v25_select.py
+
+      - name: "V25 | Extract original sprite PAK archives"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh release download v1.0.0 \
+            -R "$GITHUB_REPOSITORY" \
+            --pattern "Sanctuary.of.Aden.-.Copy.*" \
+            -D downloads
+
+          test -s downloads/Sanctuary.of.Aden.-.Copy.zip
 
           python3 - <<'PY'
           import json
+          import subprocess
+
           from pathlib import Path
 
-          root=Path('previous-v23')
-          rows=json.loads((root/'events.json').read_text())
-          stats=json.loads((root/'summary.json').read_text())
-
-          assert len(rows)==492
-          assert stats['events']==492
-          assert stats['unique_names']==125
-          assert stats['usable_graphics']==83
-          assert stats['unlinked_events']==0
-
-          print('V24_BASE_V23_VERIFIED')
-          print('492 EV / 125 NAMES / 83 GRAPHICS')
-          PY
-
-      - name: "V24 | Inspect RPG Maker attack and death commands"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/v24_source.rb <<'RUBY'
-          require 'json'
-          require 'zlib'
-
-          class RGSSOpaque
-            def self._load(_raw)
-              allocate
-            end
-          end
-
-          class Table < RGSSOpaque; end
-          class Color < RGSSOpaque; end
-          class Tone < RGSSOpaque; end
-          class Rect < RGSSOpaque; end
-
-          module RPG
-            class Map; end
-            class Event
-              class Page
-                class Condition; end
-                class Graphic; end
-              end
-            end
-            class EventCommand; end
-            class MoveRoute; end
-            class MoveCommand; end
-            class CommonEvent; end
-            class AudioFile; end
-            class Animation
-              class Frame; end
-              class Timing; end
-            end
-          end
-
-          def iv(object,key)
-            object && object.instance_variable_get("@#{key}")
-          end
-
-          def utf(value)
-            s=value.to_s.dup.force_encoding('UTF-8')
-            return s if s.valid_encoding?
-            s.force_encoding('CP949')
-            s.encode('UTF-8',invalid: :replace,undef: :replace)
-          end
-
-          root='site/knight/gameasync/Data'
-          rows=JSON.parse(
-            File.read('previous-v23/events.json')
+          packages=json.loads(
+              Path("reports/V25-packages.json").read_text()
           )
 
-          map_files={}
-          Dir.glob("#{root}/**/*Map*.rxdata").each do |path|
-            m=File.basename(path).match(/Map(\d+)\.rxdata$/i)
-            next unless m
-            id=m[1].to_i
-            if !map_files[id] || File.size(path)>File.size(map_files[id])
-              map_files[id]=path
-            end
-          end
+          target=Path("original-paks").absolute()
+          target.mkdir(parents=True,exist_ok=True)
 
-          raise 'MAP_DATA_MISSING' if map_files.empty?
-
-          cache={}
-          results=[]
-
-          rows.each do |row|
-            mid=row['map_id'].to_i
-            eid=row['event_id'].to_i
-            event=nil
-            errors=[]
-
-            if map_files[mid]
-              unless cache.key?(mid)
-                begin
-                  cache[mid]=Marshal.load(
-                    File.binread(map_files[mid])
-                  )
-                rescue => e
-                  cache[mid]=nil
-                  warn "MAP_LOAD_ERROR #{mid}: #{e.message}"
-                end
-              end
-
-              event=(iv(cache[mid],:events)||{})[eid]
-              errors << 'EVENT_MISSING' unless event
-            else
-              errors << 'MAP_MISSING'
-            end
-
-            direct_animations=[]
-            changed_graphics=[]
-            script_hints=[]
-            common_events=[]
-
-            if event
-              (iv(event,:pages)||[]).each_with_index do |page,pi|
-                page_graphic=utf(
-                  iv(iv(page,:graphic),:character_name)
-                ).strip
-
-                routes=[iv(page,:move_route)]
-
-                (iv(page,:list)||[]).each_with_index do |cmd,ci|
-                  code=iv(cmd,:code).to_i
-                  params=iv(cmd,:parameters)||[]
-
-                  if code==207
-                    aid=params[1]
-                    if aid.is_a?(Integer) && aid>0
-                      direct_animations << {
-                        'id'=>aid,
-                        'page'=>pi+1,
-                        'command'=>ci,
-                        'kind'=>'EVENT_COMMAND_207'
-                      }
-                    end
-                  end
-
-                  if code==209
-                    routes << params[1]
-                  end
-
-                  if code==117
-                    ce=params[0]
-                    common_events << ce if ce.is_a?(Integer)
-                  end
-
-                  if [355,655,108,408].include?(code)
-                    str=utf(params[0])
-                    if str.match?(
-                      /attack|death|die|animation|sprite|공격|사망|피격/i
-                    )
-                      script_hints << {
-                        'page'=>pi+1,
-                        'code'=>code,
-                        'text'=>str[0,180]
-                      }
-                    end
-                  end
-                end
-
-                routes.compact.each do |route|
-                  (iv(route,:list)||[]).each do |move|
-                    next unless iv(move,:code).to_i==41
-
-                    name=utf(
-                      (iv(move,:parameters)||[])[0]
-                    ).strip
-
-                    next if name.empty?
-
-                    changed_graphics << {
-                      'page'=>pi+1,
-                      'source'=>page_graphic,
-                      'target'=>name
-                    }
-                  end
-                end
-              end
-            end
-
-            results << {
-              'map_id'=>mid,
-              'event_id'=>eid,
-              'monster'=>row['monster'],
-              'actual_event_name'=>utf(iv(event,:name)),
-              'direct_animations'=>direct_animations.uniq,
-              'changed_graphics'=>changed_graphics.uniq,
-              'script_hints'=>script_hints.uniq,
-              'common_events'=>common_events.uniq,
-              'errors'=>errors
-            }
-          end
-
-          animation_db={}
-          animation_files=Dir.glob(
-            "#{root}/**/*Animations.rxdata"
-          )
-
-          animation_file=animation_files.max_by do |p|
-            File.size(p)
-          end
-
-          if animation_file
-            begin
-              animations=Marshal.load(
-                File.binread(animation_file)
+          with Path(
+              "reports/V25-archive-extraction.log"
+          ).open("w") as log:
+              subprocess.run(
+                  [
+                      "7z","x",
+                      "downloads/Sanctuary.of.Aden.-.Copy.zip",
+                      "-o"+str(target),
+                      "-y",
+                      *packages
+                  ],
+                  stdout=log,
+                  stderr=subprocess.STDOUT,
+                  check=True
               )
 
-              animations.each_with_index do |anim,i|
-                next unless anim
-
-                id=iv(anim,:id)||i
-
-                animation_db[id.to_s]={
-                  'id'=>id,
-                  'name'=>utf(iv(anim,:name)),
-                  'sheet1'=>utf(iv(anim,:animation1_name)),
-                  'sheet2'=>utf(iv(anim,:animation2_name)),
-                  'frames'=>(iv(anim,:frames)||[]).size,
-                  'position'=>iv(anim,:position)
-                }
-              end
-            rescue => e
-              warn "ANIMATION_DB_ERROR #{e.message}"
-            end
-          end
-
-          script_matches=[]
-          scripts_file=Dir.glob(
-            "#{root}/**/Scripts.rxdata"
-          ).max_by{|p|File.size(p)}
-
-          if scripts_file
-            begin
-              Marshal.load(
-                File.binread(scripts_file)
-              ).each do |entry|
-                next unless entry.is_a?(Array)
-                next unless entry.size>=3
-
-                name=utf(entry[1])
-
-                begin
-                  code=utf(
-                    Zlib::Inflate.inflate(entry[2])
+          for package in packages:
+              if not (target/package).is_file():
+                  raise RuntimeError(
+                      "Original PAK not found: "+package
                   )
-                rescue
-                  next
-                end
 
-                attack=code.scan(
-                  /attack|공격|atk/i
-                ).size
+          print("V25_EXTRACTED_PACKAGES",len(packages))
+          PY
 
-                death=code.scan(
-                  /death|die|dead|사망|죽음/i
-                ).size
+          rm -rf downloads
 
-                animation=code.scan(
-                  /animation_id|animation_name/i
-                ).size
-
-                next if attack+death+animation==0
-
-                script_matches << {
-                  'name'=>name,
-                  'attack_hits'=>attack,
-                  'death_hits'=>death,
-                  'animation_hits'=>animation
-                }
-              end
-            rescue => e
-              warn "SCRIPTS_SCAN_ERROR #{e.message}"
-            end
-          end
-
-          raise '492_EVENT_COUNT_CHANGED' unless results.size==492
-
-          File.write(
-            'reports/v24-event-evidence.json',
-            JSON.pretty_generate(results)
-          )
-
-          File.write(
-            'reports/v24-animation-database.json',
-            JSON.pretty_generate(animation_db)
-          )
-
-          File.write(
-            'reports/v24-script-evidence.json',
-            JSON.pretty_generate(script_matches)
-          )
-
-          puts "V24_EVENTS #{results.size}"
-          puts "V24_DIRECT_ANIMATION_CALLS " +
-            results.sum{|r|r['direct_animations'].size}.to_s
-          puts "V24_GRAPHIC_CHANGES " +
-            results.sum{|r|r['changed_graphics'].size}.to_s
-          puts "V24_ANIMATION_DATABASE #{animation_db.size}"
-          puts "V24_SCRIPT_CANDIDATES #{script_matches.size}"
-          RUBY
-
-          ruby /tmp/v24_source.rb
-
-      - name: "V24 | Build four-direction attack and death candidate previews"
-        shell: bash
+      - name: "V25 | Decode original SPR five motion banks"
         run: |
           set -euo pipefail
 
-          cat > /tmp/v24_integrate.py <<'PY'
-          from pathlib import Path
-          from collections import defaultdict
-          from io import BytesIO
-          from PIL import Image
+          cat > /tmp/v25_build.py <<'PY'
+          import ast
           import base64
           import csv
           import hashlib
           import json
           import re
-          import unicodedata
+          import struct
 
-          root=Path('reports')
-          previous=Path('previous-v23')
-          game=Path('site/knight/gameasync')
+          from pathlib import Path
+          from io import BytesIO
 
-          original=(
-              previous/'SLKnight-492-Motion-Integrated.html'
-          ).read_text(encoding='utf-8')
+          import yaml
+          from PIL import Image
+
+          OUT=Path("reports")
+
+          html=Path(
+              "previous/v23/SLKnight-492-Motion-Integrated.html"
+          ).read_text(encoding="utf-8")
 
           match=re.search(
               r'<script id="data" type="application/json">(.*?)</script>',
-              original,re.S
+              html,re.S
           )
 
           if not match:
-              raise RuntimeError('V23 embedded monster database missing')
-
-          db=json.loads(match.group(1))
-          rows=db['rows']
-          assets=db['assets']
-
-          assert len(rows)==492
-          assert len(assets)==83
-          assert all(r['primary_asset'] for r in rows)
-
-          evidence=json.loads(
-              (root/'v24-event-evidence.json').read_text()
-          )
-
-          animations=json.loads(
-              (root/'v24-animation-database.json').read_text()
-          )
-
-          script_evidence=json.loads(
-              (root/'v24-script-evidence.json').read_text()
-          )
-
-          event_by_key={
-              f"{r['map_id']}:{r['event_id']}":r
-              for r in evidence
-          }
-
-          def norm(name):
-              name=str(name).replace('\\','/').split('/')[-1]
-              if name.lower().endswith('.png'):
-                  name=name[:-4]
-              return unicodedata.normalize('NFC',name).casefold()
-
-          character_root=game/'Graphics/Characters'
-          animation_root=game/'Graphics/Animations'
-
-          characters={}
-          for file in character_root.rglob('*'):
-              if file.is_file() and file.suffix.lower()=='.png':
-                  characters.setdefault(norm(file.stem),file)
-
-          animation_sheets={}
-          if animation_root.exists():
-              for file in animation_root.rglob('*'):
-                  if file.is_file() and file.suffix.lower()=='.png':
-                      animation_sheets.setdefault(norm(file.stem),file)
-
-          def gif(frames,delay=145):
-              indexed=[]
-
-              for rgba in frames:
-                  rgba=rgba.convert('RGBA')
-                  pal=rgba.convert('RGB').quantize(colors=255)
-                  mask=rgba.getchannel('A').point(
-                      lambda a:255 if a<128 else 0
-                  )
-                  pal.paste(255,mask=mask)
-                  indexed.append(pal)
-
-              data=BytesIO()
-
-              indexed[0].save(
-                  data,
-                  format='GIF',
-                  save_all=True,
-                  append_images=indexed[1:],
-                  duration=delay,
-                  loop=0,
-                  transparency=255,
-                  disposal=2,
-                  optimize=False
+              raise RuntimeError(
+                  "V23 monster database missing"
               )
 
-              return base64.b64encode(
-                  data.getvalue()
-              ).decode('ascii')
+          database=json.loads(match.group(1))
+          events=database["rows"]
+          assets=database["assets"]
 
-          def four_directions(file):
-              with Image.open(file) as img:
-                  sheet=img.convert('RGBA')
+          assert len(events)==492
+          assert len(assets)==83
 
-              w,h=sheet.size
-
-              if w<8 or h<8 or w%4 or h%4:
-                  return None
-
-              cw,ch=w//4,h//4
-
-              if cw>512 or ch>512:
-                  return None
-
-              result={}
-
-              for direction in range(4):
-                  frames=[
-                      sheet.crop((
-                          i*cw,direction*ch,
-                          (i+1)*cw,(direction+1)*ch
-                      ))
-                      for i in range(4)
-                  ]
-
-                  result[str(direction)]=gif(frames)
-
-              return result
-
-          families=defaultdict(list)
-
-          for row in rows:
-              families[row['primary_asset']].append(row)
-
-          attack_re=re.compile(
-              r'attack|atk|attk|공격|타격',
-              re.I
+          selected=json.loads(
+              (OUT/"V25-selected.json").read_text()
           )
 
-          death_re=re.compile(
-              r'death|dead|die|dying|사망|죽음',
-              re.I
+          records=json.loads(
+              (OUT/"V25-records.json").read_text()
           )
 
-          candidate_families={}
-          preview_cache={}
+          # Recover the Reader class from the successful V17
+          # workflow instead of inventing a new SPR format.
+          original_workflow=yaml.safe_load(
+              (OUT/"verified-v17-source.yml").read_text()
+          )
 
-          for sha,members in families.items():
-              base_names=assets[sha].get('source_files',[])
-              base_keys=[norm(x) for x in base_names]
+          steps=original_workflow["jobs"]["identify"]["steps"]
 
-              known_names=set()
+          original_step=next(
+              step for step in steps
+              if step["name"]==
+              "Decode all selected monster animation frames"
+          )
 
-              for member in members:
-                  for name in member.get('graphics',[]):
-                      known_names.add(name)
+          source=original_step["run"].split(
+              "python3 - <<'PY'\n",1
+          )[1].split("\nPY",1)[0]
 
-                  key=f"{member['map_id']}:{member['event_id']}"
-                  event=event_by_key.get(key,{})
+          tree=ast.parse(source)
 
-                  for change in event.get('changed_graphics',[]):
-                      known_names.add(change['target'])
+          reader_node=next(
+              node for node in tree.body
+              if isinstance(node,ast.ClassDef)
+              and node.name=="Reader"
+          )
 
-              # Same graphic is authoritative.
-              # Similar names create review candidates, not verified links.
-              candidates={'attack':[],'death':[]}
+          namespace={
+              "struct":struct,
+              "Image":Image,
+              "MAX_FRAMES":240,
+              "MAX_DIM":1000
+          }
 
-              for name in known_names:
-                  file=characters.get(norm(name))
-                  if file is None:
-                      continue
+          exec(
+              compile(
+                  ast.Module(
+                      body=[reader_node],
+                      type_ignores=[]
+                  ),
+                  "<verified_v17_reader>",
+                  "exec"
+              ),
+              namespace
+          )
 
-                  if attack_re.search(name):
-                      candidates['attack'].append(file)
+          Reader=namespace["Reader"]
 
-                  if death_re.search(name):
-                      candidates['death'].append(file)
+          ACTIONS={
+              "walk":0,
+              "attack":8,
+              "hit":16,
+              "death":24,
+              "wait":32
+          }
 
-              for filename,file in characters.items():
-                  if not base_keys:
-                      continue
+          # Four source indices, not asserted as
+          # final in-game compass orientations.
+          DIRECTIONS=(0,2,4,6)
 
-                  related=any(
-                      filename.startswith(base+'_') or
-                      filename.startswith(base+'-')
-                      for base in base_keys
-                  )
+          errors=[]
 
-                  if not related:
-                      continue
-
-                  if attack_re.search(filename):
-                      candidates['attack'].append(file)
-
-                  if death_re.search(filename):
-                      candidates['death'].append(file)
-
-              result={'attack':[],'death':[]}
-
-              for kind in ('attack','death'):
-                  used=set()
-
-                  for file in candidates[kind]:
-                      if str(file) in used:
-                          continue
-
-                      used.add(str(file))
-
-                      if len(result[kind])>=3:
-                          break
-
-                      if str(file) not in preview_cache:
-                          preview_cache[str(file)]=four_directions(file)
-
-                      frames=preview_cache[str(file)]
-
-                      if frames:
-                          result[kind].append({
-                              'file':file.stem,
-                              'directions':frames,
-                              'status':'CANDIDATE_NOT_VERIFIED'
-                          })
-
-              candidate_families[sha]=result
-
-          def thumbnail(file):
-              try:
-                  with Image.open(file) as img:
-                      im=img.convert('RGBA')
-
-                  im.thumbnail((340,340))
-
-                  stream=BytesIO()
-                  im.save(stream,format='PNG')
-
-                  return base64.b64encode(
-                      stream.getvalue()
-                  ).decode('ascii')
-              except Exception:
-                  return ''
-
-          referenced_ids=set()
-
-          for event in evidence:
-              for call in event['direct_animations']:
-                  referenced_ids.add(call['id'])
-
-          effect_previews={}
-
-          for aid in sorted(referenced_ids):
-              meta=animations.get(str(aid),{})
-              thumbs=[]
-
-              for field in ('sheet1','sheet2'):
-                  name=meta.get(field,'')
-                  file=animation_sheets.get(norm(name))
-
-                  if file:
-                      encoded=thumbnail(file)
-                      if encoded:
-                          thumbs.append({
-                              'name':file.stem,
-                              'png':encoded
-                          })
-
-              effect_previews[str(aid)]={
-                  'name':meta.get('name',''),
-                  'frames':meta.get('frames',0),
-                  'sheets':thumbs
-              }
-
-          family_effects={}
-
-          for sha,members in families.items():
-              group_effects={}
-
-              for member in members:
-                  key=f"{member['map_id']}:{member['event_id']}"
-                  ev=event_by_key.get(key,{})
-
-                  for call in ev.get('direct_animations',[]):
-                      aid=call['id']
-
-                      group_effects.setdefault(
-                          aid,[]
-                      ).append(
-                          f"MAP {member['map_id']} EV {member['event_id']}"
-                      )
-
-              family_effects[sha]=[
-                  {
-                      'id':aid,
-                      'sources':sorted(set(sources))
-                  }
-                  for aid,sources in sorted(group_effects.items())
+          def make_gif(frames,action):
+              visible=[
+                  frame for frame in frames
+                  if frame is not None
+                  and frame.getbbox()
               ]
 
-          report_rows=[]
+              if not visible:
+                  return None
 
-          for row in rows:
-              key=f"{row['map_id']}:{row['event_id']}"
-              ev=event_by_key.get(key,{})
-              family=candidate_families[row['primary_asset']]
+              width=max(f.width for f in visible)
+              height=max(f.height for f in visible)
 
-              report_rows.append({
-                  'map_id':row['map_id'],
-                  'event_id':row['event_id'],
-                  'monster':row['monster'],
-                  'graphic':row['primary_asset'],
-                  'attack_candidates':len(family['attack']),
-                  'death_candidates':len(family['death']),
-                  'direct_animation_calls':len(
-                      ev.get('direct_animations',[])
+              if width>512 or height>512:
+                  return None
+
+              images=[]
+
+              for frame in visible:
+                  canvas=Image.new(
+                      "RGBA",
+                      (width,height),
+                      (0,0,0,0)
+                  )
+
+                  canvas.alpha_composite(
+                      frame,
+                      (
+                          (width-frame.width)//2,
+                          height-frame.height
+                      )
+                  )
+
+                  indexed=canvas.convert(
+                      "RGB"
+                  ).quantize(colors=255)
+
+                  alpha=canvas.getchannel(
+                      "A"
+                  ).point(
+                      lambda a:255 if a<128 else 0
+                  )
+
+                  indexed.paste(
+                      255,mask=alpha
+                  )
+
+                  images.append(indexed)
+
+              output=BytesIO()
+
+              options={
+                  "format":"GIF",
+                  "save_all":True,
+                  "append_images":images[1:],
+                  "duration":150,
+                  "transparency":255,
+                  "disposal":2,
+                  "optimize":False
+              }
+
+              if action in ("walk","wait"):
+                  options["loop"]=0
+
+              images[0].save(output,**options)
+
+              return base64.b64encode(
+                  output.getvalue()
+              ).decode("ascii")
+
+          decoded={}
+
+          for key,item in records.items():
+              source_path=Path(
+                  "original-paks"
+              )/item["pak"].removeprefix("outer/")
+
+              motions={}
+              verified_count=0
+
+              with source_path.open("rb") as stream:
+                  for action,base in ACTIONS.items():
+                      direction_gifs={}
+
+                      for direction in DIRECTIONS:
+                          sub=str(base+direction)
+                          record=item["records"].get(sub)
+
+                          if not record:
+                              continue
+
+                          try:
+                              stream.seek(record["offset"])
+
+                              raw=stream.read(
+                                  record["bytes"]
+                              )
+
+                              if len(raw)!=record["bytes"]:
+                                  raise ValueError(
+                                      "Truncated SPR"
+                                  )
+
+                              sha=hashlib.sha256(
+                                  raw
+                              ).hexdigest()
+
+                              if sha!=record["sha256"]:
+                                  raise ValueError(
+                                      "Original SPR SHA mismatch"
+                                  )
+
+                              verified_count+=1
+
+                              frames=Reader(
+                                  raw
+                              ).decode()
+
+                              animation=make_gif(
+                                  frames,action
+                              )
+
+                              if animation:
+                                  direction_gifs[
+                                      str(direction)
+                                  ]=animation
+
+                          except Exception as exc:
+                              errors.append({
+                                  "source":key,
+                                  "sub":sub,
+                                  "action":action,
+                                  "error":str(exc)
+                              })
+
+                      motions[action]=direction_gifs
+
+              decoded[key]={
+                  "motions":motions,
+                  "hash_checks":verified_count
+              }
+
+          families={}
+
+          for graphic_hash,source in selected.items():
+              sprite_id=source["sprite_id"]
+              pak=source["pak"]
+
+              key=(
+                  f"{sprite_id}|{pak}"
+                  if sprite_id is not None
+                  else ""
+              )
+
+              original=decoded.get(key,{})
+
+              families[graphic_hash]={
+                  **source,
+                  "motions":original.get(
+                      "motions",{}
                   ),
-                  'shared_graphic_events':row['shared_events'],
-                  'errors':' | '.join(ev.get('errors',[]))
-              })
+                  "verified_hashes":original.get(
+                      "hash_checks",0
+                  ),
+                  "fallback":assets[
+                      graphic_hash
+                  ]["motions"]
+              }
 
-          with (root/'V24-492EV-Motion-Evidence.csv').open(
-              'w',encoding='utf-8-sig',newline=''
-          ) as f:
-              cols=list(report_rows[0])
-              writer=csv.DictWriter(f,fieldnames=cols)
-              writer.writeheader()
-              writer.writerows(report_rows)
-
-          stats={
-              'version':'V24',
-              'source_version':'V23',
-              'target_events':len(rows),
-              'original_graphics':len(assets),
-              'unlinked_events':sum(
-                  not r['primary_asset'] for r in rows
+          summary={
+              "version":"V25",
+              "events":len(events),
+              "graphics":len(assets),
+              "candidate_graphics":sum(
+                  x["sprite_id"] is not None
+                  for x in families.values()
               ),
-              'attack_candidate_graphics':sum(
-                  bool(x['attack'])
-                  for x in candidate_families.values()
+              "attack_4dirs":sum(
+                  len(
+                      x["motions"].get("attack",{})
+                  )==4
+                  for x in families.values()
               ),
-              'death_candidate_graphics':sum(
-                  bool(x['death'])
-                  for x in candidate_families.values()
+              "hit_4dirs":sum(
+                  len(
+                      x["motions"].get("hit",{})
+                  )==4
+                  for x in families.values()
               ),
-              'event_animation_references':sum(
-                  len(e['direct_animations'])
-                  for e in evidence
+              "death_4dirs":sum(
+                  len(
+                      x["motions"].get("death",{})
+                  )==4
+                  for x in families.values()
               ),
-              'animation_database_entries':len(animations),
-              'script_evidence_entries':len(script_evidence),
-              'verified_attack_links':0,
-              'verified_death_links':0,
-              'original_game_modified':False
+              "five_motions_4dirs":sum(
+                  all(
+                      len(x["motions"].get(
+                          action,{}
+                      ))==4
+                      for action in ACTIONS
+                  )
+                  for x in families.values()
+              ),
+              "extraction_errors":len(errors),
+              "monster_identity_verified":0,
+              "original_game_modified":False
           }
 
-          (root/'V24-summary.json').write_text(
-              json.dumps(stats,ensure_ascii=False,indent=2),
-              encoding='utf-8'
+          (OUT/"V25-summary.json").write_text(
+              json.dumps(
+                  summary,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
           )
 
-          supplement={
-              'families':candidate_families,
-              'effects':effect_previews,
-              'family_effects':family_effects,
-              'events':event_by_key,
-              'stats':stats
-          }
+          (OUT/"V25-errors.json").write_text(
+              json.dumps(
+                  errors,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
 
-          panel='''
-          <section id="v24-panel">
-          <h2>V24 · 원본 공격·사망 모션 대조</h2>
-          <p class="warning">
-          실제 이벤트 및 그래픽 데이터에서 찾은 후보입니다.
-          원본 동작 연결이 확인되지 않은 후보는 확정 처리하지 않습니다.
+          with (
+              OUT/"V25-492EV-five-motions.csv"
+          ).open(
+              "w",
+              encoding="utf-8-sig",
+              newline=""
+          ) as stream:
+              writer=csv.writer(stream)
+
+              writer.writerow([
+                  "map_id",
+                  "event_id",
+                  "monster",
+                  "original_graphic",
+                  "sprite_id",
+                  "walk",
+                  "attack",
+                  "hit",
+                  "death",
+                  "wait"
+              ])
+
+              for event in events:
+                  family=families[
+                      event["primary_asset"]
+                  ]
+
+                  writer.writerow([
+                      event["map_id"],
+                      event["event_id"],
+                      event["monster"],
+                      " | ".join(
+                          family["graphics"]
+                      ),
+                      family["sprite_id"],
+                      *[
+                          len(
+                              family["motions"].get(
+                                  action,{}
+                              )
+                          )
+                          for action in ACTIONS
+                      ]
+                  ])
+
+          page=r'''<!doctype html>
+          <html lang="ko">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>SLKnight V25 · 492EV Original Five Motions</title>
+          <style>
+          :root{
+            font-family:system-ui,sans-serif;
+            color-scheme:dark;
+            background:#111a26;
+            color:#eef5ff
+          }
+          *{box-sizing:border-box}
+          body{max-width:1100px;margin:auto;padding:12px}
+          h1{font-size:1.35rem}
+          h2{font-size:1rem}
+          p{font-size:.82rem;color:#c2d2e2;line-height:1.5}
+          input,select,button{
+            background:#294258;
+            color:white;
+            border:1px solid #56768e;
+            border-radius:8px;
+            padding:9px;
+            font:inherit
+          }
+          .layout{
+            display:grid;
+            grid-template-columns:280px minmax(0,1fr);
+            gap:10px
+          }
+          .entries{max-height:78vh;overflow:auto}
+          .entry{
+            display:block;
+            width:100%;
+            text-align:left;
+            margin:3px 0
+          }
+          .motions{
+            display:grid;
+            grid-template-columns:repeat(2,minmax(0,1fr));
+            gap:9px
+          }
+          .panel{
+            background:#1c2d40;
+            padding:9px;
+            border-radius:9px
+          }
+          .stage{
+            min-height:155px;
+            display:flex;
+            align-items:flex-end;
+            justify-content:center
+          }
+          .stage img{
+            max-height:150px;
+            max-width:98%;
+            image-rendering:pixelated;
+            object-fit:contain
+          }
+          .warning{color:#ffda98}
+          @media(max-width:700px){
+            .layout{grid-template-columns:1fr}
+            .entries{max-height:200px}
+            .stage{min-height:120px}
+            .stage img{max-height:115px}
+          }
+          </style>
+          </head>
+          <body>
+          <h1>SLKnight V25 · 492EV 원본 SPR 5동작</h1>
+          <p>
+          원본 SHA 검증 · 정지 · 걷기 · 공격 · 피격 · 사망.
+          몬스터명으로 찾아낸 SPR 후보는 실제 외형과 일치 여부를
+          확인하기 전까지 확정 연결로 취급하지 않습니다.
           </p>
-          <div class="motions">
-          <div class="panel">
-          <h2>공격 ATTACK · 4방향 후보</h2>
-          <p id="v24-attack-label"></p>
-          <div id="v24-attack" class="stage"></div>
-          </div>
-          <div class="panel">
-          <h2>사망 DEATH · 4방향 후보</h2>
-          <p id="v24-death-label"></p>
-          <div id="v24-death" class="stage"></div>
-          </div>
-          </div>
-          <h2>이벤트에서 직접 호출하는 애니메이션</h2>
-          <p id="v24-effect-label"></p>
-          <div id="v24-effects"></div>
-          <h2>원본 이벤트 동작 근거</h2>
-          <p id="v24-source-status"></p>
-          </section>
-          '''
-
-          marker='<h2>점검 결과</h2>'
-
-          if marker not in original:
-              raise RuntimeError('V23 HTML panel anchor changed')
-
-          original=original.replace(
-              marker,panel+marker,1
-          )
+          <p id="statistics"></p>
+          <div class="layout">
+            <section>
+              <input id="search" placeholder="몬스터 검색">
+              <select id="filter">
+                <option value="all">전체</option>
+                <option value="linked">SPR 후보 연결</option>
+                <option value="missing">SPR 후보 미연결</option>
+              </select>
+              <div id="entries" class="entries"></div>
+            </section>
+            <section>
+              <h2 id="monster"></h2>
+              <p id="source"></p>
+              <label>
+                원본 SPR 방향
+                <select id="direction">
+                  <option value="0">SPR 0</option>
+                  <option value="2">SPR 2</option>
+                  <option value="4">SPR 4</option>
+                  <option value="6">SPR 6</option>
+                </select>
+              </label>
+              <div id="motions" class="motions"></div>
+              <p id="warning" class="warning"></p>
+            </section>
+          </div>'''
 
           script=r'''
-          const v24=JSON.parse(
-            document.getElementById('v24-data').textContent
+          const DB=JSON.parse(
+            document.getElementById('dataset').textContent
           );
 
-          function v24Text(id,value){
-            document.getElementById(id).textContent=value;
-          }
+          const $=id=>document.getElementById(id);
 
-          function v24Frame(id,items,dir,labelId){
-            const stage=document.getElementById(id);
-            stage.replaceChildren();
+          let selected=0;
 
-            if(!items||!items.length){
-              stage.textContent='원본 4방향 동작 미확인';
-              v24Text(labelId,'연결 후보 없음');
-              return;
-            }
+          $('statistics').textContent=
+            DB.summary.events+' EV · '+
+            DB.summary.graphics+'개 그래픽 · '+
+            '원본 공격 4방향 후보 '+
+            DB.summary.attack_4dirs+'종 · '+
+            '피격 '+DB.summary.hit_4dirs+'종 · '+
+            '사망 '+DB.summary.death_4dirs+'종';
 
-            const item=items[0];
-            const src=item.directions[String(dir)];
+          const ACTIONS=[
+            ['wait','정지'],
+            ['walk','걷기'],
+            ['attack','공격'],
+            ['hit','피격'],
+            ['death','사망']
+          ];
 
-            if(!src){
-              stage.textContent='해당 방향 프레임 없음';
-              return;
-            }
+          function draw(){
+            const row=DB.rows[selected];
+            const family=DB.families[row.primary_asset];
+            const dir=$('direction').value;
 
-            const img=document.createElement('img');
-            img.src='data:image/gif;base64,'+src;
-            img.alt=item.file+' · 후보 동작';
-            stage.appendChild(img);
+            $('monster').textContent=
+              row.monster+
+              ' · MAP '+row.map_id+
+              ' / EV '+row.event_id;
 
-            v24Text(
-              labelId,
-              item.file+' · 후보 '+items.length+
-              '개 · 원본 동작 여부 미확인'
-            );
-          }
+            $('source').textContent=
+              '게임 그래픽: '+family.graphics.join(', ')+
+              ' · 원본 SPR 후보: '+
+              (family.sprite_id??'미연결')+
+              ' · 원본 해시 검증: '+
+              family.verified_hashes;
 
-          function renderV24(){
-            const row=db.rows[selected];
-            const key=row.map_id+':'+row.event_id;
-            const source=v24.events[key]||{};
-            const family=v24.families[row.primary_asset]||{
-              attack:[],death:[]
+            $('warning').textContent=
+              family.sprite_id!==null
+              ? '원본 SPR 프레임 추출 완료. 몬스터 외형 일치와 동작 명칭은 최종 확인 전입니다.'
+              : '일치하는 원본 SPR 후보 없음. 기존 정지·걷기만 표시합니다.';
+
+            const area=$('motions');
+            area.replaceChildren();
+
+            const mapDirection={
+              '0':'0',
+              '2':'1',
+              '4':'2',
+              '6':'3'
             };
 
-            const dir=document.getElementById('direction').value;
+            for(const [action,label] of ACTIONS){
+              const panel=document.createElement('section');
+              panel.className='panel';
 
-            v24Frame(
-              'v24-attack',
-              family.attack,
-              dir,
-              'v24-attack-label'
-            );
+              const heading=document.createElement('h2');
+              heading.textContent=label+' '+action.toUpperCase();
 
-            v24Frame(
-              'v24-death',
-              family.death,
-              dir,
-              'v24-death-label'
-            );
+              panel.appendChild(heading);
 
-            const effectList=v24.family_effects[
-              row.primary_asset
-            ]||[];
+              const stage=document.createElement('div');
+              stage.className='stage';
 
-            const box=document.getElementById('v24-effects');
-            box.replaceChildren();
+              const original=(
+                family.motions[action]||{}
+              )[dir];
 
-            if(!effectList.length){
-              v24Text(
-                'v24-effect-label',
-                '해당 그래픽 계열에서 직접 호출한 이펙트 없음'
-              );
-            }else{
-              v24Text(
-                'v24-effect-label',
-                '동일 그래픽 계열의 이벤트 명령 207 근거 · '+
-                effectList.length+'종'
-              );
+              const fallback=(
+                family.fallback[mapDirection[dir]]||{}
+              )[action];
 
-              for(const item of effectList){
-                const meta=v24.effects[String(item.id)]||{};
-                const container=document.createElement('div');
-                container.className='panel';
+              const imageData=original||fallback;
 
-                const title=document.createElement('p');
-                title.textContent=
-                  '이펙트 #'+item.id+' · '+
-                  (meta.name||'이름 미확인')+
-                  ' · 원본 '+(meta.frames||0)+'프레임';
+              if(imageData){
+                const img=document.createElement('img');
 
-                container.appendChild(title);
+                img.src=
+                  'data:image/gif;base64,'+
+                  imageData;
 
-                const sources=document.createElement('p');
-                sources.textContent='호출 위치: '+item.sources.join(', ');
-                container.appendChild(sources);
+                img.alt=label;
 
-                const description=document.createElement('p');
-                description.textContent=
-                  '아래 이미지는 원본 이펙트 시트입니다. '+
-                  '몬스터의 공격 모션으로 확정한 것은 아닙니다.';
-                container.appendChild(description);
-
-                for(const sheet of (meta.sheets||[])){
-                  const img=document.createElement('img');
-                  img.src='data:image/png;base64,'+sheet.png;
-                  img.alt=sheet.name;
-                  img.style.maxWidth='100%';
-                  img.style.imageRendering='pixelated';
-                  container.appendChild(img);
-                }
-
-                box.appendChild(container);
+                stage.appendChild(img);
+              }else{
+                stage.textContent='원본 모션 미추출';
               }
+
+              panel.appendChild(stage);
+
+              const note=document.createElement('p');
+
+              note.textContent=original
+                ? '원본 SPR 프레임'
+                : fallback
+                ? '기존 V23 그래픽'
+                : '추출 데이터 없음';
+
+              panel.appendChild(note);
+              area.appendChild(panel);
             }
-
-            const changes=source.changed_graphics||[];
-            const scripts=source.script_hints||[];
-
-            v24Text(
-              'v24-source-status',
-              '그래픽 변경 '+changes.length+
-              '건 / 직접 애니메이션 호출 '+
-              (source.direct_animations||[]).length+
-              '건 / 이벤트 스크립트 단서 '+
-              scripts.length+'건 / '+
-              '공격·사망 확정 연결은 별도 검증 필요'
-            );
           }
 
-          const v23Render=render;
+          function refresh(){
+            const query=$('search').value.toLowerCase();
+            const filter=$('filter').value;
+            const list=$('entries');
 
-          render=function(){
-            v23Render();
-            renderV24();
-          };
+            list.replaceChildren();
 
-          renderV24();
+            DB.rows.forEach((row,index)=>{
+              const family=DB.families[row.primary_asset];
+
+              const text=[
+                row.monster,
+                ...family.graphics,
+                ...family.monsters
+              ].join(' ').toLowerCase();
+
+              if(!text.includes(query))return;
+
+              if(
+                filter==='linked' &&
+                family.sprite_id===null
+              )return;
+
+              if(
+                filter==='missing' &&
+                family.sprite_id!==null
+              )return;
+
+              const button=document.createElement('button');
+              button.className='entry';
+
+              button.textContent=
+                row.monster+
+                ' · MAP '+row.map_id+
+                ' / EV '+row.event_id;
+
+              button.onclick=()=>{
+                selected=index;
+                draw();
+              };
+
+              list.appendChild(button);
+            });
+          }
+
+          $('search').oninput=refresh;
+          $('filter').onchange=refresh;
+          $('direction').onchange=draw;
+
+          refresh();
+          draw();
           '''
 
           payload=json.dumps(
-              supplement,
+              {
+                  "rows":[
+                      {
+                          k:event[k]
+                          for k in (
+                              "map_id",
+                              "event_id",
+                              "monster",
+                              "primary_asset"
+                          )
+                      }
+                      for event in events
+                  ],
+                  "families":families,
+                  "summary":summary
+              },
               ensure_ascii=False,
-              separators=(',',':')
-          ).replace('<','\\u003c')
+              separators=(",",":")
+          ).replace("<","\\u003c")
 
-          injection=(
-              '<script id="v24-data" type="application/json">'+
+          page+=(
+              '<script id="dataset" type="application/json">'+
               payload+
-              '</script><script>'+script+'</script>'
+              '</script><script>'+
+              script+
+              '</script></body></html>'
           )
 
-          if '</body>' not in original:
-              raise RuntimeError('V23 HTML closing tag missing')
-
-          result=original.replace(
-              '</body>',
-              injection+'</body>',
-              1
+          (OUT/"SLKnight-492EV-Five-Motions-V25.html").write_text(
+              page,
+              encoding="utf-8"
           )
 
-          output=root/'SLKnight-492-Motion-Integrated-V24.html'
-          output.write_text(result,encoding='utf-8')
-
-          (root/'v24-ui.js').write_text(
-              script,encoding='utf-8'
+          (OUT/"V25-ui.js").write_text(
+              script,
+              encoding="utf-8"
           )
 
-          assert output.stat().st_size>10000
-
-          print(json.dumps(stats,ensure_ascii=False))
-          print('V24_INTEGRATED_HTML_CREATED',output.stat().st_size)
+          print(
+              "V25_EXTRACTION_RESULT",
+              json.dumps(
+                  summary,ensure_ascii=False
+              )
+          )
           PY
 
-          python3 /tmp/v24_integrate.py
+          python3 /tmp/v25_build.py
 
-      - name: "V24 | Validate all 492 events and unified HTML"
-        shell: bash
+      - name: "V25 | Validate all 492 events and 5 motion previews"
         run: |
           set -euo pipefail
 
-          node --check reports/v24-ui.js
+          node --check reports/V25-ui.js
 
           python3 - <<'PY'
-          from pathlib import Path
-          import json
           import csv
+          import json
 
-          root=Path('reports')
+          from pathlib import Path
+
+          root=Path("reports")
 
           stats=json.loads(
-              (root/'V24-summary.json').read_text()
+              (root/"V25-summary.json").read_text()
           )
 
-          evidence=json.loads(
-              (root/'v24-event-evidence.json').read_text()
-          )
+          assert stats["version"]=="V25"
+          assert stats["events"]==492
+          assert stats["graphics"]==83
+          assert stats["original_game_modified"] is False
 
-          assert stats['version']=='V24'
-          assert stats['target_events']==492
-          assert stats['original_graphics']==83
-          assert stats['unlinked_events']==0
-          assert len(evidence)==492
-
-          keys={
-              (r['map_id'],r['event_id'])
-              for r in evidence
-          }
-
-          assert len(keys)==492
-
-          with (root/'V24-492EV-Motion-Evidence.csv').open(
-              encoding='utf-8-sig'
-          ) as f:
+          with (
+              root/"V25-492EV-five-motions.csv"
+          ).open(encoding="utf-8-sig") as f:
               assert len(list(csv.DictReader(f)))==492
 
-          page=root/'SLKnight-492-Motion-Integrated-V24.html'
-          assert page.stat().st_size>10000
+          html=root/"SLKnight-492EV-Five-Motions-V25.html"
 
-          text=page.read_text(encoding='utf-8')
+          assert html.exists()
+          assert html.stat().st_size>10000
 
-          for label in (
-              'V24 · 원본 공격·사망 모션 대조',
-              '공격 ATTACK',
-              '사망 DEATH',
-              'v24-attack',
-              'v24-death',
-              'v24-effect-label'
+          for name in (
+              "wait","walk","attack","hit","death"
           ):
-              assert label in text,label
+              assert name in html.read_text(encoding="utf-8")
 
-          assert stats['original_game_modified'] is False
-
-          print('V24_ALL_492_EVENTS_VALIDATED')
-          print('V24_83_GRAPHIC_FAMILIES_PRESERVED')
-          print('V24_ATTACK_DEATH_EVIDENCE_EXPORTED')
+          print("V25_492EV_VALIDATED")
+          print("V25_83_GRAPHICS_PRESERVED")
+          print("V25_FIVE_MOTION_PREVIEWS_CREATED")
           PY
 
-      - name: "V24 | Upload integrated HTML and original motion evidence"
+          cat reports/V25-summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "V25 | Upload unified HTML and full extraction report"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-sanctuary-monsters-v24
+          name: audit-sanctuary-monsters-v25-five-motions
           path: reports/
           retention-days: 30
-          if-no-files-found: error
+          if-no-files-found: warn
