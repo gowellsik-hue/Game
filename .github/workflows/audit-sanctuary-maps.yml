@@ -1,83 +1,90 @@
 
-name: V3.6 | TI Dungeon Floor Tile Patch
+name: V3.7 | TI Dungeon Collision and Portal Coordinates
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: [.github/workflows/audit-sanctuary-maps.yml]
 permissions:
-  contents: read
   actions: read
+  contents: read
 jobs:
-  render:
+  map:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 25
     steps:
-      - name: V3.6 Restore source assets
+      - name: V3.7 Download verified maps
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p previous/v2 previous/v3-2 source reports
-          gh run download 39045175890 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 -D previous/v2
-          gh run download 39049871058 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V3.2-Verified-Partial-Terrain -D previous/v3-2
-          for part in zip z32 z33 z34 z35; do
-            gh release download v1.0.0 -R "$GITHUB_REPOSITORY" -p "Sanctuary.of.Aden.-.Copy.$part" -D source --clobber
-          done
-          gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/audit-sanctuary-maps.yml?ref=f31b3ebb3197820186cb5db752bed62ba8c9c131" --jq .content | base64 -d > /tmp/v3.3.yml
-          python3 -m venv /tmp/ti-v3-6
-          /tmp/ti-v3-6/bin/pip -q install Pillow==11.3.0
-      - name: V3.6 Fix diamond tile geometry and render
+          mkdir -p v2 reports
+          gh run download 39045175890 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 -D v2
+          gh run download 39090302766 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V3.6-Floor-Restored -D reports
+          test -s v2/reports/map-1-layers.json
+          test -s reports/preview/index.html
+      - name: V3.7 Export collision flags and portal candidates
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import re, textwrap
+          import base64,csv,json,struct
           from pathlib import Path
-          source=Path('/tmp/v3.3.yml').read_text()
-          match=re.search(r"(?ms)^ *cat > /tmp/ti-map-v3-3\.py <<'PY_V33'\n(.*?)^ *PY_V33\s*$",source)
-          if not match: raise SystemExit('Pinned V3.3 renderer not found')
-          code=textwrap.dedent(match.group(1))
-          pattern=r'(?m)^([ \t]*)count\s*=\s*2\s*\*\s*\(\s*y\s*\+\s*1\s+if\s+y\s*<\s*dim\s*//\s*2\s+else\s+dim\s*-\s*y\s*\)'
-          replacement='count = (2*min(y,dim-1-y)+1 if dim==24 and len(blob)==577 else 2*(y+1 if y<dim//2 else dim-y))'
-          code,n=re.subn(pattern,lambda m:m.group(1)+replacement,code)
-          if n!=1: raise SystemExit('Expected exactly one diamond decoder block, found '+str(n))
-          code=code.replace('V3.3','V3.6').replace('V3_3_DONE','V3_6_DONE')
-          Path('/tmp/render-v3.6.py').write_text(code)
+          out=Path('reports'); preview=out/'preview'; maps={}; rows=[]
+          for mid,n in ((1,12),(2,16)):
+              blocks=json.loads(Path(f'v2/reports/map-{mid}-layers.json').read_text())['blocks']
+              assert len(blocks)==n
+              x0=min(b['startX'] for b in blocks);y0=min(b['startY'] for b in blocks)
+              w=max(b['startX']+64 for b in blocks)-x0
+              h=max(b['startY']+64 for b in blocks)-y0
+              mask=bytearray([255])*(w*h);portals=[]
+              for b in blocks:
+                  values=struct.unpack('<4096H',base64.b64decode(b['layer3Attribute1Base64']))
+                  assert all(v<255 for v in values), 'Unexpected Layer3 value: use uint16'
+                  bx=b['startX']-x0;by=b['startY']-y0
+                  for y in range(64):
+                      mask[(by+y)*w+bx:(by+y)*w+bx+64]=bytes(values[y*64:y*64+64])
+                  for p in b['layer7PortalsUnverified']:
+                      item={'mapId':mid,'name':p['name'],'x':p['estimatedGameX'],
+                            'y':p['estimatedGameY'],'targetMapId':p['targetMapId'],
+                            'portalId':p['portalId'],'source':b['file'],'verifiedDestination':False}
+                      assert x0<=item['x']<x0+w and y0<=item['y']<y0+h
+                      portals.append(item);rows.append(item)
+              counts={'walkable':mask.count(0),'blocked':sum(bool(v&1) for v in mask if v!=255),
+                      'unknown':mask.count(255)}
+              assert sum(counts.values())==w*h and counts['walkable']>0
+              maps[str(mid)]={'mapId':mid,'originX':x0,'originY':y0,'width':w,'height':h,
+                              'encoding':'base64 uint8 row-major, 255=unknown, bit0=blocked',
+                              'flags':base64.b64encode(mask).decode(),'portals':portals,'counts':counts}
+              (out/f'map-{mid}-collision.json').write_text(json.dumps(maps[str(mid)],ensure_ascii=False))
+              print('MAP',mid,'SIZE',w,h,'COUNTS',counts,'PORTALS',len(portals))
+          assert len(rows)==20, 'Unexpected source portal count'
+          with (out/'portals-v3.7.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              wr=csv.DictWriter(f,fieldnames=list(rows[0]));wr.writeheader();wr.writerows(rows)
+          page='''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V3.7 말던 충돌 좌표</title>
+          <style>body{background:#121b27;color:#ecf2fa;font:15px system-ui;text-align:center;margin:12px}button,select,a{padding:7px;color:#fff;background:#293c56;border-radius:6px}canvas{width:min(96vw,750px);height:auto;image-rendering:pixelated;touch-action:manipulation;border:1px solid #60748d}p{font-size:13px}</style></head><body>
+          <h3>V3.7 말던 충돌·포털 좌표</h3><select id="floor"><option value="1">말던 1층</option><option value="2">말던 2층</option></select> <a href="index.html">원본 지형 보기</a>
+          <p>밝은색: 통행 가능 / 어두운색: 통행 불가 / 검정: 미수록 / 노란 점: 포털 후보</p><canvas id="cv"></canvas><p id="info"></p>
+          <script id="data" type="application/json">__DATA__</script><script>
+          const maps=JSON.parse(document.getElementById('data').textContent),cv=document.getElementById('cv'),ctx=cv.getContext('2d'),sel=document.getElementById('floor'),info=document.getElementById('info');let m,flags;
+          function render(){m=maps[sel.value];flags=Uint8Array.from(atob(m.flags),c=>c.charCodeAt(0));cv.width=m.width;cv.height=m.height;const im=ctx.createImageData(m.width,m.height);
+          for(let i=0;i<flags.length;i++){const v=flags[i],j=i*4;const rgb=v===255?[8,12,18]:v&1?[41,58,77]:[165,202,178];im.data.set([...rgb,255],j)}ctx.putImageData(im,0,0);
+          ctx.fillStyle='#ffdf4d';for(const p of m.portals){ctx.beginPath();ctx.arc(p.x-m.originX,p.y-m.originY,2.6,0,Math.PI*2);ctx.fill()}
+          info.textContent=`맵 ${m.mapId} / ${m.width}×${m.height} / 통행 ${m.counts.walkable} / 차단 ${m.counts.blocked} / 포털 후보 ${m.portals.length}`}
+          sel.onchange=render;cv.addEventListener('pointerup',e=>{const r=cv.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*m.width),y=Math.floor((e.clientY-r.top)/r.height*m.height),v=flags[y*m.width+x];const nearby=m.portals.filter(p=>Math.abs(p.x-(m.originX+x))<=2&&Math.abs(p.y-(m.originY+y))<=2);info.textContent=`원본 좌표 (${m.originX+x}, ${m.originY+y}) / 속성 ${v} / ${v===255?'자료 없음':v&1?'통행 불가':'통행 가능'}${nearby.length?' / 포털: '+nearby.map(p=>p.name+' → map '+p.targetMapId).join(', '):''}`});render();
+          </script></body></html>'''
+          (preview/'collision.html').write_text(page.replace('__DATA__',json.dumps(maps,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')))
+          source=(preview/'index.html').read_text()
+          assert '</header>' in source
+          source=source.replace('</header>',' <a href="collision.html" style="color:#ffdf4d">충돌·포털 V3.7</a></header>',1)
+          (preview/'index.html').write_text(source)
+          assert json.loads((out/'floor-check-v3.6.json').read_text())['floorDrawn']==229376
+          (out/'audit-v3.7.json').write_text(json.dumps({'version':'V3.7','maps':[1,2],'portalCandidates':len(rows),'portalDestinationsVerified':False,'monsterSpawnsIncluded':False},indent=2))
           PY
-          python3 -m py_compile /tmp/render-v3.6.py
-          /tmp/ti-v3-6/bin/python - <<'PY'
-          import runpy
-          parser=runpy.run_path('/tmp/render-v3.6.py')
-          assert parser['decode_frame'](b'\x00'+b'\x00'*576).size==(12,12)
-          print('V3.6 577-BYTE TILE TEST PASSED')
-          PY
-          /tmp/ti-v3-6/bin/python /tmp/render-v3.6.py
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          root=Path('reports')
-          d=json.loads((root/'summary.json').read_text())
-          n=d['counts']['floorDrawn'];total=d['counts']['floor']
-          print('V3.6 FLOOR:',n,'/',total)
-          assert total==229376 and n>=210000, 'Floor coverage below 91.6%'
-          for mid,count in ((1,12),(2,16)):
-              assert len(list((root/f'preview/tiles/{mid}').glob('*.png')))==count
-          assert (root/'preview/index.html').is_file()
-          (root/'floor-check-v3.6.json').write_text(json.dumps({'version':'V3.6','floorDrawn':n,'floorTotal':total,'ratio':round(n/total,5),'monsterSpawnsVerified':False},indent=2))
-          PY
-      - name: V3.6 Upload restored dungeon maps
-        if: success()
+          test -s reports/preview/collision.html
+      - name: V3.7 Upload collision and portal inspector
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3.6-Floor-Restored
+          name: Sanctuary-TI-Dungeon-V3.7-Collision-Portal-Inspection
           path: reports/
           if-no-files-found: error
           retention-days: 30
-      - name: V3.6 Upload diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sanctuary-TI-Dungeon-V3.6-Failure
-          path: reports/
-          if-no-files-found: warn
-          retention-days: 14
