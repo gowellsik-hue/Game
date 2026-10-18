@@ -1,7 +1,7 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R17 / NPC-to-Sanctuary original TI dungeon entry and return
-name: build-slknight-web.yml | V229R17 | Sanctuary TI Dungeon Entry
+# VERSION: V229R18 / Native Sanctuary S32 terrain in original RGSS engine
+name: build-slknight-web.yml | V229R18 | Native Sanctuary TI Dungeon
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: V229R17 Restore last successful V229R16 game
+      - name: V229R18 Restore last working native game V229R16 without iframe
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -33,7 +33,7 @@ jobs:
           github-token: ${{ github.token }}
           path: previous
 
-      - name: V229R17 Restore original Sanctuary 1F-2F terrain
+      - name: V229R18 Restore original Sanctuary S32 map tile blocks
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -42,7 +42,7 @@ jobs:
           github-token: ${{ github.token }}
           path: original-ti
 
-      - name: V229R17 Verify both successful baselines
+      - name: V229R18 Check two source artifacts and 5354 original files
         shell: bash
         run: |
           set -euo pipefail
@@ -50,33 +50,206 @@ jobs:
           test -s original-ti/preview/terrain-walk-v4.1.html
           mkdir -p site
           tar -xf previous/artifact.tar -C site
-          python3 - <<'PY_BASE_R17'
+          python3 - <<'PY_BASE'
           from pathlib import Path
-          import hashlib,json
-          root=Path('site')
-          hashes={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert len(hashes)==5354,('Invalid original file count',len(hashes))
+          import hashlib
+          r=Path('site')
+          hashes={str(f.relative_to(r)):hashlib.sha256(f.read_bytes()).hexdigest() for f in r.rglob('*') if f.is_file()}
+          assert len(hashes)==5354,('Wrong R16 asset count',len(hashes))
           reference={
-            'index.html':'a6a2c3f52bfe87e1e5821a383effae83074fdb54725f80e23454d17aa6f8f220',
-            'knight/index.html':'94dbbad46625685fe5e9f3aaa660b53c3221b1a7ebaa016a4241b96cea490f27',
+            'knight/gameasync/Data/Scripts.rxdata':'ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c',
             'knight/gameasync/mapping.js':'53ef0647a4c39ea15cb603adbb71fe4bc726b0cb4b5ec864c7473c4bd628d5c1',
             'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata':'2b99c87f691fece863c850f2217e538e3f6f76787b290507c8212b621beaf305',
-            'knight/gameasync/Data/Scripts.rxdata':'ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c',
+            'knight/index.html':'94dbbad46625685fe5e9f3aaa660b53c3221b1a7ebaa016a4241b96cea490f27',
+            'index.html':'a6a2c3f52bfe87e1e5821a383effae83074fdb54725f80e23454d17aa6f8f220'
           }
-          for path,sha in reference.items():assert hashes.get(path)==sha,(path,hashes.get(path))
-          Path('/tmp/sl-r17-before.json').write_text(json.dumps(hashes))
-          print('V229R16 original game verified:',len(hashes),'assets')
-          PY_BASE_R17
+          for n,h in reference.items():assert hashes[n]==h,('Unverified source',n)
+          for id in (45,46):assert not list((r/'knight/gameasync/Data').glob('*Map%03d.rxdata'%id))
+          print('V229R18 BASELINE: verified R16, no S32 overlay, 5354 assets')
+          PY_BASE
 
-      - name: V229R17 Replace teleporter placeholder with real entry signal
+      - name: V229R18 Convert original S32 maps to native map metadata
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/sl-ti-r17.rb <<'RUBY_R17'
+          cat > /tmp/slti-prep-r18.py <<'PY_PREP'
+          import base64, json, re, shutil, struct, sys
+          from pathlib import Path
+
+          site=Path(sys.argv[1]); origin=Path(sys.argv[2]); native=site/'knight/gameasync'; data=native/'Data'; pics=native/'Graphics/Pictures'
+          source=(origin/'preview/terrain-walk-v4.1.html').read_text(encoding='utf-8')
+          mt=re.search(r'<script id="data" type="application/json">(.*?)</script>',source,re.S)
+          assert mt, 'Cannot locate S32 original data'
+          floors=json.loads(mt.group(1)); assert set(floors)=={'1','2'}
+          config={}
+          for oldid,newid in (('1',45),('2',46)):
+              obj=floors[oldid]; w,h=obj['width'],obj['height']; assert w==256 if oldid=='1' else w==320
+              assert h==256
+              mask=base64.b64decode(obj['collisionBase64']);assert len(mask)==w*h
+              print('mask',oldid,'passable',mask.count(0),'blocked',len(mask)-mask.count(0))
+              tiles=[];constants=set()
+              for t in obj['tiles']:
+                  fn=t['src'].split('/')[-1];name='SLTI'+oldid+'_'+fn[:-4]
+                  img=origin/'preview'/t['src'];assert img.is_file(),str(img)
+                  header=img.read_bytes()[:24]
+                  assert header[:8]==b'\x89PNG\r\n\x1a\n' and struct.unpack('>II',header[16:24])==(1536,768)
+                  shutil.copyfile(img,pics/(name+'.png'))
+                  bx=int(fn[:4],16);by=int(fn[4:8],16)
+                  sx=32704+(bx-32767)*64;sy=32704+(by-32767)*64
+                  constants.add((t['x']-12*(sx+sy),t['y']+378-6*(sy-sx)))
+                  tiles.append([name,t['x'],t['y']])
+              assert len(constants)==1,constants
+              cx,cy=constants.pop()
+              assert len(tiles)==(12 if newid==45 else 16)
+              config[str(newid)]={'sourceMap':int(oldid),'originX':obj['originX'],'originY':obj['originY'],'width':w,'height':h,'constX':cx,'constY':cy,'tiles':tiles,'maskBase64':base64.b64encode(mask).decode('ascii')}
+              def get(x,y):
+                  nx=x-obj['originX'];ny=y-obj['originY'];assert 0<=nx<w and 0<=ny<h
+                  return mask[ny*w+nx]
+              for x,y in ((32670,32802),(32737,32877)) if newid==45 else ((32665,32789),):
+                  assert get(x,y)==0,('portal landing blocked',newid,x,y,get(x,y))
+              print('floor',newid,'original image tiles',len(tiles),'iso',(cx,cy))
+          # Source menu native map marker.
+          config['45']['entry']=[32670-32576,32802-32704]
+          config['45']['stairs']=[32737-32576,32877-32704]
+          config['46']['entry']=[32665-32576,32789-32704]
+          config['46']['stairs']=config['46']['entry']
+          Path('/tmp/slti-native-r18.json').write_text(json.dumps(config,separators=(',',':')))
+          assert (pics/'SLTI1_7ffe8000.png').is_file()
+          PY_PREP
+          python3 /tmp/slti-prep-r18.py site original-ti
+
+      - name: V229R18 Stage native RGSS renderer (not an HTML viewer)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/slti-r18-runtime-template.rb <<'RUBY_RUNTIME'
+          # SLTI_NATIVE_R18: RGSS native dungeon rendering, passability, character sprites.
+          # This executes inside the existing Scene_Map, not inside HTML or an iframe.
+          module SLTINative
+            META = __SLTI_META__
+            def self.active?
+              $game_map && META.has_key?($game_map.map_id.to_s)
+            end
+            def self.meta
+              META[$game_map.map_id.to_s]
+            end
+            def self.world(real_x, real_y)
+              m=meta
+              gx=m['originX']+real_x.to_f/128.0
+              gy=m['originY']+real_y.to_f/128.0
+              [m['constX']+12.0*(gx+gy),m['constY']+6.0*(gy-gx)]
+            end
+            def self.player_world
+              world($game_player.real_x,$game_player.real_y)
+            end
+            def self.screen(real_x,real_y)
+              x,y=world(real_x,real_y)
+              px,py=player_world
+              [(400+x-px).round,(230+y-py).round]
+            end
+          end
+
+          class Game_Map
+            alias slti_r18_old_passable? passable?
+            def passable?(x,y,d,self_event=nil)
+              return slti_r18_old_passable?(x,y,d,self_event) unless SLTINative.active?
+              return false unless valid?(x,y)
+              source=@map.instance_variable_get(:@slti_collision)
+              return false if source.nil?
+              source.getbyte(y*width+x)==0
+            end
+          end
+
+          class Game_Character
+            alias slti_r18_old_screen_x screen_x
+            alias slti_r18_old_screen_y screen_y
+            alias slti_r18_old_screen_z screen_z
+            def screen_x
+              return slti_r18_old_screen_x unless SLTINative.active?
+              SLTINative.screen(@real_x,@real_y)[0]
+            end
+            def screen_y
+              return slti_r18_old_screen_y unless SLTINative.active?
+              SLTINative.screen(@real_x,@real_y)[1]
+            end
+            def screen_z(height=0)
+              return slti_r18_old_screen_z(height) unless SLTINative.active?
+              @always_on_top ? 999 : (screen_y + (height>32 ? 31 : 0))
+            end
+          end
+
+          class Spriteset_Map
+            alias slti_r18_old_initialize initialize
+            alias slti_r18_old_update update
+            alias slti_r18_old_dispose dispose
+            def initialize
+              @slti_native_sprites=[]
+              slti_r18_old_initialize
+            end
+            def update
+              slti_r18_old_update
+              return unless SLTINative.active?
+              m=SLTINative.meta
+              if @slti_native_sprites.empty?
+                m['tiles'].each_with_index do |item,i|
+                  layer=Sprite.new(@viewport1)
+                  layer.bitmap=RPG::Cache.picture(item[0])
+                  layer.z=-500+i
+                  @slti_native_sprites.push(layer)
+                end
+              end
+              px,py=SLTINative.player_world
+              m['tiles'].each_with_index do |t,i|
+                layer=@slti_native_sprites[i]
+                layer.x=(400 + t[1] - px).round
+                layer.y=(230 + t[2] - py).round
+              end
+            end
+            def dispose
+              @slti_native_sprites.each{|layer|layer.dispose} if @slti_native_sprites
+              @slti_native_sprites=[]
+              slti_r18_old_dispose
+            end
+          end
+          RUBY_RUNTIME
+
+      - name: V229R18 Generate native RGSS source with string-keyed map IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/slti-r18-runtime-build.py <<'PY_RUNTIME'
+          from pathlib import Path
+          import json
+          cfg=json.loads(Path('/tmp/slti-native-r18.json').read_text())
+          for o in cfg.values():o.pop('maskBase64')
+          def lit(o):
+              if isinstance(o,dict):return '{'+','.join(lit(k)+'=>'+lit(v) for k,v in o.items())+'}'
+              if isinstance(o,list):return '['+','.join(lit(v) for v in o)+']'
+              if isinstance(o,str):return json.dumps(o,ensure_ascii=True)
+              if isinstance(o,bool):return 'true' if o else 'false'
+              if isinstance(o,(int,float)):return repr(o)
+              raise TypeError(type(o))
+          s=Path('/tmp/slti-r18-runtime-template.rb').read_text()
+          s=s.replace('__SLTI_META__',lit(cfg))
+          assert '__SLTI_META__' not in s
+          Path('/tmp/slti-native-r18-runtime.rb').write_text(s)
+          print('Generated native RGSS runtime',len(s),'bytes, Ruby string hash keys')
+          PY_RUNTIME
+          python3 /tmp/slti-r18-runtime-build.py
+          ruby -c /tmp/slti-native-r18-runtime.rb
+
+      - name: V229R18 Create native Map045 Map046 and NPC transfer 201
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/slti-r18-patch.rb <<'RUBY_PATCH'
+          require 'json'
+          require 'zlib'
           require 'digest'
           module RPG
-            class AudioFile;end
             class Map;end
+            class MapInfo;end
+            class AudioFile;end
             class Event
               class Page
                 class Condition;end
@@ -86,239 +259,348 @@ jobs:
             class EventCommand;end
             class MoveRoute;end
             class MoveCommand;end
+            class Tileset;end
           end
           class Table
-            def self._load(blob)
-              obj=allocate
-              obj.instance_variable_set(:@serialized_data,blob)
-              obj
+            def self._load(s);o=allocate;o.instance_variable_set(:@serialized,s);o;end
+            def _dump(level=0);@serialized;end
+            def self.blank(w,h)
+              data=[3,w,h,3,w*h*3].pack('V5')+"\0"*(w*h*3*2)
+              _load(data)
             end
-            def _dump(level=0); @serialized_data;end
           end
-          class Tone < Table;end
-          class Color < Table;end
-          path=ARGV.fetch(0)
-          original=File.binread(path)
-          map=Marshal.load(original)
-          raise 'Original data roundtrip failed' unless Marshal.dump(map)==original
-          events=map.instance_variable_get(:@events)
-          event=events.fetch(11)
-          raise 'Wrong teleporter event' unless event.instance_variable_get(:@x)==70 && event.instance_variable_get(:@y)==48
-          pages=event.instance_variable_get(:@pages)
-          raise 'NPC changed pages' unless pages.length==1
-          list=pages[0].instance_variable_get(:@list)
-          source= '말섬던전은 별도 맵 연결 후 이용할 수 있습니다.'
-          found=list.each_index.select do |i|
-            c=list[i]
-            c.instance_variable_get(:@code)==101 && c.instance_variable_get(:@parameters)==[source]
+          class Tone
+            def self._load(s);o=allocate;o.instance_variable_set(:@serialized,s);o;end
+            def _dump(level=0);@serialized;end
           end
-          raise "Expected one obsolete placeholder, found #{found.size}" unless found.length==1
-          idx=found.first
-          raise 'Wrong branch preceding placeholder' unless list[idx-1].instance_variable_get(:@code)==402 && list[idx-1].instance_variable_get(:@parameters)==[1,'말섬던전']
-          prior_list=Marshal.dump(event)
-          command=list[idx]
-          command.instance_variable_set(:@code,355)
-          command.instance_variable_set(:@parameters,["puts 'SLTI|ENTER|V229R17'"])
-          # Save only event 11. Compare the complete original map after restoring event 11.
-          data=Marshal.dump(map)
-          check=Marshal.load(data)
-          check.instance_variable_get(:@events)[11]=Marshal.load(prior_list)
-          raise 'Unrelated map content changed' unless Marshal.dump(check)==original
-          File.binwrite(path,data)
-          check2=Marshal.load(File.binread(path))
-          list2=check2.instance_variable_get(:@events)[11].instance_variable_get(:@pages)[0].instance_variable_get(:@list)
-          raise 'Entry script absent' unless list2.count{|c|c.instance_variable_get(:@code)==355 && c.instance_variable_get(:@parameters)==["puts 'SLTI|ENTER|V229R17'"]}==1
-          raise 'Old placeholder still active' if list2.any?{|c|c.instance_variable_get(:@parameters)==[source]}
-          raise 'Transfer commands were altered' unless list2.select{|c|c.instance_variable_get(:@code)==201}.map{|c|c.instance_variable_get(:@parameters)}==list.select{|c|c.instance_variable_get(:@code)==201}.map{|c|c.instance_variable_get(:@parameters)}
-          puts "V229R17 NPC patched: old placeholder replaced by executable map-entry signal, SHA=#{Digest::SHA256.hexdigest(data)}"
-          RUBY_R17
-          ruby -c /tmp/sl-ti-r17.rb
-          ruby /tmp/sl-ti-r17.rb site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata
+          class Color<Tone;end
+          site=ARGV.fetch(0)
+          base=site+'/knight/gameasync/Data/'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          config=JSON.parse(File.read('/tmp/slti-native-r18.json'))
+          def cmd(code,indent,args)
+           c=RPG::EventCommand.allocate
+           c.instance_variable_set(:@code,code)
+           c.instance_variable_set(:@indent,indent)
+           c.instance_variable_set(:@parameters,args)
+           c
+          end
+          def v(obj,key);obj.instance_variable_get('@'+key);end
+          def put(obj,key,val);obj.instance_variable_set('@'+key,val);end
+          sourcefile=base+pre+'Map029.rxdata'
+          original=File.binread(sourcefile)
+          town=Marshal.load(original)
+          raise 'Town Marshal round-trip changed' unless Marshal.dump(town)==original
+          npc=v(town,'events').fetch(11)
+          raise 'Wrong town NPC' unless [v(npc,'x'),v(npc,'y')]==[70,48]
+          old_npc=Marshal.dump(npc)
+          npc_list=v(v(npc,'pages')[0],'list')
+          placeholder='\uB9D0\uC12C\uB358\uC804\uC740 \uBCC4\uB3C4 \uB9F5 \uC5F0\uACB0 \uD6C4 \uC774\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.'.gsub(/\\u([0-9A-Fa-f]{4})/){[$1.to_i(16)].pack('U')}
+          idx=npc_list.find_index{|c|v(c,'code')==101 && v(c,'parameters')==[placeholder]}
+          raise 'Missing one NPC placeholder' unless idx && npc_list.count{|c|v(c,'code')==101 && v(c,'parameters')==[placeholder]}==1
+          raise 'Wrong TI selection branch' unless v(npc_list[idx-1],'parameters')==[1,'\uB9D0\uC12C\uB358\uC804'.gsub(/\\u([0-9A-Fa-f]{4})/){[$1.to_i(16)].pack('U')}]
+          put(npc_list[idx],'code',201)
+          put(npc_list[idx],'parameters',[0,45,*config['45']['entry'],0,1])
+          modified=Marshal.dump(town)
+          revert=Marshal.load(modified)
+          v(revert,'events')[11]=Marshal.load(old_npc)
+          raise 'Non-teleporter Town map changed!' unless Marshal.dump(revert)==original
+          File.binwrite(sourcefile,modified)
+          # Construct native RGSS maps, not browser HTML.
+          prototype=Marshal.load(File.binread(base+pre+'Map014.rxdata'))
+          proto_page=v(v(prototype,'events').values.first,'pages').first
 
-      - name: V229R17 Install original Sanctuary dungeon and floor navigation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - site original-ti <<'PY_VIEW_R17'
-          import sys, zipfile, json, re, shutil
-          from pathlib import Path
-          root=Path(sys.argv[1]); source_dir=Path(sys.argv[2]); target=root/'knight'/'sanctuary';target.mkdir(parents=True,exist_ok=True)
-          files=list((source_dir/'preview'/'tiles').glob('*/*.png'))
-          assert len(files)==28, ('Terrain tile count changed',len(files))
-          for source_file in files:
-              destination=target/source_file.relative_to(source_dir/'preview')
-              destination.parent.mkdir(parents=True,exist_ok=True)
-              shutil.copy2(source_file,destination)
-          html=(source_dir/'preview'/'terrain-walk-v4.1.html').read_text(encoding='utf-8')
-          assert '<title>TI Dungeon V4.1 Original Terrain Movement</title>' in html
-
-          def once(a,b):
-              global html
-              assert html.count(a)==1, ('Need exactly one source snippet',a[:110],html.count(a))
-              html=html.replace(a,b,1)
-
-          once('<title>TI Dungeon V4.1 Original Terrain Movement</title>','<title>SLKnight V229R17 · 말섬던전 (Sanctuary 1F·2F)</title>')
-          once('<b>TI Dungeon V4.1</b>','<b>말섬던전 · <span id="floor-label">1층</span></b>')
-          once('<a href="index.html" style="color:#cce7ff">Map</a>', '<button type="button" id="leave-dungeon">은기사마을 복귀</button>')
-          once('#pad button{height:40px;font-size:22px;touch-action:none;padding:0}', '#pad button{height:56px;font-size:26px;touch-action:none;padding:0}\n#floor,#jump{display:none}\n#player{width:60px;height:60px;background:transparent;border:none;border-radius:0;box-shadow:none;z-index:9;transform:translate(-50%,-80%)}\n#player canvas{width:60px;height:60px;image-rendering:pixelated}\nheader b{flex:1}\n#leave-dungeon{background:#315941;border-color:#78ac8a}')
-          once('Original terrain. Collision bit 0 is provisional. Yellow = portal candidate; no automatic warp.', 'Sanctuary 원본 지형. 통행 판정 및 1↔2층 도착 위치는 검증 중입니다. 몬스터 전투는 아직 연결되지 않았습니다.')
-          # Preserve the exact original terrain/coordinate JSON.
-          source=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S).group(1))
-          assert set(source)=={'1','2'} and sum(len(m['tiles']) for m in source.values())==28
-          assert sum(len(m['collisionBase64']) for m in source.values())>100000
-          # Floor links use source target map IDs; arrival points remain candidates.
-          once('function walk(dx,dy){\n  const nx=x+dx,ny=y+dy,ix=nx-map.originX,iy=ny-map.originY;', '''function walk(dx,dy){
-            const nx=x+dx,ny=y+dy,ix=nx-map.originX,iy=ny-map.originY;
-            const gate=map.portals.find(p=>p.x===nx&&p.y===ny);
-            if(gate && map.mapId===1 && gate.name==='to2' && gate.targetMapId===2){changeFloor('2','to1');return;}
-            if(gate && map.mapId===2 && gate.name==='to1' && gate.targetMapId===1){changeFloor('1','to2');return;}
-            if(gate && map.mapId===1 && gate.name==='go_00' && gate.targetMapId===0){leaveDungeon();return;}''')
-          once('function open(){\n  stop();', '''function changeFloor(id,landingName){
-            floor.value=id;
-            open();
-            const landing=map.portals.find(p=>p.name===landingName&&p.nearestWalkable);
-            if(landing){x=landing.nearestWalkable.x;y=landing.nearestWalkable.y;camera();}
+          def event(id,x,y,label,targetmap,coords,page_template)
+           e=RPG::Event.allocate
+           put(e,'id',id);put(e,'x',x);put(e,'y',y);put(e,'name',label)
+           page=Marshal.load(Marshal.dump(page_template))
+           cond=v(page,'condition')
+           cond.instance_variables.each{|key|put(cond,key.to_s.delete('@'),false) if key.to_s.end_with?('_valid')}
+           graphic=v(page,'graphic')
+           put(graphic,'character_name','');put(graphic,'tile_id',0)
+           put(graphic,'character_hue',0)
+           put(page,'through',true);put(page,'trigger',1);put(page,'move_type',0)
+           put(page,'always_on_top',false);put(page,'direction_fix',true)
+           put(page,'list',[cmd(201,0,[0,targetmap,*coords,0,1]),cmd(0,0,[])])
+           put(e,'pages',[page]);e
+          end
+          portals={
+           45=>[[1,*config['45']['entry'],'TI_EXIT',29,[70,49]],
+                [2,*config['45']['stairs'],'TI_STAIRS_2F',46,config['46']['entry']]],
+           46=>[[1,*config['46']['stairs'],'TI_STAIRS_1F',45,config['45']['stairs']]]
           }
-          function leaveDungeon(){closed=true;stop();window.parent.postMessage({type:'SLTI|EXIT|V229R17'},window.location.origin);}
-          function open(){
-            stop();''')
-          once('  camera();\n}\n\nfloor.onchange=open;', '''  document.getElementById('floor-label').textContent=map.mapId+'층';
-            camera();
-          }
+          config.each do |id_s,meta|
+           id=id_s.to_i
+           w=meta.fetch('width');h=meta.fetch('height')
+           image_map=Marshal.load(Marshal.dump(prototype))
+           put(image_map,'width',w);put(image_map,'height',h)
+           put(image_map,'data',Table.blank(w,h))
+           put(image_map,'encounter_list',[]);put(image_map,'encounter_step',100)
+           put(image_map,'slti_collision',meta.fetch('maskBase64').unpack('m0').first)
+           events={}
+           portals.fetch(id).each do |eid,x,y,desc,target,coordinates|
+             n=y*w+x;mask=v(image_map,'slti_collision')
+             raise "Blocked native portal #{id} #{desc}" unless mask.getbyte(n)==0
+             events[eid]=event(eid,x,y,desc,target,coordinates,proto_page)
+           end
+           put(image_map,'events',events)
+           File.binwrite(base+"#{pre}Map%03d.rxdata"%id,Marshal.dump(image_map))
+           puts "NATIVE_MAP #{id} #{w}x#{h} events=#{events.size} passable=#{v(image_map,'slti_collision').count("\0")}"
+          end
+          # Add map index metadata for map loads/save listing.
+          infosfile=base+pre+'MapInfos.rxdata'
+          infos=Marshal.load(File.binread(infosfile));raise 'MapIDs already occupied' if infos[45] || infos[46]
+          {45=>'Sanctuary TI Dungeon 1F',46=>'Sanctuary TI Dungeon 2F'}.each do |id,name|
+           ent=Marshal.load(Marshal.dump(infos[44]))
+           put(ent,'name',name);put(ent,'parent_id',0);put(ent,'order',id)
+           infos[id]=ent
+          end
+          File.binwrite(infosfile,Marshal.dump(infos))
+          # Append runtime within the actual RGSS engine, before Main.
+          scriptsfile=base+'Scripts.rxdata'
+          scripts=Marshal.load(File.binread(scriptsfile))
+          raise 'Unexpected engine version' unless scripts.size==136 && scripts[134][1]=='V230 Boss Respawn 60s 180s' && scripts[135][1]=='Main'
+          source=File.read('/tmp/slti-native-r18-runtime.rb',encoding:'UTF-8')
+          raise 'Runtime syntax invalid' unless system('ruby','-c','/tmp/slti-native-r18-runtime.rb',out:File::NULL)
+          raise 'Missing native sprite renderer' unless source.include?('class Spriteset_Map') && source.include?('SLTI_NATIVE_R18')
+          scripts.insert(135,[scripts.map{|e|e[0]}.max+1,'SLTI Native Dungeon V229R18',Zlib::Deflate.deflate(source)])
+          File.binwrite(scriptsfile,Marshal.dump(scripts))
+          puts 'NATIVE_SCRIPT',scripts.size,'append-before-Main, source SHAs',Digest::SHA256.hexdigest(source)
+          RUBY_PATCH
+          ruby -c /tmp/slti-r18-patch.rb
+          ruby /tmp/slti-r18-patch.rb site
 
-          document.getElementById('leave-dungeon').onclick=leaveDungeon;
-          floor.onchange=open;''')
-          once('let map,mask,x,y,scale=1,player,repeat=null;', 'let map,mask,x,y,scale=1,player,repeat=null,closed=false;')
-          once('    e.preventDefault();stop();walk(dx,dy);\n    repeat=setInterval(()=>walk(dx,dy),130);', '    e.preventDefault();stop();const oldFloor=map.mapId;walk(dx,dy);\n    if(!closed && map.mapId===oldFloor)repeat=setInterval(()=>walk(dx,dy),130);')
-          # Display one original knight character frame in the dungeon.
-          once("  player.id='player';player.className='pin';\n  world.append(player);", """  player.id='player';player.className='pin';
-            const spriteCanvas=document.createElement('canvas');spriteCanvas.width=90;spriteCanvas.height=80;
-            player.append(spriteCanvas);
-            const actor=new Image();actor.src='../gameasync/Graphics/Characters/knight_men.png';
-            actor.onload=()=>{
-              const ctx=spriteCanvas.getContext('2d',{willReadFrequently:true});
-              ctx.drawImage(actor,0,0,90,80,0,0,90,80);
-              const pixels=ctx.getImageData(0,0,90,80);
-              for(let i=0;i<pixels.data.length;i+=4){
-                if(pixels.data[i]<38 && pixels.data[i+1]>172 && pixels.data[i+2]<38) pixels.data[i+3]=0;
-              }
-              ctx.putImageData(pixels,0,0);
-            };
-            world.append(player);""")
-          # Retain the original V4.1 walkable test spawn.
-          result=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S).group(1))
-          assert result==source
-          assert 'function changeFloor' in html and "SLTI|EXIT|V229R17" in html
-          (target/'index.html').write_text(html,encoding='utf-8')
-          print('V229R17 Sanctuary terrain staged',len(files),'original S32 PNGs, two floors')
-
-          PY_VIEW_R17
-
-      - name: V229R17 Connect NPC output to dungeon, return and version
+      - name: V229R18 Register 30 new native assets and visible version
         shell: bash
         run: |
           set -euo pipefail
-          python3 - site <<'PY_INDEX_R17'
+          cat > /tmp/slti-r18-index.py <<'PY_INDEX'
+          import hashlib,json,re,sys
           from pathlib import Path
-          import hashlib,re,sys
-          root=Path(sys.argv[1]); knight=root/'knight'
-          rel='Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata'
-          path=knight/'gameasync/mapping.js'; mapping=path.read_text(encoding='utf-8')
-          md5=hashlib.md5((knight/'gameasync'/rel).read_bytes()).hexdigest()
-          mapping,n=re.subn(re.escape(rel+'?h=')+r'[0-9a-f]{32}',lambda m:rel+'?h='+md5,mapping)
-          assert n==1
-          path.write_text(mapping,encoding='utf-8')
-          index=knight/'index.html'; page=index.read_text(encoding='utf-8')
-          def replace_once(a,b):
-              global page
-              assert page.count(a)==1,('Source changed',a,page.count(a))
-              page=page.replace(a,b,1)
-          replace_once('  function marker(t){\n', "  function marker(t){\n    if(t.includes('SLTI|ENTER|V229R17')){window.slOpenSanctuary && window.slOpenSanctuary();return;}\n")
-          bridge="""
-          <script id="slti-v229r17-bridge">
-          (function(){
-            'use strict';
-            let layer=null, iframe=null;
-            window.slOpenSanctuary=function(){
-              if(layer)return;
-              layer=document.createElement('div');layer.id='slti-layer';
-              layer.style.cssText='position:fixed;inset:0;background:#101823;z-index:2147483000;';
-              iframe=document.createElement('iframe');iframe.id='slti-frame';
-              iframe.setAttribute('title','Sanctuary 말섬 던전');
-              iframe.style.cssText='display:block;width:100%;height:100%;border:0;';
-              iframe.src='sanctuary/index.html?v=v229r17';
-              layer.appendChild(iframe);document.body.appendChild(layer);
-              console.info('SLTI|OPEN|V229R17');
-            };
-            window.addEventListener('message',function(evt){
-              if(!iframe||evt.source!==iframe.contentWindow||evt.origin!==window.location.origin)return;
-              if(!evt.data||evt.data.type!=='SLTI|EXIT|V229R17')return;
-              layer.remove();layer=null;iframe=null;
-              const canvas=document.getElementById('canvas');if(canvas)canvas.focus();
-              console.info('SLTI|RETURN|V229R17');
-            });
-          })();
-          </script>
-          """
-          replace_once('</body>',bridge+'\n</body>')
-          replace_once('<title>SLKnight V229R16</title>','<title>SLKnight V229R17</title>')
-          replace_once("var wTitle = 'SLKnight V229R16'","var wTitle = 'SLKnight V229R17'")
-          replace_once('>V229R16</div>','>V229R17</div>')
-          replace_once('gameasync/mapping.js?v=v229r16','gameasync/mapping.js?v=v229r17')
-          replace_once('js/dpad.js?v=v229r16','js/dpad.js?v=v229r17')
-          index.write_text(page,encoding='utf-8')
-          home=root/'index.html'; s=home.read_text(encoding='utf-8')
-          assert s.count('V229R16')==2
-          home.write_text(s.replace('V229R16','V229R17'),encoding='utf-8')
-          print('V229R17 game entry bridge connected')
-          PY_INDEX_R17
+          site=Path(sys.argv[1]);root=site/'knight';data=root/'gameasync';mp=data/'mapping.js'
+          mapping=mp.read_text(encoding='utf-8');assert mapping.count('var mappingArray = [')==1
+          assert mapping.count('\n];\n\nvar mapping')==1
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          changed=[f'Data/{prefix}Map029.rxdata',f'Data/{prefix}MapInfos.rxdata','Data/Scripts.rxdata']
+          new=[f'Data/{prefix}Map045.rxdata',f'Data/{prefix}Map046.rxdata']
+          new += [str(f.relative_to(data)) for f in (data/'Graphics/Pictures').glob('SLTI*.png')]
+          assert len(new)==30 and len(changed)==3
+          for rel in changed:
+              md5=hashlib.md5((data/rel).read_bytes()).hexdigest()
+              pattern=re.escape(rel)+r'\?h=[0-9a-f]{32}'
+              mapping,n=re.subn(pattern,lambda m:rel+'?h='+md5,mapping)
+              assert n==1,('Index update failed',rel,n)
+          entries=[]
+          for rel in new:
+              f=data/rel;assert f.is_file()
+              stem=rel.rsplit('.',1)[0]
+              key=stem.lower()
+              value=rel+'?h='+hashlib.md5(f.read_bytes()).hexdigest()
+              assert not re.search(r'\["'+re.escape(key)+r'",',mapping),('Key exists',key)
+              entries.append([key,value])
+          entries.sort()
+          array=''.join('['+json.dumps(k,ensure_ascii=False)+', '+json.dumps(v,ensure_ascii=False)+'],\n' for k,v in entries)
+          mapping=mapping.replace('\n];\n\nvar mapping','\n'+array+'];\n\nvar mapping',1)
+          mp.write_text(mapping,encoding='utf-8')
+          assert all(k in mp.read_text() for k,v in entries)
+          knight_index=root/'index.html';content=knight_index.read_text(encoding='utf-8')
+          assert content.count('V229R16')==3,('Unexpected version refs',content.count('V229R16'))
+          assert content.count('v229r16')==2
+          content=content.replace('V229R16','V229R18').replace('v229r16','v229r18')
+          assert 'slti-layer' not in content and 'slOpenSanctuary' not in content and '<iframe' not in content
+          knight_index.write_text(content,encoding='utf-8')
+          home=site/'index.html';src=home.read_text(encoding='utf-8')
+          assert src.count('V229R16')==2
+          home.write_text(src.replace('V229R16','V229R18'),encoding='utf-8')
+          manifest={'version':'V229R18','nativeMapIDs':[45,46],'source':'Sanctuary S32 original 28 terrain blocks','preservesOriginalGameMaps':list(range(1,45)),'portalPairs':[{'from':29,'event':11,'to':45},{'from':45,'event':2,'to':46},{'from':46,'event':1,'to':45},{'from':45,'event':1,'to':29}],'candidateLandingPoints':True,'noMonsterSpawnsInvented':True,'noSeparateHtmlViewer':True}
+          # Store manifest only in build workspace, not game deployment.
+          Path('/tmp/slti-native-r18-manifest.json').write_text(json.dumps(manifest,indent=2))
+          print('INDEX VERIFIED',len(entries),'new assets, three modified mappings')
+          PY_INDEX
+          python3 /tmp/slti-r18-index.py site
 
-      - name: V229R17 Verify intentional changes and original dungeon data
+      - name: V229R18 Verify native map commands collision and script source
         shell: bash
         run: |
           set -euo pipefail
+          cat > /tmp/slti-r18-check.rb <<'RUBY_VERIFY'
+          require 'digest';require 'json';require 'zlib'
+          module RPG
+           class Map;end;class MapInfo;end;class AudioFile;end;class Tileset;end
+           class Event
+            class Page
+             class Graphic;end;class Condition;end
+            end
+           end
+           class EventCommand;end;class MoveRoute;end;class MoveCommand;end
+          end
+          class Table
+           def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+           def _dump(level=0);@raw;end
+           def hdr;@raw.unpack('V5');end
+           def get(x,y,z)
+            dim,w,h,n,c=hdr;raise 'wrong type' unless dim==3&&n==3
+            @raw.byteslice(20+2*(x+y*w+z*w*h),2).unpack1('v')
+           end
+          end
+          class Tone;def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end;def _dump(level=0);@raw;end;end
+          class Color<Tone;end
+          site=ARGV.fetch(0)
+          base=site+'/knight/gameasync/Data/'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          {45=>[[94,98,29,[70,49]],[161,173,46,[89,85]]],46=>[[89,85,45,[161,173]]]}.each do |id,expect|
+           m=Marshal.load(File.binread(base+"#{pre}Map%03d.rxdata"%id))
+           d=m.instance_variable_get(:@data);mask=m.instance_variable_get(:@slti_collision)
+           w=m.instance_variable_get(:@width);h=m.instance_variable_get(:@height)
+           raise 'table size' unless d.hdr==[3,w,h,3,w*h*3]
+           raise 'mask size' unless mask.bytesize==w*h
+           raise 'not blank' unless d.get(0,0,0)==0&&d.get(w-1,h-1,2)==0
+           es=m.instance_variable_get(:@events).values.sort_by{|e|e.instance_variable_get(:@id)}
+           raise 'event count' unless es.size==expect.size
+           expect.each_with_index do |(x,y,target,landing),i|
+            e=es[i];p=e.instance_variable_get(:@pages).first
+            raise 'coordinate mismatch' unless [e.instance_variable_get(:@x),e.instance_variable_get(:@y)]==[x,y]
+            raise 'blocked target' unless mask.getbyte(y*w+x)==0
+            raise 'trigger issue' unless [p.instance_variable_get(:@trigger),p.instance_variable_get(:@through)]==[1,true]
+            cs=p.instance_variable_get(:@list)
+            raise 'transfer mismatch' unless cs.first.instance_variable_get(:@code)==201&&cs.first.instance_variable_get(:@parameters)==[0,target,*landing,0,1]
+           end
+           puts "VERIFIED Native Map #{id}: #{w}x#{h} passable=#{mask.count("\0")} native transfers=#{es.size}"
+          end
+          town=Marshal.load(File.binread(base+pre+'Map029.rxdata'))
+          e=town.instance_variable_get(:@events).fetch(11)
+          cs=e.instance_variable_get(:@pages).first.instance_variable_get(:@list)
+          raise 'teleporter did not enter native Map045' unless cs.any?{|c|c.instance_variable_get(:@code)==201 && c.instance_variable_get(:@parameters)==[0,45,94,98,0,1]}
+          transfers=cs.select{|c|c.instance_variable_get(:@code)==201}.map{|c|c.instance_variable_get(:@parameters)}
+          raise 'original transfers changed' unless transfers.size==8
+          raise 'old placeholder survived' if cs.any?{|c|c.instance_variable_get(:@code)==101 && c.instance_variable_get(:@parameters).inspect.include?('map')}
+          puts "VERIFIED NPC: #{transfers.size} native transfers, 7 original and one Sanctuary entrance"
+          scripts=Marshal.load(File.binread(base+'Scripts.rxdata'))
+          raise 'wrong script count' unless scripts.size==137 && scripts[-2][1]=='SLTI Native Dungeon V229R18' && scripts[-1][1]=='Main'
+          program=Zlib::Inflate.inflate(scripts[-2][2]);File.binwrite('/tmp/slti-r18-verified.rb',program)
+          raise 'script syntax error' unless system('ruby','-c','/tmp/slti-r18-verified.rb',out:File::NULL)
+          puts 'VERIFIED source no iframe and native script source hash '+Digest::SHA256.hexdigest(program)
+          RUBY_VERIFY
+          ruby /tmp/slti-r18-check.rb site
+          node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/dpad.js
-          python3 - <<'PY_VERIFY_R17'
-          from pathlib import Path
-          import base64,hashlib,json,re,subprocess
-          root=Path('site')
-          original=json.loads(Path('/tmp/sl-r17-before.json').read_text())
-          actual={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          changed={name for name,sha in original.items() if actual.get(name)!=sha}
-          expectedChanged={'index.html','knight/index.html','knight/gameasync/mapping.js','knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata'}
-          assert changed==expectedChanged,(changed,expectedChanged)
-          assert len(original)==5354 and len(actual)==5383,('File count',len(actual))
-          new=set(actual)-set(original)
-          assert len(new)==29 and 'knight/sanctuary/index.html' in new
-          pngs=list((root/'knight/sanctuary/tiles').glob('*/*.png'))
-          assert len(pngs)==28
-          for img in pngs:
-              assert img.read_bytes()==(Path('original-ti/preview/tiles')/img.parent.name/img.name).read_bytes()
-          html=(root/'knight/sanctuary/index.html').read_text(encoding='utf-8')
-          match=re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S)
-          assert match
-          data=json.loads(match.group(1));assert set(data)=={'1','2'}
-          for floor in ('1','2'):
-              m=data[floor]
-              assert len(base64.b64decode(m['collisionBase64']))==m['width']*m['height']
-          assert len(data['1']['tiles'])==12 and len(data['2']['tiles'])==16
-          page=(root/'knight/index.html').read_text(encoding='utf-8')
-          assert 'SLTI|ENTER|V229R17' in page and 'SLTI|EXIT|V229R17' in page
-          assert 'SLKnight V229R17' in page and 'gameasync/mapping.js?v=v229r17' in page
-          assert "var namespace = 'slknight_v14_engine'" in page
-          assert 'V229R17' in (root/'index.html').read_text(encoding='utf-8')
-          for filename in ('knight/index.html','knight/sanctuary/index.html'):
-              source=(root/filename).read_text(encoding='utf-8')
-              for i,block in enumerate(re.finditer(r'<script([^>]*)>(.*?)</script>',source,re.S)):
-                  attrs,js=block.groups()
-                  if 'application/json' in attrs or not js.strip():continue
-                  check=Path('/tmp/r17-check-'+filename.replace('/','-')+'-'+str(i)+'.js')
-                  check.write_text(js)
-                  subprocess.run(['node','--check',str(check)],check=True)
-          print('V229R17 OK: NPC entry, original terrain, portal test and return are packaged')
-          PY_VERIFY_R17
 
-      - name: V229R17 Upload complete game build
+      - name: V229R18 Verify exact 5354 original assets retained
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/slti-r18-integrity.py <<'PY_INTEGRITY'
+          import hashlib,tarfile,sys
+          from pathlib import Path
+          root=Path(sys.argv[1]);tarfile_path=Path(sys.argv[2]);
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          expected_changed={'index.html','knight/index.html','knight/gameasync/mapping.js',f'knight/gameasync/Data/{pre}Map029.rxdata',f'knight/gameasync/Data/{pre}MapInfos.rxdata','knight/gameasync/Data/Scripts.rxdata'}
+          expected_new={f'knight/gameasync/Data/{pre}Map045.rxdata',f'knight/gameasync/Data/{pre}Map046.rxdata'}
+          expected_new.update(str(p.relative_to(root)) for p in (root/'knight/gameasync/Graphics/Pictures').glob('SLTI*.png'))
+          assert len(expected_new)==30
+          count=0;changed=set();observed=set();missing=[]
+          with tarfile.open(tarfile_path) as tar:
+              for member in tar:
+                  if not member.isfile():continue
+                  name=member.name.removeprefix('./')
+                  observed.add(name)
+                  original=hashlib.sha256(tar.extractfile(member).read()).digest()
+                  path=root/name
+                  if not path.is_file():missing.append(name);continue
+                  current=hashlib.sha256(path.read_bytes()).digest()
+                  if original!=current:changed.add(name)
+                  count+=1
+          assert count==5354 and not missing,(count,missing[:3])
+          assert changed==expected_changed,(changed^expected_changed)
+          files={str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
+          assert len(files)==5384 and files-observed==expected_new, (len(files),len(files-observed),len(expected_new))
+          assert not (root/'knight/sanctuary').exists(),'Separate HTML overlay should be absent'
+          print('VERIFIED exact diff: 6 existing files changed, 30 new native map/image assets, original 44 maps unchanged, 5354 old assets accounted')
+          PY_INTEGRITY
+          python3 /tmp/slti-r18-integrity.py site previous/artifact.tar
+
+      - name: V229R18 Smoke-test native Ruby isometric positions and original fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/slti-r18-test-runtime.rb <<'RUBY_TEST'
+          class Game_Map
+            attr_accessor :map_id
+            attr_accessor :data
+            def initialize
+              @map_id=45
+              @map=Struct.new(:stuff).new('')
+              @map.instance_variable_set(:@slti_collision,"\0"*65536)
+            end
+            def valid?(x,y);x>=0 && y>=0 && x<256 && y<256;end
+            def width;256;end
+            def passable?(x,y,d,e=nil);:old_pass;end
+          end
+          class Game_Character
+           attr_accessor :real_x,:real_y
+           def initialize(x=94,y=98);@real_x=x*128;@real_y=y*128;@always_on_top=false;end
+           def screen_x;:old_x;end
+           def screen_y;:old_y;end
+           def screen_z(h=0);:old_z;end
+          end
+          class Sprite
+           attr_accessor :bitmap,:z,:x,:y
+           def initialize(v);@view=v;end
+           def dispose;@disposed=true;end
+          end
+          class Spriteset_Map
+           def initialize
+             @viewport1=Object.new
+             update
+           end
+           def update;end
+           def dispose;end
+          end
+          module RPG
+           module Cache
+            def self.picture(name)
+             raise 'Picture name invalid' unless name.start_with?('SLTI')
+             return name
+            end
+           end
+          end
+          load '/tmp/slti-native-r18-runtime.rb'
+          raise 'Meta keys type error' unless SLTINative::META.keys.sort==['45','46']
+          $game_map=Game_Map.new
+          $game_player=Game_Character.new
+          raise 'Player x incorrect' unless $game_player.screen_x==400 && $game_player.screen_y==230
+          neighbor=Game_Character.new(95,98)
+          raise 'Iso neighbor x wrong' unless neighbor.screen_x==412 && neighbor.screen_y==224
+          neighbor=Game_Character.new(94,99)
+          raise 'Iso neighbor y wrong' unless neighbor.screen_x==412 && neighbor.screen_y==236
+          raise 'Collision empty failed' unless $game_map.passable?(94,98,0)
+          $game_map.instance_variable_get(:@map).instance_variable_get(:@slti_collision).setbyte(98*256+94,1)
+          raise 'Collision blocked failed' if $game_map.passable?(94,98,0)
+          render=Spriteset_Map.new
+          sprites=render.instance_variable_get(:@slti_native_sprites)
+          raise 'Missing RGSS terrain sprites' unless sprites.size==12
+          px,py=SLTINative.player_world
+          meta=SLTINative::META['45'];first=meta['tiles'][0]
+          raise 'Tile iso placement wrong' unless sprites[0].x==(400+first[1]-px).round && sprites[0].y==(230+first[2]-py).round
+          $game_map.map_id=46
+          raise 'Native 2F meta missing' unless SLTINative.active? && SLTINative.meta['tiles'].size==16
+          $game_map.map_id=29
+          raise 'Original map changed' unless $game_map.passable?(0,0,0)==:old_pass && $game_player.screen_x==:old_x && $game_player.screen_y==:old_y
+          puts 'VERIFIED NATIVE RGSS map IDs, player iso screen coordinates, collision, sprite counts, original-engine fallback'
+          RUBY_TEST
+          ruby /tmp/slti-r18-test-runtime.rb
+          mkdir -p reports
+          cp /tmp/slti-native-r18-manifest.json reports/manifest-v229r18.json
+
+      - name: V229R18 Upload native engine source verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: SLKnight-V229R18-Native-Sanctuary-Verification
+          path: reports/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: V229R18 Upload full 5384-file game with native maps
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
