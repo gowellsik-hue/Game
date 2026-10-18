@@ -1,7 +1,7 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V4.1 / Original terrain movement
-name: V4.1 | TI Dungeon Original Terrain Movement
+# VERSION: V5.0 / SLKnight 44 maps monster spawn coordinates
+name: V5.0 | 44 Map Monster Spawn Coordinate Extraction
 
 on:
   workflow_dispatch:
@@ -10,250 +10,129 @@ on:
     paths: [.github/workflows/audit-sanctuary-maps.yml]
 
 permissions:
-  actions: read
   contents: read
+  actions: read
 
 jobs:
-  terrain-movement:
+  map-spawn:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - name: V4.1 Restore verified V4.0 maps
+      - name: V5.0 Restore verified V229R9 game maps
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p reports
-          gh run download 39099232450 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V4.0-Runtime-Map -D reports
-          test -s reports/runtime-v4.0.json
-          test -s reports/preview/map-index.json
+          mkdir -p previous source reports
+          gh run download 39100666926 -R "$GITHUB_REPOSITORY" -n github-pages -D previous
+          test -s previous/artifact.tar
+          tar -xf previous/artifact.tar -C source --wildcards '*/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap*.rxdata'
+          test -s source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap044.rxdata
+          command -v ruby >/dev/null || (sudo apt-get update -qq && sudo apt-get install -qq -y ruby)
+          ruby --version
 
-      - name: V4.1 Build original terrain walking preview
+      - name: V5.0 Extract original event locations and monster relocations
+        shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import base64,json,re,struct
-          from pathlib import Path
+          cat > /tmp/map-spawn-v5.rb <<'RUBY_SPAWN_V50'
+          require 'json'
+          require 'csv'
+          require 'fileutils'
+          module RPG
+            class AudioFile;end; class Cache;end; class Map;end; class MapInfo;end
+            class Event
+              class Page
+                class Condition;end; class Graphic;end
+              end
+            end
+            class EventCommand;end; class MoveRoute;end; class MoveCommand;end
+          end
+          class Table
+            def self._load(s); allocate; end
+          end
+          class Tone
+            def self._load(s); s; end
+          end
+          class Color
+            def self._load(s); s; end
+          end
+          src=ARGV[0]||'source/Data'
+          dest=ARGV[1]||'reports'
+          FileUtils.mkdir_p(dest)
+          def attr(o,key);o.instance_variable_get('@'+key);end
+          def utf(s);s.to_s.dup.force_encoding('UTF-8').scrub;end
+          folder=File.join(src,'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO')
+          files=Dir[folder+'Map[0-9][0-9][0-9].rxdata'].sort
+          raise "Expected 44 playable source files, got #{files.size}" unless files.size==44
+          infos=Marshal.load(File.binread(folder+'MapInfos.rxdata'))
+          monsters=[];ambiguous=[];points=[];event_total=0;flagged=[];region_stats=[]
+          files.each do |file|
+            map_id=File.basename(file).match(/Map(\d{3})\.rxdata$/)[1].to_i
+            map=Marshal.load(File.binread(file))
+            events=attr(map,'events') || {}
+            width=attr(map,'width');height=attr(map,'height')
+            event_total+=events.size
+            name=utf(attr(infos[map_id],'name'))
+            count=0
+            events.each do |event_id,event|
+              pages=attr(event,'pages') || []
+              e_name=utf(attr(event,'name'))
+              commands=pages.flat_map{|p| attr(p,'list') || []}
+              combat=commands.any?{|c|attr(c,'code')==117 && attr(c,'parameters')[0]==62}
+              # Boss scripts are kept separate when their combat event does not call CE62.
+              boss_candidate=!combat && e_name.match?(/(기르타스|바알|안타라스)/) && !e_name.start_with?('EV')
+              next unless combat || boss_candidate
+              x=attr(event,'x');y=attr(event,'y')
+              unless x.is_a?(Integer) && y.is_a?(Integer) && x.between?(0,width-1) && y.between?(0,height-1)
+                raise "Bad initial event coordinate on map #{map_id} event #{event_id}"
+              end
+              evidence=combat ? 'COMBAT_EVENT_CE62' : 'BOSS_NAME_UNVERIFIED'
+              rel=[]
+              pages.each_with_index do |page,index|
+                graphic=attr(page,'graphic')
+                graphic_name=utf(attr(graphic,'character_name'))
+                is_death=graphic_name.include?('죽음')
+                (attr(page,'list')||[]).each do |c|
+                  next unless attr(c,'code')==202
+                  p=attr(c,'parameters')
+                  next unless p.is_a?(Array) && p.size>=5
+                  target,mode,cx,cy,_direction=p
+                  if target==0 && mode==0 && cx.is_a?(Integer) && cy.is_a?(Integer)
+                    item={'x'=>cx,'y'=>cy,'page'=>index,'deathPage'=>is_death,'insideMap'=>cx.between?(0,width-1) && cy.between?(0,height-1),'type'=>'SCRIPTED_RELOCATION_CANDIDATE'}
+                    rel<<item unless rel.any?{|r|r['x']==cx && r['y']==cy && r['page']==index}
+                    flagged<<[map_id,event_id,e_name,cx,cy] unless item['insideMap']
+                  elsif target==0
+                    flagged<<[map_id,event_id,e_name,'VARIABLE_OR_NON_LITERAL',p]
+                  end
+                end
+              end
+              record={'source'=>'SLKnight_RPG_Maker_RxData','mapId'=>map_id,'mapName'=>name,'eventId'=>event_id,'monsterName'=>e_name,'initialX'=>x,'initialY'=>y,'evidence'=>evidence,'arenaOrSpecial'=>[16,43,44].include?(map_id),'relocations'=>rel}
+              (combat ? monsters : ambiguous)<<record
+              # The first point is the actual stored initial location, not guaranteed live spawn.
+              points << [map_id,name,event_id,e_name,'INITIAL_EVENT',x,y,'',evidence,record['arenaOrSpecial'],true]
+              rel.each{|q| points << [map_id,name,event_id,e_name,'SCRIPTED_RELOCATION',q['x'],q['y'],q['page'],evidence,record['arenaOrSpecial'],q['insideMap']]}
+              count+=1
+            end
+            region_stats << {'mapId'=>map_id,'mapName'=>name,'width'=>width,'height'=>height,'events'=>events.size,'combatOrBossCandidates'=>count}
+          end
+          raise "Unexpected game event count #{event_total}" unless event_total==845
+          raise "Low monster count #{monsters.size}" unless monsters.size>=400
+          headers=['sourceMapId','mapName','eventId','monsterName','pointType','x','y','pageIndex','evidence','specialArena','withinMap']
+          CSV.open(File.join(dest,'monster-spawn-points-v5.0.csv'),'w',write_headers:true,headers:headers,encoding:'UTF-8') { |csv| points.each{|p| csv<<p} }
+          manifest={version:'V5.0',sourceGame:'SLKnight RPG Maker map event database',notSanctuaryS32Coordinates:true,monsterCandidates:monsters.size,unverifiedBossCandidates:ambiguous.size,eventsExamined:event_total,sourceMaps:files.size,coordinateRows:points.size,nonLiteralOrOutOfBoundsRelocations:flagged,monsterEvents:monsters,unverifiedBossEvents:ambiguous,maps:region_stats,portalWarpLinksIncluded:false}
+          File.write(File.join(dest,'monster-spawn-index-v5.0.json'),JSON.pretty_generate(manifest))
+          puts "MAP V5.0 OK: 44 maps, #{event_total} events, #{monsters.size} combat, #{ambiguous.size} boss candidates, #{points.size} coordinate rows, #{flagged.size} location exceptions"
+          RUBY_SPAWN_V50
+          ruby -c /tmp/map-spawn-v5.rb
+          ruby /tmp/map-spawn-v5.rb source/knight/gameasync/Data reports
+          test -s reports/monster-spawn-index-v5.0.json
+          test -s reports/monster-spawn-points-v5.0.csv
 
-          root=Path('reports')
-          preview=root/'preview'
-          src=json.loads((root/'runtime-v4.0.json').read_text())
-          index=json.loads((preview/'map-index.json').read_text())
-          assert src['version']=='V4.0'
-          pack={}
-
-          for mid,expected in (('1',12),('2',16)):
-              m=src['maps'][mid]
-              tiles=m['tiles']
-              assert len(tiles)==expected
-              assert len(base64.b64decode(m['collisionBase64']))==m['width']*m['height']
-
-              for t in tiles:
-                  head=(preview/t['src']).open('rb').read(24)
-                  assert head[:8]==b'\x89PNG\r\n\x1a\n'
-                  assert struct.unpack('>II',head[16:24])==(1536,768)
-
-              def projected(wx,wy):
-                  bx=(wx-32704)//64+32767
-                  by=(wy-32704)//64+32767
-                  key=f'{bx:04x}{by:04x}.png'
-                  block=next((t for t in tiles if t['src'].endswith('/'+key)),None)
-                  if not block:return None
-                  dx=wx-(32704+(bx-32767)*64)
-                  dy=wy-(32704+(by-32767)*64)
-                  return block['x']+12*(dx+dy),block['y']+378+6*(dy-dx)
-
-              start=m['spawnForMovementTest']
-              assert projected(start['x'],start['y']) is not None
-              assert all(projected(p['x'],p['y']) for p in m['portals'])
-              assert len(m['portals'])==(6 if mid=='1' else 14)
-
-              m['mapWidth']=index[mid]['width']
-              m['mapHeight']=index[mid]['height']
-              pack[mid]=m
-
-          page=r"""<!doctype html><html lang="ko">
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>TI Dungeon V4.1 Original Terrain Movement</title>
-          <style>
-          *{box-sizing:border-box}
-          body{margin:0;background:#101823;color:#eff7ff;font:14px system-ui}
-          header{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px}
-          button,select{font:inherit;background:#293c53;color:#fff;border:1px solid #5f748c;border-radius:7px;padding:7px}
-          #scene{height:calc(100dvh - 208px);min-height:185px;overflow:hidden;position:relative;background:#070d13;touch-action:none}
-          #world{position:absolute;left:0;top:0;transform-origin:0 0}
-          #world img{position:absolute;max-width:none;image-rendering:pixelated;pointer-events:none}
-          .pin{position:absolute;transform:translate(-50%,-50%);pointer-events:none}
-          .portal{width:13px;height:13px;background:#ffe061;border:2px solid #483000;border-radius:50%;opacity:.8;z-index:2}
-          #player{width:19px;height:19px;background:#fa536c;border:3px solid white;border-radius:50%;box-shadow:0 0 9px #f56;z-index:9}
-          #pad{display:grid;grid-template-columns:repeat(3,67px);gap:5px;justify-content:center;margin:7px}
-          #pad button{height:40px;font-size:22px;touch-action:none;padding:0}
-          #state{padding:4px 9px;min-height:22px}
-          small{color:#abc0d4}
-          </style>
-
-          <header>
-          <b>TI Dungeon V4.1</b>
-          <select id="floor"><option value="1">1F</option><option value="2">2F</option></select>
-          <select id="jump"><option value="">Start</option></select>
-          <button id="minus">-</button><button id="plus">+</button>
-          <a href="index.html" style="color:#cce7ff">Map</a>
-          </header>
-
-          <div id="scene"><div id="world"></div></div>
-          <div id="state"></div>
-          <div id="pad">
-          <span></span><button data-dir="0,-1">&#9650;</button><span></span>
-          <button data-dir="-1,0">&#9664;</button><button data-dir="0,1">&#9660;</button><button data-dir="1,0">&#9654;</button>
-          </div>
-          <small style="display:block;text-align:center">Original terrain. Collision bit 0 is provisional. Yellow = portal candidate; no automatic warp.</small>
-
-          <script id="data" type="application/json">__DATA__</script>
-          <script>
-          'use strict';
-          const maps=JSON.parse(document.getElementById('data').textContent);
-          const floor=document.getElementById('floor');
-          const jump=document.getElementById('jump');
-          const world=document.getElementById('world');
-          const scene=document.getElementById('scene');
-          const state=document.getElementById('state');
-          let map,mask,x,y,scale=1,player,repeat=null;
-
-          function placement(wx,wy){
-            const bx=Math.floor((wx-32704)/64)+32767;
-            const by=Math.floor((wy-32704)/64)+32767;
-            const key=bx.toString(16).padStart(4,'0')+by.toString(16).padStart(4,'0')+'.png';
-            const block=map.tiles.find(t=>t.src.endsWith('/'+key));
-            if(!block)return null;
-            const sx=32704+(bx-32767)*64,sy=32704+(by-32767)*64;
-            const dx=wx-sx,dy=wy-sy;
-            return {x:block.x+12*(dx+dy),y:block.y+378+6*(dy-dx)};
-          }
-
-          function camera(){
-            const p=placement(x,y);
-            if(!p){state.textContent='Unmapped coordinate';return;}
-            player.style.left=p.x+'px';
-            player.style.top=p.y+'px';
-            world.style.transform=`translate(${scene.clientWidth/2-p.x*scale}px,${scene.clientHeight/2-p.y*scale}px) scale(${scale})`;
-            const near=map.portals.filter(v=>Math.abs(v.x-x)<=1&&Math.abs(v.y-y)<=1).map(v=>v.name).join(', ');
-            state.textContent=`Map ${map.mapId} | X ${x}, Y ${y} | zoom ${scale.toFixed(2)}${near?' | portal: '+near:''}`;
-          }
-
-          function walk(dx,dy){
-            const nx=x+dx,ny=y+dy,ix=nx-map.originX,iy=ny-map.originY;
-            if(ix<0||iy<0||ix>=map.width||iy>=map.height)return;
-            const v=mask[iy*map.width+ix];
-            if(v===255||(v&1)||!placement(nx,ny))return;
-            x=nx;y=ny;camera();
-          }
-
-          function stop(){
-            if(repeat!==null){clearInterval(repeat);repeat=null;}
-          }
-
-          function open(){
-            stop();
-            map=maps[floor.value];
-            mask=Uint8Array.from(atob(map.collisionBase64),c=>c.charCodeAt(0));
-            x=map.spawnForMovementTest.x;
-            y=map.spawnForMovementTest.y;
-            world.replaceChildren();
-            world.style.width=map.mapWidth+'px';
-            world.style.height=map.mapHeight+'px';
-
-            for(const t of map.tiles){
-              const im=new Image();
-              im.src=t.src;
-              im.style.left=t.x+'px';
-              im.style.top=t.y+'px';
-              im.width=1536;im.height=768;im.draggable=false;
-              world.append(im);
-            }
-            for(const p of map.portals){
-              const pos=placement(p.x,p.y);
-              if(!pos)continue;
-              const dot=document.createElement('div');
-              dot.className='pin portal';
-              dot.style.left=pos.x+'px';
-              dot.style.top=pos.y+'px';
-              dot.title=p.name+' (unverified portal)';
-              world.append(dot);
-            }
-
-            player=document.createElement('div');
-            player.id='player';player.className='pin';
-            world.append(player);
-            jump.replaceChildren(new Option('Start',''));
-            map.portals.forEach(p=>{
-              const option=new Option(p.name,p.name);
-              option.disabled=!p.nearestWalkable;
-              jump.add(option);
-            });
-            camera();
-          }
-
-          floor.onchange=open;
-          jump.onchange=()=>{
-            if(!jump.value){
-              x=map.spawnForMovementTest.x;y=map.spawnForMovementTest.y;
-            }else{
-              const p=map.portals.find(v=>v.name===jump.value);
-              if(!p||!p.nearestWalkable)return;
-              x=p.nearestWalkable.x;y=p.nearestWalkable.y;
-            }
-            camera();
-          };
-
-          document.getElementById('minus').onclick=()=>{scale=Math.max(.5,scale/1.25);camera()};
-          document.getElementById('plus').onclick=()=>{scale=Math.min(2.5,scale*1.25);camera()};
-
-          for(const b of document.querySelectorAll('[data-dir]')){
-            const [dx,dy]=b.dataset.dir.split(',').map(Number);
-            b.onpointerdown=e=>{
-              e.preventDefault();stop();walk(dx,dy);
-              repeat=setInterval(()=>walk(dx,dy),130);
-            };
-            b.onpointerup=b.onpointercancel=b.onpointerleave=stop;
-          }
-          window.addEventListener('pointerup',stop);
-          document.onkeydown=e=>{
-            const dir={ArrowUp:[0,-1],ArrowDown:[0,1],ArrowLeft:[-1,0],ArrowRight:[1,0],KeyW:[0,-1],KeyS:[0,1],KeyA:[-1,0],KeyD:[1,0]}[e.code];
-            if(dir){e.preventDefault();walk(...dir);}
-          };
-          window.addEventListener('resize',()=>{if(player)camera()});
-          open();
-          </script></html>"""
-
-          (preview/'terrain-walk-v4.1.html').write_text(
-              page.replace('__DATA__',json.dumps(pack,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')),
-              encoding='utf-8'
-          )
-          index_file=preview/'index.html'
-          index_html=index_file.read_text(encoding='utf-8')
-          assert '</header>' in index_html
-          index_file.write_text(
-              index_html.replace('</header>',' <a href="terrain-walk-v4.1.html" style="color:#ffd86f">V4.1 WALK</a></header>',1),
-              encoding='utf-8'
-          )
-          (root/'terrain-walk-v4.1-check.json').write_text(json.dumps({
-              'version':'V4.1','terrainBlocks':28,'floorTiles':229376,
-              'portalCandidates':20,'actualWarpDestinationsVerified':0,
-              'monsterSpawnsVerified':0
-          },indent=2))
-          script=re.findall(r'<script>(.*?)</script>',(preview/'terrain-walk-v4.1.html').read_text(),re.S)[-1]
-          Path('/tmp/terrain-v4.1.js').write_text(script)
-          print('V4.1 ORIGINAL TERRAIN MOVEMENT READY')
-
-          PY
-          node --check /tmp/terrain-v4.1.js
-          test -s reports/preview/terrain-walk-v4.1.html
-
-      - name: V4.1 Upload terrain movement preview
+      - name: V5.0 Upload monster spawn coordinate audit
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V4.1-Original-Terrain-Walk
+          name: Sanctuary-Map-V5.0-Monster-Spawn-Coordinates
           path: reports/
           if-no-files-found: error
           retention-days: 30
