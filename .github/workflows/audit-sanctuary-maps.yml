@@ -1,118 +1,259 @@
 
-name: V4.0 | TI Dungeon Runtime Map and Movement Test
+# FILE: .github/workflows/audit-sanctuary-maps.yml
+# VERSION: V4.1 / Original terrain movement
+name: V4.1 | TI Dungeon Original Terrain Movement
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: [.github/workflows/audit-sanctuary-maps.yml]
+
 permissions:
-  contents: read
   actions: read
+  contents: read
+
 jobs:
-  runtime:
+  terrain-movement:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Restore V3.9 verified map data
+      - name: V4.1 Restore verified V4.0 maps
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p reports
-          gh run download 39098802617 -R "$GITHUB_REPOSITORY" -n Sanctuary-MAP-TI-Dungeon-V3.9-Portal-Links -D reports
-          test -s reports/topology-v3.8.json
-          test -s reports/preview/index.html
+          gh run download 39099232450 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V4.0-Runtime-Map -D reports
+          test -s reports/runtime-v4.0.json
+          test -s reports/preview/map-index.json
 
-      - name: Export V4.0 runtime maps and test movement
+      - name: V4.1 Build original terrain walking preview
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64,collections,json,struct
+          import base64,json,re,struct
           from pathlib import Path
 
           root=Path('reports')
-          view=root/'preview'
-          topology=json.loads((root/'topology-v3.8.json').read_text())['maps']
-          images=json.loads((view/'map-index.json').read_text())
-          runtime={};routes={};checks={}
+          preview=root/'preview'
+          src=json.loads((root/'runtime-v4.0.json').read_text())
+          index=json.loads((preview/'map-index.json').read_text())
+          assert src['version']=='V4.0'
+          pack={}
 
-          for mid,expected in [('1',12),('2',16)]:
-              d=json.loads((root/f'map-{mid}-collision.json').read_text())
-              t=topology[mid]
-              w,h=d['width'],d['height']
-              mask=base64.b64decode(d['flags'])
-              regions=base64.b64decode(t['regions'])
-              assert len(mask)==len(regions)==w*h
-              assert len(images[mid]['blocks'])==expected
+          for mid,expected in (('1',12),('2',16)):
+              m=src['maps'][mid]
+              tiles=m['tiles']
+              assert len(tiles)==expected
+              assert len(base64.b64decode(m['collisionBase64']))==m['width']*m['height']
 
-              for tile in images[mid]['blocks']:
-                  header=(view/tile['src']).read_bytes()[:24]
-                  assert header[:8]==b'\x89PNG\r\n\x1a\n'
-                  assert struct.unpack('>II',header[16:24])==(1536,768)
+              for t in tiles:
+                  head=(preview/t['src']).open('rb').read(24)
+                  assert head[:8]==b'\x89PNG\r\n\x1a\n'
+                  assert struct.unpack('>II',head[16:24])==(1536,768)
 
-              anchor='to2' if mid=='1' else 'to1'
-              portal=next(z for z in t['portals'] if z['name']==anchor)
-              near=portal['nearestWalkable']
-              assert near and near['regionSize']>0
-              start=(near['y']-d['originY'])*w+near['x']-d['originX']
-              assert mask[start]!=255 and mask[start]&1==0
+              def projected(wx,wy):
+                  bx=(wx-32704)//64+32767
+                  by=(wy-32704)//64+32767
+                  key=f'{bx:04x}{by:04x}.png'
+                  block=next((t for t in tiles if t['src'].endswith('/'+key)),None)
+                  if not block:return None
+                  dx=wx-(32704+(bx-32767)*64)
+                  dy=wy-(32704+(by-32767)*64)
+                  return block['x']+12*(dx+dy),block['y']+378+6*(dy-dx)
 
-              distance=[-1]*(w*h)
-              distance[start]=0
-              q=collections.deque([start])
-              while q:
-                  cur=q.popleft()
-                  x=cur%w;y=cur//w
-                  for nx,ny in ((x-1,y),(x+1,y),(x,y-1),(x,y+1)):
-                      if 0<=nx<w and 0<=ny<h:
-                          i=ny*w+nx
-                          if distance[i]<0 and mask[i]!=255 and not(mask[i]&1):
-                              distance[i]=distance[cur]+1
-                              q.append(i)
+              start=m['spawnForMovementTest']
+              assert projected(start['x'],start['y']) is not None
+              assert all(projected(p['x'],p['y']) for p in m['portals'])
+              assert len(m['portals'])==(6 if mid=='1' else 14)
 
-              count=sum(v>=0 for v in distance)
-              assert count==near['regionSize']
-              route=[]
-              for p in t['portals']:
-                  pt=p['nearestWalkable'];steps=None
-                  if pt:
-                      i=(pt['y']-d['originY'])*w+pt['x']-d['originX']
-                      steps=distance[i] if distance[i]>=0 else None
-                  route.append(dict(name=p['name'],x=p['x'],y=p['y'],stepsFromStart=steps,targetMapId=p['targetMapId'],destinationVerified=False))
+              m['mapWidth']=index[mid]['width']
+              m['mapHeight']=index[mid]['height']
+              pack[mid]=m
 
-              runtime[mid]=dict(mapId=int(mid),originX=d['originX'],originY=d['originY'],width=w,height=h,collisionBase64=d['flags'],collisionLegend='255=unknown; bit0=blocked candidate',regionsBase64=t['regions'],tileRoot='preview/',tiles=images[mid]['blocks'],spawnForMovementTest=dict(x=near['x'],y=near['y']),portals=t['portals'])
-              routes[mid]=route
-              checks[mid]=dict(mapBlocks=expected,reachable=count,regions=len(t['regionSizes']),portals=len(route))
-              print('V4.0 MAP',mid,checks[mid])
+          page=r"""<!doctype html><html lang="ko">
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>TI Dungeon V4.1 Original Terrain Movement</title>
+          <style>
+          *{box-sizing:border-box}
+          body{margin:0;background:#101823;color:#eff7ff;font:14px system-ui}
+          header{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px}
+          button,select{font:inherit;background:#293c53;color:#fff;border:1px solid #5f748c;border-radius:7px;padding:7px}
+          #scene{height:calc(100dvh - 208px);min-height:185px;overflow:hidden;position:relative;background:#070d13;touch-action:none}
+          #world{position:absolute;left:0;top:0;transform-origin:0 0}
+          #world img{position:absolute;max-width:none;image-rendering:pixelated;pointer-events:none}
+          .pin{position:absolute;transform:translate(-50%,-50%);pointer-events:none}
+          .portal{width:13px;height:13px;background:#ffe061;border:2px solid #483000;border-radius:50%;opacity:.8;z-index:2}
+          #player{width:19px;height:19px;background:#fa536c;border:3px solid white;border-radius:50%;box-shadow:0 0 9px #f56;z-index:9}
+          #pad{display:grid;grid-template-columns:repeat(3,67px);gap:5px;justify-content:center;margin:7px}
+          #pad button{height:40px;font-size:22px;touch-action:none;padding:0}
+          #state{padding:4px 9px;min-height:22px}
+          small{color:#abc0d4}
+          </style>
 
-          assert sum(v['portals'] for v in checks.values())==20
-          (root/'runtime-v4.0.json').write_text(json.dumps(dict(version='V4.0',collisionVerification='provisional Layer3 bit0',verifiedWarpDestinations=0,verifiedMonsterSpawns=0,maps=runtime),ensure_ascii=False,separators=(',',':')))
-          (root/'routes-v4.0.json').write_text(json.dumps(dict(version='V4.0',movement='4 directions, no warps',maps=routes,checks=checks),ensure_ascii=False,indent=2))
+          <header>
+          <b>TI Dungeon V4.1</b>
+          <select id="floor"><option value="1">1F</option><option value="2">2F</option></select>
+          <select id="jump"><option value="">Start</option></select>
+          <button id="minus">-</button><button id="plus">+</button>
+          <a href="index.html" style="color:#cce7ff">Map</a>
+          </header>
 
-          page='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>TI Dungeon V4.0 Movement Test</title>
-          <style>body{margin:9px;background:#121b28;color:#eaf3ff;text-align:center;font:14px system-ui}select,button,a{font:inherit;padding:9px;background:#263a52;color:white;border:1px solid #536880;border-radius:7px}canvas{width:min(92vw,440px);image-rendering:pixelated;background:#0e1622;border:1px solid #657383}#pad{display:grid;grid-template-columns:repeat(3,70px);justify-content:center;gap:5px;margin:auto}#pad button{height:55px;font-size:20px}</style>
-          <h3>말던 이동 검사 V4.0</h3><select id="floor"><option value="1">1층</option><option value="2">2층</option></select> <a href="index.html">원본 지형</a><p id="info"></p>
-          <canvas id="cv" width="360" height="360"></canvas>
-          <div id="pad"><span></span><button data-d="0,-1">▲</button><span></span><button data-d="-1,0">◀</button><button data-d="0,1">▼</button><button data-d="1,0">▶</button></div>
-          <p>방향키·WASD·화면 버튼 이동. 포털 자동이동 없음.</p>
-          <script id="data" type="application/json">__DATA__</script><script>
-          const maps=JSON.parse(document.getElementById('data').textContent),sel=document.getElementById('floor'),cv=document.getElementById('cv'),ctx=cv.getContext('2d'),info=document.getElementById('info');let m,b,x,y;
-          function open(){m=maps[sel.value];b=Uint8Array.from(atob(m.collisionBase64),c=>c.charCodeAt(0));x=m.spawnForMovementTest.x;y=m.spawnForMovementTest.y;draw()}
-          function walk(dx,dy){const nx=x+dx,ny=y+dy,ix=nx-m.originX,iy=ny-m.originY;if(ix>=0&&iy>=0&&ix<m.width&&iy<m.height){const v=b[iy*m.width+ix];if(v!==255&&!(v&1)){x=nx;y=ny}}draw()}
-          function draw(){ctx.fillStyle='#111a29';ctx.fillRect(0,0,360,360);const size=12,range=15;for(let yy=-range;yy<=range;yy++)for(let xx=-range;xx<=range;xx++){let tx=x+xx-m.originX,ty=y+yy-m.originY,v=tx>=0&&ty>=0&&tx<m.width&&ty<m.height?b[ty*m.width+tx]:255;ctx.fillStyle=v===255?'#070e16':v&1?'#344257':'#91af95';ctx.fillRect(180+xx*size-5,180+yy*size-5,11,11)}for(const p of m.portals){let px=p.x-x,py=p.y-y;if(Math.abs(px)<=range&&Math.abs(py)<=range){ctx.fillStyle='#efc84c';ctx.fillRect(180+px*size-4,180+py*size-4,9,9)}}ctx.fillStyle='#f36869';ctx.beginPath();ctx.arc(180,180,5,0,Math.PI*2);ctx.fill();const hit=m.portals.filter(p=>Math.abs(p.x-x)<=1&&Math.abs(p.y-y)<=1).map(p=>p.name+' → map '+p.targetMapId).join(', ');info.textContent=`맵 ${m.mapId} (${x}, ${y})${hit?' / 포털 후보 '+hit+' (이동 미확인)':''}`}
-          sel.onchange=open;for(const btn of document.querySelectorAll('[data-d]'))btn.onclick=()=>{const [dx,dy]=btn.dataset.d.split(',').map(Number);walk(dx,dy)};document.onkeydown=e=>{const d={ArrowUp:[0,-1],KeyW:[0,-1],ArrowDown:[0,1],KeyS:[0,1],ArrowLeft:[-1,0],KeyA:[-1,0],ArrowRight:[1,0],KeyD:[1,0]}[e.code];if(d){e.preventDefault();walk(...d)}};open();
-          </script></html>'''
-          (view/'movement-v4.0.html').write_text(page.replace('__DATA__',json.dumps(runtime,ensure_ascii=False,separators=(',',':'))))
-          assert (view/'movement-v4.0.html').stat().st_size>100000
+          <div id="scene"><div id="world"></div></div>
+          <div id="state"></div>
+          <div id="pad">
+          <span></span><button data-dir="0,-1">&#9650;</button><span></span>
+          <button data-dir="-1,0">&#9664;</button><button data-dir="0,1">&#9660;</button><button data-dir="1,0">&#9654;</button>
+          </div>
+          <small style="display:block;text-align:center">Original terrain. Collision bit 0 is provisional. Yellow = portal candidate; no automatic warp.</small>
+
+          <script id="data" type="application/json">__DATA__</script>
+          <script>
+          'use strict';
+          const maps=JSON.parse(document.getElementById('data').textContent);
+          const floor=document.getElementById('floor');
+          const jump=document.getElementById('jump');
+          const world=document.getElementById('world');
+          const scene=document.getElementById('scene');
+          const state=document.getElementById('state');
+          let map,mask,x,y,scale=1,player,repeat=null;
+
+          function placement(wx,wy){
+            const bx=Math.floor((wx-32704)/64)+32767;
+            const by=Math.floor((wy-32704)/64)+32767;
+            const key=bx.toString(16).padStart(4,'0')+by.toString(16).padStart(4,'0')+'.png';
+            const block=map.tiles.find(t=>t.src.endsWith('/'+key));
+            if(!block)return null;
+            const sx=32704+(bx-32767)*64,sy=32704+(by-32767)*64;
+            const dx=wx-sx,dy=wy-sy;
+            return {x:block.x+12*(dx+dy),y:block.y+378+6*(dy-dx)};
+          }
+
+          function camera(){
+            const p=placement(x,y);
+            if(!p){state.textContent='Unmapped coordinate';return;}
+            player.style.left=p.x+'px';
+            player.style.top=p.y+'px';
+            world.style.transform=`translate(${scene.clientWidth/2-p.x*scale}px,${scene.clientHeight/2-p.y*scale}px) scale(${scale})`;
+            const near=map.portals.filter(v=>Math.abs(v.x-x)<=1&&Math.abs(v.y-y)<=1).map(v=>v.name).join(', ');
+            state.textContent=`Map ${map.mapId} | X ${x}, Y ${y} | zoom ${scale.toFixed(2)}${near?' | portal: '+near:''}`;
+          }
+
+          function walk(dx,dy){
+            const nx=x+dx,ny=y+dy,ix=nx-map.originX,iy=ny-map.originY;
+            if(ix<0||iy<0||ix>=map.width||iy>=map.height)return;
+            const v=mask[iy*map.width+ix];
+            if(v===255||(v&1)||!placement(nx,ny))return;
+            x=nx;y=ny;camera();
+          }
+
+          function stop(){
+            if(repeat!==null){clearInterval(repeat);repeat=null;}
+          }
+
+          function open(){
+            stop();
+            map=maps[floor.value];
+            mask=Uint8Array.from(atob(map.collisionBase64),c=>c.charCodeAt(0));
+            x=map.spawnForMovementTest.x;
+            y=map.spawnForMovementTest.y;
+            world.replaceChildren();
+            world.style.width=map.mapWidth+'px';
+            world.style.height=map.mapHeight+'px';
+
+            for(const t of map.tiles){
+              const im=new Image();
+              im.src=t.src;
+              im.style.left=t.x+'px';
+              im.style.top=t.y+'px';
+              im.width=1536;im.height=768;im.draggable=false;
+              world.append(im);
+            }
+            for(const p of map.portals){
+              const pos=placement(p.x,p.y);
+              if(!pos)continue;
+              const dot=document.createElement('div');
+              dot.className='pin portal';
+              dot.style.left=pos.x+'px';
+              dot.style.top=pos.y+'px';
+              dot.title=p.name+' (unverified portal)';
+              world.append(dot);
+            }
+
+            player=document.createElement('div');
+            player.id='player';player.className='pin';
+            world.append(player);
+            jump.replaceChildren(new Option('Start',''));
+            map.portals.forEach(p=>{
+              const option=new Option(p.name,p.name);
+              option.disabled=!p.nearestWalkable;
+              jump.add(option);
+            });
+            camera();
+          }
+
+          floor.onchange=open;
+          jump.onchange=()=>{
+            if(!jump.value){
+              x=map.spawnForMovementTest.x;y=map.spawnForMovementTest.y;
+            }else{
+              const p=map.portals.find(v=>v.name===jump.value);
+              if(!p||!p.nearestWalkable)return;
+              x=p.nearestWalkable.x;y=p.nearestWalkable.y;
+            }
+            camera();
+          };
+
+          document.getElementById('minus').onclick=()=>{scale=Math.max(.5,scale/1.25);camera()};
+          document.getElementById('plus').onclick=()=>{scale=Math.min(2.5,scale*1.25);camera()};
+
+          for(const b of document.querySelectorAll('[data-dir]')){
+            const [dx,dy]=b.dataset.dir.split(',').map(Number);
+            b.onpointerdown=e=>{
+              e.preventDefault();stop();walk(dx,dy);
+              repeat=setInterval(()=>walk(dx,dy),130);
+            };
+            b.onpointerup=b.onpointercancel=b.onpointerleave=stop;
+          }
+          window.addEventListener('pointerup',stop);
+          document.onkeydown=e=>{
+            const dir={ArrowUp:[0,-1],ArrowDown:[0,1],ArrowLeft:[-1,0],ArrowRight:[1,0],KeyW:[0,-1],KeyS:[0,1],KeyA:[-1,0],KeyD:[1,0]}[e.code];
+            if(dir){e.preventDefault();walk(...dir);}
+          };
+          window.addEventListener('resize',()=>{if(player)camera()});
+          open();
+          </script></html>"""
+
+          (preview/'terrain-walk-v4.1.html').write_text(
+              page.replace('__DATA__',json.dumps(pack,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')),
+              encoding='utf-8'
+          )
+          index_file=preview/'index.html'
+          index_html=index_file.read_text(encoding='utf-8')
+          assert '</header>' in index_html
+          index_file.write_text(
+              index_html.replace('</header>',' <a href="terrain-walk-v4.1.html" style="color:#ffd86f">V4.1 WALK</a></header>',1),
+              encoding='utf-8'
+          )
+          (root/'terrain-walk-v4.1-check.json').write_text(json.dumps({
+              'version':'V4.1','terrainBlocks':28,'floorTiles':229376,
+              'portalCandidates':20,'actualWarpDestinationsVerified':0,
+              'monsterSpawnsVerified':0
+          },indent=2))
+          script=re.findall(r'<script>(.*?)</script>',(preview/'terrain-walk-v4.1.html').read_text(),re.S)[-1]
+          Path('/tmp/terrain-v4.1.js').write_text(script)
+          print('V4.1 ORIGINAL TERRAIN MOVEMENT READY')
+
           PY
-          test -s reports/runtime-v4.0.json
-          test -s reports/routes-v4.0.json
+          node --check /tmp/terrain-v4.1.js
+          test -s reports/preview/terrain-walk-v4.1.html
 
-      - name: Upload V4.0 map runtime and movement test
+      - name: V4.1 Upload terrain movement preview
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V4.0-Runtime-Map
+          name: Sanctuary-TI-Dungeon-V4.1-Original-Terrain-Walk
           path: reports/
           if-no-files-found: error
           retention-days: 30
