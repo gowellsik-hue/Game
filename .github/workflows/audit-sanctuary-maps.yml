@@ -1,170 +1,189 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V5.2 / 44 native map collision masks and monster spawn audit
-name: audit-sanctuary-maps.yml | V5.2 | 44 Map Collision and Spawn Audit
-
+# VERSION: V5.3 / Original monster spawn, setup relocation, self-switch A relocation
+name: audit-sanctuary-maps.yml | V5.3 | Monster Spawn Branch Audit
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: [.github/workflows/audit-sanctuary-maps.yml]
-
 permissions:
   contents: read
   actions: read
-
 jobs:
-  maps:
+  classify-spawns:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 35
     steps:
-      - name: V5.2 Restore V5.1 maps and native tileset rules
+      - name: V5.3 Restore V5.2 collision masks and game event pages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p reports previous/game source
-          gh run download 39103205009 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.1-44-Terrain-Monster-Spawns -D reports
-          gh run download 39100666926 -R "$GITHUB_REPOSITORY" -n github-pages -D previous/game
-          test -s reports/native-maps-v5.1.json
+          mkdir -p reports previous source
+          gh run download 39123602635 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.2-44-Collision-Spawn-Audit -D reports
+          gh run download 39100666926 -R "$GITHUB_REPOSITORY" -n github-pages -D previous
+          test -s reports/collision-index-v5.2.json
           test -s reports/monster-spawn-index-v5.0.json
-          test -s previous/game/artifact.tar
-          tar -xf previous/game/artifact.tar -C source './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata'
+          test -s previous/artifact.tar
+          tar -xf previous/artifact.tar -C source --wildcards \
+            './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap*.rxdata'
           command -v ruby >/dev/null || (sudo apt-get update -qq && sudo apt-get install -qq -y ruby)
 
-      - name: V5.2 Export native passage and priority tables
+      - name: V5.3 Decode original event-page conditions and relocations
         run: |
           set -euo pipefail
-          cat > /tmp/map-v52-rules.rb <<'RUBY_V52'
+          cat > /tmp/spawn-v5.3.rb <<'RUBY_V53'
           require 'json'
-          require 'base64'
-          module RPG;class Tileset;end;end
-          class Table
-            def self._load(s)
-              dim,w,h,z,n=s.unpack('V5')
-              raise 'Invalid tileset table' unless w*h*z==n && s.bytesize==20+n*2
-              obj=allocate
-              obj.instance_variable_set('@values',s.byteslice(20..).unpack('v*'))
-              obj
+          module RPG
+            class AudioFile;end; class Map;end
+            class Event
+              class Page
+                class Condition;end; class Graphic;end
+              end
             end
-            def values;@values;end
+            class EventCommand;end; class MoveRoute;end; class MoveCommand;end
           end
-          f='source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata'
-          sets=Marshal.load(File.binread(f))
-          out={}
-          sets.compact.each do |s|
-            id=s.instance_variable_get('@id')
-            next unless id
-            pas=s.instance_variable_get('@passages').values
-            pri=s.instance_variable_get('@priorities').values
-            raise "Bad rules for #{id}" unless pas.size==pri.size && pas.all?{|x|x.between?(0,255)} && pri.all?{|x|x.between?(0,255)}
-            out[id.to_s]={length:pas.size,passageBase64:Base64.strict_encode64(pas.pack('C*')),priorityBase64:Base64.strict_encode64(pri.pack('C*'))}
+          class Table;def self._load(s);allocate;end;end
+          class Tone;def self._load(s);s;end;end
+          class Color;def self._load(s);s;end;end
+          def at(o,k);o.instance_variable_get('@'+k);end
+          def utf(s);s.to_s.dup.force_encoding('UTF-8').scrub;end
+          source=JSON.parse(File.read('reports/monster-spawn-index-v5.0.json'))
+          original=source['monsterEvents']+source['unverifiedBossEvents']
+          by_map=original.group_by{|e|e['mapId']}
+          base='source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          records=[]
+          by_map.sort.each do |mid,list|
+            map=Marshal.load(File.binread("#{base}Map%03d.rxdata" % mid))
+            game_events=at(map,'events')||{}
+            list.each do |ref|
+              event=game_events.fetch(ref['eventId'])
+              raise 'Initial event mismatch' unless at(event,'x')==ref['initialX'] && at(event,'y')==ref['initialY']
+              pages=[]
+              (at(event,'pages')||[]).each_with_index do |page,i|
+                con=at(page,'condition'); commands=at(page,'list')||[]
+                selfa=!!at(con,'self_switch_valid') && at(con,'self_switch_ch')=='A'
+                flags={
+                  switch1:(at(con,'switch1_id') if at(con,'switch1_valid')),
+                  switch2:(at(con,'switch2_id') if at(con,'switch2_valid')),
+                  variable:( {id:at(con,'variable_id'),minimum:at(con,'variable_value')} if at(con,'variable_valid')),
+                  selfSwitch:(at(con,'self_switch_ch') if at(con,'self_switch_valid'))
+                }.compact
+                moves=[];seen={}
+                commands.each do |c|
+                  next unless at(c,'code')==202
+                  p=at(c,'parameters')
+                  next unless p.is_a?(Array) && p.size>=5 && p[0]==0 && p[1]==0 && p[2].is_a?(Integer) && p[3].is_a?(Integer)
+                  key=[p[2],p[3]];next if seen[key]
+                  seen[key]=true
+                  moves<<{x:p[2],y:p[3],pageIndex:i,indent:at(c,'indent').to_i,
+                    role:(selfa ? 'SELF_SWITCH_A_RELOCATION' : 'SCRIPTED_SETUP_RELOCATION')}
+                end
+                pages<<{index:i,trigger:at(page,'trigger'),conditions:flags,
+                  graphic:utf(at(at(page,'graphic'),'character_name')),
+                  combatCall62:commands.any?{|c|at(c,'code')==117 && at(c,'parameters')[0]==62},
+                  hasBranches:commands.any?{|c|at(c,'code')==111},
+                  relocations:moves}
+              end
+              expected=ref['relocations'].map{|r|[r['page'],r['x'],r['y']]}.sort
+              actual=pages.flat_map{|p|p[:relocations].map{|v|[v[:pageIndex],v[:x],v[:y]]}}.sort
+              raise "Relocation mismatch #{mid}/#{ref['eventId']}" unless expected==actual
+              records<<{mapId:mid,mapName:ref['mapName'],eventId:ref['eventId'],monsterName:ref['monsterName'],
+                initialX:ref['initialX'],initialY:ref['initialY'],evidence:ref['evidence'],
+                arenaOrSpecial:ref['arenaOrSpecial'],pages:pages}
+            end
           end
-          raise 'Expected at least 23 tilesets' unless out.size>=23
-          File.write('reports/tileset-rules-v5.2.json',JSON.generate(out))
-          puts "V5.2 tileset rules: #{out.size}"
-          RUBY_V52
-          ruby -c /tmp/map-v52-rules.rb
-          ruby /tmp/map-v52-rules.rb
+          raise 'Monster event coverage mismatch' unless records.size==500
+          positions=records.sum{|e|1+e[:pages].sum{|p|p[:relocations].size}}
+          raise "Coordinate coverage mismatch #{positions}" unless positions==1708
+          File.write('reports/spawn-event-pages-v5.3.json',JSON.generate(records))
+          puts "V5.3 ORIGINAL PAGES: #{records.size} events / #{positions} positions"
+          RUBY_V53
+          ruby -c /tmp/spawn-v5.3.rb
+          ruby /tmp/spawn-v5.3.rb
 
-      - name: V5.2 Build directional collision and validate all monster points
+      - name: V5.3 Classify spawn roles and static-collision exceptions
         run: |
           set -euo pipefail
-          mkdir -p reports/collision
-          cat > /tmp/map-v52-audit.py <<'PY_V52'
-          import base64,csv,json,collections
-          from array import array
+          cat > /tmp/spawn-v5.3.py <<'PY_V53'
+          import csv,json,collections
           from pathlib import Path
           root=Path('reports')
-          native=json.loads((root/'native-maps-v5.1.json').read_text())
-          rules=json.loads((root/'tileset-rules-v5.2.json').read_text())
-          source=json.loads((root/'monster-spawn-index-v5.0.json').read_text())
-          assert len(native)==44 and source['sourceMaps']==44
-          events=collections.defaultdict(list)
-          for e in source['monsterEvents']+source['unverifiedBossEvents']:
-              events[e['mapId']].append(e)
-          assert sum(map(len,events.values()))==500
-          audit=[];index={};summary=collections.Counter()
-          for m in native:
-              mid=m['mapId'];w=m['width'];h=m['height'];n=w*h
-              raw=array('H');raw.frombytes((root/m['tilesFile']).read_bytes())
-              assert len(raw)==3*n
-              t=rules[str(m['tilesetId'])]
-              pas=base64.b64decode(t['passageBase64'])
-              pri=base64.b64decode(t['priorityBase64'])
-              assert len(pas)==len(pri)==t['length']
-              mask=bytearray(n);special=[]
-              for k in range(n):
-                  ids=(raw[k+2*n],raw[k+n],raw[k])
-                  if max(ids)>=len(pas):
-                      mask[k]=255
-                      special.append([k%w,k//w,list(ids)])
-                      continue
-                  blocked=0
-                  for bit in (1,2,4,8):
-                      for tid in ids:
-                          if pas[tid]&bit:
-                              blocked|=bit
-                              break
-                          if pri[tid]==0:
-                              break
-                  mask[k]=blocked
-              file=f'collision/map-{mid:03d}.bin'
-              (root/file).write_bytes(mask)
-              stats=collections.Counter(mask)
-              records=[]
-              for e in events[mid]:
-                  points=[('INITIAL_EVENT',e['initialX'],e['initialY'],None,False)]
-                  points.extend(('SCRIPTED_RELOCATION',p['x'],p['y'],p['page'],p['deathPage']) for p in e['relocations'])
-                  for typ,x,y,page,death in points:
-                      inside=0<=x<w and 0<=y<h
-                      flag=mask[y*w+x] if inside else 255
-                      state=('OUT_OF_BOUNDS' if not inside else 'UNKNOWN_TILE' if flag==255 else 'BLOCKED' if flag==15 else 'PASSABLE' if flag==0 else 'DIRECTION_LIMITED')
-                      records.append(dict(mapId=mid,mapName=m['mapName'],eventId=e['eventId'],monsterName=e['monsterName'],type=typ,x=x,y=y,page=page,deathGraphicPage=death,collision=state,directionBlockMask=int(flag),evidence=e['evidence']))
-                      summary['points_'+state]+=1
-              audit.extend(records)
-              info=dict(mapId=mid,mapName=m['mapName'],width=w,height=h,tilesetId=m['tilesetId'],collisionFile=file,
-                        bitMeaning='bit0=down bit1=left bit2=right bit3=up; 255=unknown',
-                        walkable=stats[0],blocked=stats[15],directionLimited=sum(v for k,v in stats.items() if k not in (0,15,255)),unknown=stats[255],
-                        unresolvedTileIds=special,monsterEvents=len(events[mid]),spawnPointCandidates=len(records),terrainPng=m['terrainPng'])
-              index[str(mid)]=info
-              summary.update(maps=1,tiles=n,walkable=stats[0],blocked=stats[15],unknown=stats[255])
-              print('V5.2',mid,m['mapName'],'walk',stats[0],'block',stats[15],'unknown',stats[255],'spawn',len(records),flush=True)
-          assert len(audit)==source['coordinateRows']==1708
-          assert summary['maps']==44 and summary['unknown']==1
-          assert sum(audit[i]['type']=='INITIAL_EVENT' for i in range(len(audit)))==500
-          assert all((root/d['collisionFile']).stat().st_size==d['width']*d['height'] for d in index.values())
-          cols=['mapId','mapName','eventId','monsterName','type','x','y','page','deathGraphicPage','collision','directionBlockMask','evidence']
-          with (root/'monster-spawn-collision-v5.2.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              writer=csv.DictWriter(f,fieldnames=cols);writer.writeheader();writer.writerows(audit)
-          (root/'collision-index-v5.2.json').write_text(json.dumps({'version':'V5.2','coordinateSystem':'SLKnight_RPG_Maker_RxData','notSanctuaryS32Coordinates':True,'nativeStaticTileRulesOnly':True,'eventBlockingNotIncluded':True,'portalWarpLinksIncluded':False,'maps':index},ensure_ascii=False,separators=(',',':')))
-          (root/'audit-summary-v5.2.json').write_text(json.dumps({'version':'V5.2','totals':dict(summary),'monsterSpawnCoordinatesVerifiedAsEvents':500,'respawnRuntimeConditionsVerified':False,'unresolvedTileCells':summary['unknown'],'spawnSafetyIsStaticOnly':True},ensure_ascii=False,indent=2))
-          # Self-contained collision overlay on 44 rendered V5.1 maps.
-          embed={k:{'name':v['mapName'],'w':v['width'],'h':v['height'],'image':v['terrainPng'],'mask':base64.b64encode((root/v['collisionFile']).read_bytes()).decode()} for k,v in index.items()}
-          for e in audit:
-              embed[str(e['mapId'])].setdefault('points',[]).append({k:e[k] for k in ('monsterName','eventId','type','x','y','collision')})
-          page='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V5.2 Terrain Collision and Spawns</title>
-          <style>body{font:14px system-ui;margin:10px;background:#111b27;color:#e9f5ff}select,input{font:inherit}select{padding:7px;background:#263b52;color:white}#viewport{height:70dvh;overflow:auto;border:1px solid #607389}#board{width:800px;position:relative}img{width:100%;display:block;image-rendering:pixelated}canvas,svg{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated}canvas{pointer-events:none}circle{stroke:#111;stroke-width:2.5;cursor:pointer}p{margin:8px 0}</style>
-          <b>V5.2 / 44 native maps: collision and monster events</b><p><select id="map"></select> <label><input type="checkbox" id="blocked" checked> blocked (red)</label> <label><input type="checkbox" id="monsters" checked> monster points</label></p>
-          <div id="viewport"><div id="board"><img id="terrain"><canvas id="overlay"></canvas><svg id="dots"></svg></div></div><p id="status"></p><p>Red = static blocked; yellow = unknown. Dots = initial event (cyan) and script relocation (orange). Actual respawn and event blocking are not verified.</p>
-          <script id="pack" type="application/json">__DATA__</script><script>
-          const data=JSON.parse(document.getElementById('pack').textContent),pick=document.getElementById('map'),board=document.getElementById('board'),img=document.getElementById('terrain'),cv=document.getElementById('overlay'),svg=document.getElementById('dots'),status=document.getElementById('status');let active;
-          for(const [id,m] of Object.entries(data))pick.add(new Option(id.padStart(2,'0')+' / '+m.name,id));
-          function render(){active=data[pick.value];const m=active;board.style.width=Math.max(320,Math.min(1000,m.w*16))+'px';img.src=m.image;board.style.aspectRatio=m.w+'/'+m.h;cv.width=m.w;cv.height=m.h;const cx=cv.getContext('2d'),pixels=cx.createImageData(m.w,m.h),raw=atob(m.mask);let blocked=0,unknown=0;for(let i=0;i<raw.length;i++){const a=raw.charCodeAt(i),j=i*4;if(a===15){pixels.data.set([232,48,58,120],j);blocked++}else if(a===255){pixels.data.set([255,226,34,200],j);unknown++}else if(a){pixels.data.set([36,154,252,130],j)}}cx.putImageData(pixels,0,0);cv.style.display=document.getElementById('blocked').checked?'block':'none';svg.setAttribute('viewBox',`0 0 ${m.w*16} ${m.h*16}`);svg.replaceChildren();for(const p of m.points||[]){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',(p.x+.5)*16);c.setAttribute('cy',(p.y+.5)*16);c.setAttribute('r',Math.max(5,Math.min(14,m.w/20)));c.setAttribute('fill',p.type==='INITIAL_EVENT'?'#3ff4ea':'#ffad40');const t=document.createElementNS('http://www.w3.org/2000/svg','title');t.textContent=`${p.monsterName} ID ${p.eventId} (${p.x},${p.y}) ${p.type} ${p.collision}`;c.append(t);svg.append(c)}svg.style.display=document.getElementById('monsters').checked?'block':'none';status.textContent=`${m.name} / ${m.w}x${m.h} / blocked ${blocked} / unknown ${unknown} / event points ${(m.points||[]).length}`}
-          pick.onchange=render;document.getElementById('blocked').onchange=render;document.getElementById('monsters').onchange=render;pick.value='15';render();
-          </script></html>'''
-          (root/'collision-spawn-view-v5.2.html').write_text(page.replace('__DATA__',json.dumps(embed,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')))
-          Path('/tmp/view-v52.js').write_text(page.split('<script>')[1].split('</script>')[0])
-          print('V5.2 DONE:',dict(summary))
-          PY_V52
-          python3 /tmp/map-v52-audit.py
-          node --check /tmp/view-v52.js
-          test -s reports/collision-spawn-view-v5.2.html
+          events=json.loads((root/'spawn-event-pages-v5.3.json').read_text())
+          maps=json.loads((root/'collision-index-v5.2.json').read_text())['maps']
+          v52=json.loads((root/'audit-summary-v5.2.json').read_text())['totals']
+          masks={mid:(root/m['collisionFile']).read_bytes() for mid,m in maps.items()}
+          counts=collections.Counter();rows=[];issues=[];pack={}
+          def add(e,kind,x,y,page=None):
+              mid=str(e['mapId']);m=maps[mid];w=m['width'];h=m['height']
+              inside=0<=x<w and 0<=y<h
+              v=masks[mid][y*w+x] if inside else 255
+              state='OUT_OF_BOUNDS' if not inside else 'UNKNOWN_TILE' if v==255 else 'BLOCKED' if v==15 else 'PASSABLE' if v==0 else 'DIRECTION_LIMITED'
+              out={k:e[k] for k in ('mapId','mapName','eventId','monsterName','evidence','arenaOrSpecial')}
+              out.update(role=kind,x=x,y=y,pageIndex=page['index'] if page else None,
+                pageTrigger=page['trigger'] if page else None,
+                pageConditions=page['conditions'] if page else {},
+                branchSelectionUnverified=bool(page and page['hasBranches']),
+                collision=state,collisionMask=v,actualSpawnVerified=False)
+              rows.append(out);counts[kind]+=1;counts['collision_'+state]+=1
+              if state not in ('PASSABLE','DIRECTION_LIMITED'):
+                  issues.append(out)
+              return out
+          for mid,m in sorted(maps.items(),key=lambda t:int(t[0])):
+              pack[mid]={'mapId':int(mid),'mapName':m['mapName'],'width':m['width'],'height':m['height'],
+                'terrainPng':m['terrainPng'],'collisionFile':m['collisionFile'],'events':[]}
+          for e in events:
+              entry={k:e[k] for k in ('mapId','eventId','monsterName','evidence','arenaOrSpecial')}
+              entry['initial']=add(e,'INITIAL_EVENT',e['initialX'],e['initialY'])
+              entry['setupRelocations']=[];entry['selfSwitchARelocations']=[]
+              entry['conditionPagesWithoutRelocation']=[]
+              for page in e['pages']:
+                  if page['conditions'].get('selfSwitch')=='A' and not page['relocations']:
+                      entry['conditionPagesWithoutRelocation'].append(page['index'])
+                      counts['selfSwitchAPagesWithoutRelocation']+=1
+                  for p in page['relocations']:
+                      item=add(e,p['role'],p['x'],p['y'],page)
+                      key='selfSwitchARelocations' if p['role']=='SELF_SWITCH_A_RELOCATION' else 'setupRelocations'
+                      entry[key].append(item)
+              pack[str(e['mapId'])]['events'].append(entry)
+          assert len(events)==500 and len(rows)==1708
+          counts['selfSwitchAPages']=sum(p['conditions'].get('selfSwitch')=='A' for e in events for p in e['pages'])
+          counts['selfSwitchAPagesWithRelocation']=sum(p['conditions'].get('selfSwitch')=='A' and bool(p['relocations']) for e in events for p in e['pages'])
+          counts['eventsWithoutSelfSwitchAPage']=sum(not any(p['conditions'].get('selfSwitch')=='A' for p in e['pages']) for e in events)
+          assert counts['selfSwitchAPages']==484 and counts['selfSwitchAPagesWithRelocation']==401
+          assert counts['INITIAL_EVENT']==500
+          assert counts['SCRIPTED_SETUP_RELOCATION']==109
+          assert counts['SELF_SWITCH_A_RELOCATION']==1099
+          assert counts['collision_BLOCKED']==v52['points_BLOCKED']==35
+          assert counts['collision_UNKNOWN_TILE']==v52['points_UNKNOWN_TILE']==2
+          assert len(issues)==37
+          data={'version':'V5.3','source':'SLKnight/RPG Maker native game events','notSanctuaryS32Coordinates':True,
+            'staticCollisionOnly':True,'realSpawnTimersVerified':False,'deathSwitchAIsInferredNotVerified':True,
+            'actualWarpDestinationsIncluded':False,'maps':pack}
+          (root/'spawn-integration-v5.3.json').write_text(json.dumps(data,ensure_ascii=False,separators=(',',':')))
+          (root/'spawn-summary-v5.3.json').write_text(json.dumps({'version':'V5.3','events':len(events),'positions':len(rows),'counts':dict(counts),'unresolvedPositions':len(issues),
+            'interpretation':'Self-switch A page relocation is a possible post-death relocation, not a proven live spawn.'},ensure_ascii=False,indent=2))
+          cols=['mapId','mapName','eventId','monsterName','evidence','arenaOrSpecial','role','x','y','pageIndex','pageTrigger','pageConditions','branchSelectionUnverified','collision','collisionMask','actualSpawnVerified']
+          def writecsv(path,items):
+              with (root/path).open('w',encoding='utf-8-sig',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
+                  for r in items:
+                      val=r.copy();val['pageConditions']=json.dumps(val['pageConditions'],ensure_ascii=False,separators=(',',':'))
+                      w.writerow(val)
+          writecsv('spawn-candidates-v5.3.csv',rows)
+          writecsv('spawn-review-v5.3.csv',issues)
+          print('V5.3 CLASSIFIED',json.dumps(dict(counts),ensure_ascii=False))
+          PY_V53
+          python3 /tmp/spawn-v5.3.py
+          test -s reports/spawn-integration-v5.3.json
+          test -s reports/spawn-candidates-v5.3.csv
+          test -s reports/spawn-review-v5.3.csv
 
-      - name: V5.2 Upload complete native static collision and spawn evidence
+      - name: V5.3 Upload 44-map classified spawn package
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V5.2-44-Collision-Spawn-Audit
+          name: Sanctuary-Map-V5.3-Classified-Monster-Spawns
           path: reports/
           if-no-files-found: error
           retention-days: 30
