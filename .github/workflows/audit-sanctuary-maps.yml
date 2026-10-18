@@ -1,5 +1,5 @@
 
-name: V3.5 | TI Dungeon 577-byte Floor Tile Fix
+name: V3.6 | TI Dungeon Floor Tile Patch
 on:
   workflow_dispatch:
   push:
@@ -12,31 +12,22 @@ jobs:
   render:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Restore V2 maps and V3.2 comparison images
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: V3.6 Restore source assets
         run: |
           set -euo pipefail
           mkdir -p previous/v2 previous/v3-2 source reports
           gh run download 39045175890 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 -D previous/v2
           gh run download 39049871058 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V3.2-Verified-Partial-Terrain -D previous/v3-2
-          test -s previous/v2/extracted/map/1/7ffe8000.s32
-          test -s previous/v3-2/summary.json
-
-      - name: Download original tiles and pinned V3.3 renderer
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
           for part in zip z32 z33 z34 z35; do
             gh release download v1.0.0 -R "$GITHUB_REPOSITORY" -p "Sanctuary.of.Aden.-.Copy.$part" -D source --clobber
           done
           gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/audit-sanctuary-maps.yml?ref=f31b3ebb3197820186cb5db752bed62ba8c9c131" --jq .content | base64 -d > /tmp/v3.3.yml
-          python3 -m venv /tmp/ti-v3-5
-          /tmp/ti-v3-5/bin/pip -q install Pillow==11.3.0
-
-      - name: V3.5 Fix 577-byte diamond and render both dungeon floors
+          python3 -m venv /tmp/ti-v3-6
+          /tmp/ti-v3-6/bin/pip -q install Pillow==11.3.0
+      - name: V3.6 Fix diamond tile geometry and render
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -44,42 +35,49 @@ jobs:
           from pathlib import Path
           source=Path('/tmp/v3.3.yml').read_text()
           match=re.search(r"(?ms)^ *cat > /tmp/ti-map-v3-3\.py <<'PY_V33'\n(.*?)^ *PY_V33\s*$",source)
-          if not match: raise SystemExit('Pinned renderer not found')
+          if not match: raise SystemExit('Pinned V3.3 renderer not found')
           code=textwrap.dedent(match.group(1))
-          old='count=2*(y+1 if y<dim//2 else dim-y)'
-          new='count=(2*min(y,dim-1-y)+1 if dim==24 and len(blob)==577 else 2*(y+1 if y<dim//2 else dim-y))'
-          if code.count(old)!=1: raise SystemExit('TIL decoder signature changed')
-          code=code.replace(old,new).replace('V3.3','V3.5').replace('V3_3_DONE','V3_5_DONE')
-          Path('/tmp/render-v3.5.py').write_text(code)
+          pattern=r'(?m)^([ \t]*)count\s*=\s*2\s*\*\s*\(\s*y\s*\+\s*1\s+if\s+y\s*<\s*dim\s*//\s*2\s+else\s+dim\s*-\s*y\s*\)'
+          replacement='count = (2*min(y,dim-1-y)+1 if dim==24 and len(blob)==577 else 2*(y+1 if y<dim//2 else dim-y))'
+          code,n=re.subn(pattern,lambda m:m.group(1)+replacement,code)
+          if n!=1: raise SystemExit('Expected exactly one diamond decoder block, found '+str(n))
+          code=code.replace('V3.3','V3.6').replace('V3_3_DONE','V3_6_DONE')
+          Path('/tmp/render-v3.6.py').write_text(code)
           PY
-          python3 -m py_compile /tmp/render-v3.5.py
-          /tmp/ti-v3-5/bin/python /tmp/render-v3.5.py
+          python3 -m py_compile /tmp/render-v3.6.py
+          /tmp/ti-v3-6/bin/python - <<'PY'
+          import runpy
+          parser=runpy.run_path('/tmp/render-v3.6.py')
+          assert parser['decode_frame'](b'\x00'+b'\x00'*576).size==(12,12)
+          print('V3.6 577-BYTE TILE TEST PASSED')
+          PY
+          /tmp/ti-v3-6/bin/python /tmp/render-v3.6.py
           python3 - <<'PY'
           import json
           from pathlib import Path
-          d=json.loads(Path('reports/summary.json').read_text())
+          root=Path('reports')
+          d=json.loads((root/'summary.json').read_text())
           n=d['counts']['floorDrawn'];total=d['counts']['floor']
-          print('V3.5 FLOOR RENDERED:',n,'/',total)
-          assert total==229376 and n>=210000, 'Original floor texture restoration incomplete'
-          assert len(list(Path('reports/preview/tiles/1').glob('*.png')))==12
-          assert len(list(Path('reports/preview/tiles/2').glob('*.png')))==16
-          Path('reports/floor-check-v3.5.json').write_text(json.dumps({'version':'V3.5','floorDrawn':n,'floorTotal':total,'floorCoverage':round(n/total,5),'monsterSpawnsVerified':False},indent=2))
+          print('V3.6 FLOOR:',n,'/',total)
+          assert total==229376 and n>=210000, 'Floor coverage below 91.6%'
+          for mid,count in ((1,12),(2,16)):
+              assert len(list((root/f'preview/tiles/{mid}').glob('*.png')))==count
+          assert (root/'preview/index.html').is_file()
+          (root/'floor-check-v3.6.json').write_text(json.dumps({'version':'V3.6','floorDrawn':n,'floorTotal':total,'ratio':round(n/total,5),'monsterSpawnsVerified':False},indent=2))
           PY
-
-      - name: Upload V3.5 original dungeon preview
+      - name: V3.6 Upload restored dungeon maps
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3.5-Floor-Restored
+          name: Sanctuary-TI-Dungeon-V3.6-Floor-Restored
           path: reports/
           if-no-files-found: error
           retention-days: 30
-
-      - name: Upload V3.5 diagnostics on failure
+      - name: V3.6 Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3.5-Failure
+          name: Sanctuary-TI-Dungeon-V3.6-Failure
           path: reports/
           if-no-files-found: warn
           retention-days: 14
