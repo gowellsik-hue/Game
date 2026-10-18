@@ -1,7 +1,7 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V5.1 / 44 original SLKnight terrain maps and monster spawn overlay
-name: audit-sanctuary-maps.yml | V5.1 | 44 Terrain and Spawn Overlay
+# VERSION: V5.2 / 44 native map collision masks and monster spawn audit
+name: audit-sanctuary-maps.yml | V5.2 | 44 Map Collision and Spawn Audit
 
 on:
   workflow_dispatch:
@@ -14,355 +14,157 @@ permissions:
   actions: read
 
 jobs:
-  render-maps:
+  maps:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - name: V5.1 Restore original maps and V5.0 monster coordinates
+      - name: V5.2 Restore V5.1 maps and native tileset rules
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p previous/game previous/spawns source reports/maps reports/native-tiles
+          mkdir -p reports previous/game source
+          gh run download 39103205009 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.1-44-Terrain-Monster-Spawns -D reports
           gh run download 39100666926 -R "$GITHUB_REPOSITORY" -n github-pages -D previous/game
-          gh run download 39102323194 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.0-Monster-Spawn-Coordinates -D previous/spawns
+          test -s reports/native-maps-v5.1.json
+          test -s reports/monster-spawn-index-v5.0.json
           test -s previous/game/artifact.tar
-          test -s previous/spawns/monster-spawn-index-v5.0.json
-          tar -xf previous/game/artifact.tar -C source --wildcards \
-            './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap*.rxdata' \
-            './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata' \
-            './knight/gameasync/Graphics/Tilesets/*'
-          cp previous/spawns/monster-spawn-index-v5.0.json reports/
-          cp previous/spawns/monster-spawn-points-v5.0.csv reports/
-          python3 -m venv /tmp/map-v51
-          /tmp/map-v51/bin/pip -q install Pillow==11.3.0
+          tar -xf previous/game/artifact.tar -C source './knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata'
+          command -v ruby >/dev/null || (sudo apt-get update -qq && sudo apt-get install -qq -y ruby)
 
-      - name: V5.1 Decode native RPG map tile tables
+      - name: V5.2 Export native passage and priority tables
         run: |
           set -euo pipefail
-          cat > /tmp/map-v51.rb <<'RUBY'
+          cat > /tmp/map-v52-rules.rb <<'RUBY_V52'
           require 'json'
-          module RPG
-            class AudioFile;end;class Map;end;class MapInfo;end;class Tileset;end
-            class Event
-              class Page
-                class Condition;end;class Graphic;end
-              end
-            end
-            class EventCommand;end;class MoveRoute;end;class MoveCommand;end
-          end
-          class Color;def self._load(s);s;end;end
-          class Tone;def self._load(s);s;end;end
+          require 'base64'
+          module RPG;class Tileset;end;end
           class Table
-            attr_reader :w,:h,:z,:raw
             def self._load(s)
               dim,w,h,z,n=s.unpack('V5')
-              raise 'Invalid RPG tile table' unless dim.between?(1,3) && w*h*z==n && s.bytesize==20+2*n
-              t=allocate;t.instance_variable_set(:@w,w);t.instance_variable_set(:@h,h)
-              t.instance_variable_set(:@z,z);t.instance_variable_set(:@raw,s.byteslice(20..));t
+              raise 'Invalid tileset table' unless w*h*z==n && s.bytesize==20+n*2
+              obj=allocate
+              obj.instance_variable_set('@values',s.byteslice(20..).unpack('v*'))
+              obj
             end
+            def values;@values;end
           end
-          def utf(s);s.to_s.dup.force_encoding('UTF-8').scrub;end
-          base='source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          infos=Marshal.load(File.binread(base+'MapInfos.rxdata'))
-          tilesets=Marshal.load(File.binread(base+'Tilesets.rxdata'))
-          rows=[]
-          Dir[base+'Map[0-9][0-9][0-9].rxdata'].sort.each do |f|
-            id=f[/Map(\d{3})\.rxdata$/,1].to_i
-            m=Marshal.load(File.binread(f));table=m.instance_variable_get('@data')
-            tile_id=m.instance_variable_get('@tileset_id');tileset=tilesets[tile_id]
-            raise "Missing tileset #{tile_id}" unless tileset
-            File.binwrite("reports/native-tiles/map-#{'%03d'%id}.u16",table.raw)
-            rows<<{mapId:id,mapName:utf(infos[id].instance_variable_get('@name')),
-              width:table.w,height:table.h,layers:table.z,tilesetName:utf(tileset.instance_variable_get('@tileset_name')),
-              tilesetId:tile_id,tilesFile:"native-tiles/map-#{'%03d'%id}.u16"}
+          f='source/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata'
+          sets=Marshal.load(File.binread(f))
+          out={}
+          sets.compact.each do |s|
+            id=s.instance_variable_get('@id')
+            next unless id
+            pas=s.instance_variable_get('@passages').values
+            pri=s.instance_variable_get('@priorities').values
+            raise "Bad rules for #{id}" unless pas.size==pri.size && pas.all?{|x|x.between?(0,255)} && pri.all?{|x|x.between?(0,255)}
+            out[id.to_s]={length:pas.size,passageBase64:Base64.strict_encode64(pas.pack('C*')),priorityBase64:Base64.strict_encode64(pri.pack('C*'))}
           end
-          raise "Expected 44 native maps; got #{rows.size}" unless rows.size==44
-          File.write('reports/native-maps-v5.1.json',JSON.generate(rows))
-          puts "V5.1 native maps decoded: #{rows.size}"
-          RUBY
-          ruby -c /tmp/map-v51.rb
-          ruby /tmp/map-v51.rb
+          raise 'Expected at least 23 tilesets' unless out.size>=23
+          File.write('reports/tileset-rules-v5.2.json',JSON.generate(out))
+          puts "V5.2 tileset rules: #{out.size}"
+          RUBY_V52
+          ruby -c /tmp/map-v52-rules.rb
+          ruby /tmp/map-v52-rules.rb
 
-      - name: V5.1 Render 44 terrain PNGs with spawn overlay viewer
+      - name: V5.2 Build directional collision and validate all monster points
         run: |
           set -euo pipefail
-          cat > /tmp/render-v51.py <<'PY'
-          import json,base64,collections
+          mkdir -p reports/collision
+          cat > /tmp/map-v52-audit.py <<'PY_V52'
+          import base64,csv,json,collections
           from array import array
           from pathlib import Path
-          from PIL import Image
-
           root=Path('reports')
-          source=Path('source/knight/gameasync/Graphics/Tilesets')
           native=json.loads((root/'native-maps-v5.1.json').read_text())
-          spawn=json.loads((root/'monster-spawn-index-v5.0.json').read_text())
-          assert len(native)==44 and spawn['sourceMaps']==44 and spawn['coordinateRows']==1708
-
+          rules=json.loads((root/'tileset-rules-v5.2.json').read_text())
+          source=json.loads((root/'monster-spawn-index-v5.0.json').read_text())
+          assert len(native)==44 and source['sourceMaps']==44
           events=collections.defaultdict(list)
-          for e in spawn['monsterEvents']+spawn['unverifiedBossEvents']:
+          for e in source['monsterEvents']+source['unverifiedBossEvents']:
               events[e['mapId']].append(e)
           assert sum(map(len,events.values()))==500
-
-          render_stats=[]
-          display={}
-
+          audit=[];index={};summary=collections.Counter()
           for m in native:
-              mid=m['mapId']
-              w=m['width']
-              h=m['height']
-              sheet=Image.open(source/(m['tilesetName']+'.png')).convert('RGBA')
-              tiles=array('H')
-              tiles.frombytes((root/m['tilesFile']).read_bytes())
-              assert m['layers']==3 and len(tiles)==w*h*3
-
-              image=Image.new('RGBA',(w*16,h*16),(15,21,30,255))
-              cache={}
-              missing=0
-              painted=0
-              autotile=0
-
-              for layer in range(3):
-                  for y in range(h):
-                      for x in range(w):
-                          tid=tiles[layer*w*h+y*w+x]
-                          if tid==0:
-                              continue
-                          if tid<384:
-                              autotile+=1
-                              continue
-
-                          if tid not in cache:
-                              t=tid-384
-                              sx=(t%8)*32
-                              sy=(t//8)*32
-                              if sx+32>sheet.width or sy+32>sheet.height:
-                                  cache[tid]=Image.new('RGBA',(16,16),(255,0,185,255))
-                              else:
-                                  cache[tid]=sheet.crop((sx,sy,sx+32,sy+32)).resize(
-                                      (16,16),Image.Resampling.NEAREST
-                                  )
-
-                          if (tid-384)//8*32+32>sheet.height:
-                              missing+=1
-                          image.alpha_composite(cache[tid],(x*16,y*16))
-                          painted+=1
-
-              path=f'maps/map-{mid:03d}.png'
-              image.convert('RGB').save(root/path,optimize=True)
-
-              m['terrainPng']=path
-              m['monsters']=len(events[mid])
-              m['sourceTileMissing']=missing
-              m['autotileOverlayCellsOmitted']=autotile
-              m['visibleTileDraws']=painted
-
-              render_stats.append({
-                  'mapId':mid,
-                  'name':m['mapName'],
-                  'drawn':painted,
-                  'missingSourceTileDraws':missing,
-                  'controlAutotileOmitted':autotile
-              })
-
-              points=[]
+              mid=m['mapId'];w=m['width'];h=m['height'];n=w*h
+              raw=array('H');raw.frombytes((root/m['tilesFile']).read_bytes())
+              assert len(raw)==3*n
+              t=rules[str(m['tilesetId'])]
+              pas=base64.b64decode(t['passageBase64'])
+              pri=base64.b64decode(t['priorityBase64'])
+              assert len(pas)==len(pri)==t['length']
+              mask=bytearray(n);special=[]
+              for k in range(n):
+                  ids=(raw[k+2*n],raw[k+n],raw[k])
+                  if max(ids)>=len(pas):
+                      mask[k]=255
+                      special.append([k%w,k//w,list(ids)])
+                      continue
+                  blocked=0
+                  for bit in (1,2,4,8):
+                      for tid in ids:
+                          if pas[tid]&bit:
+                              blocked|=bit
+                              break
+                          if pri[tid]==0:
+                              break
+                  mask[k]=blocked
+              file=f'collision/map-{mid:03d}.bin'
+              (root/file).write_bytes(mask)
+              stats=collections.Counter(mask)
+              records=[]
               for e in events[mid]:
-                  base={
-                      'eventId':e['eventId'],
-                      'name':e['monsterName'],
-                      'evidence':e['evidence']
-                  }
-                  points.append(dict(
-                      base,x=e['initialX'],y=e['initialY'],
-                      type='INITIAL_EVENT'
-                  ))
-                  for a in e['relocations']:
-                      points.append(dict(
-                          base,x=a['x'],y=a['y'],page=a['page'],
-                          type='DEATH_GRAPHIC_PAGE' if a['deathPage']
-                          else 'SCRIPTED_RELOCATION'
-                      ))
-
-              display[str(mid)]={
-                  'name':m['mapName'],
-                  'width':w,
-                  'height':h,
-                  'image':path,
-                  'points':points
-              }
-
-              print(
-                  'V5.1 MAP',mid,'tiles',painted,
-                  'monsterEvents',len(events[mid]),
-                  'points',len(points),
-                  'missing',missing,flush=True
-              )
-
-          assert len(list((root/'maps').glob('map-*.png')))==44
-          assert sum(v['sourceTileMissing'] for v in native)==2
-          assert sum(len(v['points']) for v in display.values())==1708
-
-          (root/'render-audit-v5.1.json').write_text(json.dumps({
-              'version':'V5.1',
-              'terrainSource':'SLKnight_RPG_Maker_RxData',
-              'notSanctuaryS32':True,
-              'mapsRendered':44,
-              'monsterEvents':500,
-              'coordinateCandidates':1708,
-              'missingTileDraws':2,
-              'autotilesOmitted':True,
-              'movementAndWarpsImplemented':False,
-              'mapStats':render_stats
-          },ensure_ascii=False,indent=2))
-
-          (root/'native-maps-v5.1.json').write_text(
-              json.dumps(native,ensure_ascii=False,indent=2)
-          )
-
-          page=r'''<!doctype html><html lang="ko">
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>V5.1 44맵 몬스터 스폰 좌표</title>
-          <style>
-          body{margin:9px;background:#131c28;color:#e9f2fe;font:14px system-ui}
-          header{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-          select,button{background:#273951;color:#fff;border:1px solid #60728b;border-radius:6px;padding:8px;font:inherit}
-          #view{margin:9px auto;height:65dvh;overflow:auto;border:1px solid #5e7084;background:#090f18}
-          #layer{position:relative}
-          img{width:100%;display:block;image-rendering:pixelated}
-          svg{position:absolute;inset:0;width:100%;height:100%}
-          circle{cursor:pointer;stroke:#142434;stroke-width:3}
-          #detail{padding:8px;min-height:44px}
-          label{margin-right:9px}
-          small{color:#b2c4d8}
-          </style>
-
-          <header>
-          <b>V5.1 · 44개 맵 몬스터 좌표</b>
-          <select id="map"></select>
-          <button id="smaller">−</button>
-          <button id="larger">+</button>
-          </header>
-
-          <p>
-          <label><input type="checkbox" id="init" checked> 노랑: 초기 이벤트</label>
-          <label><input type="checkbox" id="script" checked> 청록: 스크립트 이동</label>
-          <label><input type="checkbox" id="death" checked> 자홍: 사망 그래픽 페이지 이동</label>
-          </p>
-
-          <div id="view">
-          <div id="layer">
-          <img id="terrain">
-          <svg id="dots"></svg>
-          </div>
-          </div>
-
-          <p id="detail"></p>
-          <small>
-          SLKnight 원본 타일 좌표. 모든 점은 후보이며 리스폰 확정 아님.
-          별도 Sanctuary S32 및 포털 이동과 연결하지 않음.
-          </small>
-
-          <script id="data" type="application/json">__DATA__</script>
-          <script>
-          const data=JSON.parse(document.getElementById('data').textContent);
-          const sel=document.getElementById('map');
-          const view=document.getElementById('view');
-          const layer=document.getElementById('layer');
-          const img=document.getElementById('terrain');
-          const dots=document.getElementById('dots');
-          const detail=document.getElementById('detail');
-          let zoom=1,m;
-          const ns='http://www.w3.org/2000/svg';
-
-          for(const [id,entry] of Object.entries(data)){
-            const o=new Option(
-              id.padStart(2,'0')+' · '+entry.name+' ('+entry.points.length+'점)',id
-            );
-            sel.add(o);
-          }
-
-          function draw(){
-            m=data[sel.value];
-            const width=Math.min(view.clientWidth-12,920)*zoom;
-            layer.style.width=width+'px';
-            layer.style.height=(width*m.height/m.width)+'px';
-            img.src=m.image;
-            dots.setAttribute('viewBox',`0 0 ${m.width*16} ${m.height*16}`);
-            dots.replaceChildren();
-            const r=Math.min(90,Math.max(5,5*m.width*16/width));
-            let shown=0;
-
-            for(const p of m.points){
-              const kind=p.type==='INITIAL_EVENT'
-                ?'init':p.type==='SCRIPTED_RELOCATION'?'script':'death';
-              if(!document.getElementById(kind).checked)continue;
-
-              const c=document.createElementNS(ns,'circle');
-              c.setAttribute('cx',(p.x+.5)*16);
-              c.setAttribute('cy',(p.y+.5)*16);
-              c.setAttribute('r',r);
-              c.setAttribute('fill',
-                kind==='init'?'#ffe65b':kind==='script'?'#4df5ed':'#fe5fae'
-              );
-              const title=document.createElementNS(ns,'title');
-              title.textContent=(p.name||'(이름 없음)')
-                +` [${p.eventId}] (${p.x},${p.y}) · ${p.type}`;
-              c.append(title);
-              c.onclick=()=>{
-                detail.textContent=`맵 ${sel.value} / ${p.name||'(이름 없음)'}`
-                  +` / 이벤트 ${p.eventId} / (${p.x},${p.y})`
-                  +` / ${p.type} / ${p.evidence}`;
-              };
-              dots.append(c);
-              shown++;
-            }
-            detail.textContent=`맵 ${sel.value}: ${m.name}`
-              +` / ${m.width}×${m.height} / 표시 ${shown}점`;
-          }
-
-          sel.onchange=()=>{
-            zoom=1;
-            draw();
-            view.scrollTo(0,0);
-          };
-          document.getElementById('smaller').onclick=()=>{
-            zoom=Math.max(.5,zoom/1.5);
-            draw();
-          };
-          document.getElementById('larger').onclick=()=>{
-            zoom=Math.min(12,zoom*1.5);
-            draw();
-          };
-          for(const id of ['init','script','death']){
-            document.getElementById(id).onchange=draw;
-          }
-          sel.value='15';
-          draw();
+                  points=[('INITIAL_EVENT',e['initialX'],e['initialY'],None,False)]
+                  points.extend(('SCRIPTED_RELOCATION',p['x'],p['y'],p['page'],p['deathPage']) for p in e['relocations'])
+                  for typ,x,y,page,death in points:
+                      inside=0<=x<w and 0<=y<h
+                      flag=mask[y*w+x] if inside else 255
+                      state=('OUT_OF_BOUNDS' if not inside else 'UNKNOWN_TILE' if flag==255 else 'BLOCKED' if flag==15 else 'PASSABLE' if flag==0 else 'DIRECTION_LIMITED')
+                      records.append(dict(mapId=mid,mapName=m['mapName'],eventId=e['eventId'],monsterName=e['monsterName'],type=typ,x=x,y=y,page=page,deathGraphicPage=death,collision=state,directionBlockMask=int(flag),evidence=e['evidence']))
+                      summary['points_'+state]+=1
+              audit.extend(records)
+              info=dict(mapId=mid,mapName=m['mapName'],width=w,height=h,tilesetId=m['tilesetId'],collisionFile=file,
+                        bitMeaning='bit0=down bit1=left bit2=right bit3=up; 255=unknown',
+                        walkable=stats[0],blocked=stats[15],directionLimited=sum(v for k,v in stats.items() if k not in (0,15,255)),unknown=stats[255],
+                        unresolvedTileIds=special,monsterEvents=len(events[mid]),spawnPointCandidates=len(records),terrainPng=m['terrainPng'])
+              index[str(mid)]=info
+              summary.update(maps=1,tiles=n,walkable=stats[0],blocked=stats[15],unknown=stats[255])
+              print('V5.2',mid,m['mapName'],'walk',stats[0],'block',stats[15],'unknown',stats[255],'spawn',len(records),flush=True)
+          assert len(audit)==source['coordinateRows']==1708
+          assert summary['maps']==44 and summary['unknown']==1
+          assert sum(audit[i]['type']=='INITIAL_EVENT' for i in range(len(audit)))==500
+          assert all((root/d['collisionFile']).stat().st_size==d['width']*d['height'] for d in index.values())
+          cols=['mapId','mapName','eventId','monsterName','type','x','y','page','deathGraphicPage','collision','directionBlockMask','evidence']
+          with (root/'monster-spawn-collision-v5.2.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              writer=csv.DictWriter(f,fieldnames=cols);writer.writeheader();writer.writerows(audit)
+          (root/'collision-index-v5.2.json').write_text(json.dumps({'version':'V5.2','coordinateSystem':'SLKnight_RPG_Maker_RxData','notSanctuaryS32Coordinates':True,'nativeStaticTileRulesOnly':True,'eventBlockingNotIncluded':True,'portalWarpLinksIncluded':False,'maps':index},ensure_ascii=False,separators=(',',':')))
+          (root/'audit-summary-v5.2.json').write_text(json.dumps({'version':'V5.2','totals':dict(summary),'monsterSpawnCoordinatesVerifiedAsEvents':500,'respawnRuntimeConditionsVerified':False,'unresolvedTileCells':summary['unknown'],'spawnSafetyIsStaticOnly':True},ensure_ascii=False,indent=2))
+          # Self-contained collision overlay on 44 rendered V5.1 maps.
+          embed={k:{'name':v['mapName'],'w':v['width'],'h':v['height'],'image':v['terrainPng'],'mask':base64.b64encode((root/v['collisionFile']).read_bytes()).decode()} for k,v in index.items()}
+          for e in audit:
+              embed[str(e['mapId'])].setdefault('points',[]).append({k:e[k] for k in ('monsterName','eventId','type','x','y','collision')})
+          page='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V5.2 Terrain Collision and Spawns</title>
+          <style>body{font:14px system-ui;margin:10px;background:#111b27;color:#e9f5ff}select,input{font:inherit}select{padding:7px;background:#263b52;color:white}#viewport{height:70dvh;overflow:auto;border:1px solid #607389}#board{width:800px;position:relative}img{width:100%;display:block;image-rendering:pixelated}canvas,svg{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated}canvas{pointer-events:none}circle{stroke:#111;stroke-width:2.5;cursor:pointer}p{margin:8px 0}</style>
+          <b>V5.2 / 44 native maps: collision and monster events</b><p><select id="map"></select> <label><input type="checkbox" id="blocked" checked> blocked (red)</label> <label><input type="checkbox" id="monsters" checked> monster points</label></p>
+          <div id="viewport"><div id="board"><img id="terrain"><canvas id="overlay"></canvas><svg id="dots"></svg></div></div><p id="status"></p><p>Red = static blocked; yellow = unknown. Dots = initial event (cyan) and script relocation (orange). Actual respawn and event blocking are not verified.</p>
+          <script id="pack" type="application/json">__DATA__</script><script>
+          const data=JSON.parse(document.getElementById('pack').textContent),pick=document.getElementById('map'),board=document.getElementById('board'),img=document.getElementById('terrain'),cv=document.getElementById('overlay'),svg=document.getElementById('dots'),status=document.getElementById('status');let active;
+          for(const [id,m] of Object.entries(data))pick.add(new Option(id.padStart(2,'0')+' / '+m.name,id));
+          function render(){active=data[pick.value];const m=active;board.style.width=Math.max(320,Math.min(1000,m.w*16))+'px';img.src=m.image;board.style.aspectRatio=m.w+'/'+m.h;cv.width=m.w;cv.height=m.h;const cx=cv.getContext('2d'),pixels=cx.createImageData(m.w,m.h),raw=atob(m.mask);let blocked=0,unknown=0;for(let i=0;i<raw.length;i++){const a=raw.charCodeAt(i),j=i*4;if(a===15){pixels.data.set([232,48,58,120],j);blocked++}else if(a===255){pixels.data.set([255,226,34,200],j);unknown++}else if(a){pixels.data.set([36,154,252,130],j)}}cx.putImageData(pixels,0,0);cv.style.display=document.getElementById('blocked').checked?'block':'none';svg.setAttribute('viewBox',`0 0 ${m.w*16} ${m.h*16}`);svg.replaceChildren();for(const p of m.points||[]){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',(p.x+.5)*16);c.setAttribute('cy',(p.y+.5)*16);c.setAttribute('r',Math.max(5,Math.min(14,m.w/20)));c.setAttribute('fill',p.type==='INITIAL_EVENT'?'#3ff4ea':'#ffad40');const t=document.createElementNS('http://www.w3.org/2000/svg','title');t.textContent=`${p.monsterName} ID ${p.eventId} (${p.x},${p.y}) ${p.type} ${p.collision}`;c.append(t);svg.append(c)}svg.style.display=document.getElementById('monsters').checked?'block':'none';status.textContent=`${m.name} / ${m.w}x${m.h} / blocked ${blocked} / unknown ${unknown} / event points ${(m.points||[]).length}`}
+          pick.onchange=render;document.getElementById('blocked').onchange=render;document.getElementById('monsters').onchange=render;pick.value='15';render();
           </script></html>'''
+          (root/'collision-spawn-view-v5.2.html').write_text(page.replace('__DATA__',json.dumps(embed,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')))
+          Path('/tmp/view-v52.js').write_text(page.split('<script>')[1].split('</script>')[0])
+          print('V5.2 DONE:',dict(summary))
+          PY_V52
+          python3 /tmp/map-v52-audit.py
+          node --check /tmp/view-v52.js
+          test -s reports/collision-spawn-view-v5.2.html
 
-          (root/'spawn-map-view-v5.1.html').write_text(
-              page.replace(
-                  '__DATA__',
-                  json.dumps(
-                      display,ensure_ascii=False,separators=(',',':')
-                  ).replace('<','\\u003c')
-              )
-          )
-
-          script=page.split('<script>')[1].split('</script>')[0]
-          Path('/tmp/map-view-v51.js').write_text(script)
-          PY
-
-          /tmp/map-v51/bin/python /tmp/render-v51.py
-          node --check /tmp/map-view-v51.js
-          test -s reports/spawn-map-view-v5.1.html
-          test -s reports/native-maps-v5.1.json
-
-      - name: V5.1 Upload all terrain and monster coordinate previews
+      - name: V5.2 Upload complete native static collision and spawn evidence
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V5.1-44-Terrain-Monster-Spawns
+          name: Sanctuary-Map-V5.2-44-Collision-Spawn-Audit
           path: reports/
           if-no-files-found: error
           retention-days: 30
