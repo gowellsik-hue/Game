@@ -1,5 +1,5 @@
 
-name: V3.7 | TI Dungeon Collision and Portal Coordinates
+name: V3.8 | TI Dungeon Walkable Regions and Portal Pairs
 on:
   workflow_dispatch:
   push:
@@ -9,82 +9,102 @@ permissions:
   actions: read
   contents: read
 jobs:
-  map:
+  regions:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - name: V3.7 Download verified maps
+      - name: V3.8 Restore original map and collision preview
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p v2 reports
-          gh run download 39045175890 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 -D v2
-          gh run download 39090302766 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V3.6-Floor-Restored -D reports
-          test -s v2/reports/map-1-layers.json
-          test -s reports/preview/index.html
-      - name: V3.7 Export collision flags and portal candidates
+          mkdir -p reports
+          gh run download 39097116516 -R "$GITHUB_REPOSITORY" -n Sanctuary-TI-Dungeon-V3.7-Collision-Portal-Inspection -D reports
+          test -s reports/map-1-collision.json
+          test -s reports/map-2-collision.json
+      - name: V3.8 Find connected regions and portal candidates
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64,csv,json,struct
+          import base64, collections, csv, json
           from pathlib import Path
-          out=Path('reports'); preview=out/'preview'; maps={}; rows=[]
-          for mid,n in ((1,12),(2,16)):
-              blocks=json.loads(Path(f'v2/reports/map-{mid}-layers.json').read_text())['blocks']
-              assert len(blocks)==n
-              x0=min(b['startX'] for b in blocks);y0=min(b['startY'] for b in blocks)
-              w=max(b['startX']+64 for b in blocks)-x0
-              h=max(b['startY']+64 for b in blocks)-y0
-              mask=bytearray([255])*(w*h);portals=[]
-              for b in blocks:
-                  values=struct.unpack('<4096H',base64.b64decode(b['layer3Attribute1Base64']))
-                  assert all(v<255 for v in values), 'Unexpected Layer3 value: use uint16'
-                  bx=b['startX']-x0;by=b['startY']-y0
-                  for y in range(64):
-                      mask[(by+y)*w+bx:(by+y)*w+bx+64]=bytes(values[y*64:y*64+64])
-                  for p in b['layer7PortalsUnverified']:
-                      item={'mapId':mid,'name':p['name'],'x':p['estimatedGameX'],
-                            'y':p['estimatedGameY'],'targetMapId':p['targetMapId'],
-                            'portalId':p['portalId'],'source':b['file'],'verifiedDestination':False}
-                      assert x0<=item['x']<x0+w and y0<=item['y']<y0+h
-                      portals.append(item);rows.append(item)
-              counts={'walkable':mask.count(0),'blocked':sum(bool(v&1) for v in mask if v!=255),
-                      'unknown':mask.count(255)}
-              assert sum(counts.values())==w*h and counts['walkable']>0
-              maps[str(mid)]={'mapId':mid,'originX':x0,'originY':y0,'width':w,'height':h,
-                              'encoding':'base64 uint8 row-major, 255=unknown, bit0=blocked',
-                              'flags':base64.b64encode(mask).decode(),'portals':portals,'counts':counts}
-              (out/f'map-{mid}-collision.json').write_text(json.dumps(maps[str(mid)],ensure_ascii=False))
-              print('MAP',mid,'SIZE',w,h,'COUNTS',counts,'PORTALS',len(portals))
-          assert len(rows)==20, 'Unexpected source portal count'
-          with (out/'portals-v3.7.csv').open('w',encoding='utf-8-sig',newline='') as f:
+          root=Path('reports'); view=root/'preview'; result={}; rows=[]; pairs=[]
+          for mid,expected in ((1,6),(2,14)):
+              d=json.loads((root/f'map-{mid}-collision.json').read_text())
+              w,h=d['width'],d['height']; a=base64.b64decode(d['flags'])
+              assert len(a)==w*h
+              walk=bytes(v!=255 and (v&1)==0 for v in a)
+              region=bytearray(w*h); sizes=[]
+              for p in range(w*h):
+                  if not walk[p] or region[p]: continue
+                  label=len(sizes)+1
+                  assert label<255
+                  q=collections.deque([p]);region[p]=label; size=0
+                  while q:
+                      c=q.popleft();size+=1;x=c%w;y=c//w
+                      for n in (c-1 if x else -1,c+1 if x<w-1 else -1,c-w if y else -1,c+w if y<h-1 else -1):
+                          if n>=0 and walk[n] and not region[n]:
+                              region[n]=label;q.append(n)
+                  sizes.append(size)
+              portals=[]
+              for p in d['portals']:
+                  x=p['x']-d['originX'];y=p['y']-d['originY'];v=a[y*w+x]
+                  nearest=None
+                  for dist in range(7):
+                      for dy in range(-dist,dist+1):
+                          for dx in {dist-abs(dy),abs(dy)-dist}:
+                              xx=x+dx;yy=y+dy
+                              if 0<=xx<w and 0<=yy<h and walk[yy*w+xx]:
+                                  nearest={'x':xx+d['originX'],'y':yy+d['originY'],'distance':dist,'region':region[yy*w+xx],'regionSize':sizes[region[yy*w+xx]-1]};break
+                          if nearest:break
+                      if nearest:break
+                  record={'mapId':mid,'name':p['name'],'x':p['x'],'y':p['y'],'targetMapId':p['targetMapId'],'portalId':p['portalId'],'layer3':v,'locationPassable':bool(walk[y*w+x]),'nearestWalkable':nearest,'source':p['source'],'destinationVerified':False}
+                  portals.append(record)
+                  rows.append({'mapId':mid,'name':p['name'],'x':p['x'],'y':p['y'],'targetMapId':p['targetMapId'],'layer3':v,'cellPassable':int(record['locationPassable']),'nearestWalkX':nearest['x'] if nearest else '', 'nearestWalkY':nearest['y'] if nearest else '', 'distance':nearest['distance'] if nearest else '', 'region':nearest['region'] if nearest else '', 'portalId':p['portalId']})
+              assert len(portals)==expected
+              result[str(mid)]={'mapId':mid,'originX':d['originX'],'originY':d['originY'],'width':w,'height':h,'regions':base64.b64encode(region).decode(),'regionSizes':sizes,'portals':portals}
+              print('V3.8 FLOOR',mid,'REGIONS',len(sizes),'PORTALS',len(portals))
+          for num in ('01','02','03'):
+              group=[p for p in result['2']['portals'] if p['name'] in (f'bp{num}_in',f'bp{num}_out')]
+              assert len(group)==2
+              pairs.append({'names':[p['name'] for p in group],'mapIds':[2,2],'basis':'name match only','destinationVerified':False})
+          pairs.append({'names':['to2','to1'],'mapIds':[1,2],'basis':'name and target map match only','destinationVerified':False})
+          raw={'version':'V3.8','maps':result,'candidateLinks':pairs,'verifiedWarpDestinations':0,'mobSpawnDataPresent':False}
+          (root/'topology-v3.8.json').write_text(json.dumps(raw,ensure_ascii=False,separators=(',',':')))
+          with (root/'portal-regions-v3.8.csv').open('w',encoding='utf-8-sig',newline='') as f:
               wr=csv.DictWriter(f,fieldnames=list(rows[0]));wr.writeheader();wr.writerows(rows)
-          page='''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V3.7 말던 충돌 좌표</title>
-          <style>body{background:#121b27;color:#ecf2fa;font:15px system-ui;text-align:center;margin:12px}button,select,a{padding:7px;color:#fff;background:#293c56;border-radius:6px}canvas{width:min(96vw,750px);height:auto;image-rendering:pixelated;touch-action:manipulation;border:1px solid #60748d}p{font-size:13px}</style></head><body>
-          <h3>V3.7 말던 충돌·포털 좌표</h3><select id="floor"><option value="1">말던 1층</option><option value="2">말던 2층</option></select> <a href="index.html">원본 지형 보기</a>
-          <p>밝은색: 통행 가능 / 어두운색: 통행 불가 / 검정: 미수록 / 노란 점: 포털 후보</p><canvas id="cv"></canvas><p id="info"></p>
+          page='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V3.8 말던 통행구역</title>
+          <style>body{font:14px system-ui;background:#111925;color:#edf4fc;text-align:center;margin:12px}select,a{padding:7px;background:#273a52;color:white;border-radius:6px}canvas{width:min(96vw,750px);image-rendering:pixelated;touch-action:manipulation;border:1px solid #566a7f}table{border-collapse:collapse;text-align:left;margin:auto;font-size:12px}td,th{padding:5px;border-bottom:1px solid #39475a}small{color:#bac9d8}</style>
+          <h3>V3.8 · 말던 통행 구역과 포털</h3><select id="mid"><option value="1">말던 1층</option><option value="2">말던 2층</option></select> <a href="index.html">원본 지형</a> <a href="collision.html">충돌속성</a>
+          <p><small>색상별 영역: 4방향 통행 후보 / 노란 점: 포털 후보. 순간이동 목적지는 미확인.</small></p><canvas id="cv"></canvas><p id="info"></p><div id="table"></div>
           <script id="data" type="application/json">__DATA__</script><script>
-          const maps=JSON.parse(document.getElementById('data').textContent),cv=document.getElementById('cv'),ctx=cv.getContext('2d'),sel=document.getElementById('floor'),info=document.getElementById('info');let m,flags;
-          function render(){m=maps[sel.value];flags=Uint8Array.from(atob(m.flags),c=>c.charCodeAt(0));cv.width=m.width;cv.height=m.height;const im=ctx.createImageData(m.width,m.height);
-          for(let i=0;i<flags.length;i++){const v=flags[i],j=i*4;const rgb=v===255?[8,12,18]:v&1?[41,58,77]:[165,202,178];im.data.set([...rgb,255],j)}ctx.putImageData(im,0,0);
-          ctx.fillStyle='#ffdf4d';for(const p of m.portals){ctx.beginPath();ctx.arc(p.x-m.originX,p.y-m.originY,2.6,0,Math.PI*2);ctx.fill()}
-          info.textContent=`맵 ${m.mapId} / ${m.width}×${m.height} / 통행 ${m.counts.walkable} / 차단 ${m.counts.blocked} / 포털 후보 ${m.portals.length}`}
-          sel.onchange=render;cv.addEventListener('pointerup',e=>{const r=cv.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*m.width),y=Math.floor((e.clientY-r.top)/r.height*m.height),v=flags[y*m.width+x];const nearby=m.portals.filter(p=>Math.abs(p.x-(m.originX+x))<=2&&Math.abs(p.y-(m.originY+y))<=2);info.textContent=`원본 좌표 (${m.originX+x}, ${m.originY+y}) / 속성 ${v} / ${v===255?'자료 없음':v&1?'통행 불가':'통행 가능'}${nearby.length?' / 포털: '+nearby.map(p=>p.name+' → map '+p.targetMapId).join(', '):''}`});render();
-          </script></body></html>'''
-          (preview/'collision.html').write_text(page.replace('__DATA__',json.dumps(maps,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')))
-          source=(preview/'index.html').read_text()
-          assert '</header>' in source
-          source=source.replace('</header>',' <a href="collision.html" style="color:#ffdf4d">충돌·포털 V3.7</a></header>',1)
-          (preview/'index.html').write_text(source)
-          assert json.loads((out/'floor-check-v3.6.json').read_text())['floorDrawn']==229376
-          (out/'audit-v3.7.json').write_text(json.dumps({'version':'V3.7','maps':[1,2],'portalCandidates':len(rows),'portalDestinationsVerified':False,'monsterSpawnsIncluded':False},indent=2))
+          const maps=JSON.parse(document.getElementById('data').textContent),sel=document.getElementById('mid'),cv=document.getElementById('cv'),ctx=cv.getContext('2d'),info=document.getElementById('info'),tab=document.getElementById('table');let m,reg;
+          function draw(){m=maps[sel.value];reg=Uint8Array.from(atob(m.regions),c=>c.charCodeAt(0));cv.width=m.width;cv.height=m.height;let pic=ctx.createImageData(m.width,m.height);for(let i=0;i<reg.length;i++){let v=reg[i],j=i*4;if(v){pic.data[j]=55+v*71%160;pic.data[j+1]=55+v*41%160;pic.data[j+2]=55+v*97%160}else{pic.data[j]=13;pic.data[j+1]=20;pic.data[j+2]=30}pic.data[j+3]=255}ctx.putImageData(pic,0,0);ctx.fillStyle='#ffe144';for(let p of m.portals){ctx.beginPath();ctx.arc(p.x-m.originX,p.y-m.originY,2.6,0,Math.PI*2);ctx.fill()}info.textContent=`연결구역 ${m.regionSizes.length}개 / 통행 가능 ${m.regionSizes.reduce((a,b)=>a+b,0)}칸 / 포털 ${m.portals.length}개`;tab.innerHTML='<table><tr><th>포털</th><th>좌표</th><th>지역</th><th>접근</th><th>목표 맵</th></tr>'+m.portals.map(p=>{let n=p.nearestWalkable;return `<tr><td>${p.name}</td><td>${p.x},${p.y}</td><td>${n?n.region:'미확인'}</td><td>${n?n.distance+'칸':'6칸 내 없음'}</td><td>${p.targetMapId}</td></tr>`}).join('')+'</table>'}
+          sel.onchange=draw;cv.onclick=e=>{let r=cv.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*m.width),y=Math.floor((e.clientY-r.top)/r.height*m.height),id=reg[y*m.width+x];info.textContent=`좌표 ${m.originX+x},${m.originY+y} / ${id?'구역 '+id+' · '+m.regionSizes[id-1]+'칸':'통행 불가 또는 미수록'}`};draw();
+          </script></html>'''
+          (view/'regions.html').write_text(page.replace('__DATA__',json.dumps(result,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')))
+          index=(view/'index.html').read_text()
+          assert '</header>' in index
+          (view/'index.html').write_text(index.replace('</header>',' <a href="regions.html" style="color:#ffdf4d">V3.8 통행구역</a></header>',1))
+          assert sum(len(x['portals']) for x in result.values())==20
+          assert len(pairs)==4
+          print('V3.8 VERIFIED: 20 portals, 4 candidate links')
           PY
-          test -s reports/preview/collision.html
-      - name: V3.7 Upload collision and portal inspector
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          h=Path('reports/preview/regions.html').read_text()
+          scripts=re.findall(r'<script>(.*?)</script>',h,re.S)
+          assert len(scripts)==1
+          Path('/tmp/v3.8-check.js').write_text(scripts[0])
+          PY
+          node --check /tmp/v3.8-check.js
+          test -s reports/topology-v3.8.json
+          test -s reports/portal-regions-v3.8.csv
+      - name: V3.8 Upload terrain, regions and portal graph
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-TI-Dungeon-V3.7-Collision-Portal-Inspection
+          name: Sanctuary-TI-Dungeon-V3.8-Portal-Regions
           path: reports/
           if-no-files-found: error
           retention-days: 30
