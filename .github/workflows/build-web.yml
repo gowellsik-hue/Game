@@ -19,377 +19,201 @@ concurrency:
 
 jobs:
   build_v23:
-    name: "build-web.yml | V23 | Restore and wire original SPR61"
+    name: "build-web.yml | V23 | Independent Sanctuary trial"
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      - name: "V23 | Checkout"
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    timeout-minutes: 30
 
-      - name: "V23 | Restore verified original V19 runtime (V22 baseline)"
+    steps:
+      - name: "V23 | Restore successful original game"
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 39125690585
-          name: Sanctuary-Mobile-V19-Timeline-Filters-Frame-Review
+          run-id: 39201817637
+          name: Sanctuary-Mobile-V23-Original-SPR61-Trial
           github-token: ${{ github.token }}
-          path: dist/mobile
+          path: restored
 
-      - name: "V23 | Prepare verified source extraction tools"
+      - name: "V23 | Build independent website"
         shell: bash
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full python3-pil python3-yaml
-          mkdir -p source/v2 downloads paks reports dist/mobile/assets
-          python3 -c 'import PIL, yaml; print("V23 decoder requirements available")'
 
-      - name: "V23 | Restore original SPR index and unpack only Sprite.pak"
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh run download 38784834277 -R "$GITHUB_REPOSITORY" -n Sanctuary-V2-Reports -D source/v2
-          git show 5c40dc3de28ee879182c6f60802a89432072c138:.github/workflows/audit-sanctuary-monsters.yml > source/decoder-v17.yml
-          test -s source/v2/all_sprite_candidates.csv
-          test -s source/v2/exported_sprite_manifest.csv
-          test -s source/decoder-v17.yml
-          # This is a split ZIP release. Unpack only the original Sprite.pak member.
-          gh release download v1.0.0 -R "$GITHUB_REPOSITORY" --pattern 'Sanctuary.of.Aden.-.Copy.*' -D downloads
-          7z x downloads/Sanctuary.of.Aden.-.Copy.zip 'Sanctuary of Aden - Copy/Sprite.pak' "-o${PWD}/paks" -y > reports/V23-original-extraction.log
-          test -s 'paks/Sanctuary of Aden - Copy/Sprite.pak'
-          rm -rf downloads
+          mkdir -p site
+          cp -a restored/dist/mobile/. site/
 
-      - name: "V23 | Verify and decode all 168 original SPR61 keys"
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > reports/extract61.py <<'PY_V23_SOURCE61'
-          import ast
-          import csv
-          import hashlib
-          import json
-          import re
-          import struct
-          from pathlib import Path
-          
-          import yaml
-          from PIL import Image
-          
-          ROOT = Path.cwd()
-          source = ROOT / 'source'
-          asset_dir = ROOT / 'dist/mobile/assets'
-          report_dir = ROOT / 'reports'
-          actor_id = 61
-          pak_rel = 'outer/Sanctuary of Aden - Copy/Sprite.pak'
-          pak = ROOT / 'paks' / pak_rel.removeprefix('outer/')
-          assert pak.is_file(), 'Verified original Sprite.pak missing'
-          asset_dir.mkdir(parents=True, exist_ok=True)
-          report_dir.mkdir(parents=True, exist_ok=True)
-          
-          def csv_rows(filename):
-              candidates = list(source.rglob(filename))
-              assert len(candidates) == 1, (filename, candidates)
-              with candidates[0].open(encoding='utf-8-sig', newline='') as handle:
-                  return list(csv.DictReader(handle))
-          
-          candidates = {}
-          for row in csv_rows('all_sprite_candidates.csv'):
-              if row['pak'] != pak_rel:
-                  continue
-              match = re.fullmatch(r'61-(\d+)\.spr', Path(row['file'].replace('\\', '/')).name, re.I)
-              if match:
-                  key = int(match.group(1))
-                  assert key not in candidates, 'Ambiguous SPR key 61-'+str(key)
-                  candidates[key] = {'offset':int(row['offset']), 'bytes':int(row['bytes'])}
-          assert set(candidates) == set(range(168)), '61 requires exact 168 original SPR keys'
-          
-          source_sha = {}
-          for row in csv_rows('exported_sprite_manifest.csv'):
-              if row['pak'] == pak_rel and re.fullmatch(r'61-\d+\.spr', row['sprite_file'], re.I):
-                  key = int(row['sprite_file'][3:-4])
-                  assert key not in source_sha
-                  assert int(row['bytes']) == candidates[key]['bytes'], 'Original sprite size mismatch'
-                  source_sha[key] = row['sha256'].lower()
-          assert set(source_sha) == set(candidates), 'Verified SHA256 record missing'
-          
-          workflow = yaml.safe_load((source/'decoder-v17.yml').read_text(encoding='utf-8'))
-          step = next(s for s in workflow['jobs']['identify']['steps'] if s.get('name') == 'Decode all selected monster animation frames')
-          shell = step['run']
-          python_source = shell.split("python3 - <<'PY'\n", 1)[1].split('\nPY', 1)[0]
-          classes = [x for x in ast.parse(python_source).body if isinstance(x, ast.ClassDef) and x.name == 'Reader']
-          assert len(classes) == 1, 'Pinned original SPR decoder missing'
-          scope = {'struct':struct, 'Image':Image, 'MAX_FRAMES':240, 'MAX_DIM':1000}
-          exec(compile(ast.Module(body=classes, type_ignores=[]), '<verified-v17-spr-reader>', 'exec'), scope)
-          Reader = scope['Reader']
-          
-          paths = {}
-          png_sha = {}
-          source_file_sha = {}
-          frame_sizes = {}
-          blank = 0
-          frames_total = 0
-          with pak.open('rb') as stream:
-              for key in sorted(candidates):
-                  row = candidates[key]
-                  stream.seek(row['offset'])
-                  raw = stream.read(row['bytes'])
-                  assert len(raw) == row['bytes'], 'Short Sprite.pak record 61-'+str(key)
-                  digest = hashlib.sha256(raw).hexdigest()
-                  assert digest == source_sha[key], 'Original sprite SHA mismatch 61-'+str(key)
-                  source_file_sha[str(key)] = digest
-                  frames = Reader(raw).decode()
-                  assert frames, 'Empty original SPR 61-'+str(key)
-                  items = []
-                  meta = []
-                  for i, frame in enumerate(frames):
-                      # None means no sprite blocks in the original frame. Preserve it as transparent.
-                      if frame is None:
-                          blank += 1
-                          frame = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
-                          originally_blank = True
-                      else:
-                          originally_blank = False
-                      name = f'knight61-61-{key}-{i}.png'
-                      target = asset_dir / name
-                      frame.save(target, format='PNG', optimize=True)
-                      url = 'assets/' + name
-                      items.append(url)
-                      png_sha[url] = hashlib.sha256(target.read_bytes()).hexdigest()
-                      meta.append({'width': frame.width, 'height': frame.height, 'blank': originally_blank})
-                      frames_total += 1
-                  paths[str(key)] = items
-                  frame_sizes[str(key)] = meta
-          
-          assert len(paths) == 168, 'Missing complete source keys'
-          assert frames_total == 545, ('Unexpected source frame count', frames_total)
-          assert all(all(paths[str(k)] for k in range(start, start+8)) for start in (0, 8, 16, 24, 32))
-          source_report = {
-              'schema':'sanctuary.v23.original-spr61',
-              'version':'V23',
-              'pak':pak_rel,
-              'sprId':61,
-              'originalKeys':len(paths),
-              'originalFrames':frames_total,
-              'emptyOriginalFrames':blank,
-              'sourceSHA256ByKey':source_file_sha,
-              'pngSHA256ByPath':png_sha,
-              'actions':paths,
-              'frameSizes':frame_sizes,
-              'motionSemanticsVerified':False,
-              'directionOrderVerified':False,
-              'playerIdentityVerified':False,
-              'gameplayScaleModified':False,
-          }
-          (report_dir/'V23-spr61-source.json').write_text(json.dumps(source_report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
-          print('V23_ORIGINAL_61_DECODED', len(paths), frames_total, 'blank', blank)
-          PY_V23_SOURCE61
-          python3 reports/extract61.py
-          rm -rf paks
-
-      - name: "V23 | Add opt-in original player visual without gameplay changes"
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > reports/patch23.py <<'PY_V23_BUILD'
-          import hashlib
+          python3 - <<'PY'
           import json
           from pathlib import Path
-          from PIL import Image, ImageDraw
-          
-          root = Path('dist/mobile')
-          report = Path('reports')
-          meta = json.loads((report/'V23-spr61-source.json').read_text(encoding='utf-8'))
-          info_file = root/'build-info.json'
-          info = json.loads(info_file.read_text(encoding='utf-8'))
-          assert (info.get('package'),info.get('runtime'),info.get('display_version')) == (19,19,'V19')
-          for rel, sha in info['sha256'].items():
-              assert hashlib.sha256((root/rel).read_bytes()).hexdigest() == sha, 'V19 base changed: '+rel
-          assert meta['sprId'] == 61 and meta['originalKeys'] == 168 and meta['originalFrames'] == 545
-          for rel, sha in meta['pngSHA256ByPath'].items():
-              assert hashlib.sha256((root/rel).read_bytes()).hexdigest() == sha, 'Source frame changed '+rel
-          
-          manifest_file = root/'manifest.json'
-          original = json.loads(manifest_file.read_text(encoding='utf-8'))
-          assert original['actors']['hero']['sprite_id'] == 2786
-          assert 'knight61' not in original['actors']
-          original['actors']['knight61'] = {
-              'sprite_id':61,
-              'actions':meta['actions'],
-              'total_indexed':168,
-              'converted':168,
-              'keys_are_verified_actions':False,
-              'source_verification':'SHA256 verified against Sanctuary-V2-Reports',
-              'role':'player_visual_trial_only'
-          }
-          original['v23_hero_comparison'] = {
-              'source':'Sanctuary of Aden original Sprite.pak',
-              'candidateSpriteId':61,
-              'existingSpriteId':2786,
-              'visualSwitchOnly':True,
-              'identityConfirmed':False,
-              'motionMeaningConfirmed':False,
-              'scaleAdjusted':False
-          }
-          manifest_file.write_text(json.dumps(original, ensure_ascii=False, separators=(',',':')), encoding='utf-8')
-          (root/'game-data.js').write_text('window.SANCTUARY_MANIFEST='+json.dumps(original, ensure_ascii=False, separators=(',',':'))+';\n', encoding='utf-8')
-          
-          js_file = root/'game.js'
-          js = js_file.read_text(encoding='utf-8')
-          def replace_once(text, old, new, label):
-              n = text.count(old)
-              if n != 1:
-                  raise RuntimeError('V23 unexpected '+label+' match '+str(n))
-              return text.replace(old, new, 1)
-          js = replace_once(js, 'let score=0,potions=10,hero,mobs=[],', "let heroVisualTrial='hero';\nlet score=0,potions=10,hero,mobs=[],", 'trial state')
-          js = replace_once(js, 'let p=screen(unit.x,unit.y),foot=p.y+17,seq=paths(type,unit.mode,unit.dir),', "const displayType=type==='hero'?heroVisualTrial:type;let p=screen(unit.x,unit.y),foot=p.y+17,seq=paths(displayType,unit.mode,unit.dir),", 'display sprite routing')
-          js = replace_once(js, 'Math.floor(elapsed*visualFPS(type,unit.mode,unit.dir))%seq.length', 'Math.floor(elapsed*visualFPS(displayType,unit.mode,unit.dir))%seq.length', 'original timing routing')
-          js = replace_once(js, "(key==='hero'?' · 플레이어 시험':' · 원본 몬스터 후보')", "(key==='hero'?' · 현재 플레이어':key==='knight61'?' · 원본 기사 SPR61 시험':' · 원본 몬스터 후보')", 'review actor label')
-          js = replace_once(js, "el('assetRetry').onclick=retryFailedImages;", """el('assetRetry').onclick=retryFailedImages;
-          el('heroVisualTrial').onchange=()=>{
-            const selected=el('heroVisualTrial').value;
-            heroVisualTrial=selected==='knight61'?'knight61':'hero';
-            const spr=D.actors[heroVisualTrial].sprite_id;
-            el('heroVisualStatus').textContent='현재 화면 SPR '+spr+' · 캐릭터 정체·동작키 검증 전 · 게임 데이터 불변';
-            msg('캐릭터 외형 비교: 원본 SPR '+spr+' (시험 적용)',1.8);
-          };""", 'trial control binding')
-          js_file.write_text(js, encoding='utf-8')
-          
-          html_file = root/'index.html'
-          html = html_file.read_text(encoding='utf-8')
-          html = replace_once(html, 'Sanctuary of Aden Mobile V19', 'Sanctuary of Aden Mobile V23', 'title')
-          html = replace_once(html, 'Sanctuary Mobile V19</strong>', 'Sanctuary Mobile V23</strong>', 'HUD version')
-          html = replace_once(html, '원본 SPR 동작 검증 V19</strong>', '원본 SPR 동작 검증 V23</strong>', 'lab version')
-          html = replace_once(html, '<div id="settingsLegacy"></div>', '''<div class="settingRow"><label for="heroVisualTrial">주인공 외형 시험</label><select id="heroVisualTrial"><option value="hero">기존 SPR 2786</option><option value="knight61">원본 SPR 61</option></select></div>
-          <small id="heroVisualStatus">현재 화면 SPR 2786 · 캐릭터 정체·동작키 검증 전 · 게임 데이터 불변</small>
-          <div id="settingsLegacy"></div>''', 'settings sprite selector')
-          html_file.write_text(html, encoding='utf-8')
-          
-          # The comparison is a visual diagnostic, not a claim that SPR 61 and 2786 depict the same identity.
-          canvas = Image.new('RGB', (8*160, 4*168), (24, 40, 36))
-          pen = ImageDraw.Draw(canvas)
-          for row, (name, ids) in enumerate((('V19 SPR 2786 / key0..7', [str(i) for i in range(8)]),
-                                              ('Original SPR 61 / key0..7', [str(i) for i in range(8)]),
-                                              ('V19 SPR 2786 / key32..39', [str(i) for i in range(32,40)]),
-                                              ('Original SPR 61 / key32..39', [str(i) for i in range(32,40)]))):
-              is_61 = row % 2 == 1
-              actor = 'knight61' if is_61 else 'hero'
-              for col, key in enumerate(ids):
-                  path = original['actors'][actor]['actions'].get(key, [None])[0]
-                  if not path:
-                      continue
-                  im = Image.open(root/path).convert('RGBA')
-                  # Identical native pixel dimensions for both actors, no per-actor scaling.
-                  ox, oy = col*160+(160-im.width)//2, row*168+14+(130-im.height)
-                  canvas.paste(im, (ox,oy), im)
-                  pen.text((col*160+7,row*168+147), name.split('/')[0]+' K'+key, fill=(245,239,210))
-          canvas.save(report/'V23-Sprite61-vs-2786.png')
-          
-          info.update(version='23', package=23, runtime=23, display_version='V23',
-                      previous_version='V22 (restored V19, unchanged)',
-                      previous_successful_game_run=39125690585,
-                      added_original_player_visual_spr=61,
-                      original_actor61_full_keys=168,
-                      original_actor61_frames=545,
-                      original_actor61_identity_verified=False,
-                      original_actor61_action_mapping_verified=False,
-                      hero_visual_selection_default='hero-2786',
-                      gameplay_timing_changed=False,
-                      gameplay_stats_changed=False,
-                      monster_data_changed=False,
-                      map_data_changed=False,
-                      sprite_scale_changed=False,
-                      v23_source_manifest_sha256=hashlib.sha256((report/'V23-spr61-source.json').read_bytes()).hexdigest())
-          for name in ('index.html', 'game.js', 'game-data.js', 'manifest.json'):
-              info['sha256'][name] = hashlib.sha256((root/name).read_bytes()).hexdigest()
-          info_file.write_text(json.dumps(info, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
-          with (root/'README_KO.txt').open('a', encoding='utf-8') as out:
-              out.write('\nV23 | 원본 SPR 61의 168개 키·545프레임을 원본 SHA256 확인 후 추가했습니다. 설정 > 주인공 외형 시험에서 기존 2786과 61을 바꿔 볼 수 있습니다. 기본 2786 유지. 액션/방향 의미는 미확정이며 맵·캐릭터 비율·데미지·이동은 바꾸지 않습니다.\n')
-          print('V23_PATCHED', 168, 545, 'SPR 61 trial selector with original 2786 default')
-          PY_V23_BUILD
-          python3 reports/patch23.py
 
-      - name: "V23 | Verify both hero SPR sets and preserve V19 engine"
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > reports/verify23.py <<'PY_V23_VERIFY'
-          import hashlib
-          import json
-          from pathlib import Path
-          from PIL import Image
-          
-          p=Path('dist/mobile')
-          r=Path('reports')
-          info=json.loads((p/'build-info.json').read_text(encoding='utf-8'))
-          m=json.loads((p/'manifest.json').read_text(encoding='utf-8'))
-          source=json.loads((r/'V23-spr61-source.json').read_text(encoding='utf-8'))
-          js=(p/'game.js').read_text(encoding='utf-8')
-          html=(p/'index.html').read_text(encoding='utf-8')
-          assert (info['package'],info['runtime'],info['display_version'])==(23,23,'V23')
-          assert info['previous_successful_game_run']==39125690585
-          assert info['v23_source_manifest_sha256']==hashlib.sha256((r/'V23-spr61-source.json').read_bytes()).hexdigest()
-          assert m['actors']['hero']['sprite_id']==2786 and m['actors']['knight61']['sprite_id']==61
-          assert len(m['actors'])==9 and len(m['actors']['knight61']['actions'])==168
-          assert m['actors']['knight61']['actions']==source['actions']
-          assert sum(map(len,source['actions'].values()))==545
-          assert not m['v23_hero_comparison']['identityConfirmed']
-          assert not m['v23_hero_comparison']['scaleAdjusted']
-          assert m['map']['id']==4 and m['map']['size']==[192,192]
-          assert len(m['map']['objects'])==59963 and len(m['map']['flags'])==36864
-          assert len(list((p/'tiles').glob('*.png')))==218
-          assert len(list((p/'assets').glob('hero-2786-*.png')))==1480
-          assert len(list((p/'assets').glob('knight61-61-*.png')))==545
-          assert len(list((p/'assets').glob('*.png')))==3616+545
-          for rel,sha in source['pngSHA256ByPath'].items():
-              assert hashlib.sha256((p/rel).read_bytes()).hexdigest()==sha, rel
-          for rel,sha in info['sha256'].items():
-              assert hashlib.sha256((p/rel).read_bytes()).hexdigest()==sha, rel
-          assert 'native-world' not in html and not (p/'native-world').exists()
-          assert 'SLKnight' not in js and 'SLKnight' not in html
-          assert "let heroVisualTrial='hero';" in js
-          assert "seq=paths(displayType,unit.mode,unit.dir)" in js
-          assert "visualFPS(displayType,unit.mode,unit.dir)" in js
-          assert js.count("let scale=1.04")==1
-          assert 'heroVisualTrial' in html and 'knight61' in html
-          assert html.count('<option value="hero">기존 SPR 2786</option>')==1
-          assert len(list((p/'motion-gifs/v18').glob('*.gif')))==40
-          assert (r/'V23-Sprite61-vs-2786.png').is_file()
-          with Image.open(r/'V23-Sprite61-vs-2786.png') as comparison:
-              assert comparison.size==(1280,672)
-          assert json.loads((p/'game-data.js').read_text(encoding='utf-8').split('=',1)[1].rstrip().removesuffix(';'))==m
-          print('V23_SOURCE_SHA_VERIFIED',source['originalKeys'],source['originalFrames'])
-          print('V23_NO_GAMEPLAY_OR_SCALE_CHANGE',info['gameplay_timing_changed'],info['sprite_scale_changed'])
-          print('V23_GAME_AND_UI_VALIDATED')
-          PY_V23_VERIFY
-          python3 reports/verify23.py
-          node --check dist/mobile/game.js
-          node --check dist/mobile/motion-review.js
-          node --check dist/mobile/monster-pack.js
-          node - <<'NODE_V23'
-          const fs=require('fs'),vm=require('vm');
-          const ctx={window:{}};
-          vm.runInNewContext(fs.readFileSync('dist/mobile/game-data.js','utf8'),ctx);
-          const actors=ctx.window.SANCTUARY_MANIFEST.actors;
-          if(actors.hero.sprite_id!==2786||actors.knight61.sprite_id!==61)throw Error('V23 hero identity mapping mismatch');
-          for(let i=0;i<168;i++)if(!actors.knight61.actions[String(i)]?.length)throw Error('V23 missing SPR61 key '+i);
-          console.log('V23_DATA_AND_MOTION_SELECTION_READY');
-          NODE_V23
-          cat reports/V23-spr61-source.json | python3 -c 'import json,sys; x=json.load(sys.stdin); print("V23 source:",x["originalKeys"],"SPR keys,",x["originalFrames"],"frames; source motion identity unverified")' >> "$GITHUB_STEP_SUMMARY"
-          echo 'V23: gameplay unchanged; optional hero SPR 61 visual comparison only.' >> "$GITHUB_STEP_SUMMARY"
+          root = Path("site")
 
-      - name: "V23 | Upload Sanctuary playable build and comparison"
+          html = (root / "index.html").read_text(
+              encoding="utf-8"
+          )
+
+          title = (
+              "<title>Sanctuary of Aden Mobile V23 "
+              "· Filtered Motion Timeline and Frame Review</title>"
+          )
+
+          assert html.count(title) == 1
+
+          html = html.replace(
+              title,
+              "<title>Sanctuary V23 Independent Test</title>",
+              1
+          )
+
+          label = "<strong>Sanctuary Mobile V23</strong>"
+          assert html.count(label) == 1
+
+          html = html.replace(
+              label,
+              "<strong>Sanctuary V23 · 독립 시험판</strong>",
+              1
+          )
+
+          (root / "index.html").write_text(
+              html, encoding="utf-8"
+          )
+
+          (root / "Sanctuary-V23-SPR61-Test.html").write_text(
+              html, encoding="utf-8"
+          )
+
+          (root / ".nojekyll").touch()
+
+          manifest = json.loads(
+              (root / "manifest.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          assert manifest["actors"]["hero"]["sprite_id"] == 2786
+          assert manifest["actors"]["knight61"]["sprite_id"] == 61
+
+          actions = manifest["actors"]["knight61"]["actions"]
+
+          assert len(actions) == 168
+          assert sum(map(len, actions.values())) == 545
+
+          assert len(list(
+              (root / "assets").glob("*.png")
+          )) == 4161
+
+          assert len(list(
+              (root / "tiles").glob("*.png")
+          )) == 218
+
+          for filename in (
+              "index.html",
+              "game.js",
+              "game-data.js",
+              "game.css",
+              "monster-pack.js",
+              "motion-review.js"
+          ):
+              assert (root / filename).is_file(), filename
+
+          print("V23 INDEPENDENT WEBSITE READY")
+          PY
+
+          node --check site/game.js
+          node --check site/motion-review.js
+
+      - name: "V23 | Upload independent website"
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Mobile-V23-Original-SPR61-Trial
-          path: |
-            dist/mobile/
-            reports/V23-spr61-source.json
-            reports/V23-Sprite61-vs-2786.png
-            reports/V23-original-extraction.log
+          name: Sanctuary-Test-V23-Independent-Site
+          path: site/
           retention-days: 90
           if-no-files-found: error
+
+      - name: "V23 | Publish only to Sanctuary-Test"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SANCTUARY_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::SANCTUARY_DEPLOY_TOKEN is missing"
+            echo "Game Pages remains unchanged."
+            exit 1
+          fi
+
+          target="gowellsik-hue/Sanctuary-Test"
+
+          actor="$(gh api user --jq .login)"
+
+          if [ "$actor" != "gowellsik-hue" ]; then
+            echo "::error::Incorrect publishing account"
+            exit 1
+          fi
+
+          if gh repo view "$target" \
+            --json name --jq .name >/dev/null 2>&1
+          then
+            echo "Independent repository exists"
+          else
+            gh api --method POST user/repos \
+              -f name=Sanctuary-Test \
+              -F private=false \
+              -F auto_init=true \
+              --jq .full_name
+
+            echo "Independent repository created"
+          fi
+
+          gh auth setup-git
+
+          git clone \
+            "https://github.com/$target.git" \
+            sanctuary-deploy
+
+          git -C sanctuary-deploy checkout -B main
+
+          rsync -a --delete \
+            --exclude=".git/" \
+            site/ sanctuary-deploy/
+
+          git -C sanctuary-deploy config \
+            user.name "github-actions[bot]"
+
+          git -C sanctuary-deploy config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git -C sanctuary-deploy add -A
+
+          if ! git -C sanctuary-deploy \
+            diff --cached --quiet
+          then
+            git -C sanctuary-deploy commit \
+              -m "Sanctuary V23 independent release"
+
+            git -C sanctuary-deploy push origin HEAD:main
+          fi
+
+          if gh api "repos/$target/pages" \
+            --silent >/dev/null 2>&1
+          then
+            echo "Independent Pages already configured"
+          else
+            printf '%s' \
+              '{"build_type":"legacy","source":{"branch":"main","path":"/"}}' \
+              | gh api --method POST \
+                  "repos/$target/pages" \
+                  --input - >/dev/null
+          fi
+
+          pages_url="$(
+            gh api "repos/$target/pages" --jq .html_url
+          )"
+
+          echo "Independent site: $pages_url"
+
+          echo "Game Pages was not modified."
+
+          echo "V23 site: $pages_url" \
+            >> "$GITHUB_STEP_SUMMARY"
