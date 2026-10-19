@@ -1,7 +1,8 @@
-
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R21 / Fresh R16 rollback; 1:1 original S32 pixels into native RGSS Tilemap
-name: build-slknight-web.yml | V229R21 | Native Original Dungeon Map Data Only
+# VERSION: V229R22 - Sanctuary original terrain geometry x2 test; R16 base preserved
+# TEST ONLY: V4.1 preview x2 NEAREST (not lossless native Tile.pak pixels)
+# NO arbitrary monster placement. Only verified-source portal locations are used.
+name: build-slknight-web.yml | V229R22 | Sanctuary Map 2x Isolated Test
 
 on:
   workflow_dispatch:
@@ -22,9 +23,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 90
     steps:
-      - name: V229R21 Restore last verified engine V229R16
+      - name: V229R22 Restore verified V229R16 game artifact
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -33,7 +34,7 @@ jobs:
           github-token: ${{ github.token }}
           path: previous
 
-      - name: V229R21 Restore actual Sanctuary 1F and 2F source
+      - name: V229R22 Restore original TI Dungeon V4.1 terrain and portals
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -42,162 +43,156 @@ jobs:
           github-token: ${{ github.token }}
           path: original-ti
 
-      - name: V229R21 Verify clean game baseline, no R18-R20 code
+      - name: V229R22 Preserve live R16; create separate scale test
         shell: bash
         run: |
           set -euo pipefail
           test -s previous/artifact.tar
           test -s original-ti/preview/terrain-walk-v4.1.html
-          mkdir -p pristine site build
+          mkdir -p pristine site/test-map-v229r22 build
           tar -xf previous/artifact.tar -C pristine
           cp -a pristine/. site/
+          cp -a pristine/. site/test-map-v229r22/
           python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib
-          root=Path('site')
-          files=[p for p in root.rglob('*') if p.is_file()]
-          assert len(files)==5354,len(files)
+          root=Path('site/test-map-v229r22')
+          assert len([p for p in root.rglob('*') if p.is_file()])==5354
           expected={
-            'knight/gameasync/Data/Scripts.rxdata':'ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata':'2b99c87f691fece863c850f2217e538e3f6f76787b290507c8212b621beaf305'
+              'knight/gameasync/Data/Scripts.rxdata':'ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c',
+              'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata':'2b99c87f691fece863c850f2217e538e3f6f76787b290507c8212b621beaf305'
           }
-          for name,digest in expected.items():
-            assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest,name
-          assert not (root/'knight/sanctuary').exists()
-          assert all(not (root/f'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap{id:03d}.rxdata').exists() for id in (45,46))
-          print('V229R21 CLEAN R16, no custom map renderer or movement override')
+          for filename,digest in expected.items():
+              assert hashlib.sha256((root/filename).read_bytes()).hexdigest()==digest,filename
+          for mid in (45,46):
+              assert not (root/f'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap{mid:03d}.rxdata').exists()
+          print('PASS original R16 baseline isolated; live root not modified')
           PY_BASE
-          (cd original-ti && zip -qr /tmp/sanctuary-v41-original.zip preview/terrain-walk-v4.1.html preview/tiles)
           if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq python3-pil
           fi
 
-      - name: V229R21 Slice untouched original pixels into RGSS tiles
+      - name: V229R22 Restore preview geometry x2 in 1024px visual chunks
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/build_art.py <<'PY_ART'
+          cat > /tmp/terrain_2x.py <<'PY_TERRAIN'
           from PIL import Image
-          import zipfile,io,json,re,hashlib,collections,base64,struct,zlib,sys,math
           from pathlib import Path
+          from collections import deque
+          import json,base64,re,zlib,hashlib,struct,math,sys
 
-          orig=Path(sys.argv[1]); target=Path(sys.argv[2]); report=Path(sys.argv[3]);report.mkdir(parents=True,exist_ok=True)
-          z=zipfile.ZipFile(orig)
-          txt=z.read('preview/terrain-walk-v4.1.html').decode()
-          data=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',txt,re.S).group(1))
-          result={}; all_walk={}
-          for sourceid,mid in [('1',45),('2',46)]:
-           source=data[sourceid];sx0=min(x['x'] for x in source['tiles']);sy0=min(x['y'] for x in source['tiles']);sw=max(x['x']+1536 for x in source['tiles'])-sx0;sh=max(x['y']+768 for x in source['tiles'])-sy0
-           assert sw%32==0 and sh%32==0
-           W=sw//32;H=sh//32
-           canvas=Image.new('RGBA',(sw,sh))
-           for tile in source['tiles']:
-            image=Image.open(io.BytesIO(z.read('preview/'+tile['src']))).convert('RGBA')
-            assert image.size==(1536,768)
-            canvas.alpha_composite(image,(tile['x']-sx0,tile['y']-sy0))
-           example=source['tiles'][0];name=example['src'].split('/')[-1];bx=int(name[:4],16);by=int(name[4:8],16)
-           x=32704+(bx-32767)*64;y=32704+(by-32767)*64
-           a=example['x']-12*(x+y);b=example['y']+378-6*(y-x)
-           mask=base64.b64decode(source['collisionBase64']);cw=source['width'];ch=source['height'];ox=source['originX'];oy=source['originY']
-           assert len(mask)==cw*ch
-           def project(gx,gy):return (a+12*(gx+gy)-sx0,b+6*(gy-gx)-sy0)
-           def walk_at(cx,cy):
-            if not(0<=cx<sw and 0<=cy<sh):return False
-            aa=(cx+sx0-a)/12;bb=(cy+sy0-b)/6
-            sx=int(round((aa-bb)/2))-ox;sy=int(round((aa+bb)/2))-oy
-            return (0<=sx<cw and 0<=sy<ch and mask[sy*cw+sx]==0 and canvas.getpixel((int(cx),int(cy)))[3]>20)
-           walk=[]
-           for iy in range(H):
-            for ix in range(W):
-             px=ix*32+16;py=iy*32+29
-             # Sample the actor's foot area and one-quarter square around it;
-             # don't infer walkability from a picture's color.
-             walk.append(any(walk_at(px+dx,py+dy) for dx,dy in [(0,0),(-8,0),(8,0),(0,-8)]))
-           # Dedupe exact original RGBA pixels, but passage distinctions must have different tile IDs.
-           names={};images=[];ids=[]
-           for iy in range(H):
-            for ix in range(W):
-             rgba=canvas.crop((ix*32,iy*32,ix*32+32,iy*32+32))
-             raw=rgba.tobytes();blocked=not walk[iy*W+ix]
-             key=(hashlib.blake2b(raw,digest_size=16).digest(),blocked)
-             index=names.get(key)
-             if index is None:
-              index=len(images);images.append(rgba);names[key]=index
-             ids.append(384+index)
-           tiles=len(images)
-           atlas=Image.new('RGBA',(256,((tiles+7)//8)*32))
-           for i,img in enumerate(images):atlas.paste(img,((i%8)*32,(i//8)*32))
-           name=f'SLTI_{mid}_Original'
-           out=target/(name+'.png');out.parent.mkdir(parents=True,exist_ok=True);atlas.save(out,compress_level=6)
-           # Exact no-scaling, no-rotation pixel audit for each pixel tile.
-           for i in range(0,len(ids),max(1,len(ids)//100)):
-            tileidx=ids[i]-384; tx=i%W;ty=i//W
-            assert canvas.crop((32*tx,32*ty,32*(tx+1),32*(ty+1))).tobytes()==atlas.crop(((tileidx%8)*32,(tileidx//8)*32,(tileidx%8+1)*32,(tileidx//8+1)*32)).tobytes()
-           entryworld=(32670,32802) if mid==45 else (32665,32789)
-           ep=project(*entryworld);entry=(round(ep[0]/32),round(ep[1]/32))
-           stairs_world=(32737,32877) if mid==45 else (32665,32789)
-           tp=project(*stairs_world);stairs=(round(tp[0]/32),round(tp[1]/32))
-           from collections import deque
-           components=[];seen=set()
-           for start in range(W*H):
-            if not walk[start] or start in seen:continue
-            queue=deque([start]);seen.add(start);part=[]
-            while queue:
-             v=queue.popleft();part.append(v);yy,xx=divmod(v,W)
-             for xp,yp in [(xx+1,yy),(xx-1,yy),(xx,yy+1),(xx,yy-1)]:
-              k=yp*W+xp
-              if 0<=xp<W and 0<=yp<H and walk[k] and k not in seen:seen.add(k);queue.append(k)
-            components.append(part)
-           def nearest(point,chosen=None):
-            target=point
-            pool=chosen or [i for i,v in enumerate(walk) if v]
-            assert pool
-            node=min(pool,key=lambda i:(abs(i%W-target[0])+abs(i//W-target[1]),abs(i%W-target[0]),i))
-            return [node%W,node//W]
-           entry=nearest(entry)
-           target_component=next(set(c) for c in components if entry[1]*W+entry[0] in c)
-           # Preserve original scripted events; put healer and monsters in a connected region.
-           source_anchor=(61,13)
-           offset=(entry[0]-source_anchor[0],entry[1]-source_anchor[1])
-           used={tuple(entry)}
-           def place(pos,avoid=2):
-            goal=(pos[0]+offset[0],pos[1]+offset[1])
-            safe=[i for i in target_component if all(max(abs(i%W-x),abs(i//W-y))>=avoid for x,y in used)]
-            p=nearest(goal,safe or list(target_component));used.add(tuple(p));return p
-           # These two portal locations are derived from the actual Sanctuary map, not RPG coordinates.
-           exit_pos=entry
-           stair=nearest(stairs) # may lie in disconnected region
-           # Preserve destination evidence and flag in report, never present guesses as verified.
-           reach=stair[1]*W+stair[0] in target_component
-           emap={'exit':exit_pos,'stairs':stair}
-           rows={'id':mid,'width':W,'height':H,'tilesetName':name,'uniqueGraphicPassageTiles':tiles,'imageSha256':hashlib.sha256(out.read_bytes()).hexdigest(),
-           'tileBase64':base64.b64encode(zlib.compress(struct.pack('<'+'H'*len(ids),*ids),9)).decode(),
-           'passagesBase64':base64.b64encode(bytes([0 if not k[1] else 15 for k in names])).decode(),
-           'walkBase64':base64.b64encode(bytes([1 if w else 0 for w in walk])).decode(),
-           'entry':entry,'stairs':stair,'stairsReachableFromEntry':reach,
-           'nativeRoomCount':len(components),'entryRoomSize':len(target_component),
-           'graphicSha256':hashlib.sha256(canvas.tobytes()).hexdigest(),
-           'sourceOrigin':source['originX'],'sourceTileBlocks':len(source['tiles']),
-           'eventTargetOffset':offset,
-           'srcOriginPixel':[sx0,sy0], 'sourceProjection':[a,b],
-           'sourceEntryWorld':entryworld,'sourceStairsWorld':stairs_world}
-           result[str(mid)]=rows
-           all_walk[str(mid)]={'walk':walk,'W':W,'H':H,'set':target_component,'place':place,'used':used}
-           print(mid,'size',W,H,'unique',tiles,'png',round(out.stat().st_size/1e6,2),'walk',sum(walk),'components',len(components),'entry',entry,'stairs',stair,'reachable',reach)
-          # relocate snapshot of RPG map events in deterministic order; keep native event command scripts unchanged except necessary coordinate operands
-          # Map14 and Map20 built-in dungeon NPCs/mobs: positions are recorded and placement evidence separately.
-          # Values from original event source map are supplied during ruby patch; python will create stable assignment on request.
-          Path(report/'map-art.json').write_text(json.dumps(result,separators=(',',':')))
-          PY_ART
-          python3 /tmp/build_art.py /tmp/sanctuary-v41-original.zip site/knight/gameasync/Graphics/Tilesets build
+          source=Path('original-ti/preview')
+          root=Path('site/test-map-v229r22/knight/gameasync')
+          output=root/'Graphics/Panoramas';output.mkdir(parents=True,exist_ok=True)
+          html=(source/'terrain-walk-v4.1.html').read_text(encoding='utf-8')
+          data=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S).group(1))
+          assert set(data)>={'1','2'}
+          metadata={}
+          for floor,mid in [('1',45),('2',46)]:
+              m=data[floor];blocks=m['tiles']
+              x0=min(t['x'] for t in blocks);y0=min(t['y'] for t in blocks)
+              sw=max(t['x']+1536 for t in blocks)-x0
+              sh=max(t['y']+768 for t in blocks)-y0
+              assert sw%16==0 and sh%16==0
+              canvas=Image.new('RGBA',(sw,sh))
+              for block in blocks:
+                  p=source/block['src'];assert p.is_file(),str(p)
+                  with Image.open(p) as f:
+                      assert f.size==(1536,768),str(p)
+                      canvas.alpha_composite(f.convert('RGBA'),(block['x']-x0,block['y']-y0))
+              # Strict 2x GEOMETRY restoration. This is an initial play test,
+              # not a claim to restore lost native Tile.pak image detail.
+              fullw,fullh=sw*2,sh*2
+              cols=(fullw+1023)//1024;rows=(fullh+1023)//1024
+              files=[]
+              for cy in range(rows):
+                  for cx in range(cols):
+                      crop=canvas.crop((cx*512,cy*512,cx*512+512,cy*512+512))
+                      chunk=crop.resize((1024,1024),Image.Resampling.NEAREST)
+                      name=f'SLTI_{mid}_C{cx}_{cy}.png'
+                      path=output/name
+                      chunk.save(path,compress_level=1)
+                      files.append('Graphics/Panoramas/'+name)
+              # Source S32 world -> original V4.1 screen -> exact 2x screen.
+              first=blocks[0];name=Path(first['src']).stem
+              bx=int(name[:4],16);by=int(name[4:8],16)
+              wx=32704+(bx-32767)*64;wy=32704+(by-32767)*64
+              a=first['x']-12*(wx+wy)
+              b=first['y']+378-6*(wy-wx)
+              def project(x,y):return [2*(a+12*(x+y)-x0),2*(b+6*(y-x)-y0)]
+              collision=base64.b64decode(m['collisionBase64'])
+              cw,ch=m['width'],m['height'];ox,oy=m['originX'],m['originY']
+              assert len(collision)==cw*ch
+              def source_walk_at(px,py):
+                  cx,cy=px/2,py/2
+                  if not (0<=cx<sw and 0<=cy<sh):return False
+                  aa=(cx+x0-a)/12;bb=(cy+y0-b)/6
+                  sx=round((aa-bb)/2)-ox;sy=round((aa+bb)/2)-oy
+                  return (0<=sx<cw and 0<=sy<ch and collision[sy*cw+sx]==0
+                          and canvas.getpixel((int(cx),int(cy)))[3]>20)
+              W,H=fullw//32,fullh//32
+              walk=[]
+              for gy in range(H):
+                  for gx in range(W):
+                      px=gx*32+16;py=gy*32+29
+                      walk.append(any(source_walk_at(px+dx,py+dy)
+                                      for dx,dy in ((0,0),(-8,0),(8,0),(0,-8))))
+              available=[i for i,v in enumerate(walk) if v];assert available
+              def nearest(world):
+                  px,py=project(*world);gx,gy=round(px/32),round(py/32)
+                  p=min(available,key=lambda i:(abs(i%W-gx)+abs(i//W-gy),abs(i%W-gx),i))
+                  return [p%W,p//W]
+              # Read actual portal names/positions, never invent their world coordinates.
+              portals={p['name']:p for p in m['portals'] if p['name'] in ('go_00','to2','to1')}
+              if mid==45:
+                  assert 'go_00' in portals and 'to2' in portals
+                  entry_world=tuple(portals['go_00']['nearestWalkable'][k] for k in ('x','y'))
+                  stair_world=(portals['to2']['x'],portals['to2']['y'])
+              else:
+                  assert 'to1' in portals and portals['to1']['nearestWalkable']
+                  entry_world=tuple(portals['to1']['nearestWalkable'][k] for k in ('x','y'))
+                  stair_world=entry_world
+              entry=nearest(entry_world);stairs=nearest(stair_world)
+              start=entry[1]*W+entry[0];goal=stairs[1]*W+stairs[0]
+              visited={start};queue=deque([start])
+              while queue:
+                  i=queue.popleft();y,x=divmod(i,W)
+                  for nx,ny in ((x+1,y),(x-1,y),(x,y+1),(x,y-1)):
+                      k=ny*W+nx
+                      if 0<=nx<W and 0<=ny<H and walk[k] and k not in visited:
+                          visited.add(k);queue.append(k)
+              assert goal in visited,('portal blocked',mid,entry,stairs)
+              ids=[384 if v else 385 for v in walk]
+              records={
+                  'mapId':mid,'width':W,'height':H,'chunkCols':cols,'chunkRows':rows,
+                  'chunkSize':1024,'graphicScale':2,'previewTileBlocks':len(blocks),
+                  'entry':entry,'stairs':stairs,'sourceEntryWorld':entry_world,
+                  'sourceStairsWorld':stair_world,'walkableCells':sum(walk),
+                  'entryConnectedCells':len(visited),'files':files,
+                  'tilesBase64':base64.b64encode(zlib.compress(struct.pack('<'+'H'*len(ids),*ids),9)).decode(),
+                  'walkBase64':base64.b64encode(zlib.compress(bytes(walk),9)).decode(),
+                  'previewCanvasSha256':hashlib.sha256(canvas.tobytes()).hexdigest(),
+                  'geometry':'2x V4.1 preview pixels; not lossless native S32/TIL artwork',
+                  'collision':'same V4.1 collision mask raster rule, sampled at 2x; direction data not invented'
+              }
+              metadata[str(mid)]=records
+              print(f'MAP {mid}: {W}x{H}, chunks {cols}x{rows}, passable {sum(walk)}, entry {entry}, stairs {stairs}',flush=True)
+          Path('build/terrain2x.json').write_text(json.dumps(metadata,ensure_ascii=False),encoding='utf-8')
+          # A tiny transparent tileset: RGSS retains the native 32px collision grid.
+          # The map visuals are independent background chunks, not a huge RGSS atlas.
+          tile=Image.new('RGBA',(256,32),(0,0,0,0))
+          tile.save(root/'Graphics/Tilesets/SLTI_Collision_Transparent.png')
+          PY_TERRAIN
+          python3 /tmp/terrain_2x.py
 
-      - name: V229R21 Copy ALL existing native healers monsters events to new maps
+      - name: V229R22 Add two test maps and source-placed portal events
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/patch.rb <<'RUBY_PATCH'
-          require 'json';require 'zlib';require 'base64';require 'digest';require 'set'
+          cat > /tmp/native_maps.rb <<'RUBY_MAPS'
+          require 'json';require 'zlib';require 'base64';require 'digest'
           module RPG
             class Map;end;class MapInfo;end;class AudioFile;end;class Tileset;end
             class Event
@@ -209,383 +204,242 @@ jobs:
           end
           class Table
             def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
-            def _dump(limit=0);@raw;end
+            def _dump(depth=0);@raw;end
             def self.make(values)
               _load([1,values.size,1,1,values.size].pack('V5')+values.pack('v*'))
             end
-            def self.map(w,h,values)
-              raise 'tile count' unless values.length==w*h
-              _load([3,w,h,3,3*w*h].pack('V5')+values.pack('v*')+("\0"*w*h*4))
+            def self.map(w,h,ids)
+              raise 'bad map cells' unless ids.size==w*h
+              _load([3,w,h,3,w*h*3].pack('V5')+ids.pack('v*')+"\0"*(w*h*4))
             end
-            def values;@raw.byteslice(20..).unpack('v*');end
-            def header;@raw.unpack('V5');end
           end
-          class Tone;def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end;def _dump(limit=0);@raw;end;end
+          class Tone
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth=0);@raw;end
+          end
           class Color<Tone;end
-
-          def get(obj,k);obj.instance_variable_get('@'+k);end
-          def put(obj,k,v);obj.instance_variable_set('@'+k,v);end
-
-          def script_commands(event)
-            get(event,'pages').flat_map{|p|get(p,'list')||[]}
-          end
-
-          def select_area(w,h,binary,entry)
-            mask=binary.bytes
-            start=entry[1]*w+entry[0]
-            raise 'blocked entry' unless mask[start]==1
-            q=[start]; seen={start=>true}; i=0
-            while i<q.size
-              pos=q[i];i+=1;y=pos/w;x=pos%w
-              [[x-1,y],[x+1,y],[x,y-1],[x,y+1]].each do |xx,yy|
-                next unless xx>=0 && yy>=0 && xx<w && yy<h
-                pp=yy*w+xx;next unless mask[pp]==1 && !seen[pp]
-                q<<pp;seen[pp]=true
-              end
-            end
-            q.map{|pos|[pos%w,pos/w]}
-          end
-
-          def closest(target,area,used=[],distance=1)
-            available=area.select{|p|used.all?{|u|[(p[0]-u[0]).abs,(p[1]-u[1]).abs].max>=distance}}
-            available=area if available.empty?
-            available.min_by{|p|[(p[0]-target[0]).abs+(p[1]-target[1]).abs,(p[0]-target[0]).abs,p[1],p[0]]}
-          end
-
+          def get(o,k);o.instance_variable_get('@'+k);end
+          def put(o,k,v);o.instance_variable_set('@'+k,v);end
           root=ARGV.fetch(0);meta=JSON.parse(File.read(ARGV.fetch(1)))
-          base=root+'/knight/gameasync/Data/'
+          data=root+'/knight/gameasync/Data/'
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          mp=->(id){base+("#{pre}Map%03d.rxdata"%id)}
-          original_scripts=Digest::SHA256.file(base+'Scripts.rxdata').hexdigest
-          original_maps={}
-          (1..44).each{|id|original_maps[id]=Digest::SHA256.file(mp.call(id)).hexdigest}
-
-          setsfile=base+pre+'Tilesets.rxdata'
-          setsraw=File.binread(setsfile);sets=Marshal.load(setsraw)
-          raise 'Tileset marshal changed' unless Marshal.dump(sets)==setsraw
-          raise 'Need game native tileset' unless get(sets[3],'tileset_name').dup.force_encoding('UTF-8')=='던전'
-          infosfile=base+pre+'MapInfos.rxdata'
-          infosraw=File.binread(infosfile);infos=Marshal.load(infosraw)
-          raise 'MapInfos marshal changed' unless Marshal.dump(infos)==infosraw
-          raise 'Map IDs already used' if infos[45]||infos[46]||File.exist?(mp.call(45))||File.exist?(mp.call(46))
-
-          # Tile map source and event source are separate.  Existing RPG events are deep-copied, not recreated.
-          report={}
-          [ [45,14],[46,20] ].each do |target,origin|
-            m=meta.fetch(target.to_s);w=m.fetch('width');h=m.fetch('height')
-            ids=Zlib::Inflate.inflate(Base64.strict_decode64(m.fetch('tileBase64'))).unpack('v*')
-            flags=Base64.strict_decode64(m.fetch('passagesBase64')).bytes
-            walk=Base64.strict_decode64(m.fetch('walkBase64'))
-            raise 'Bad tile data' unless ids.length==w*h && walk.bytesize==w*h && ids.max==383+flags.size
-            tindex=sets.size
-            passages=Array.new(384,0)+flags
-            priorities=Array.new(passages.length,0)
-            priorities[0]=5 # RPG Maker XP requires blank upper layers to defer to the terrain layer
-            terrains=Array.new(passages.length,0)
+          mapfile=->(id){data+("%sMap%03d.rxdata"%[pre,id])}
+          setsfile=data+pre+'Tilesets.rxdata'
+          infosfile=data+pre+'MapInfos.rxdata'
+          sets=Marshal.load(File.binread(setsfile))
+          infos=Marshal.load(File.binread(infosfile))
+          raise 'nonoriginal tileset' unless get(sets[3],'tileset_name').dup.force_encoding('UTF-8')=='던전'
+          raise 'existing IDs' if infos[45] || infos[46] || File.exist?(mapfile.call(45)) || File.exist?(mapfile.call(46))
+          originals=(1..44).to_h{|i|[i,Digest::SHA256.file(mapfile.call(i)).hexdigest]}
+          portal_report={}
+          [[45,14,[1,2]],[46,20,[2]]].each do |mid,sourceid,event_ids|
+            d=meta.fetch(mid.to_s);w=d.fetch('width');h=d.fetch('height')
+            ids=Zlib::Inflate.inflate(Base64.strict_decode64(d.fetch('tilesBase64'))).unpack('v*')
+            walk=Zlib::Inflate.inflate(Base64.strict_decode64(d.fetch('walkBase64')))
+            raise 'map size mismatch' unless ids.size==w*h && walk.size==w*h
             t=Marshal.load(Marshal.dump(sets[3]))
-            put(t,'id',tindex);put(t,'name',"Sanctuary Original #{target}")
-            put(t,'tileset_name',m.fetch('tilesetName'))
+            index=sets.length
+            put(t,'id',index);put(t,'name',"Sanctuary 2x TEST #{mid}")
+            put(t,'tileset_name','SLTI_Collision_Transparent')
             put(t,'autotile_names',Array.new(7,''))
             put(t,'panorama_name','');put(t,'fog_name','')
-            put(t,'passages',Table.make(passages));put(t,'priorities',Table.make(priorities));put(t,'terrain_tags',Table.make(terrains))
+            passages=Array.new(386,0);passages[385]=15
+            priorities=Array.new(386,0);priorities[0]=5
+            put(t,'passages',Table.make(passages));put(t,'priorities',Table.make(priorities))
+            put(t,'terrain_tags',Table.make(Array.new(386,0)))
             sets<<t
-
-            sourcefile=mp.call(origin)
-            origbytes=File.binread(sourcefile)
-            original=Marshal.load(origbytes)
-            raise "Map#{origin} cannot marshal without loss" unless Marshal.dump(original)==origbytes
-            copied=Marshal.load(Marshal.dump(original))
-            put(copied,'width',w);put(copied,'height',h);put(copied,'tileset_id',tindex)
-            put(copied,'data',Table.map(w,h,ids))
-            area=select_area(w,h,walk,m.fetch('entry'))
-            raise 'Insufficient connected walk area' unless area.size>200
-            dx,dy=m.fetch('eventTargetOffset')
-            used=[m.fetch('entry')]; coords={}
-            events=get(copied,'events')
-            portals={}
-            # Preserve the source game's 1F/2F healers, monsters, movement pages, combat scripts and items.
-            events.sort.each do |eid,event|
-              px=get(event,'x');py=get(event,'y')
-              is1=target==45
-              position= if (is1 && eid==1)
-                  # Original S32 floor 2 portal coordinate; preserve its location if walkable.
-                  closest(m.fetch('stairs'),area,used,0)
-                elsif (is1 && eid==2)||(target==46 && eid==2)
-                  exit_goal=[m.fetch('entry')[0]-2,m.fetch('entry')[1]]
-                  closest(exit_goal,area,used,1)
-                elsif (is1 && eid==13)||(target==46 && eid==3)
-                  healer_goal=[m.fetch('entry')[0]+2,m.fetch('entry')[1]]
-                  closest(healer_goal,area,used,2)
+            original=Marshal.load(File.binread(mapfile.call(sourceid)))
+            m=Marshal.load(Marshal.dump(original))
+            put(m,'width',w);put(m,'height',h);put(m,'tileset_id',index)
+            put(m,'data',Table.map(w,h,ids))
+            events={}
+            event_ids.each do |eid|
+              e=Marshal.load(Marshal.dump(get(original,'events').fetch(eid)))
+              p= if mid==45 && eid==1
+                   d.fetch('stairs')
+                 else
+                   d.fetch('entry')
+                 end
+              put(e,'x',p[0]);put(e,'y',p[1]);events[eid]=e
+              raise 'portal on blocked cell' unless walk.getbyte(p[1]*w+p[0])==1
+              if (mid==45 && eid==1)||(mid==46 && eid==2)
+                commands=get(e,'pages').flat_map{|page|get(page,'list')}
+                transfers=commands.select{|cmd|get(cmd,'code')==201 && get(cmd,'parameters')[0]==0}
+                raise 'source portal transfer not unique' unless transfers.size==1
+                code=transfers[0];old=get(code,'parameters').dup
+                if mid==45
+                  raise 'wrong source portal' unless old[1]==20
+                  target=meta.fetch('46').fetch('entry');destination=46
                 else
-                  closest([px+dx,py+dy],area,used,2)
+                  raise 'wrong source portal' unless old[1]==14
+                  target=meta.fetch('45').fetch('stairs');destination=45
                 end
-              raise 'Could not place event' if position.nil?
-              put(event,'x',position[0]);put(event,'y',position[1]);coords[eid]=position
-              used<<position
-            end
-            # Specific transfer targets use original Sanctuary portal evidence, not placeholder screens.
-            other=meta.fetch((target==45 ? 46 : 45).to_s)
-            events.sort.each do |eid,event|
-              script_commands(event).each do |c|
-                op=get(c,'code');args=get(c,'parameters')
-                if op==202 && args.is_a?(Array) && args.length>=4 && args[0]==0 && args[1]==0
-                  # Native scripted respawn destinations are map-relative, so move them with their parent.
-                  p=closest([args[2]+dx,args[3]+dy],area,[],1)
-                  put(c,'parameters',args.dup.tap{|v|v[2]=p[0];v[3]=p[1]})
-                elsif op==201 && args.is_a?(Array) && args[0]==0
-                  rewritten=args.dup
-                  if target==45 && eid==1 && args[1]==20
-                    rewritten[1]=46;rewritten[2],rewritten[3]=*other.fetch('entry')
-                  elsif target==46 && eid==2 && args[1]==14
-                    rewritten[1]=45
-                    prev=meta.fetch('45')
-                    return_walk=Base64.strict_decode64(prev.fetch('walkBase64'))
-                    return_area=select_area(prev.fetch('width'),prev.fetch('height'),return_walk,prev.fetch('entry'))
-                    goal=[prev.fetch('stairs')[0]-2,prev.fetch('stairs')[1]]
-                    dest=closest(goal,return_area,[prev.fetch('stairs')],1)
-                    rewritten[2],rewritten[3]=*dest
-                  end
-                  put(c,'parameters',rewritten) if rewritten!=args
-                elsif op==355 && args.is_a?(Array) && args[0].is_a?(String) && args[0].include?('$MapName')
-                  text=args[0].dup.force_encoding('UTF-8').scrub
-                  text=text.gsub('수련 던전','말섬던전')
-                  put(c,'parameters',[text]+args.drop(1)) if text!=args[0]
-                end
+                old[1]=destination;old[2]=target[0];old[3]=target[1]
+                put(code,'parameters',old)
               end
             end
-            # A duplicated monster event retains all non-coordinate operations and conditional pages.
-            raise 'Monster/NPC event loss' unless events.size==get(original,'events').size
-            raise 'NPC has disappeared' unless events.values.any?{|e|get(e,'name').dup.force_encoding('UTF-8').scrub.include?('힐러 마법사')}
-            File.binwrite(mp.call(target),Marshal.dump(copied))
-            entry=Marshal.load(Marshal.dump(infos[origin]));put(entry,'name',"Sanctuary 말섬던전 #{target==45 ? '1' : '2'}층");put(entry,'parent_id',0);put(entry,'order',target);infos[target]=entry
-            report[target.to_s]={mapId:target,sourceEventMap:origin,width:w,height:h,atlasTiles:flags.size,events:events.size,healerPreserved:true,walkableArea:area.size,entry:m.fetch('entry'),stairs:m.fetch('stairs'),coords:coords}
-            puts "MAP#{target} copied events #{events.size}, image atlas #{flags.size} tiles, 1x original, reachable #{area.size}"
+            # No copied monster spawns or guessed NPC positions in a scale-only test.
+            put(m,'events',events)
+            File.binwrite(mapfile.call(mid),Marshal.dump(m))
+            info=Marshal.load(Marshal.dump(infos[sourceid]))
+            put(info,'name',"Sanctuary 말섬던전 #{mid==45 ? '1' : '2'}층 2x TEST")
+            put(info,'parent_id',0);put(info,'order',mid);infos[mid]=info
+            portal_report[mid]={source:sourceid,events:events.keys,entry:d['entry'],stairs:d['stairs']}
           end
-          # Patch only the existing teleporter menu branch. No separate movement/graphics Ruby scripts.
-          townraw=File.binread(mp.call(29));town=Marshal.load(townraw)
-          raise 'Town roundtrip changed' unless Marshal.dump(town)==townraw
+          town=Marshal.load(File.binread(mapfile.call(29)))
           npc=get(town,'events').fetch(11)
-          raise 'Wrong NPC' unless [get(npc,'x'),get(npc,'y')]==[70,48]
-          commands=get(get(npc,'pages').first,'list')
+          raise 'wrong town teleporter' unless [get(npc,'x'),get(npc,'y')]==[70,48]
+          list=get(get(npc,'pages').first,'list')
           placeholder='말섬던전은 별도 맵 연결 후 이용할 수 있습니다.'
-          a=commands.select{|c|get(c,'code')==101 && get(c,'parameters')==[placeholder]}
-          raise 'Missing unique NPC placeholder' unless a.size==1
-          c=a.first;put(c,'code',201);put(c,'parameters',[0,45,*meta.fetch('45').fetch('entry'),0,1])
-          File.binwrite(mp.call(29),Marshal.dump(town))
+          candidates=list.select{|cmd|get(cmd,'code')==101 && get(cmd,'parameters')==[placeholder]}
+          raise 'unique old dungeon menu entry missing' unless candidates.size==1
+          c=candidates.first;put(c,'code',201)
+          put(c,'parameters',[0,45,*meta.fetch('45').fetch('entry'),0,1])
+          File.binwrite(mapfile.call(29),Marshal.dump(town))
           File.binwrite(setsfile,Marshal.dump(sets))
           File.binwrite(infosfile,Marshal.dump(infos))
-          (1..44).each do |id|
-           next if id==29
-           raise "Original map #{id} changed" unless Digest::SHA256.file(mp.call(id)).hexdigest==original_maps[id]
-          end
-          raise 'Original core game scripts changed' unless Digest::SHA256.file(base+'Scripts.rxdata').hexdigest==original_scripts
-          File.write(ARGV.fetch(2),JSON.pretty_generate(report))
-          puts "PASS native source retained. 44 old maps except NPC menu unchanged. No renderer and no camera/movement overrides."
-          RUBY_PATCH
-          ruby -c /tmp/patch.rb && ruby /tmp/patch.rb site build/map-art.json build/clone-report.json
+          (1..44).each{|id|next if id==29;raise "original map changed #{id}" unless Digest::SHA256.file(mapfile.call(id)).hexdigest==originals[id]}
+          File.write(ARGV.fetch(2),JSON.pretty_generate(portal_report))
+          puts 'PASS two scale test maps, native event pages only; old 43 maps unchanged'
+          RUBY_MAPS
+          ruby -c /tmp/native_maps.rb
+          ruby /tmp/native_maps.rb site/test-map-v229r22 build/terrain2x.json build/portal-events.json
 
-      - name: V229R21 Update asset mapping and visible build version
+      - name: V229R22 Patch ONLY map background sprites; no movement or combat edits
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/index.py <<'PY_INDEX'
+          cat > /tmp/render_chunks.rb <<'RUBY_RENDER'
+          require 'zlib';require 'digest'
+          root=ARGV.fetch(0)
+          path=root+'/knight/gameasync/Data/Scripts.rxdata'
+          original=File.binread(path)
+          scripts=Marshal.load(original)
+          raise 'Spriteset_Map slot changed' unless scripts[32][1]=='Spriteset_Map'
+          source=Zlib::Inflate.inflate(scripts[32][2])
+          init='    @tilemap.priorities = $game_map.priorities'
+          update='    @tilemap.update'
+          dispose='    @tilemap.dispose'
+          raise 'map renderer pattern changed' unless [init,update,dispose].all?{|t|source.scan(t).size==1}
+          source=source.sub(init,init+%q{
+              # V229R22: terrain image background chunks. Map physics is unmodified.
+              @slti_chunks = {}
+              @slti_floor = [45,46].include?($game_map.map_id) ? $game_map.map_id : nil
+              @slti_cols = @slti_floor == 45 ? 9 : (@slti_floor == 46 ? 11 : 0)
+              @slti_rows = @slti_floor == 45 ? 5 : (@slti_floor == 46 ? 6 : 0)})
+                    source=source.sub(update,update+%q{
+              slti_update_terrain if @slti_floor})
+                    source=source.sub(dispose,dispose+%q{
+              if @slti_chunks
+                @slti_chunks.each_value do |sprite|
+                  sprite.bitmap.dispose if sprite.bitmap != nil
+                  sprite.dispose
+                end
+                @slti_chunks.clear
+              end})
+                    method=%q{
+            # Only 1024x1024 nearby image chunks are decoded; no giant tileset.
+            # Each chunk sits at its original 2x map-pixel coordinates.
+            def slti_update_terrain
+              sx = $game_map.display_x / 4
+              sy = $game_map.display_y / 4
+              left = [sx / 1024 - 1, 0].max
+              top = [sy / 1024 - 1, 0].max
+              right = [(sx + 800) / 1024 + 1, @slti_cols - 1].min
+              bottom = [(sy + 600) / 1024 + 1, @slti_rows - 1].min
+              visible = {}
+              for y in top..bottom
+                for x in left..right
+                  key = [x,y]
+                  visible[key] = true
+                  if @slti_chunks[key] == nil
+                    sprite = Sprite.new(@viewport1)
+                    sprite.z = -900
+                    name = "Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}"
+                    sprite.bitmap = Bitmap.new(name)
+                    @slti_chunks[key] = sprite
+                  end
+                  sprite = @slti_chunks[key]
+                  sprite.x = x * 1024 - sx
+                  sprite.y = y * 1024 - sy
+                end
+              end
+              @slti_chunks.keys.each do |key|
+                next if visible[key]
+                sprite = @slti_chunks.delete(key)
+                sprite.bitmap.dispose if sprite.bitmap != nil
+                sprite.dispose
+              end
+            end
+          }
+          raise 'unexpected source end' unless source.rstrip.end_with?('end')
+          source=source.rstrip.sub(/end\z/,method+"\nend\n")
+          scripts[32][2]=Zlib::Deflate.deflate(source)
+          File.binwrite(path,Marshal.dump(scripts))
+          rebuilt=Marshal.load(File.binread(path))
+          raise 'other scripts changed' unless scripts.each_index.all?{|i|i==32 || scripts[i]==rebuilt[i]}
+          raise 'base scripts file unchanged' if Digest::SHA256.hexdigest(original)==Digest::SHA256.file(path).hexdigest
+          File.binwrite(ARGV.fetch(1),source)
+          puts 'PASS Spriteset_Map image-only x2 background; Game_Map, Game_Character, combat untouched'
+          RUBY_RENDER
+          ruby -c /tmp/render_chunks.rb
+          ruby /tmp/render_chunks.rb site/test-map-v229r22 build/Spriteset_Map_V229R22.rb
+          ruby -c build/Spriteset_Map_V229R22.rb
+
+      - name: V229R22 Register new assets and visible test version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/register.py <<'PY_REG'
           from pathlib import Path
-          import hashlib,re,json,sys
-          root=Path(sys.argv[1]);g=root/'knight/gameasync';prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          old=[f'Data/{prefix}Tilesets.rxdata',f'Data/{prefix}MapInfos.rxdata',f'Data/{prefix}Map029.rxdata']
-          new=[f'Data/{prefix}Map045.rxdata',f'Data/{prefix}Map046.rxdata','Graphics/Tilesets/SLTI_45_Original.png','Graphics/Tilesets/SLTI_46_Original.png']
+          import hashlib,json,re,sys
+          root=Path(sys.argv[1]);g=root/'knight/gameasync'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          changed=[
+              f'Data/{pre}Tilesets.rxdata',f'Data/{pre}MapInfos.rxdata',
+              f'Data/{pre}Map029.rxdata','Data/Scripts.rxdata'
+          ]
+          added=[f'Data/{pre}Map045.rxdata',f'Data/{pre}Map046.rxdata',
+                 'Graphics/Tilesets/SLTI_Collision_Transparent.png']
+          added += [str(p.relative_to(g)) for p in sorted((g/'Graphics/Panoramas').glob('SLTI_*.png'))]
           mapping=g/'mapping.js';s=mapping.read_text(encoding='utf-8')
-          for item in old:
-           path=g/item;digest=hashlib.md5(path.read_bytes()).hexdigest()
-           s,n=re.subn(re.escape(item+'?h=')+r'[0-9a-f]{32}',lambda z:item+'?h='+digest,s)
-           assert n==1,(item,n)
+          for item in changed:
+              digest=hashlib.md5((g/item).read_bytes()).hexdigest()
+              pattern=re.escape(item+'?h=')+r'[0-9a-f]{32}'
+              s,n=re.subn(pattern,lambda m:item+'?h='+digest,s)
+              assert n==1,(item,n)
           lines=[]
-          for item in new:
-           path=g/item;assert path.is_file(),item
-           key=item.rsplit('.',1)[0].lower();digest=hashlib.md5(path.read_bytes()).hexdigest()
-           assert ('["'+key+'",') not in s
-           lines.append('['+json.dumps(key,ensure_ascii=False)+', '+json.dumps(item+'?h='+digest,ensure_ascii=False)+'],\n')
+          for item in added:
+              path=g/item;assert path.is_file(),item
+              key=item.rsplit('.',1)[0].lower();digest=hashlib.md5(path.read_bytes()).hexdigest()
+              assert ('["'+key+'",') not in s,key
+              lines.append('['+json.dumps(key,ensure_ascii=False)+', '+json.dumps(item+'?h='+digest,ensure_ascii=False)+'],\n')
           assert s.count('\n];\n\nvar mapping')==1
           s=s.replace('\n];\n\nvar mapping','\n'+''.join(lines)+'];\n\nvar mapping',1)
           mapping.write_text(s,encoding='utf-8')
           for file in (root/'index.html',root/'knight/index.html'):
-           t=file.read_text(encoding='utf-8')
-           assert 'V229R16' in t
-           file.write_text(t.replace('V229R16','V229R21').replace('v229r16','v229r21'),encoding='utf-8')
-          print('INDEX_V229R21_COMPLETE: original mapping index updated, 4 native assets added')
-          PY_INDEX
-          python3 /tmp/index.py site && node --check site/knight/gameasync/mapping.js
+              t=file.read_text(encoding='utf-8')
+              assert 'V229R16' in t
+              t=t.replace('V229R16','V229R22').replace('v229r16','v229r22')
+              if file.name=='index.html' and file.parent.name=='knight':
+                  old="var namespace = 'slknight_v14_engine'"
+                  assert t.count(old)==1
+                  t=t.replace(old,"var namespace = 'slknight_v229r22_test'")
+              file.write_text(t,encoding='utf-8')
+          Path('build/asset-list.json').write_text(json.dumps({'changed':changed,'added':added},indent=2,ensure_ascii=False))
+          print('Registered',len(added),'new graphics/maps in TEST copy only')
+          PY_REG
+          python3 /tmp/register.py site/test-map-v229r22
+          node --check site/test-map-v229r22/knight/gameasync/mapping.js
 
-      - name: V229R21 Execute original core native passability over ALL tiles
+      - name: V229R22 Validate 2x coordinates, original root and unchanged gameplay scripts
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/verify.rb <<'RUBY_VERIFY'
-          require 'json';require 'base64';require 'zlib';require 'digest'
-          module RPG
-            class Map;end;class MapInfo;end;class AudioFile;end;class Tileset;end
-            class Event
-              class Page
-                class Condition;end;class Graphic;end
-              end
-            end
-            class EventCommand;end;class MoveRoute;end;class MoveCommand;end
-          end
-          class Table
-            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
-            def _dump(d=0);@raw;end
-            def header;@raw.unpack('V5');end
-            def [](x,y=0,z=0)
-              dim,w,h,depth,n=header
-              return nil if x<0 || x>=w || y<0 || y>=h || z<0 || z>=depth
-              @raw.byteslice(20+2*(x+y*w+z*w*h),2).unpack1('v')
-            end
-            def values;@raw.byteslice(20..).unpack('v*');end
-          end
-          class Tone;def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end;def _dump(d=0);@raw;end;end
-          class Color<Tone;end
-          def at(o,s);o.instance_variable_get('@'+s);end
-          root=ARGV.fetch(0)
-          meta=JSON.parse(File.read(ARGV.fetch(1)))
-          b=root+'/knight/gameasync/Data/';pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          sets=Marshal.load(File.binread(b+pre+'Tilesets.rxdata'))
-          scripts=Marshal.load(File.binread(b+'Scripts.rxdata'))
-          source=Zlib::Inflate.inflate(scripts[21][2])
-          eval(source,TOPLEVEL_BINDING,'Game_Map_original')
-          class RPG::Map;attr_reader :width,:height,:data;end
-          [ [45,14],[46,20] ].each do |id,origid|
-           a=meta.fetch(id.to_s);m=Marshal.load(File.binread(b+('%sMap%03d.rxdata'%[pre,id])));
-           prev=Marshal.load(File.binread(b+('%sMap%03d.rxdata'%[pre,origid])));
-           w=a['width'];h=a['height'];tiles=at(m,'data');set=sets[at(m,'tileset_id')]
-           pass=at(set,'passages');prior=at(set,'priorities')
-           raise 'Invalid passage default' unless prior[0]==5 && pass[0]==0
-           mask=Base64.strict_decode64(a['walkBase64'])
-           raise 'Wrong native table' unless tiles.header==[3,w,h,3,w*h*3]
-           raise 'Event missing' unless at(m,'events').size==at(prev,'events').size
-           origs=at(prev,'events'); events=at(m,'events')
-           origs.each do |eid,e|
-            clone=events.fetch(eid)
-            raise 'event label changed' unless at(e,'name')==at(clone,'name')
-            raise 'event page lost' unless at(e,'pages').size==at(clone,'pages').size
-            x=at(clone,'x');y=at(clone,'y')
-            raise "blocked event #{id}/#{eid}" unless mask.getbyte(y*w+x)==1
-            at(clone,'pages').each do |page|
-             at(page,'list').each do |cmd|
-              if at(cmd,'code')==202
-                c=at(cmd,'parameters');next unless c.is_a?(Array)&&c.size>=4&&c[0]==0&&c[1]==0
-                raise 'Scripted relocation blocked' unless mask.getbyte(c[3]*w+c[2])==1
-              end
-             end
-            end
-           end
-           # Execute unchanged core native Game_Map passability against EVERY tile.
-           current=Game_Map.allocate
-           current.instance_variable_set(:@map,m)
-           current.instance_variable_set(:@passages,pass)
-           current.instance_variable_set(:@priorities,prior)
-           current.instance_variable_set(:@events,{})
-           for y in 0...h
-            for x in 0...w
-             want=mask.getbyte(y*w+x)==1
-             raise "Raster mismatch #{id}/#{x}/#{y}" unless (pass[tiles[x,y,0]]&15)==(want ? 0 : 15)
-             [2,4,6,8].each do |dir|
-              got=current.passable?(x,y,dir)
-              raise "Original engine collision mismatch #{id}/#{x}/#{y}/#{dir}: #{got} wanted #{want}" unless got==want
-             end
-            end
-           end
-           puts "PASS #{id}: original engine collision on #{w*h} tiles, #{events.size} events, NPC/monsters preserved"
-          end
-          raise 'Core game scripts modified' unless Digest::SHA256.file(b+'Scripts.rxdata').hexdigest=='ac9aa3508341546e8467454a87b728b232fea910734357e3df4711e9cc82a61c'
-          puts 'PASS untouched game movement, camera, combat and script bytes'
-          RUBY_VERIFY
-          ruby -c /tmp/verify.rb && ruby /tmp/verify.rb site build/map-art.json
-
-      - name: V229R21 Byte-compare original S32 pixels and source game files
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/integrity.py <<'PY_INTEGRITY'
+          cat > /tmp/validate.py <<'PY_VALIDATE'
           from pathlib import Path
-          import hashlib,json,sys,zipfile,io,re,base64,struct,zlib
-          from PIL import Image
-          old=Path(sys.argv[1]);new=Path(sys.argv[2]);orig=Path(sys.argv[3]);build=Path(sys.argv[4]);
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          def catalog(d):
-           return {str(p.relative_to(d)):hashlib.sha256(p.read_bytes()).hexdigest() for p in d.rglob('*') if p.is_file()}
-          a=catalog(old);b=catalog(new)
-          assert len(a)==5354,('Baseline changed',len(a))
-          changed={k for k in a if b.get(k)!=a[k]}
-          expected={f'knight/gameasync/Data/{prefix}Map029.rxdata',f'knight/gameasync/Data/{prefix}Tilesets.rxdata',f'knight/gameasync/Data/{prefix}MapInfos.rxdata','knight/gameasync/mapping.js','knight/index.html','index.html'}
-          assert changed==expected,('Unexpected changed originals',changed^expected)
-          added=set(b)-set(a)
-          expected_add={f'knight/gameasync/Data/{prefix}Map045.rxdata',f'knight/gameasync/Data/{prefix}Map046.rxdata','knight/gameasync/Graphics/Tilesets/SLTI_45_Original.png','knight/gameasync/Graphics/Tilesets/SLTI_46_Original.png'}
-          assert added==expected_add,('Unexpected new files',added^expected_add)
-          assert len(b)==5358
-          assert a['knight/gameasync/Data/Scripts.rxdata']==b['knight/gameasync/Data/Scripts.rxdata']
-          assert a['knight/js/dpad.js']==b['knight/js/dpad.js']
-          mapinfo=json.loads((build/'map-art.json').read_text())
-          with zipfile.ZipFile(orig) as z:
-           html=z.read('preview/terrain-walk-v4.1.html').decode('utf-8')
-           original=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S).group(1))
-           for srcid,mid in [('1','45'),('2','46')]:
-            m=mapinfo[mid];src=original[srcid]
-            x0=min(t['x'] for t in src['tiles']);y0=min(t['y'] for t in src['tiles'])
-            W=m['width'];H=m['height']
-            image=Image.new('RGBA',(W*32,H*32))
-            for t in src['tiles']:
-             p=Image.open(io.BytesIO(z.read('preview/'+t['src']))).convert('RGBA')
-             image.alpha_composite(p,(t['x']-x0,t['y']-y0))
-            atlas=new/'knight/gameasync/Graphics/Tilesets'/f'SLTI_{mid}_Original.png'
-            with Image.open(atlas) as pack:
-             assert pack.width==256 and pack.height%32==0
-             indexes=struct.unpack('<'+'H'*(W*H),zlib.decompress(base64.b64decode(m['tileBase64'])))
-             for y in range(H):
-              for x in range(W):
-               i=indexes[y*W+x]-384
-               a=pack.crop(((i%8)*32,(i//8)*32,(i%8+1)*32,(i//8+1)*32))
-               b=image.crop((x*32,y*32,x*32+32,y*32+32))
-               assert a.tobytes()==b.tobytes(),('Pixel changed',mid,x,y)
-            assert hashlib.sha256(image.tobytes()).hexdigest()==m['graphicSha256']
-            print('EXACT 1:1 ORIGINAL PIXELS VERIFIED',mid,'tile count',W*H)
-          index=(new/'knight/gameasync/mapping.js').read_text(encoding='utf-8')
-          for rel in expected_add:
-           sub=rel.removeprefix('knight/gameasync/')
-           key=sub.rsplit('.',1)[0].lower()
-           assert index.count('["'+key+'",')==1,(key,'missing/duplicate')
-           digest=hashlib.md5((new/rel).read_bytes()).hexdigest()
-           assert sub+'?h='+digest in index,('Wrong hash',rel)
-          html=(new/'knight/index.html').read_text(encoding='utf-8');homepage=(new/'index.html').read_text(encoding='utf-8')
-          assert 'V229R21' in html and 'V229R21' in homepage
-          assert 'slti-layer' not in html and 'slOpenSanctuary' not in html
-          assert not (new/'knight/sanctuary').exists()
-          assert 'v229r21' in html
-          print('PASS 5354 original files preserved except six map/index/version assets; four native files added; game scripts unchanged')
-          PY_INTEGRITY
-          python3 /tmp/integrity.py pristine site /tmp/sanctuary-v41-original.zip build
-
-      - name: V229R21 Upload original-map preservation report
-        uses: actions/upload-artifact@v4
-        with:
-          name: SLKnight-V229R21-Original-Map-Data-Audit
-          path: |
-            build/map-art.json
-            build/clone-report.json
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: V229R21 Upload game using unchanged core movement and combat
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: site
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/configure-pages@v6
-      - id: deployment
-        uses: actions/deploy-pages@v5
+          import hashlib,json,subprocess,zlib,base64,sys
+          old=Path('pristine');site=Path('site');test=site/'test-map-v229r22'
+          info=json.loads(Path('build/terrain2x.json').read_text())
+          for mid in ('45','46'):
+              d=info
