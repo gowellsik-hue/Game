@@ -1,12 +1,11 @@
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R28 - Fetch complete destination floor BEFORE loading Map045/046; restore native Asyncify callback
-# V4.1 preview geometry shown at 2x by Sprite.zoom; native TIL detail is not reconstructed.
+# VERSION: V229R29 - Mobile 256px panorama, native R16 loader untouched, native per-map preload manifests
+# V4.1 preview geometry is preserved at 2x on-screen; 512px source cropped and downsampled to 256px.
 # Map45/46 added in existing game, NPC Map029 teleporter connected.
 # Fix: late loading resolution script 97 overrides Spriteset_Map from script 32.
-# Memory limit: 512x512 RGBA per loaded terrain texture (1 MiB), at most 4 visible chunks on 800x600 viewport.
-# Only script 97 and asset loader drive.js are modified; Game_Map, combat and 43 maps remain untouched.
-# Entry policy: 1F 45 compressed PNGs at Map045 load; 2F 66 PNGs at Map046 load. No network requests while walking.
-name: build-slknight-web.yml | V229R28 | Native Transfer Resume After Floor Download
+# Texture size: 256x256 RGBA (0.25MiB each), up to 4 visible chunks; 1024px game map area per chunk.
+# No drive.js edits, Promise gates or overridden load callbacks. Use existing preload/Data/*.json on map entry.
+name: build-slknight-web.yml | V229R29 | Mobile 256px Terrain - R16 Native Loader
 
 on:
   workflow_dispatch:
@@ -29,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: V229R28 Restore verified V229R16 game artifact
+      - name: V229R29 Restore verified V229R16 game artifact
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -38,7 +37,7 @@ jobs:
           github-token: ${{ github.token }}
           path: previous
 
-      - name: V229R28 Restore original TI Dungeon V4.1 terrain and portals
+      - name: V229R29 Restore original TI Dungeon V4.1 terrain and portals
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -47,7 +46,7 @@ jobs:
           github-token: ${{ github.token }}
           path: original-ti
 
-      - name: V229R28 Upgrade existing game in-place during build
+      - name: V229R29 Upgrade existing game in-place during build
         shell: bash
         run: |
           set -euo pipefail
@@ -76,7 +75,7 @@ jobs:
             sudo apt-get install -y -qq python3-pil
           fi
 
-      - name: V229R28 Keep unscaled 512px source textures; apply geometry 2x on GPU
+      - name: V229R29 Downsample 512px panorama sources to 256px for mobile
         shell: bash
         run: |
           set -euo pipefail
@@ -105,20 +104,21 @@ jobs:
                   with Image.open(p) as f:
                       assert f.size==(1536,768),str(p)
                       canvas.alpha_composite(f.convert('RGBA'),(block['x']-x0,block['y']-y0))
-              # Strict 2x GEOMETRY restoration. This is an initial play test,
-              # not a claim to restore lost native Tile.pak image detail.
+              # Strict 2x geometry restoration, using mobile-resolution artwork.
+              # Native Tile.pak detail is not reconstructed in this test.
               fullw,fullh=sw*2,sh*2
               cols=(fullw+1023)//1024;rows=(fullh+1023)//1024
               files=[]
               for cy in range(rows):
                   for cx in range(cols):
                       crop=canvas.crop((cx*512,cy*512,cx*512+512,cy*512+512))
-                      # V229R28: do NOT allocate/store a 1024x1024 image.
-                      # One source pixel occupies 2x2 screen pixels via Sprite.zoom_x/y.
-                      # Retains the exact same 2x geometry as V229R24, 1/4 texture RAM.
+                      # One 256px texture pixel occupies 4x4 screen pixels.
+                      # Same 2x world geometry as V229R24.
+                      # Per-texture RGBA RAM is 1/16 of V229R24.
                       name=f'SLTI_{mid}_C{cx}_{cy}.png'
                       path=output/name
-                      crop.save(path,compress_level=6)
+                      crop.resize((256,256),Image.Resampling.LANCZOS).save(
+                          path,compress_level=9,optimize=True)
                       files.append('Graphics/Panoramas/'+name)
               # Source S32 world -> original V4.1 screen -> exact 2x screen.
               first=blocks[0];name=Path(first['src']).stem
@@ -149,7 +149,6 @@ jobs:
                   px,py=project(*world);gx,gy=round(px/32),round(py/32)
                   p=min(available,key=lambda i:(abs(i%W-gx)+abs(i//W-gy),abs(i%W-gx),i))
                   return [p%W,p//W]
-              # Read actual portal names/positions, never invent their world coordinates.
               portals={p['name']:p for p in m['portals'] if p['name'] in ('go_00','to2','to1')}
               if mid==45:
                   assert 'go_00' in portals and 'to2' in portals
@@ -172,7 +171,7 @@ jobs:
               ids=[384 if v else 385 for v in walk]
               records={
                   'mapId':mid,'width':W,'height':H,'chunkCols':cols,'chunkRows':rows,
-                  'chunkSize':1024,'sourceTextureSize':512,'textureZoom':2,
+                  'chunkSize':1024,'sourceTextureSize':256,'textureZoom':4,
                   'graphicScale':2,'previewTileBlocks':len(blocks),
                   'entry':entry,'stairs':stairs,'sourceEntryWorld':entry_world,
                   'sourceStairsWorld':stair_world,'walkableCells':sum(walk),
@@ -180,20 +179,18 @@ jobs:
                   'tilesBase64':base64.b64encode(zlib.compress(struct.pack('<'+'H'*len(ids),*ids),9)).decode(),
                   'walkBase64':base64.b64encode(zlib.compress(bytes(walk),9)).decode(),
                   'previewCanvasSha256':hashlib.sha256(canvas.tobytes()).hexdigest(),
-                  'geometry':'512px original V4.1 source chunks zoomed 2x at runtime; not native TIL detail',
+                  'geometry':'256px mobile terrain chunks zoomed 4x to cover 1024px each; same 2x world geometry',
                   'collision':'same V4.1 collision mask raster rule, sampled at 2x; direction data not invented'
               }
               metadata[str(mid)]=records
-              print(f'MAP {mid}: {W}x{H}, source chunks {cols}x{rows} at 512px + GPU zoom 2x, passable {sum(walk)}, entry {entry}, stairs {stairs}',flush=True)
+              print(f'MAP {mid}: {W}x{H}, source chunks {cols}x{rows} at 256px + native sprite zoom 4x, passable {sum(walk)}, entry {entry}, stairs {stairs}',flush=True)
           Path('build/terrain2x.json').write_text(json.dumps(metadata,ensure_ascii=False),encoding='utf-8')
-          # A tiny transparent tileset: RGSS retains the native 32px collision grid.
-          # The map visuals are independent background chunks, not a huge RGSS atlas.
           tile=Image.new('RGBA',(256,32),(0,0,0,0))
           tile.save(root/'Graphics/Tilesets/SLTI_Collision_Transparent.png')
           PY_TERRAIN
           python3 /tmp/terrain_2x.py
 
-      - name: V229R28 Add original 2x map IDs to existing game and connect town teleporter
+      - name: V229R29 Add original 2x map IDs to existing game and connect town teleporter
         shell: bash
         run: |
           set -euo pipefail
@@ -220,7 +217,7 @@ jobs:
             end
           end
           class Tone
-            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);end
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
             def _dump(depth=0);@raw;end
           end
           class Color<Tone;end
@@ -284,7 +281,6 @@ jobs:
                 put(code,'parameters',old)
               end
             end
-            # Do not fabricate monster spawns or NPC positions in this geometry-only stage.
             put(m,'events',events)
             File.binwrite(mapfile.call(mid),Marshal.dump(m))
             info=Marshal.load(Marshal.dump(infos[sourceid]))
@@ -315,7 +311,7 @@ jobs:
           ruby -c /tmp/native_maps.rb
           ruby /tmp/native_maps.rb site build/terrain2x.json build/portal-events.json
 
-      - name: V229R28 Fix live Spriteset_Map resolution override; render 2x terrain
+      - name: V229R29 Fix live Spriteset_Map resolution override; render 2x terrain
         shell: bash
         run: |
           set -euo pipefail
@@ -330,8 +326,6 @@ jobs:
           raise 'Wrong resolution script' unless scripts[97][1].dup.force_encoding('UTF-8') == '해상도'
           raise 'Original Spriteset_Map slot changed' unless scripts[32][1] == 'Spriteset_Map'
           source = Zlib::Inflate.inflate(scripts[97][2])
-          # Script 97 is loaded AFTER script 32 and redefines initialize, update, dispose.
-          # Never patch script 32: its implementation is overridden before gameplay.
           raise 'Missing late renderer' unless source.scan('class Spriteset_Map').size == 1
           raise 'Wrong active viewport' unless source.include?('@tilemap = Tilemap.new(@viewport2)')
           raise 'Wrong existing panorama viewport' unless source.include?('@panorama = Sprite.new(@viewport2)')
@@ -342,7 +336,7 @@ jobs:
             raise "Missing or repeated anchor #{needle}" unless source.scan(needle).size == 1
           end
           source = source.sub(init, init + %q{
-              # V229R28: source terrain chunks, attached to the ACTIVE renderer.
+              # V229R29: mobile terrain chunks, attached to the existing ACTIVE renderer.
               @slti_chunks = {}
               @slti_floor = [45,46].include?($game_map.map_id) ? $game_map.map_id : nil
               @slti_cols = @slti_floor == 45 ? 9 : (@slti_floor == 46 ? 11 : 0)
@@ -361,10 +355,8 @@ jobs:
               end
           } + dispose)
           method = %q{
-            # V229R28: bounded 512px texture streaming for the original 2x map.
-            # Only screen-visible chunks are resident. One terrain chunk = 512x512
-            # RGBA (1 MiB) and Sprite.zoom 2x; no 1024px bitmap allocations.
-            # This changes neither native map movement nor battle scripts.
+            # 256px textures represent 1024px in the existing 2x map.
+            # Only screen-visible chunks are decoded.
             def slti_update_terrain
               sx = $game_map.display_x / 4
               sy = $game_map.display_y / 4
@@ -378,7 +370,6 @@ jobs:
                   visible[[x, y]] = true
                 end
               end
-              # Release old images BEFORE allocating new ones to lower peak RAM.
               @slti_chunks.keys.each do |key|
                 next if visible[key]
                 sprite = @slti_chunks.delete(key)
@@ -387,7 +378,6 @@ jobs:
                 sprite.dispose
                 old_bitmap.dispose if old_bitmap != nil && !old_bitmap.disposed?
               end
-              # Limit new image decodes to two per frame to avoid a mobile RAM spike.
               new_count = 0
               visible.each_key do |key|
                 x, y = key
@@ -396,8 +386,8 @@ jobs:
                   next if new_count >= 2
                   sprite = Sprite.new(@viewport2)
                   sprite.z = -1500
-                  sprite.zoom_x = 2.0
-                  sprite.zoom_y = 2.0
+                  sprite.zoom_x = 4.0
+                  sprite.zoom_y = 4.0
                   name = "Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}"
                   sprite.bitmap = Bitmap.new(name)
                   @slti_chunks[key] = sprite
@@ -425,10 +415,10 @@ jobs:
           puts 'PASS: active script97 renderer connected; base script32, movement, combat unchanged'
           RUBY_RENDER
           ruby -c /tmp/render_chunks.rb
-          ruby /tmp/render_chunks.rb site build/Spriteset_Map_V229R28.rb
-          ruby -c build/Spriteset_Map_V229R28.rb
+          ruby /tmp/render_chunks.rb site build/Spriteset_Map_V229R29.rb
+          ruby -c build/Spriteset_Map_V229R29.rb
 
-      - name: V229R28 Register map assets and visible game version at existing URL
+      - name: V229R29 Register map assets and visible game version at existing URL
         shell: bash
         run: |
           set -euo pipefail
@@ -454,7 +444,7 @@ jobs:
           for item in added:
               path=g/item;assert path.is_file(),item
               key=item.rsplit('.',1)[0].lower();digest=hashlib.md5(path.read_bytes()).hexdigest()
-              assert ('["'+key+'",') not in s,key
+              assert ('["'+key+'",') not in s
               lines.append('['+json.dumps(key,ensure_ascii=False)+', '+json.dumps(item+'?h='+digest,ensure_ascii=False)+'],\n')
           assert s.count('\n];\n\nvar mapping')==1
           s=s.replace('\n];\n\nvar mapping','\n'+''.join(lines)+'];\n\nvar mapping',1)
@@ -462,7 +452,7 @@ jobs:
           for file in (root/'index.html',root/'knight/index.html'):
               t=file.read_text(encoding='utf-8')
               assert 'V229R16' in t
-              t=t.replace('V229R16','V229R28').replace('v229r16','v229r28')
+              t=t.replace('V229R16','V229R29').replace('v229r16','v229r29')
               file.write_text(t,encoding='utf-8')
           Path('build/asset-list.json').write_text(json.dumps({'changed':changed,'added':added},indent=2,ensure_ascii=False))
           print('Registered',len(added),'new graphics/maps in EXISTING game site/')
@@ -470,234 +460,120 @@ jobs:
           python3 /tmp/register.py site
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R28 Prefetch floor BEFORE native Map RXDATA and preserve original wake-up callback
+      - name: V229R29 Declare entire destination floor using ORIGINAL map preload manifests
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_ENTRY'
+          python3 - <<'PY_PRELOAD'
           from pathlib import Path
+          import json,hashlib
           root=Path('site/knight')
-          loader=root/'js/drive.js'
-          js=loader.read_text(encoding='utf-8')
-          dummy='''        // Get filename
-                  const file = mappingArray[i][1];'''
-          changed=r'''        // Floor PNGs are not downloaded/registered in the village.
-                  if (/^graphics\/panoramas\/slti_(?:45|46)_/i.test(mappingArray[i][0])) continue;
-                  // Get filename
-                  const file = mappingArray[i][1];'''
-          assert js.count(dummy)==1,'createDummies anchor missing'
-          js=js.replace(dummy,changed,1)
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          for mid,count in ((45,45),(46,66)):
+              pngs=sorted((root/'gameasync/Graphics/Panoramas').glob(f'SLTI_{mid}_C*.png'))
+              assert len(pngs)==count,(mid,len(pngs))
+              names=['Graphics/Panoramas/'+p.name for p in pngs]
+              target=root/'preload'/'Data'/f'{pre}Map{mid:03}.rxdata.json'
+              target.parent.mkdir(parents=True,exist_ok=True)
+              target.write_text(json.dumps(names,ensure_ascii=False,separators=(',',':'))+'\n',encoding='utf-8')
+              assert json.loads(target.read_text())==names
+              print('Native map-entry prefetch manifest:',mid,count,'PNG assets')
+          original=Path('pristine/knight/js/drive.js').read_bytes()
+          current=(root/'js/drive.js').read_bytes()
+          assert hashlib.sha256(original).digest()==hashlib.sha256(current).digest(), 'Original drive.js changed!'
+          print('R16 drive.js byte-perfect preserved.')
+          PY_PRELOAD
 
-          # V229R27 broke the native wakeUp callback by moving it to Promise.then().
-          # V229R28 preserves FS.createPreloadedFile -> callback() exactly as R16.
-          # Prefetch PNGs BEFORE requesting the Map045/046 RXDATA instead.
-          original_callback='''                window.fileAsyncCache[mappingKey] = 1;
-                          if (!bitmap && window.setNotBusy) window.setNotBusy();
-                          if (window.fileLoadedAsync) window.fileLoadedAsync(fullPath);
-                          callback();
-                          if (cb1) cb1();'''
-          assert js.count(original_callback)==1,'Native Asyncify callback changed'
-          native_load="        load();" + chr(10) + "    }" + chr(10) + "}"
-          gated_load=r'''        const destination = !bitmap && /^data\/[^/]*map0?(45|46)$/.exec(mappingKey);
-                  if (!destination) {
-                      load(); // R16 completion callback is untouched.
-                  } else {
-                      const floor = Number(destination[1]);
-                      // Fetch this floor first, THEN run the ordinary map data loader.
-                      // Native callback remains in FS.createPreloadedFile onload.
-                      const prepare = () => window.sltiDownloadFloor(floor).then(() => {
-                          if (!window.sltiFloorCompleted[floor]) throw new Error('Floor not ready');
-                          console.log('SLTI_GATE_READY|' + floor);
-                          load();
-                      }).catch(error => {
-                          console.error('SLTI_FLOOR_FAILED|' + floor, error);
-                          const p = document.getElementById('progress');
-                          if (p) {
-                              p.style.opacity = '1';
-                              p.innerHTML = 'Dungeon floor ' + floor + ' download failed. Tap to retry.';
-                              p.onclick = function() { p.onclick = null; prepare(); };
-                          }
-                      });
-                      prepare();
-                  }
-              }
-          }'''
-          assert js.count(native_load)==1,'Original map load anchor changed'
-          js=js.replace(native_load,gated_load,1)
-          assert js.count(original_callback)==1,'Original wake-up callback must be untouched'
-          anchor='window.setBusy = function() {'
-          prefetch=r'''// Download ONE COMPLETE FLOOR when Map045/Map046 is requested, not at startup.
-          // Store compressed PNG bytes into the existing game FS WITHOUT decoding them.
-          // The original native RXDATA load begins ONLY after all PNG files finish.
-          // During movement Bitmap.new uses these cached files, making ZERO HTTP calls.
-          window.sltiFloorDownloadPromises = {};
-          window.sltiFloorCompleted = {};
-          window.sltiDownloadFloor = function(floor) {
-              if (floor !== 45 && floor !== 46) return Promise.reject(new Error('Unknown floor'));
-              if (window.sltiFloorCompleted[floor]) return Promise.resolve();
-              if (window.sltiFloorDownloadPromises[floor]) return window.sltiFloorDownloadPromises[floor];
-              const prefix = 'graphics/panoramas/slti_' + floor + '_';
-              const items = mappingArray.filter(row => row[0].indexOf(prefix) === 0);
-              const expected = floor === 45 ? 45 : 66;
-              if (items.length !== expected) return Promise.reject(new Error('Missing floor files: ' + items.length));
-              let next = 0, done = 0;
-              const progress = document.getElementById('progress');
-              function show() {
-                  if (progress) {
-                      progress.style.opacity = '0.8';
-                      progress.innerHTML = 'Dungeon ' + (floor === 45 ? '1F' : '2F') +
-                                           ' download ' + done + '/' + expected;
-                  }
-              }
-              function worker() {
-                  if (next >= items.length) return Promise.resolve();
-                  const row = items[next++];
-                  const key = row[0], asset = row[1];
-                  const full = '/game/' + asset.split('?')[0];
-                  if (window.fileAsyncCache[key] && FS.analyzePath(full).exists) {
-                      done++; show();
-                      return worker();
-                  }
-                  const url = 'gameasync/' + asset;
-                  const filename = asset.substring(asset.lastIndexOf('/') + 1).split('?')[0];
-                  return new Promise((resolve, reject) => {
-                      function attempt(retry) {
-                          getLazyAsset(url, filename, data => {
-                              if (!data || !data.byteLength) {
-                                  if (retry < 2) return attempt(retry + 1);
-                                  return reject(new Error('PNG download failed: ' + filename));
-                              }
-                              try {
-                                  if (FS.analyzePath(full).exists) FS.unlink(full);
-                                  FS.writeFile(full, new Uint8Array(data));
-                                  window.fileAsyncCache[key] = 1;
-                                  resolve();
-                              } catch (error) { reject(error); }
-                          }, true);
-                      }
-                      attempt(0);
-                  }).then(() => {
-                      done++; show();
-                      return worker();
-                  });
-              }
-              show();
-              // At most three simultaneous compressed-file network downloads.
-              // No 45-image decode and no 45-image texture allocation at floor entry.
-              const task = Promise.all([worker(), worker(), worker()]).then(() => {
-                  if (done !== expected) throw new Error('Incomplete floor: ' + done + '/' + expected);
-                  window.sltiFloorCompleted[floor] = true;
-                  if (progress) { progress.style.opacity = '0'; progress.onclick = null; }
-              }).catch(error => {
-                  delete window.sltiFloorDownloadPromises[floor];
-                  throw error;
-              });
-              window.sltiFloorDownloadPromises[floor] = task;
-              return task;
-          };
-
-          '''
-          assert js.count(anchor)==1,'download insertion anchor missing'
-          js=js.replace(anchor,prefetch+anchor,1)
-          old='''        const mappingKey = getMappingKey(file);
-                  const mappingValue = mapping[mappingKey];
-                  if (!mappingValue || window.fileAsyncCache[mappingKey]) return;'''
-          new='''        const mappingKey = getMappingKey(file);
-                  // Never preload the other floor, or either map, while in the village.
-                  if (/^graphics\\/panoramas\\/slti_(?:45|46)_/.test(mappingKey) ||
-                      /^data\\/[^/]*map0?(45|46)$/.test(mappingKey)) return;
-                  const mappingValue = mapping[mappingKey];
-                  if (!mappingValue || window.fileAsyncCache[mappingKey]) return;'''
-          assert js.count(old)==1,'preloadList anchor missing'
-          js=js.replace(old,new,1)
-          loader.write_text(js,encoding='utf-8')
-          html=root/'index.html';t=html.read_text(encoding='utf-8')
-          old='js/drive.js?v=v143z100'
-          assert t.count(old)==1,'browser loader URL changed'
-          html.write_text(t.replace(old,'js/drive.js?v=v229r28'),encoding='utf-8')
-          print('PASS full floor prefetch before Map RXDATA; untouched original native callback')
-          PY_ENTRY
-          node --check site/knight/js/drive.js
-
-      - name: V229R28 Simulate boot, whole-floor entrance, and zero network walking
+      - name: V229R29 Check native per-floor PNG prefetch without rewriting the loader
         shell: bash
         run: |
           set -euo pipefail
-          node <<'JS_FLOOR_GATE'
+          node <<'JS_NATIVE_PRELOAD'
           const fs=require('fs'),vm=require('vm'),assert=require('assert');
           const root='site/knight/';
-          const files=new Map(),dirs=new Set(),requests=[];
+          const events={requests:[],preloaded:[]};
+          const mem=new Set();
           const FS={
-            mkdir(path){dirs.add(path);},
-            writeFile(path,bytes){files.set(path,bytes);},
-            analyzePath(path){return {exists:files.has(path)||dirs.has(path)};},
-            createPreloadedFile(path,name,bytes,r,w,ok){files.set(path+'/'+name,bytes);if(ok)ok();},
-            unlink(path){files.delete(path);}
+            mkdir:()=>{},
+            writeFile:(p)=>mem.add(p),
+            unlink:p=>mem.delete(p),
+            analyzePath:p=>({exists:mem.has(p)}),
+            createPreloadedFile:(dir,name,body,r,w,ok)=>{
+              events.preloaded.push(dir+'/'+name);
+              ok();
+            }
           };
-          function FakeXHR(){this.readyState=0;this.status=200;this.responseType='';}
-          FakeXHR.DONE=4;
-          FakeXHR.prototype.open=function(method,url){this.url=url;};
-          FakeXHR.prototype.send=function(){
-            requests.push(this.url);
-            setImmediate(()=>{
-              this.response=new Uint8Array([137,80,78,71,99]).buffer;
-              this.readyState=4;
-              if(this.onreadystatechange)this.onreadystatechange();
-            });
+          function XHR(){this.readyState=0;this.status=200;}
+          XHR.DONE=4;
+          XHR.prototype.open=function(method,url){this.url=url};
+          XHR.prototype.send=function(){
+            events.requests.push(this.url);
+            this.readyState=4;
+            this.response=new Uint8Array([137,80,78,71]).buffer;
+            if(this.onreadystatechange)this.onreadystatechange();
           };
-          FakeXHR.prototype.abort=function(){};
-          const progress={style:{},innerHTML:'',onclick:null};
-          const spinner={style:{},innerHTML:''};
-          const sandbox={FS,console,XMLHttpRequest:FakeXHR,
-            document:{title:'',createElement:()=>({}),getElementById:id=>(id==='progress'?progress:spinner)},
-            localforage:{},wTitle:'SLKnight',setTimeout,clearTimeout,
-            fetch:()=>Promise.resolve({json:()=>Promise.resolve([])})};
+          XHR.prototype.abort=function(){};
+          const ui={style:{},innerHTML:''};
+          const sandbox={
+            FS,console,XMLHttpRequest:XHR,
+            document:{
+              title:'',
+              createElement:()=>({}),
+              getElementById:()=>ui
+            },
+            localforage:{},
+            wTitle:'SLKnight',
+            setTimeout:fn=>{fn();return 0},
+            clearTimeout:()=>{},
+            fetch:async url=>({
+              json:async()=>{
+                const file=root+url;
+                return fs.existsSync(file)
+                  ?JSON.parse(fs.readFileSync(file,'utf8'))
+                  :[];
+              }
+            })
+          };
           sandbox.window=sandbox;
           vm.createContext(sandbox);
           vm.runInContext(fs.readFileSync(root+'gameasync/mapping.js','utf8'),sandbox);
           vm.runInContext(fs.readFileSync(root+'js/drive.js','utf8'),sandbox);
           sandbox.createDummies();
-          const assets=sandbox.mappingArray.filter(x=>/^graphics\/panoramas\/slti_(45|46)_/.test(x[0]));
-          assert.equal(assets.length,111);
-          const floorAssets=n=>assets.filter(x=>x[0].startsWith('graphics/panoramas/slti_'+n+'_'));
-          const pathFor=row=>'/game/'+row[1].split('?')[0];
-          assert.equal(floorAssets(45).filter(row=>files.has(pathFor(row))).length,0);
-          assert.equal(floorAssets(46).filter(row=>files.has(pathFor(row))).length,0);
-          sandbox.preloadList(['Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata',
-             'Graphics/Panoramas/SLTI_45_C1_1.png']);
-          assert.equal(requests.length,0,'Dungeon download occurred during village preload');
-          function load(name){return new Promise((resolve,reject)=>{
-            let count=0;
-            sandbox.loadFileAsync(name,null,()=>{count++; if(count>1)reject(new Error('double callback'));else resolve();});
-          });}
-          (async()=>{
-            const pre='Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap';
-            await load(pre+'045.rxdata');
-            assert.equal(requests.length,46,'Map045 + all 45 PNGs must download before first play frame');
-            assert(requests.slice(0,45).every(u=>/SLTI_45_/i.test(u)),'Map045 requested before 1F PNG prefetch');
-            assert(/Map045\.rxdata/i.test(requests[45]),'Map045 RXDATA must download last');
-            assert.equal(floorAssets(45).filter(row=>files.has(pathFor(row))).length,45);
-            assert.equal(floorAssets(46).filter(row=>files.has(pathFor(row))).length,0);
-            assert.equal(sandbox.sltiFloorCompleted[45],true);
-            let before=requests.length;
-            for(const row of floorAssets(45)){
-              await load(row[1].split('?')[0]);
-            }
-            assert.equal(requests.length,before,'Walking across 1F caused network requests');
-            await load(pre+'046.rxdata');
-            assert.equal(requests.length,before+67,'Map046 + all 66 PNGs at 2F entrance');
-            assert(requests.slice(before,before+66).every(u=>/SLTI_46_/i.test(u)),'Map046 requested before 2F PNG prefetch');
-            assert(/Map046\.rxdata/i.test(requests[before+66]),'Map046 RXDATA must download last');
-            assert.equal(floorAssets(46).filter(row=>files.has(pathFor(row))).length,66);
-            before=requests.length;
-            for(const row of floorAssets(46))await load(row[1].split('?')[0]);
-            await load(pre+'045.rxdata');
-            assert.equal(requests.length,before,'Walking or revisiting floor caused network requests');
-            console.log('PASS village=0; 1F=45 PNGs THEN native Map045 callback; 1F walking=0; 2F=66 THEN native Map046; 2F walking=0; revisit=0');
-          })().catch(e=>{console.error(e);process.exitCode=1;});
-          JS_FLOOR_GATE
+          assert.equal(
+            events.requests.filter(u=>/SLTI_/i.test(u)).length,0,
+            'Dungeon loaded in village'
+          );
+          sandbox.fileLoadedAsync(
+            'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata'
+          );
+          Promise.resolve().then(()=>Promise.resolve()).then(()=>{
+            assert.equal(
+              events.requests.filter(u=>/SLTI_/i.test(u)).length,0,
+              'Village preloaded dungeon'
+            );
+            sandbox.fileLoadedAsync(
+              'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata'
+            );
+            return Promise.resolve().then(()=>Promise.resolve());
+          }).then(()=>{
+            assert.equal(events.requests.filter(u=>/SLTI_45_/i.test(u)).length,45);
+            assert.equal(events.requests.filter(u=>/SLTI_46_/i.test(u)).length,0);
+            sandbox.fileLoadedAsync(
+              'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata'
+            );
+            return Promise.resolve().then(()=>Promise.resolve());
+          }).then(()=>{
+            assert.equal(events.requests.filter(u=>/SLTI_46_/i.test(u)).length,66);
+            console.log(
+              'PASS: R16 original preloader: village 0, 1F 45, 2F 66.'
+            );
+          }).catch(e=>{
+            console.error(e);
+            process.exitCode=1;
+          });
+          JS_NATIVE_PRELOAD
 
-      - name: V229R28 Verify original engine and in-game map/teleporter integration
+      - name: V229R29 Verify original engine and in-game map/teleporter integration
         shell: bash
         run: |
           set -euo pipefail
@@ -709,10 +585,11 @@ jobs:
           for mid in ('45','46'):
               d=info[mid]
               assert d['graphicScale']==2 and d['chunkSize']==1024
-              assert d['sourceTextureSize']==512 and d['textureZoom']==2
-              assert d['width']*32==d['chunkCols']*1024 or d['width']*32<d['chunkCols']*1024
+              assert d['sourceTextureSize']==256 and d['textureZoom']==4
+              assert d['width']*32<=d['chunkCols']*1024
               assert d['entryConnectedCells']>500
-              assert 0<=d['entry'][0]<d['width'] and 0<=d['entry'][1]<d['height']
+              assert 0<=d['entry'][0]<d['width']
+              assert 0<=d['entry'][1]<d['height']
               assert len(d['files'])==d['chunkCols']*d['chunkRows']
               mask=zlib.decompress(base64.b64decode(d['walkBase64']))
               assert len(mask)==d['width']*d['height']
@@ -721,36 +598,66 @@ jobs:
                   filename=test/'knight/gameasync'/name
                   assert filename.is_file(),name
                   with Image.open(filename) as image:
-                      assert image.size==(512,512),(name,image.size)
-          # The game is deployed only at its EXISTING root. No secondary site.
+                      assert image.size==(256,256),(name,image.size)
           assert not (site/'test-map-v229r22').exists()
-          assert not (site/'test-map-v229r28').exists()
-          originals={str(p.relative_to(old)):hashlib.sha256(p.read_bytes()).hexdigest()
-                     for p in old.rglob('*') if p.is_file()}
-          output={str(p.relative_to(site)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in site.rglob('*') if p.is_file()}
+          assert not (site/'test-map-v229r29').exists()
+          assert (
+            site/'knight/js/drive.js'
+          ).read_bytes()==(
+            old/'knight/js/drive.js'
+          ).read_bytes()
+          originals={
+            str(p.relative_to(old)):hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in old.rglob('*') if p.is_file()
+          }
+          output={
+            str(p.relative_to(site)):hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in site.rglob('*') if p.is_file()
+          }
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          modified={f'knight/gameasync/Data/{pre}Map029.rxdata',
-                    f'knight/gameasync/Data/{pre}Tilesets.rxdata',
-                    f'knight/gameasync/Data/{pre}MapInfos.rxdata',
-                    'knight/gameasync/Data/Scripts.rxdata',
-                    'knight/gameasync/mapping.js','knight/js/drive.js','knight/index.html','index.html'}
+          modified={
+              f'knight/gameasync/Data/{pre}Map029.rxdata',
+              f'knight/gameasync/Data/{pre}Tilesets.rxdata',
+              f'knight/gameasync/Data/{pre}MapInfos.rxdata',
+              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/mapping.js',
+              'knight/index.html',
+              'index.html'
+          }
           actual={k for k in originals if originals[k]!=output.get(k)}
-          assert actual==modified,('Unexpected existing game files modified',actual^modified)
-          asset_list=json.loads(Path('build/asset-list.json').read_text(encoding='utf-8'))
-          expected_add={('knight/gameasync/'+name) for name in asset_list['added']}
+          assert actual==modified,(
+              'Unexpected existing game files modified',actual^modified
+          )
+          asset_list=json.loads(
+              Path('build/asset-list.json').read_text(encoding='utf-8')
+          )
+          expected_add={
+              'knight/gameasync/'+name for name in asset_list['added']
+          }
           actual_add=set(output)-set(originals)
-          assert actual_add==expected_add,('Missing/unexpected new game assets',actual_add^expected_add)
+          expected_add|={
+              f'knight/preload/Data/{pre}Map{mid:03}.rxdata.json'
+              for mid in (45,46)
+          }
+          for mid,n in ((45,45),(46,66)):
+              manifest=site/f'knight/preload/Data/{pre}Map{mid:03}.rxdata.json'
+              entries=json.loads(manifest.read_text())
+              assert len(entries)==n and len(set(entries))==n
+              assert all(
+                  (site/'knight/gameasync'/item).is_file()
+                  for item in entries
+              )
+          assert actual_add==expected_add,(
+              'Missing/unexpected new game assets',actual_add^expected_add
+          )
           assert len(output)==len(originals)+len(expected_add)
-          assert 'V229R28' in (site/'index.html').read_text(encoding='utf-8')
-          assert 'V229R28' in (site/'knight/index.html').read_text(encoding='utf-8')
-          assert 'js/drive.js?v=v229r28' in (site/'knight/index.html').read_text(encoding='utf-8')
-          assert 'window.sltiFloorCompleted' in (site/'knight/js/drive.js').read_text(encoding='utf-8')
-          active_loader=(site/'knight/js/drive.js').read_text(encoding='utf-8')
-          assert 'SLTI_GATE_READY|' in active_loader
-          assert 'if (cb1) cb1();' in active_loader
-          assert 'window.sltiDownloadFloor' in (site/'knight/js/drive.js').read_text(encoding='utf-8')
-          assert 'test-map-v229r28' not in (site/'knight/index.html').read_text(encoding='utf-8')
+          assert 'V229R29' in (site/'index.html').read_text(encoding='utf-8')
+          assert 'V229R29' in (
+              site/'knight/index.html'
+          ).read_text(encoding='utf-8')
+          assert 'test-map-v229r29' not in (
+              site/'knight/index.html'
+          ).read_text(encoding='utf-8')
           scripts=site/'knight/gameasync/Data/Scripts.rxdata'
           assert scripts.is_file()
           ruby_check=r"""
@@ -773,121 +680,72 @@ jobs:
             def _dump(depth=0);@raw;end
           end
           class Color<Tone;end
-          root=ARGV[0];pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          a=Marshal.load(File.binread(root+'/knight/gameasync/Data/Scripts.rxdata'))
-          b=Marshal.load(File.binread(ARGV[1]+'/knight/gameasync/Data/Scripts.rxdata'))
-          raise 'Unexpected other script modified' unless a.each_index.all?{|i|i==97 || a[i]==b[i]}
+          root=ARGV[0]
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          a=Marshal.load(
+            File.binread(root+'/knight/gameasync/Data/Scripts.rxdata')
+          )
+          b=Marshal.load(
+            File.binread(ARGV[1]+'/knight/gameasync/Data/Scripts.rxdata')
+          )
+          raise 'Unexpected other script modified' unless a.each_index.all?{
+            |i|i==97 || a[i]==b[i]
+          }
           raise 'Default renderer script 32 changed' unless a[32]==b[32]
           raise 'Active renderer script 97 not changed' if a[97]==b[97]
           patched=Zlib::Inflate.inflate(a[97][2])
-          raise 'Renderer not connected to viewport2' unless patched.include?('Sprite.new(@viewport2)')
-          raise 'Renderer update not connected' unless patched.include?('slti_update_terrain if @slti_floor')
-          raise 'Renderer terrain chunk lifetime not installed' unless patched.include?('@slti_chunks.each_value')
-          raise '2x visual zoom absent' unless patched.include?('sprite.zoom_x = 2.0') && patched.include?('sprite.zoom_y = 2.0')
-          raise 'Visible-only chunks absent' unless patched.include?('right = [(sx + $window_width2 - 1) / 1024')
-          raise 'Old 1024px source texture path detected' if patched.include?('sx / 1024 - 1')
-          town=Marshal.load(File.binread(root+'/knight/gameasync/Data/'+pre+'Map029.rxdata'))
+          raise 'Renderer not connected to viewport2' unless patched.include?(
+            'Sprite.new(@viewport2)'
+          )
+          raise 'Renderer update not connected' unless patched.include?(
+            'slti_update_terrain if @slti_floor'
+          )
+          raise 'Renderer terrain chunk lifetime not installed' unless patched.include?(
+            '@slti_chunks.each_value'
+          )
+          raise '4x visual zoom absent' unless patched.include?(
+            'sprite.zoom_x = 4.0'
+          ) && patched.include?('sprite.zoom_y = 4.0')
+          town=Marshal.load(
+            File.binread(root+'/knight/gameasync/Data/'+pre+'Map029.rxdata')
+          )
           e=town.instance_variable_get('@events').fetch(11)
           commands=e.instance_variable_get('@pages').first.instance_variable_get('@list')
           text='말섬던전은 별도 맵 연결 후 이용할 수 있습니다.'
-          raise 'Placeholder still active' if commands.any?{|c|c.instance_variable_get('@code')==101 && c.instance_variable_get('@parameters')==[text]}
-          raise 'In-game transfer absent' unless commands.any?{|c|c.instance_variable_get('@code')==201 && c.instance_variable_get('@parameters')[0,2]==[0,45]}
+          raise 'Placeholder still active' if commands.any?{
+            |c|c.instance_variable_get('@code')==101 &&
+              c.instance_variable_get('@parameters')==[text]
+          }
+          raise 'In-game transfer absent' unless commands.any?{
+            |c|c.instance_variable_get('@code')==201 &&
+              c.instance_variable_get('@parameters')[0,2]==[0,45]
+          }
           [45,46].each do |mid|
-            path=root+'/knight/gameasync/Data/'+('%sMap%03d.rxdata'%[pre,mid])
+            path=root+'/knight/gameasync/Data/'+(
+              '%sMap%03d.rxdata'%[pre,mid]
+            )
             raise 'Missing map' unless File.file?(path)
             m=Marshal.load(File.binread(path))
             raise 'Missing map event' if m.instance_variable_get('@events').empty?
           end
-          puts 'PASS Map045/046, NPC teleporter, script97 512px/2x zoom and visible-only streaming; base script32 untouched'
+          puts 'PASS Map045/046, native teleporter, renderer97 256px/4x; renderer32 untouched'
           """
-          result=subprocess.run(['ruby','-e',ruby_check,str(site),str(old)],text=True,capture_output=True)
+          result=subprocess.run(
+              ['ruby','-e',ruby_check,str(site),str(old)],
+              text=True,capture_output=True
+          )
           assert result.returncode==0,(result.stdout,result.stderr)
           print(result.stdout.strip())
-          print('PASS V229R28: whole-floor prefetch BEFORE Map RXDATA; no texture fetch while walking.')
+          print(
+              'PASS R16 loader unchanged, 256px terrain, native preload manifests.'
+          )
           PY_VALIDATE
           python3 /tmp/validate.py
 
-      - name: V229R28 Execute Ruby terrain-streaming memory budget simulation
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/test_slti_streaming.rb <<'RUBY_BUDGET'
-          require 'zlib'
-          scripts = Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
-          s = Zlib::Inflate.inflate(scripts[97][2])
-          i=s.index('def slti_update_terrain')
-          raise 'no live renderer method' unless i
-          j=s.rindex("\nend\n")
-          raise 'no renderer method end' unless j
-          method=s[i...j]
-
-          class Bitmap
-            @@alive=0; @@peak=0; @@created=0
-            def self.stats; {alive:@@alive,peak:@@peak,created:@@created};end
-            def initialize(name)
-              @name=name;@disposed=false
-              @@alive+=1;@@created+=1;@@peak=[@@peak,@@alive].max
-            end
-            def dispose
-              raise 'bitmap double dispose' if @disposed
-              @disposed=true;@@alive-=1
-            end
-            def disposed?;@disposed;end
-          end
-          class Sprite
-            attr_accessor :bitmap,:x,:y,:zoom_x,:zoom_y,:z
-            def initialize(v);@disposed=false;end
-            def dispose;raise 'sprite double dispose' if @disposed;@disposed=true;end
-          end
-          class GameMap
-            attr_accessor :display_x,:display_y
-            def initialize;@display_x=0;@display_y=0;end
-          end
-          $game_map=GameMap.new
-          $window_width2=800;$window_height2=600
-          klass=Class.new do
-            attr_accessor :slti_chunks,:slti_cols,:slti_rows,:slti_floor
-            def initialize
-              @slti_chunks={}
-              @slti_cols=9;@slti_rows=5;@slti_floor=45;@viewport2=Object.new
-            end
-          end
-          klass.class_eval(method)
-          k=klass.new
-          # Test camera scrolling across 1F in every direction; 2x native map unchanged.
-          xmax=9*1024-800;ymax=5*1024-600
-          steps=[]
-          (0..xmax).step(128){|x|steps << [x,0]}
-          (0..ymax).step(128){|y|steps << [xmax,y]}
-          xmax.step(0,-128){|x|steps << [x,ymax]}
-          ymax.step(0,-128){|y|steps << [0,y]}
-          steps += [[1020,540],[1025,541],[2040,1022],[2049,1025],[4090,2040],[4098,2050]]
-          # Hold at boundary to ensure all four visible chunks are eventually allocated.
-          steps += [[1020,540]] * 4
-          steps.each_with_index do |(px,py),idx|
-           $game_map.display_x=px*4;$game_map.display_y=py*4
-           k.slti_update_terrain
-           raise "too many chunks at #{idx}" if k.instance_variable_get(:@slti_chunks).size>4
-           k.instance_variable_get(:@slti_chunks).each do |(cx,cy),sprite|
-            raise 'bad zoom' unless sprite.zoom_x==2.0 && sprite.zoom_y==2.0
-            raise 'sprite wrong x' unless sprite.x==cx*1024-px
-            raise 'sprite wrong y' unless sprite.y==cy*1024-py
-           end
-          end
-          raise 'native texture memory too high' if Bitmap.stats[:peak]>4
-          k.instance_variable_get(:@slti_chunks).each_value do |spr|
-           old=spr.bitmap;spr.bitmap=nil;spr.dispose;old.dispose unless old.disposed?
-          end
-          raise 'bitmap leaked after cleanup' unless Bitmap.stats[:alive]==0
-          puts "PASS simulated camera ticks=#{steps.size} max_live_bitmaps=#{Bitmap.stats[:peak]} created=#{Bitmap.stats[:created]} zoom=2x images=512px cleanup=zero"
-          RUBY_BUDGET
-          ruby -c /tmp/test_slti_streaming.rb
-          ruby /tmp/test_slti_streaming.rb
-
-      - name: V229R28 Upload in-game map build audit
+      - name: V229R29 Upload in-game map build audit
         uses: actions/upload-artifact@v4
         with:
-          name: SLKnight-V229R28-InGame-Sanctuary-2x-Audit
+          name: SLKnight-V229R29-InGame-Sanctuary-2x-Audit
           path: |
             build/terrain2x.json
             build/portal-events.json
@@ -895,7 +753,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: V229R28 Upload low-memory game to existing GitHub Pages
+      - name: V229R29 Upload low-memory game to existing GitHub Pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
