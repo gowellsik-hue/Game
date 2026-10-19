@@ -1,333 +1,821 @@
 
-name: "audit-sanctuary-monsters.yml | V26 | 492EV 원본 외형 대조"
-run-name: "audit-sanctuary-monsters.yml | V26 | 83종 SPR 자동 비교"
+name: "audit-sanctuary-monsters.yml | V28 | SingleLineage 61CE Physical Attack SPR"
+run-name: "audit-sanctuary-monsters.yml | V28 | Original Physical Attack SPR 61CE"
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths: [".github/workflows/audit-sanctuary-monsters.yml"]
-permissions: {contents: read, actions: read}
+
+permissions:
+  contents: read
+  actions: read
+
 jobs:
-  compare:
-    name: "V26 | 83종 외형 대조 및 24종 누락 복구"
+  extract-physical:
+    name: "V28 | Original SPR physical attack extraction | 61CE"
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-        with: {fetch-depth: 0}
-      - name: "V26 | V25 성공 결과 복원"
-        uses: actions/download-artifact@v4
         with:
-          repository: gowellsik-hue/Game
-          run-id: 39122782107
-          name: audit-sanctuary-monsters-v25-five-motions
-          github-token: ${{ github.token }}
-          path: v25
-      - name: "V26 | 원본 SPR 인덱스 및 디코더 복원"
-        env: {GH_TOKEN: "${{ github.token }}"}
+          fetch-depth: 0
+
+      - name: "V28 | Restore verified V25 GIFs and original SPR directory"
+        env:
+          GH_TOKEN: "${{ github.token }}"
         run: |
           set -euo pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full python3-pil python3-numpy python3-yaml
-          mkdir -p source/v2 source/v12 downloads paks reports
-          gh run download 38784834277 -R "$GITHUB_REPOSITORY" -n Sanctuary-V2-Reports -D source/v2
-          gh run download 38872552732 -R "$GITHUB_REPOSITORY" -n Sanctuary-V12-External-Action-and-NPC-Crosscheck -D source/v12
+          sudo apt-get install -y -qq p7zip-full python3-pil python3-yaml
+          mkdir -p v25 source/v2 paks downloads reports
+          gh run download 39122782107 -R "$GITHUB_REPOSITORY" \
+            -n audit-sanctuary-monsters-v25-five-motions -D v25
+          gh run download 38784834277 -R "$GITHUB_REPOSITORY" \
+            -n Sanctuary-V2-Reports -D source/v2
           git show 5c40dc3de28ee879182c6f60802a89432072c138:.github/workflows/audit-sanctuary-monsters.yml > source/decoder.yml
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          rows=json.loads(Path('v25/V25-selected.json').read_text())
-          paks={r['pak'] for r in rows.values() if r['pak']}
-          assert len(rows)==83 and len(paks)==1,paks
-          Path('reports/source-pak.txt').write_text(next(iter(paks)))
-          PY
-          gh release download v1.0.0 -R "$GITHUB_REPOSITORY" --pattern "Sanctuary.of.Aden.-.Copy.*" -D downloads
-          pak="$(cat reports/source-pak.txt)"
-          7z x downloads/Sanctuary.of.Aden.-.Copy.zip "${pak#outer/}" "-o${PWD}/paks" -y > reports/extract.log
-          test -s "paks/${pak#outer/}"
+          test -s v25/SLKnight-492EV-Five-Motions-V25.html
+          test -s source/decoder.yml
+          test -s source/v2/all_sprite_candidates.csv
+          test -s source/v2/exported_sprite_manifest.csv
+
+      - name: "V28 | Extract original Sanctuary Sprite.pak"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          set -euo pipefail
+          gh release download v1.0.0 -R "$GITHUB_REPOSITORY" \
+            --pattern "Sanctuary.of.Aden.-.Copy.*" -D downloads
+          7z x downloads/Sanctuary.of.Aden.-.Copy.zip \
+            "Sanctuary of Aden - Copy/Sprite.pak" "-o${PWD}/paks" -y > reports/source-extract.log
+          test -s "paks/Sanctuary of Aden - Copy/Sprite.pak"
           rm -rf downloads
-      - name: "V26 | 83종 이미지 비교 및 누락 동작 추출"
+
+      - name: "V28 | Decode 12 unextracted SPR actors, loop previous GIFs; protect finished sources"
         run: |
           set -euo pipefail
-          cat > /tmp/v26.py <<'PY'
-          import ast,base64,csv,hashlib,json,re,struct
-          from pathlib import Path
+          cat > /tmp/v28_runner.py <<'PY'
+          #!/usr/bin/env python3
+          """Sanctuary physical-attack SPR extraction, V28.
+
+          Input: V2 original PAK byte-index/hash manifest, V25 verified HTML archive,
+                 Sprite.pak original 1.9GB resource, verified historical Reader.
+          Only 12 previously unavailable actors are decoded. Protected SPR152 isn't changed.
+          """
+          from __future__ import annotations
+          import ast
+          import base64
+          import csv
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import struct
+          import sys
           from collections import defaultdict
-          from io import BytesIO
-          import numpy as np,yaml
+          from pathlib import Path
           from PIL import Image
+          import yaml
 
-          O=Path('reports')
-          html=Path('v25/SLKnight-492EV-Five-Motions-V25.html').read_text()
-          found=re.search(r'<script id="dataset" type="application/json">(.*?)</script>',html,re.S)
-          if not found:raise RuntimeError('V25 database missing')
-          db=json.loads(found.group(1));rows=db['rows'];groups=db['families']
-          assert len(rows)==492 and len(groups)==83
-          pak=Path('reports/source-pak.txt').read_text().strip()
-          path=Path('paks')/pak.removeprefix('outer/')
+          ROOT=Path('.')
+          OUT=ROOT/'reports'
+          OUT.mkdir(parents=True,exist_ok=True)
 
-          def load(folder,name):
-              files=list(Path(folder).rglob(name))
-              if len(files)!=1:raise RuntimeError('Missing index '+name)
-              with files[0].open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
+          # "CE|original actor ID|name".
+          # Unmapped IDs remain blank, no best-guess assignments.
+          # These are original SPR actor identifiers from multilingual
+          # actor name references, not user-approved animation implementations.
+          ROSTER='''784||테베 몹
+          827||파우스트 악령
+          852|1206|홉고블린
+          863|2064|눈사람
+          864|1525|아이스골렘
+          865|2134|예티
+          866|2137|좀비엘모어장군
+          867|2150|좀비엘모어병사
+          868|52|좀비
+          869||구울
+          870|2086|샤벨타이거
+          871|1134|해골근위병
+          872||해골돌격병
+          873|1024|하피
+          874|1047|스콜피온
+          875|1052|코카트리스
+          879|1098|트롤
+          887|1844|드래곤플라이
+          888|1770|불타는전사
+          889|1762|라바골렘
+          891|1841|아시타지오
+          894|894|킹버그베어
+          902|1037|거대개미
+          903|1039|거대병정개미
+          904|1390|거대여왕개미
+          906|1098|잊섬 트롤
+          907||잊섬 에틴
+          908|1173|잊섬 리자드맨
+          909|1108|잊섬 라이칸스로프
+          910|95|잊섬 셸로브
+          911|1041|잊섬 바실리스크
+          912||잊섬 라미아
+          913|1202|잊섬 사이클롭스
+          914||잊섬 웅골리언트
+          915|1024|잊섬 하피
+          916|152|잊섬 버그베어
+          918|1052|잊섬 코카트리스
+          919|1517|잊섬 미노타우르스
+          920||오만 변종라미아
+          921||오만 변종웅골
+          922|4097|오만 메두사
+          923|2407|오만 키메라
+          924|4088|오만 나이트메어
+          927||오만 난폭해골돌격
+          928|145|오만 난폭스파토이
+          929||오만 난폭구울
+          930|2147|오만 공포 아이언
+          931||오만 (적)화염고스트
+          934|2379|오만 레서드래곤
+          935|2409|오만 본드래곤
+          936|2137|오만 저주엘모장군
+          937|2150|오만 저주엘모병사
+          938|1108|오만 어둠라이칸
+          939|2086|오만 냉혹샤벨
+          940|1841|오만 화염아시타
+          942|3066|오만 나이트발드
+          943||오만 암흑흑기사
+          944|1770|오만 어둠불탄전사
+          951|1041|바실리스크
+          952|1173|리자드맨
+          954||선택받지못한자'''
 
-          spr=load('source/v2','all_sprite_candidates.csv')
-          manifest=load('source/v2','exported_sprite_manifest.csv')
-          npc=load('source/v12','03_external_npc_gfx_candidates.csv')
-          checks={(r['pak'],r['sprite_file'].lower(),int(r['bytes'])):r['sha256'] for r in manifest}
-          actors=defaultdict(dict);names=defaultdict(set)
-          for r in npc:
-              try:actor=int(r['gfx_id'])
-              except (ValueError,KeyError):continue
-              if actor>0 and 'monster' in r.get('implementation','').lower():
-                  if r.get('npc_name'):names[actor].add(r['npc_name'])
-          for r in spr:
-              if r['pak']!=pak:continue
-              file=Path(r['file'].replace('\\','/')).name
-              m=re.fullmatch(r'(\d+)-(\d+)\.spr',file,re.I)
-              if not m:continue
-              actor,sub=map(int,m.groups())
-              if actor<=0 or sub>=40:continue
-              sha=checks.get((pak,file.lower(),int(r['bytes'])))
-              if not sha:continue
-              rec={'offset':int(r['offset']),'size':int(r['bytes']),'sha':sha}
-              if sub not in actors[actor] or rec['offset']<actors[actor][sub]['offset']:
-                  actors[actor][sub]=rec
+          ROSTER=[
+              dict(
+                  ce=int(x.split('|')[0]),
+                  actor=int(x.split('|')[1]) if x.split('|')[1] else None,
+                  name=x.split('|')[2]
+              )
+              for x in ROSTER.splitlines()
+          ]
 
-          wf=yaml.safe_load(Path('source/decoder.yml').read_text())
-          step=next(s for s in wf['jobs']['identify']['steps']
-                    if s['name']=='Decode all selected monster animation frames')
-          code=step['run'].split("python3 - <<'PY'\n",1)[1].split('\nPY',1)[0]
-          node=next(n for n in ast.parse(code).body if isinstance(n,ast.ClassDef) and n.name=='Reader')
-          scope={'struct':struct,'Image':Image,'MAX_FRAMES':240,'MAX_DIM':1000}
-          exec(compile(ast.Module(body=[node],type_ignores=[]),'<V17 Reader>','exec'),scope)
-          Reader=scope['Reader'];errors=[]
+          assert len(ROSTER)==61
+          assert len({r['ce'] for r in ROSTER})==61
 
-          def first(frames):
-              return next((x for x in frames if x is not None and x.getbbox()),None)
+          PROTECTED={152}
+          EXTRACT={
+              95,1039,1047,1134,1206,1390,
+              1770,1844,2086,2134,2137,2150
+          }
 
-          def feature(image):
-              if image is None or not image.getbbox():return None
-              image=image.convert('RGBA').crop(image.getbbox())
-              image.thumbnail((40,40),Image.Resampling.NEAREST)
-              canvas=Image.new('RGBA',(48,48))
-              canvas.alpha_composite(image,((48-image.width)//2,48-image.height))
-              p=np.asarray(canvas,dtype=np.float32)/255
-              alpha=p[:,:,3];luma=p[:,:,:3].mean(axis=2)
-              v=np.concatenate([alpha.ravel(),(alpha*luma).ravel()]).astype(np.float32)
-              length=np.linalg.norm(v)
-              return v/length if length>0 else None
+          assert len(EXTRACT)==12
+          assert sum(r['actor'] in EXTRACT for r in ROSTER)==16
 
-          def png(image):
-              if image is None:return ''
-              image=image.copy();image.thumbnail((100,100))
-              b=BytesIO();image.save(b,format='PNG')
-              return base64.b64encode(b.getvalue()).decode()
+          ORIGINAL_BANK=8
+          DIRECTIONS=(0,2,4,6)
 
-          def gif(frames):
-              frames=[x for x in frames if x is not None and x.getbbox()]
-              if not frames:return None
-              w=max(x.width for x in frames);h=max(x.height for x in frames)
-              if w>512 or h>512:return None
-              result=[]
-              for frame in frames:
-                  c=Image.new('RGBA',(w,h))
-                  c.alpha_composite(frame,((w-frame.width)//2,h-frame.height))
-                  p=c.convert('RGB').quantize(colors=255)
-                  p.paste(255,mask=c.getchannel('A').point(lambda a:255 if a<128 else 0))
-                  result.append(p)
-              b=BytesIO()
-              result[0].save(b,format='GIF',save_all=True,append_images=result[1:],
-                             duration=150,loop=0,transparency=255,disposal=2,optimize=False)
-              return base64.b64encode(b.getvalue()).decode()
+          # Preserve GIF frame bytes and delays.
+          # Only add/update infinite-loop application extension.
+          GIF_LOOP_EXT=b'\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00'
 
-          def wait_image(encoded):
-              with Image.open(BytesIO(base64.b64decode(encoded))) as im:
-                  return im.convert('RGBA')
+          def force_infinite_gif(raw):
+              if raw[:6] not in (b'GIF87a',b'GIF89a'):
+                  raise RuntimeError('Invalid GIF signature')
 
-          def decode(stream,rec):
-              stream.seek(rec['offset']);raw=stream.read(rec['size'])
-              if len(raw)!=rec['size'] or hashlib.sha256(raw).hexdigest()!=rec['sha']:
-                  raise ValueError('Original SPR hash mismatch')
-              return Reader(raw).decode()
+              with Image.open(io.BytesIO(raw)) as im:
+                  if im.format!='GIF':
+                      raise RuntimeError('Unexpected source GIF')
+                  before_count=im.n_frames
+                  before_ms=[]
+                  for n in range(before_count):
+                      im.seek(n)
+                      before_ms.append(im.info.get('duration',0))
+                  loop=im.info.get('loop')
 
-          source_vectors=[];source_ids=[];thumbnails={}
-          with path.open('rb') as f:
-              for actor,recs in sorted(actors.items()):
-                  if not all(32+d in recs for d in (0,2,4,6)):continue
-                  try:
-                      frames=[first(decode(f,recs[32+d])) for d in (0,2,4,6)]
-                      vectors=[feature(x) for x in frames]
-                      if any(x is None for x in vectors):continue
-                      source_ids.append(actor);source_vectors.extend(vectors)
-                      thumbnails[actor]=png(frames[0])
-                  except Exception as e:errors.append({'actor':actor,'stage':'wait','error':str(e)})
-          if not source_ids:raise RuntimeError('No visual SPR candidates found')
+              if loop==0:
+                  return raw
 
-          hashes=list(groups);ref_vectors=[];ref_images={}
-          for sha in hashes:
-              g=groups[sha];images=[
-                  wait_image(g['fallback'][str(d)]['wait'])
-                  for d in range(4)
-              ]
-              vectors=[feature(x) for x in images]
-              if any(x is None for x in vectors):raise RuntimeError('Empty reference '+sha)
-              ref_vectors.extend(vectors);ref_images[sha]=png(images[0])
+              if loop is None:
+                  packed=raw[10]
+                  start=13+(3*(1<<((packed&7)+1)) if packed&128 else 0)
+                  result=raw[:start]+GIF_LOOP_EXT+raw[start:]
+                  if raw[:6]==b'GIF87a':
+                      result=b'GIF89a'+result[6:]
+              else:
+                  match=re.search(
+                      rb'\x21\xff\x0bNETSCAPE2\.0\x03\x01(..)\x00',
+                      raw,re.S
+                  )
+                  if not match:
+                      raise RuntimeError('Loop extension not found')
+                  result=(
+                      raw[:match.start(1)]
+                      +b'\x00\x00'
+                      +raw[match.end(1):]
+                  )
 
-          source_matrix=np.stack(source_vectors)
-          reference_matrix=np.stack(ref_vectors)
-          comparison=reference_matrix@source_matrix.T
-          scores=comparison.reshape(len(hashes),4,len(source_ids),4).max(axis=3).mean(axis=1)
-          source_lookup={actor:i for i,actor in enumerate(source_ids)}
-
-          matches={};missing=0;new_previews=0
-          with path.open('rb') as f:
-              for index,sha in enumerate(hashes):
-                  g=groups[sha]
-                  order=np.argsort(-scores[index])[:3]
-                  ranked=[{
-                      'id':source_ids[int(j)],
-                      'score':round(float(scores[index,j]),4),
-                      'names':sorted(names[source_ids[int(j)]])[:4],
-                      'thumb':thumbnails[source_ids[int(j)]]
-                  } for j in order]
-                  current=g['sprite_id'];idx=source_lookup.get(current)
-                  old_score=round(float(scores[index,idx]),4) if idx is not None else None
-                  preview={}
-                  if current is None:
-                      missing+=1;actor=ranked[0]['id'];recs=actors[actor]
-                      for action,base in [('attack',8),('hit',16),('death',24)]:
-                          dirs={}
-                          for d in (0,2,4,6):
-                              if base+d not in recs:continue
-                              try:
-                                  data=gif(decode(f,recs[base+d]))
-                                  if data:dirs[str(d)]=data
-                              except Exception as e:
-                                  errors.append({'actor':actor,'action':action,'dir':d,'error':str(e)})
-                          preview[action]=dirs
-                      if all(len(preview.get(a,{}))==4 for a in ('attack','hit','death')):
-                          new_previews+=1
-                  matches[sha]={
-                      'reference':ref_images[sha],
-                      'existing':current,
-                      'existing_score':old_score,
-                      'ranked':ranked,
-                      'preview':preview,
-                      'needs_review':current is None or (
-                          old_score is not None and ranked[0]['score']>old_score+0.07
+              with Image.open(io.BytesIO(result)) as im:
+                  if im.info.get('loop')!=0 or im.n_frames!=before_count:
+                      raise RuntimeError(
+                          'Infinite GIF loop or frame preservation failed'
                       )
+                  after_ms=[]
+                  for n in range(before_count):
+                      im.seek(n)
+                      after_ms.append(im.info.get('duration',0))
+                  if before_ms!=after_ms:
+                      raise RuntimeError('GIF frame timings changed')
+
+              return result
+
+          def get_v25():
+              matches=list(
+                  (ROOT/'v25').rglob(
+                      'SLKnight-492EV-Five-Motions-V25.html'
+                  )
+              )
+              if len(matches)!=1:
+                  raise RuntimeError(
+                      'Missing previous V25 492EV verified HTML'
+                  )
+
+              source=matches[0].read_text('utf-8')
+              match=re.search(
+                  r'<script id="dataset" type="application/json">(.*?)</script>',
+                  source,re.S
+              )
+              if not match:
+                  raise RuntimeError(
+                      'Prior original attack GIF dataset missing'
+                  )
+
+              data=json.loads(match.group(1))
+              assert len(data['families'])==83
+
+              old=defaultdict(list)
+              for f in data['families'].values():
+                  a=f.get('sprite_id')
+                  dirs=f.get('motions',{}).get('attack',{})
+                  if a is not None and all(str(d) in dirs for d in DIRECTIONS):
+                      old[a].append(dirs)
+
+              verified={}
+              for actor,ds in old.items():
+                  signatures={
+                      tuple(
+                          hashlib.sha256(
+                              base64.b64decode(x[str(d)])
+                          ).hexdigest()
+                          for d in DIRECTIONS
+                      )
+                      for x in ds
                   }
+                  if len(signatures)!=1:
+                      raise RuntimeError(
+                          'V25 has inconsistent original GIF for actor '
+                          +str(actor)
+                      )
+                  verified[actor]={
+                      str(d):force_infinite_gif(
+                          base64.b64decode(ds[0][str(d)])
+                      )
+                      for d in DIRECTIONS
+                  }
+              return verified
 
-          summary={
-              'version':'V26','events':len(rows),'graphics':len(groups),
-              'previous_source_matches':len(groups)-missing,
-              'previous_missing':missing,'visual_candidate_pool':len(source_ids),
-              'new_complete_motion_previews':new_previews,
-              'families_requiring_review':sum(x['needs_review'] for x in matches.values()),
-              'decoding_errors':len(errors),
-              'visual_identity_confirmed':0,'game_modified':False
-          }
-          (O/'V26-summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2))
-          (O/'V26-errors.json').write_text(json.dumps(errors,ensure_ascii=False,indent=2))
-          with (O/'V26-83-graphics.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w=csv.writer(f);w.writerow(['graphic','monsters','V25_SPR','V25_similarity','V26_candidate_1','score_1','V26_candidate_2','score_2','needs_review'])
-              for sha,g in groups.items():
-                  m=matches[sha]
-                  w.writerow([sha,' | '.join(g['monsters']),m['existing'],m['existing_score'],
-                              m['ranked'][0]['id'],m['ranked'][0]['score'],
-                              m['ranked'][1]['id'] if len(m['ranked'])>1 else '',
-                              m['ranked'][1]['score'] if len(m['ranked'])>1 else '',
-                              m['needs_review']])
-          with (O/'V26-492EV.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w=csv.writer(f);w.writerow(['map','EV','monster','graphic','V25_SPR','V26_candidate','score','review'])
-              for r in rows:
-                  m=matches[r['primary_asset']]
-                  w.writerow([r['map_id'],r['event_id'],r['monster'],r['primary_asset'],
-                              m['existing'],m['ranked'][0]['id'],m['ranked'][0]['score'],m['needs_review']])
+          def reader_cls():
+              wf=yaml.safe_load(
+                  (ROOT/'source'/'decoder.yml').read_text('utf-8')
+              )
+              actions=wf['jobs']['identify']['steps']
+              step=next(
+                  x for x in actions
+                  if x.get('name')==
+                  'Decode all selected monster animation frames'
+              )
+              code=step['run'].split(
+                  "python3 - <<'PY'\n",1
+              )[1].split('\nPY',1)[0]
+              clazz=next(
+                  n for n in ast.parse(code).body
+                  if isinstance(n,ast.ClassDef) and n.name=='Reader'
+              )
+              names={
+                  'struct':struct,
+                  'Image':Image,
+                  'MAX_FRAMES':240,
+                  'MAX_DIM':1000
+              }
+              exec(
+                  compile(
+                      ast.Module(body=[clazz],type_ignores=[]),
+                      '<sanctuary-v17-Reader>','exec'
+                  ),
+                  names
+              )
+              return names['Reader']
 
-          panel='''<section style="padding:12px;margin-top:16px;border:1px solid #536b80;border-radius:9px">
-          <h2>V26 · 원본 SPR 외형 자동 비교</h2>
-          <p>유사도는 자동 추천 점수이며 몬스터 외형 일치가 확정됐다는 뜻이 아닙니다.</p>
-          <p id="v26-status"></p><div id="v26-images" style="display:flex;flex-wrap:wrap;gap:10px"></div>
-          <h2>V25에서 미연결된 몬스터의 공격·피격·사망 미리보기</h2>
-          <div id="v26-motions" class="motions"></div></section>'''
-          script=r'''
-          const V26=JSON.parse(document.getElementById('v26-data').textContent);
-          function renderV26(){
-            const row=DB.rows[selected],match=V26[row.primary_asset];
-            const status=document.getElementById('v26-status');
-            const images=document.getElementById('v26-images');
-            const motions=document.getElementById('v26-motions');
-            images.replaceChildren();motions.replaceChildren();
-            status.textContent='V25 SPR: '+(match.existing??'미연결')+
-              ' · 기존 유사도: '+(match.existing_score??'-')+
-              ' · 재검토: '+(match.needs_review?'필요':'보류 가능');
-            const items=[{id:'게임 원본',score:null,thumb:match.reference},...match.ranked];
-            for(const item of items){
-              const box=document.createElement('div');
-              box.style.cssText='background:#20354b;padding:9px;border-radius:8px;width:130px';
-              const label=document.createElement('p');
-              label.textContent=item.id+' '+(item.score===null?'':item.score);
-              box.appendChild(label);
-              const img=document.createElement('img');
-              img.src='data:image/png;base64,'+item.thumb;
-              img.style.cssText='width:100%;height:110px;object-fit:contain;image-rendering:pixelated';
-              box.appendChild(img);images.appendChild(box);
-            }
-            const dir=document.getElementById('direction').value;
-            for(const [action,title] of [['attack','공격'],['hit','피격'],['death','사망']]){
-              const p=document.createElement('section');p.className='panel';
-              const h=document.createElement('h2');h.textContent=title+' · 원본 후보';
-              p.appendChild(h);
-              const box=document.createElement('div');box.className='stage';
-              const code=(match.preview[action]||{})[dir];
-              if(code){
-                const img=document.createElement('img');
-                img.src='data:image/gif;base64,'+code;
-                box.appendChild(img);
-              }else box.textContent=match.existing!==null?'기존 V25 동작 유지':'후보 프레임 없음';
-              p.appendChild(box);motions.appendChild(p);
-            }
+          def index_original_spr():
+              base=ROOT/'source'/'v2'
+
+              def load(name):
+                  candidates=list(base.rglob(name))
+                  if len(candidates)!=1:
+                      raise RuntimeError(
+                          'Missing or duplicate original catalogue '+name
+                      )
+                  with candidates[0].open(
+                      encoding='utf-8-sig',newline=''
+                  ) as f:
+                      return list(csv.DictReader(f))
+
+              rows=load('all_sprite_candidates.csv')
+              manifest=load('exported_sprite_manifest.csv')
+              signatures={
+                  (
+                      x['pak'],
+                      x['sprite_file'].lower(),
+                      int(x['bytes'])
+                  ):x['sha256']
+                  for x in manifest
+              }
+
+              records=defaultdict(dict)
+              sourcepak=None
+
+              for row in rows:
+                  p=row['pak']
+                  if not p.endswith('/Sprite.pak'):
+                      continue
+
+                  file=Path(
+                      row['file'].replace('\\','/')
+                  ).name
+                  m=re.fullmatch(r'(\d+)-(\d+)\.spr',file,re.I)
+                  if not m:
+                      continue
+
+                  actor,sub=map(int,m.groups())
+                  if (
+                      actor not in EXTRACT or
+                      sub not in {
+                          ORIGINAL_BANK+d for d in DIRECTIONS
+                      }
+                  ):
+                      continue
+
+                  checksum=signatures.get(
+                      (p,file.lower(),int(row['bytes']))
+                  )
+                  if not checksum:
+                      raise RuntimeError(
+                          f'SHA256 missing in original manifest {file}'
+                      )
+
+                  records[actor][sub]=dict(
+                      offset=int(row['offset']),
+                      bytes=int(row['bytes']),
+                      sha256=checksum
+                  )
+                  sourcepak=p
+
+              for actor in EXTRACT:
+                  found=set(records[actor])
+                  expected={
+                      ORIGINAL_BANK+d for d in DIRECTIONS
+                  }
+                  if found!=expected:
+                      raise RuntimeError(
+                          f'Original attack source incomplete SPR '
+                          f'{actor}: {sorted(found)}'
+                      )
+
+              if sourcepak is None:
+                  raise RuntimeError('Original source PAK not found')
+              return sourcepak,records
+
+          def gif_encode(frames):
+              imgs=[
+                  im for im in frames
+                  if im is not None and im.getbbox()
+              ]
+              if not imgs:
+                  raise RuntimeError('No nontransparent frames')
+
+              w=max(im.width for im in imgs)
+              h=max(im.height for im in imgs)
+              if max(w,h)>900:
+                  raise RuntimeError(
+                      'Unexpectedly huge decoded source frame'
+                  )
+
+              rendered=[]
+              for im in imgs:
+                  canvas=Image.new(
+                      'RGBA',(w,h),(0,0,0,0)
+                  )
+                  canvas.alpha_composite(
+                      im,((w-im.width)//2,h-im.height)
+                  )
+                  pal=canvas.convert('RGB').quantize(colors=255)
+                  pal.paste(
+                      255,
+                      mask=canvas.getchannel('A').point(
+                          lambda a:255 if a<128 else 0
+                      )
+                  )
+                  rendered.append(pal)
+
+              out=io.BytesIO()
+              # Fixed GIF duration is for review playback.
+              rendered[0].save(
+                  out,
+                  format='GIF',
+                  save_all=True,
+                  append_images=rendered[1:],
+                  duration=150,
+                  loop=0,
+                  disposal=2,
+                  transparency=255,
+                  optimize=False
+              )
+              return force_infinite_gif(out.getvalue()),len(imgs)
+
+          def extract(Reader,records,pakfile):
+              source_bytes={}
+              audit=[]
+
+              with pakfile.open('rb') as stream:
+                  for actor in sorted(EXTRACT):
+                      source_bytes[actor]={}
+                      for d in DIRECTIONS:
+                          sub=ORIGINAL_BANK+d
+                          r=records[actor][sub]
+                          stream.seek(r['offset'])
+                          raw=stream.read(r['bytes'])
+
+                          if (
+                              len(raw)!=r['bytes'] or
+                              hashlib.sha256(raw).hexdigest()!=r['sha256']
+                          ):
+                              raise RuntimeError(
+                                  f'SPR source checksum mismatch: '
+                                  f'{actor}-{sub}.spr'
+                              )
+
+                          frames=Reader(raw).decode()
+                          gif,count=gif_encode(frames)
+                          if count<1:
+                              raise RuntimeError(
+                                  'Empty original animation '+str(actor)
+                              )
+
+                          source_bytes[actor][str(d)]=gif
+                          audit.append(dict(
+                              actor=actor,
+                              sub=sub,
+                              source_sha256=r['sha256'],
+                              original_bytes=len(raw),
+                              frames=count,
+                              gif_sha256=hashlib.sha256(gif).hexdigest()
+                          ))
+
+              return source_bytes,audit
+
+          def render_html(entries,bytes_by_actor):
+              serialized={
+                  str(a):{
+                      str(d):base64.b64encode(v).decode('ascii')
+                      for d,v in data.items()
+                  }
+                  for a,data in bytes_by_actor.items()
+                  if a not in PROTECTED
+              }
+              payload=json.dumps(
+                  {
+                      'entries':entries,
+                      'sources':serialized
+                  },
+                  ensure_ascii=False,
+                  separators=(',',':')
+              ).replace('<','\\u003c')
+
+              return '''<!doctype html>
+          <html lang="ko">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>audit-sanctuary-monsters.yml | V28 | 물리공격 61 CE SPR</title>
+          <style>
+          :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#111923;color:#eff6fa;font-size:14px}
+          *{box-sizing:border-box}
+          body{max-width:1300px;margin:auto;padding:22px}
+          h1{font-size:1.5rem;margin:4px 0}
+          p{line-height:1.5;color:#c3d1de}
+          input,select{padding:10px;background:#263849;color:#fff;border:1px solid #58738e;border-radius:8px;font:inherit}
+          .toolbar{display:flex;gap:8px;margin:16px 0;flex-wrap:wrap}
+          input{flex:1;min-width:180px}
+          .cards{display:grid;gap:10px}
+          .card{background:#1e2b39;border:1px solid #3e566c;border-radius:10px;padding:12px}
+          .card h3{margin:0 0 4px}
+          .sub{font-size:.85rem;color:#9bb0c1}
+          .dirgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:12px 0 0}
+          .dir{background:#0f1c27;border:1px solid #364a59;border-radius:7px;padding:8px;text-align:center}
+          .dir img{height:105px;max-width:100%;object-fit:contain;image-rendering:pixelated}
+          .state{color:#dabf87}
+          @media(max-width:670px){
+            .dirgrid{grid-template-columns:repeat(2,1fr)}
+            .dir img{height:90px}
+            body{padding:12px}
           }
-          const previousDraw=draw;
-          draw=function(){previousDraw();renderV26()};
-          document.getElementById('direction').addEventListener('change',renderV26);
-          renderV26();
-          '''
-          payload=json.dumps(matches,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')
-          html=html.replace('</body>',panel+
-              '<script id="v26-data" type="application/json">'+payload+'</script>'+
-              '<script>'+script+'</script></body>',1)
-          (O/'SLKnight-492EV-V26-Motion-Matching.html').write_text(html,encoding='utf-8')
-          (O/'V26-ui.js').write_text(script)
-          print('V26_RESULT',json.dumps(summary,ensure_ascii=False))
+          </style>
+          </head>
+          <body>
+          <header>
+          <h1>audit-sanctuary-monsters.yml · V28 · 원본 물리공격 모션</h1>
+          <p>싱글리니지 물리공격 CE 61개에서 생추어리 원본 Sprite.pak 고유 ID의 4방향 GIF를 연결합니다. 원본 모션 파일의 체크섬은 통과했지만, 공격 뱅크의 실제 의미·정확한 방향·게임 작동은 별도 시각 검증 전입니다. 기존 성공 SPR 152는 건드리지 않았습니다.</p>
+          </header>
+          <div class="toolbar">
+            <select id="filter">
+              <option value="all">전체 61개</option>
+              <option value="original">원본 GIF 확보</option>
+              <option value="unresolved">ID 미확정</option>
+              <option value="protected">기존 성공 보호</option>
+            </select>
+            <input id="q" placeholder="CE/몬스터/SPR 검색">
+            <span id="count"></span>
+          </div>
+          <div class="cards" id="cards"></div>
+          <script id="db" type="application/json">'''+payload+'''</script>
+          <script>
+          const DB=JSON.parse(document.getElementById('db').textContent);
+          const $=id=>document.getElementById(id);
+
+          function refresh(){
+            const q=$('q').value.trim().toLowerCase();
+            const f=$('filter').value;
+            const root=$('cards');
+            root.replaceChildren();
+            let count=0;
+
+            for(const r of DB.entries){
+              const ok=Boolean(DB.sources[String(r.actor)]);
+
+              if(f==='original'&&!ok)continue;
+              if(f==='unresolved'&&r.actor!==null)continue;
+              if(f==='protected'&&!r.protected)continue;
+              if(!(''+r.ce+' '+r.name+' '+(r.actor||'')).toLowerCase().includes(q))continue;
+
+              count++;
+              const c=document.createElement('div');
+              c.className='card';
+              const h=document.createElement('h3');
+              h.textContent='CE '+r.ce+' · '+r.name+
+                (r.actor===null?'':' / SPR '+r.actor);
+              c.appendChild(h);
+
+              const p=document.createElement('div');
+              p.className='sub state';
+              p.textContent=r.status;
+              c.appendChild(p);
+
+              if(ok){
+                const g=document.createElement('div');
+                g.className='dirgrid';
+                for(const d of ['0','2','4','6']){
+                  const item=document.createElement('div');
+                  item.className='dir';
+                  const l=document.createElement('p');
+                  l.className='sub';
+                  l.textContent='원본 SPR '+r.actor+'-'+(8+Number(d))+'.spr';
+                  item.appendChild(l);
+
+                  const im=document.createElement('img');
+                  im.loading='lazy';
+                  im.src='data:image/gif;base64,'+
+                    DB.sources[String(r.actor)][d];
+                  item.appendChild(im);
+                  g.appendChild(item);
+                }
+                c.appendChild(g);
+              }
+              root.appendChild(c);
+            }
+            $('count').textContent=count+'개 표시';
+          }
+          $('filter').onchange=refresh;
+          $('q').oninput=refresh;
+          refresh();
+          </script>
+          </body>
+          </html>'''
+
+          def main():
+              original=get_v25()
+              orig_actor_ids={
+                  r['actor']
+                  for r in ROSTER
+                  if r['actor'] and r['actor'] not in PROTECTED|EXTRACT
+              }
+
+              for actor in orig_actor_ids:
+                  if actor not in original:
+                      raise RuntimeError(
+                          'V25 accepted actor missing, would silently drop '
+                          +str(actor)
+                      )
+
+              if len(sys.argv)>1 and sys.argv[1]=='--offline-test':
+                  extracted={}
+                  audit=[]
+              else:
+                  sourcepak,records=index_original_spr()
+                  pakfile=ROOT/'paks'/sourcepak.removeprefix('outer/')
+                  if not pakfile.is_file():
+                      raise RuntimeError(
+                          'No Sanctuary original Sprite.pak, cannot assert success'
+                      )
+                  extracted,audit=extract(
+                      reader_cls(),records,pakfile
+                  )
+
+              both={
+                  **{
+                      k:v for k,v in original.items()
+                      if k in orig_actor_ids
+                  },
+                  **extracted
+              }
+
+              outdir=OUT/'gifs'
+              entries=[]
+
+              for r in ROSTER:
+                  actor=r['actor']
+                  protected=actor in PROTECTED
+
+                  state=(
+                      '이전 성공본 고정 · 변경 없음'
+                      if protected else
+                      '원본 명칭 일치 SPR ID 미확정 · 임의 연결 금지'
+                      if actor is None else
+                      '이번 V28 생추어리 SPR 원본 추출 · 해시 검증'
+                      if actor in extracted else
+                      '기존 V25 생추어리 SPR 원본 추출 · 해시 검증'
+                      if actor in both else
+                      '생추어리 원본 추출 작업 남음'
+                  )
+
+                  entries.append({
+                      **r,
+                      'status':state,
+                      'protected':protected,
+                      'motion_confirmed':False
+                  })
+
+              for actor,dirs in both.items():
+                  p=outdir/str(actor)
+                  p.mkdir(parents=True,exist_ok=True)
+
+                  for d,raw in dirs.items():
+                      with Image.open(io.BytesIO(raw)) as im:
+                          assert (
+                              im.format=='GIF' and
+                              im.n_frames>=1 and
+                              im.info.get('loop')==0
+                          ),f'Non-looping GIF {actor}/{d}'
+
+                      (p/f'{actor}-bank8-dir{d}.gif').write_bytes(raw)
+
+              (OUT/'V28-61CE-physical-source.json').write_text(
+                  json.dumps({
+                      'version':'V28',
+                      'rows':entries,
+                      'new_extraction_hashes':audit,
+                      'game_modified':False,
+                      'approved_in_game':False
+                  },ensure_ascii=False,indent=2),
+                  encoding='utf-8'
+              )
+
+              (OUT/'V28-Physical-Attack-61CE.html').write_text(
+                  render_html(entries,both),
+                  encoding='utf-8'
+              )
+
+              with (OUT/'V28-61CE-status.csv').open(
+                  'w',encoding='utf-8-sig',newline=''
+              ) as f:
+                  w=csv.writer(f)
+                  w.writerow([
+                      'CE','Monster','Sanctuary_SPR_ID',
+                      'Status','GIF_4direction','Verified_Game_Action'
+                  ])
+                  for e in entries:
+                      w.writerow([
+                          e['ce'],
+                          e['name'],
+                          e['actor'] or '',
+                          e['status'],
+                          e['actor'] in both,
+                          'NO'
+                      ])
+
+              summary={
+                  'version':'V28',
+                  'physical_ce_total':len(entries),
+                  'previous_gif_ce':sum(
+                      e['actor'] in orig_actor_ids for e in entries
+                  ),
+                  'new_source_gif_ce':sum(
+                      e['actor'] in extracted for e in entries
+                  ),
+                  'unresolved_ce':sum(
+                      e['actor'] is None for e in entries
+                  ),
+                  'protected_ce':sum(
+                      e['protected'] for e in entries
+                  ),
+                  'original_spr_hash_checked':len(audit),
+                  'infinite_loop_files':sum(
+                      len(dirs) for dirs in both.values()
+                  ),
+                  'infinite_loop_spr':len(both),
+                  'game_modified':False
+              }
+
+              if '--offline-test' not in sys.argv:
+                  assert summary['previous_gif_ce']==30,summary
+                  assert summary['new_source_gif_ce']==16,summary
+                  assert summary['unresolved_ce']==14,summary
+                  assert summary['protected_ce']==1,summary
+                  assert len(audit)==48,summary
+                  assert summary['infinite_loop_files']==4*summary['infinite_loop_spr']
+                  assert summary['infinite_loop_files']>=100,summary
+
+              (OUT/'V28-summary.json').write_text(
+                  json.dumps(summary,ensure_ascii=False,indent=2),
+                  'utf8'
+              )
+
+              print(
+                  'V28_PHYSICAL_SOURCE',
+                  json.dumps(summary,ensure_ascii=False)
+              )
+
+          if __name__=='__main__':
+              main()
           PY
-          python3 /tmp/v26.py
-      - name: "V26 | 492EV 결과 검증"
+          python3 /tmp/v28_runner.py
+
+      - name: "V28 | Validate all 61 physical CE results"
         run: |
           set -euo pipefail
-          node --check reports/V26-ui.js
           python3 - <<'PY'
-          import csv,json
           from pathlib import Path
-          p=Path('reports');s=json.loads((p/'V26-summary.json').read_text())
-          assert s['version']=='V26' and s['events']==492 and s['graphics']==83
-          assert not s['game_modified']
-          assert (p/'SLKnight-492EV-V26-Motion-Matching.html').stat().st_size>10000
-          with (p/'V26-83-graphics.csv').open(encoding='utf-8-sig') as f:
-              assert len(list(csv.DictReader(f)))==83
-          with (p/'V26-492EV.csv').open(encoding='utf-8-sig') as f:
-              assert len(list(csv.DictReader(f)))==492
-          print('V26_VALIDATED',json.dumps(s,ensure_ascii=False))
+          import csv,json,re,subprocess
+
+          r=Path('reports')
+          d=json.loads((r/'V28-summary.json').read_text())
+
+          assert d['version']=='V28'
+          assert d['physical_ce_total']==61
+          assert d['previous_gif_ce']==30
+          assert d['new_source_gif_ce']==16
+          assert d['unresolved_ce']==14
+          assert d['protected_ce']==1
+          assert d['original_spr_hash_checked']==48
+          assert d['game_modified'] is False
+
+          assert len(
+              list(
+                  csv.DictReader(
+                      (r/'V28-61CE-status.csv').open(
+                          encoding='utf-8-sig'
+                      )
+                  )
+              )
+          )==61
+
+          html=(r/'V28-Physical-Attack-61CE.html').read_text()
+          scripts=re.findall(r'<script>(.*?)</script>',html,re.S)
+          assert len(scripts)==1
+
+          Path('/tmp/v28-ui.js').write_text(scripts[0])
+          subprocess.run(
+              ['node','--check','/tmp/v28-ui.js'],
+              check=True
+          )
+          print('V28_61CE_SOURCE_EXTRACT_OK',d)
           PY
-          cat reports/V26-summary.json >> "$GITHUB_STEP_SUMMARY"
-      - name: "V26 | 통합 HTML 및 외형 대조 결과"
+
+          cat reports/V28-summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "V28 | Original SPR physical GIFs (loop forever), HTML, metadata"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-sanctuary-monsters-v26
+          name: audit-sanctuary-monsters-v28-physical-61CE
           path: reports/
           retention-days: 30
           if-no-files-found: warn
