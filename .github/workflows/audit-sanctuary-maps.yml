@@ -1,7 +1,7 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V5.5 / 44-map terrain + collision + native spawn handoff
-name: audit-sanctuary-maps.yml | V5.5 | 44 Map Spawn Handoff
+# VERSION: V6.0 / Original knight sprite scale audit
+name: audit-sanctuary-maps.yml | V6.0 | Original Knight Scale Audit
 
 on:
   workflow_dispatch:
@@ -10,116 +10,542 @@ on:
     paths: [.github/workflows/audit-sanctuary-maps.yml]
 
 permissions:
-  actions: read
   contents: read
+  actions: read
 
 jobs:
-  handoff:
+  sprite-scale-audit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
-      - name: V5.5 Restore verified V5.4 source without modifying it
+      - name: V6.0 Download Sanctuary original Sprite archive volume
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p source handoff
-          gh run download 39125584203 -R "$GITHUB_REPOSITORY" -n Sanctuary-Map-V5.4-Spawn-Lifecycle-and-Boss-Overrides -D source
-          for f in native-maps-v5.1.json collision-index-v5.2.json spawn-integration-v5.3.json lifecycle-evidence-v5.4.json boss-spawn-overrides-v5.4.json; do
-            test -s "source/$f"
-          done
+          mkdir -p original previous game reports
+          gh release download v1.0.0 -R "$GITHUB_REPOSITORY" \
+            -p 'Sanctuary.of.Aden.-.Copy.z01' -D original --clobber
+          test -s original/Sanctuary.of.Aden.-.Copy.z01
+          test "$(stat -c %s original/Sanctuary.of.Aden.-.Copy.z01)" -eq 100000000
 
-      - name: V5.5 Package 44 original maps and classified spawn records
+      - name: V6.0 Restore verified single Lineage knight
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 39136791761
+          name: github-pages
+          github-token: ${{ github.token }}
+          path: previous
+
+      - name: V6.0 Verify knight sprite sheet
         run: |
           set -euo pipefail
-          python3 - <<'PY_V55'
-          import csv,hashlib,json,shutil,struct
-          from collections import Counter
-          from pathlib import Path
-          src=Path('source');out=Path('handoff')
-          def read(name):return json.loads((src/name).read_text(encoding='utf-8'))
-          native=read('native-maps-v5.1.json')
-          coll=read('collision-index-v5.2.json')['maps']
-          spawns=read('spawn-integration-v5.3.json')['maps']
-          lifecycle=read('lifecycle-evidence-v5.4.json')['events']
-          boss=read('boss-spawn-overrides-v5.4.json')['bosses']
-          evidence={(e['mapId'],e['eventId']):e for e in lifecycle}
-          overrides={(e['mapId'],e['eventId']):e for e in boss}
-          assert len(native)==len(coll)==len(spawns)==44
-          assert len(evidence)==500 and len(overrides)==35
-          (out/'maps').mkdir(parents=True,exist_ok=True)
-          (out/'collision').mkdir(exist_ok=True)
-          (out/'data').mkdir(exist_ok=True)
-          totals=Counter();maplist=[];reviews=[];bossrows=[]
-          for m in native:
-              mid=m['mapId'];key=str(mid);c=coll[key];s=spawns[key]
-              w=m['width'];h=m['height']
-              assert (w,h)==(c['width'],c['height'])==(s['width'],s['height'])
-              png=src/m['terrainPng'];maskfile=src/c['collisionFile']
-              mask=maskfile.read_bytes()
-              header=png.open('rb').read(24)
-              assert header[:8]==b'\x89PNG\r\n\x1a\n'
-              assert struct.unpack('>II',header[16:24])==(w*16,h*16)
-              assert len(mask)==w*h
-              shutil.copy2(png,out/m['terrainPng'])
-              shutil.copy2(maskfile,out/c['collisionFile'])
-              events=[]
-              for e in s['events']:
-                  eid=e['eventId'];ident=(mid,eid)
-                  assert ident in evidence
-                  positions=[e['initial']]+e['setupRelocations']+e['selfSwitchARelocations']
-                  for p in positions:
-                      x,y=p['x'],p['y']
-                      flag=mask[y*w+x] if 0<=x<w and 0<=y<h else 255
-                      state='UNKNOWN_TILE' if flag==255 else 'BLOCKED' if flag==15 else 'PASSABLE' if flag==0 else 'DIRECTION_LIMITED'
-                      assert state==p['collision'] and flag==p['collisionMask'],ident
-                      totals['coordinateCandidates']+=1
-                      if state not in ('PASSABLE','DIRECTION_LIMITED'):
-                          reviews.append(dict(mapId=mid,eventId=eid,monster=e['monsterName'],role=p['role'],x=x,y=y,collision=state))
-                  b=overrides.get(ident)
-                  if b:
-                      totals['bossOverrides']+=1
-                      for x,y in b['placementCandidates']:
-                          assert 0<=x<w and 0<=y<h
-                          flag=mask[y*w+x]
-                          bossrows.append(dict(mapId=mid,eventId=eid,monster=e['monsterName'],x=x,y=y,collisionFlag=flag))
-                  events.append(dict(eventId=eid,monsterName=e['monsterName'],evidence=e['evidence'],arenaOrSpecial=e['arenaOrSpecial'],
-                      initial=e['initial'],setupRelocations=e['setupRelocations'],selfSwitchARelocations=e['selfSwitchARelocations'],
-                      pagesWithoutRelocation=e['conditionPagesWithoutRelocation'],lifecycleEvidence=evidence[ident],bossOverride=b))
-                  totals['monsterEvents']+=1
-              filename=f'data/map-{mid:03d}.json'
-              packaged=dict(version='V5.5',mapId=mid,mapName=m['mapName'],width=w,height=h,
-                  coordinateSystem='SLKnight_RPG_Maker',terrainPng=m['terrainPng'],collisionFile=c['collisionFile'],
-                  directionalCollision='bit0=down; bit1=left; bit2=right; bit3=up; 255=unknown',
-                  collisionIsStaticOnly=True,monsterEvents=events,portalsNotImplemented=True)
-              (out/filename).write_text(json.dumps(packaged,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
-              maplist.append(dict(mapId=mid,name=m['mapName'],data=filename,terrain=m['terrainPng'],collision=c['collisionFile'],
-                  terrainSha256=hashlib.sha256(png.read_bytes()).hexdigest(),collisionSha256=hashlib.sha256(mask).hexdigest(),monsterEvents=len(events)))
-              totals['maps']+=1
-          assert totals['maps']==44 and totals['monsterEvents']==500 and totals['coordinateCandidates']==1708
-          assert totals['bossOverrides']==35 and len(bossrows)==21 and len(reviews)==37
-          assert sum(r['collision']=='BLOCKED' for r in reviews)==35
-          assert sum(r['collision']=='UNKNOWN_TILE' for r in reviews)==2
-          assert all(row['collisionFlag']==0 for row in bossrows)
-          for name,rows,fields in [('spawn-review-v5.5.csv',reviews,['mapId','eventId','monster','role','x','y','collision']),
-                                   ('boss-fixed-positions-v5.5.csv',bossrows,['mapId','eventId','monster','x','y','collisionFlag'])]:
-              with (out/name).open('w',encoding='utf-8-sig',newline='') as f:
-                  writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(rows)
-          manifest=dict(version='V5.5',status='INTEGRATION_INPUT_NOT_APPLIED',sourceRun=39125584203,
-              coordinateSystem='SLKnight_RPG_Maker_not_Sanctuary_S32',sourceAssetsUnchanged=True,
-              staticCollisionOnly=True,respawnExecutionNotFullyVerified=True,
-              forcedBossCoordinatesAreCandidates=True,portalWarpImplementationExcluded=True,
-              totals=dict(totals),bossForcedPositionCandidates=len(bossrows),spawnPositionsNeedingReview=len(reviews),maps=maplist)
-          (out/'manifest-v5.5.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('V5.5 HANDOFF VERIFIED',dict(totals),'review',len(reviews),'boss positions',len(bossrows))
-          PY_V55
-          test -s handoff/manifest-v5.5.json
-          test -s handoff/data/map-044.json
+          test -s previous/artifact.tar
+          tar -xf previous/artifact.tar -C game \
+            './knight/gameasync/Graphics/Characters/knight_men.png'
+          test -s game/knight/gameasync/Graphics/Characters/knight_men.png
+          if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-pil
+          fi
+          python3 - <<'PY_VERIFY'
+          from PIL import Image
+          image=Image.open(
+              'game/knight/gameasync/Graphics/Characters/knight_men.png'
+          )
+          assert image.size==(360,320),image.size
+          print('SINGLE KNIGHT: 4x4 frames, each 90x80')
+          PY_VERIFY
 
-      - name: V5.5 Upload separate integration handoff only
+      - name: V6.0 Extract original Sprite.idx and knight frames
+        run: |
+          set -euo pipefail
+          cat > /tmp/scale-audit.py <<'PY_AUDIT'
+          from pathlib import Path
+          from PIL import Image
+          import csv,json,re,struct,sys,zlib
+
+          part=Path(sys.argv[1])
+          single=Path(sys.argv[2])
+          out=Path(sys.argv[3])
+          out.mkdir(parents=True,exist_ok=True)
+          raw=part.read_bytes()
+
+          def get_entry(name,packed_size):
+              needle=name.encode('utf-8')
+              start=0
+              while True:
+                  i=raw.find(needle,start)
+                  if i<0:
+                      raise RuntimeError('ZIP local header missing: '+name)
+                  start=i+len(needle)
+                  p=i-30
+                  if p<0 or raw[p:p+4]!=b'PK\x03\x04':
+                      continue
+                  vals=struct.unpack_from('<IHHHHHIIIHH',raw,p)
+                  _,_,flags,method,_,_,crc,sz,unpacked,nlen,extra=vals
+                  if raw[p+30:p+30+nlen]!=needle:
+                      continue
+                  if method!=8:
+                      raise RuntimeError('Unsupported ZIP method')
+                  offset=p+30+nlen+extra
+                  if len(raw)>=offset+packed_size:
+                      return raw[offset:offset+packed_size],offset
+                  return raw[offset:],offset
+
+          base='Sanctuary of Aden - Copy/'
+          packed,idx_offset=get_entry(base+'Sprite.idx',778861)
+          idx=zlib.decompress(packed,-15)
+
+          assert len(idx)==2580176,len(idx)
+          (out/'Sprite.idx.original').write_bytes(idx)
+
+          count,=struct.unpack_from('<I',idx)
+          assert 4+count*28==len(idx),(count,len(idx))
+
+          records={}
+          for i in range(count):
+              offset,name,size=struct.unpack_from('<i20si',idx,4+i*28)
+              filename=name.split(b'\0',1)[0].decode('latin1').lower()
+              if 0<=offset<1894922173 and size>0:
+                  records[filename]={'offset':offset,'size':size}
+
+          candidates={
+              name:entry for name,entry in records.items()
+              if re.match(r'^(61|3213)-\d+\.spr$',name)
+          }
+          (out/'knight-sprite-idx.json').write_text(
+              json.dumps({
+                  'indexCount':count,
+                  'knightCandidates':candidates
+              },indent=2)
+          )
+
+          wanted=[
+              '61-0.spr','61-1.spr',
+              '61-2.spr','61-3.spr',
+              '61-24.spr',
+              '3213-0.spr','3213-1.spr'
+          ]
+          selected=[
+              (name,records[name])
+              for name in wanted if name in records
+          ]
+
+          compressed,pak_offset=get_entry(
+              base+'Sprite.pak',1050110062
+          )
+          (out/'Sprite.pak-first8MB.deflate').write_bytes(
+              compressed[:8*1024*1024]
+          )
+
+          limit=96*1024*1024
+          selected=[
+              (name,entry) for name,entry in selected
+              if entry['offset']+entry['size']<=limit
+          ]
+          needed=max((
+              x['offset']+x['size']
+              for name,x in selected
+          ),default=0)
+
+          extracted=b''
+          if needed:
+              decoder=zlib.decompressobj(-15)
+              pos=0
+              while pos<len(compressed) and len(extracted)<needed:
+                  block=compressed[pos:pos+524288]
+                  pos+=len(block)
+                  extracted+=decoder.decompress(block)
+
+          def headers(data):
+              pos=0
+              if not data:
+                  return []
+              count=data[pos]
+              pos+=1
+              if count==255:
+                  palette=data[pos] or 256
+                  pos+=1+palette*2
+                  count=data[pos]
+                  pos+=1
+              if not 0<count<255:
+                  return []
+              frames=[]
+              for frame in range(count):
+                  if pos+14>len(data):
+                      break
+                  values=struct.unpack_from('<hhhhHHH',data,pos)
+                  pos+=14
+                  x0,y0,x1,y1,u1,u2,blocks=values
+                  if blocks>1000:
+                      break
+                  pos+=blocks*5
+                  frames.append({
+                      'frame':frame,
+                      'width':x1-x0+1,
+                      'height':y1-y0+1,
+                      'x0':x0,'y0':y0,
+                      'x1':x1,'y1':y1
+                  })
+              return frames
+
+          rows=[]
+          for name,entry in selected:
+              start=entry['offset']
+              end=start+entry['size']
+              if end>len(extracted):
+                  continue
+              data=extracted[start:end]
+              (out/name).write_bytes(data)
+              for frame in headers(data):
+                  rows.append(dict(sourceName=name,**frame))
+
+          with (out/'sanctuary-knight-raw-frames.csv').open(
+              'w',newline=''
+          ) as file:
+              fields=[
+                  'sourceName','frame','width','height',
+                  'x0','y0','x1','y1'
+              ]
+              writer=csv.DictWriter(file,fieldnames=fields)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          image=Image.open(single).convert('RGBA')
+          assert image.size==(360,320)
+          game=[]
+
+          for direction in range(4):
+              for frame in range(4):
+                  crop=image.crop((
+                      frame*90,direction*80,
+                      (frame+1)*90,(direction+1)*80
+                  ))
+                  b=crop.getchannel('A').getbbox()
+                  game.append({
+                      'directionRow':direction,
+                      'frame':frame,
+                      'frameW':90,'frameH':80,
+                      'opaqueW':b[2]-b[0] if b else 0,
+                      'opaqueH':b[3]-b[1] if b else 0,
+                      'bbox':b
+                  })
+
+          with (out/'slknight-knight-frames.csv').open(
+              'w',newline=''
+          ) as file:
+              fields=[
+                  'directionRow','frame','frameW','frameH',
+                  'opaqueW','opaqueH','bbox'
+              ]
+              writer=csv.DictWriter(file,fieldnames=fields)
+              writer.writeheader()
+              writer.writerows(game)
+
+          result={
+              'version':'V6.0',
+              'status':(
+                  'SOURCE_FRAMES_EXTRACTED'
+                  if rows else 'SOURCE_FRAMES_NOT_YET_AVAILABLE'
+              ),
+              'indexRecords':count,
+              'matchedSpriteNames':[x for x,y in selected],
+              'originalFrameHeaders':len(rows),
+              'partialPakBytes':len(extracted),
+              'requiredPakBytes':needed,
+              'gameFrame':[90,80],
+              'gameOpaqueSamples':game[:4],
+              'verifiedScale':None,
+              'gameModified':False
+          }
+          (out/'scale-audit.json').write_text(
+              json.dumps(result,indent=2,ensure_ascii=False)
+          )
+          print(json.dumps(result,indent=2,ensure_ascii=False))
+          PY_AUDIT
+
+          python3 /tmp/scale-audit.py \
+            original/Sanctuary.of.Aden.-.Copy.z01 \
+            game/knight/gameasync/Graphics/Characters/knight_men.png \
+            reports
+
+          test -s reports/scale-audit.json
+          test -s reports/knight-sprite-idx.json
+
+      - name: V6.0 Decode original SPR graphics and compare frames
+        run: |
+          set -euo pipefail
+          cat > /tmp/compare-spr.py <<'PY_COMPARE'
+          from pathlib import Path
+          from PIL import Image,ImageDraw
+          import csv,json,struct,sys
+
+          source=Path(sys.argv[1])
+          out=Path(sys.argv[2])
+          gamefile=Path(sys.argv[3])
+          out.mkdir(parents=True,exist_ok=True)
+
+          def rgb555(value):
+              return tuple(
+                  round(((value>>shift)&31)*255/31)
+                  for shift in (10,5,0)
+              )
+
+          def frames(blob):
+              pos=0
+              length=len(blob)
+
+              def read(fmt):
+                  nonlocal pos
+                  size=struct.calcsize(fmt)
+                  if pos+size>length:
+                      raise ValueError('Incomplete SPR')
+                  result=struct.unpack_from(fmt,blob,pos)
+                  pos+=size
+                  return result[0] if len(result)==1 else result
+
+              count=read('<B')
+              palette=None
+              if count==255:
+                  n=read('<B') or 256
+                  palette=[read('<H') for i in range(n)]
+                  count=read('<B')
+              if not 1<=count<=254:
+                  raise ValueError('Invalid frame count')
+
+              headers=[]
+              for frame in range(count):
+                  x0,y0,x1,y1,u1,u2,nblocks=read('<hhhhHHH')
+                  if nblocks>512:
+                      raise ValueError('Invalid block count')
+                  defs=[
+                      read('<bbBH') for i in range(nblocks)
+                  ]
+                  headers.append((frame,defs))
+
+              n=read('<i')
+              if not 0<=n<=65535:
+                  raise ValueError('Invalid block table')
+              offsets=[read('<i') for i in range(n)]
+              read('<i')
+              data_start=pos
+              blocks=[]
+
+              for offset in offsets:
+                  pos=data_start+offset
+                  sx,sy,unknown,lines=read('<BBBB')
+                  image=Image.new('RGBA',(24,24))
+                  pixels=image.load()
+                  if sx>24 or sy>24 or lines>24:
+                      raise ValueError('Invalid block dimensions')
+
+                  for y in range(lines):
+                      x=sx
+                      segments=read('<B')
+                      for j in range(segments):
+                          x+=read('<B')//2
+                          count=read('<B')
+                          for k in range(count):
+                              if palette is None:
+                                  color=read('<H')
+                              else:
+                                  color=palette[read('<B')]
+                              if 0<=x<24 and 0<=sy+y<24:
+                                  if color!=32768:
+                                      pixels[x,sy+y]=(
+                                          *rgb555(color),255
+                                      )
+                              x+=1
+                  blocks.append(image)
+
+              result=[]
+              for frame,defs in headers:
+                  placed=[]
+                  for a,b,typ,blockid in defs:
+                      if blockid>=len(blocks):
+                          continue
+                      adjusted=a-1 if a<0 else a
+                      half=int(adjusted/2)
+                      x=24*(b+a-half)
+                      y=12*(b-half)
+                      placed.append((x,y,blockid))
+
+                  if not placed:
+                      continue
+                  x0=min(x for x,y,i in placed)
+                  y0=min(y for x,y,i in placed)
+                  x1=max(x+24 for x,y,i in placed)
+                  y1=max(y+24 for x,y,i in placed)
+                  if x1-x0>512 or y1-y0>512:
+                      continue
+                  image=Image.new(
+                      'RGBA',(x1-x0,y1-y0)
+                  )
+                  for x,y,i in placed:
+                      image.alpha_composite(
+                          blocks[i],(x-x0,y-y0)
+                      )
+                  bbox=image.getchannel('A').getbbox()
+                  if bbox:
+                      result.append((frame,image,bbox))
+              return result
+
+          original=[]
+          errors=[]
+          for file in sorted(source.glob('*.spr')):
+              try:
+                  for n,image,bbox in frames(file.read_bytes())[:8]:
+                      name=f'{file.stem}-{n:02d}.png'
+                      image.save(out/name)
+                      original.append({
+                          'name':name,
+                          'image':image,
+                          'bbox':bbox,
+                          'width':bbox[2]-bbox[0],
+                          'height':bbox[3]-bbox[1]
+                      })
+              except Exception as exc:
+                  errors.append({
+                      'file':file.name,
+                      'error':str(exc)
+                  })
+
+          game=[]
+          sheet=Image.open(gamefile).convert('RGBA')
+          for direction in range(4):
+              for frame in range(4):
+                  image=sheet.crop((
+                      frame*90,direction*80,
+                      (frame+1)*90,(direction+1)*80
+                  ))
+                  bbox=image.getchannel('A').getbbox()
+                  game.append({
+                      'name':f'game-{direction}-{frame}',
+                      'image':image,
+                      'bbox':bbox,
+                      'width':bbox[2]-bbox[0],
+                      'height':bbox[3]-bbox[1]
+                  })
+
+          def signature(item):
+              crop=item['image'].getchannel('A').crop(
+                  item['bbox']
+              )
+              return crop.resize(
+                  (48,48),Image.Resampling.NEAREST
+              ).point(
+                  lambda v:255 if v else 0
+              ).tobytes()
+
+          for item in original+game:
+              item['signature']=signature(item)
+
+          results=[]
+          for a in original:
+              if min(a['width'],a['height'])<10:
+                  continue
+              for b in game:
+                  rx=b['width']/a['width']
+                  ry=b['height']/a['height']
+                  if not(.45<rx<3.5 and .45<ry<3.5):
+                      continue
+                  if abs(rx-ry)/max(rx,ry)>.22:
+                      continue
+                  x=a['signature']
+                  y=b['signature']
+                  intersection=sum(
+                      p==255 and q==255
+                      for p,q in zip(x,y)
+                  )
+                  union=sum(
+                      p==255 or q==255
+                      for p,q in zip(x,y)
+                  )
+                  score=intersection/union if union else 0
+                  results.append({
+                      'source':a['name'],
+                      'game':b['name'],
+                      'shapeIoU':round(score,4),
+                      'widthRatio':round(rx,4),
+                      'heightRatio':round(ry,4)
+                  })
+
+          results.sort(
+              key=lambda x:x['shapeIoU'],reverse=True
+          )
+
+          with (out/'shape-match-candidates.csv').open(
+              'w',newline=''
+          ) as file:
+              fields=[
+                  'source','game','shapeIoU',
+                  'widthRatio','heightRatio'
+              ]
+              writer=csv.DictWriter(file,fieldnames=fields)
+              writer.writeheader()
+              writer.writerows(results[:60])
+
+          summary={
+              'version':'V6.0',
+              'originalFramesDecoded':len(original),
+              'decoderErrors':errors,
+              'bestCandidates':results[:12],
+              'scaleVerified':False,
+              'scaleToApply':None,
+              'reason':'Identical pose and direction must be verified before adopting a scale.'
+          }
+
+          (out/'character-scale-candidates.json').write_text(
+              json.dumps(summary,indent=2,ensure_ascii=False)
+          )
+
+          if original:
+              chosen=original[:12]
+              panel=Image.new(
+                  'RGB',(720,700),(40,40,40)
+              )
+              draw=ImageDraw.Draw(panel)
+
+              for i,item in enumerate(chosen):
+                  image=item['image'].crop(item['bbox'])
+                  image.thumbnail((130,100))
+                  x=i%4*180+25
+                  y=i//4*145+8
+                  panel.paste(image,(x,y),image)
+                  draw.text(
+                      (x,y+105),item['name'][:24],
+                      fill='white'
+                  )
+
+              for i,item in enumerate(game[:8]):
+                  image=item['image'].crop(item['bbox'])
+                  x=i%4*180+25
+                  y=445+(i//4)*120
+                  panel.paste(image,(x,y),image)
+                  draw.text(
+                      (x,y+85),item['name'],
+                      fill='white'
+                  )
+              panel.save(out/'original-vs-single-knight.png')
+
+          print(json.dumps(
+              summary,indent=2,ensure_ascii=False
+          )[:5000])
+          PY_COMPARE
+
+          python3 /tmp/compare-spr.py \
+            reports \
+            reports/frames \
+            game/knight/gameasync/Graphics/Characters/knight_men.png
+
+          test -s reports/frames/character-scale-candidates.json
+
+      - name: V6.0 Upload original character scale evidence
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V5.5-44-Map-Integration-Handoff
-          path: handoff/
+          name: Sanctuary-V6.0-Knight-Sprite-Scale-Evidence
+          path: reports/
           if-no-files-found: error
           retention-days: 30
