@@ -1,9 +1,10 @@
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R23 - Sanctuary 2x in-game test within EXISTING game, no separate URL
+# VERSION: V229R24 - Fix invisible 2x terrain: patch actual resolution renderer script 97
 # V4.1 preview x2 NEAREST restores geometry for validation, not native TIL detail.
 # Map45/46 added in existing game, NPC Map029 teleporter connected.
-# Existing Game_Map movement, battle and 43 other maps are not changed.
-name: build-slknight-web.yml | V229R23 | In-Game Sanctuary Map 2x
+# Fix: late loading resolution script 97 overrides Spriteset_Map from script 32.
+# Change only Spriteset_Map in script 97; existing Game_Map movement, combat and 43 maps remain untouched.
+name: build-slknight-web.yml | V229R24 | In-Game Sanctuary Terrain Visible
 
 on:
   workflow_dispatch:
@@ -26,7 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: V229R23 Restore verified V229R16 game artifact
+      - name: V229R24 Restore verified V229R16 game artifact
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -35,7 +36,7 @@ jobs:
           github-token: ${{ github.token }}
           path: previous
 
-      - name: V229R23 Restore original TI Dungeon V4.1 terrain and portals
+      - name: V229R24 Restore original TI Dungeon V4.1 terrain and portals
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -44,7 +45,7 @@ jobs:
           github-token: ${{ github.token }}
           path: original-ti
 
-      - name: V229R23 Upgrade existing game in-place during build
+      - name: V229R24 Upgrade existing game in-place during build
         shell: bash
         run: |
           set -euo pipefail
@@ -73,7 +74,7 @@ jobs:
             sudo apt-get install -y -qq python3-pil
           fi
 
-      - name: V229R23 Restore preview geometry x2 in 1024px visual chunks
+      - name: V229R24 Restore preview geometry x2 in 1024px visual chunks
         shell: bash
         run: |
           set -euo pipefail
@@ -187,7 +188,7 @@ jobs:
           PY_TERRAIN
           python3 /tmp/terrain_2x.py
 
-      - name: V229R23 Add original 2x map IDs to existing game and connect town teleporter
+      - name: V229R24 Add original 2x map IDs to existing game and connect town teleporter
         shell: bash
         run: |
           set -euo pipefail
@@ -214,7 +215,7 @@ jobs:
             end
           end
           class Tone
-            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);end
             def _dump(depth=0);@raw;end
           end
           class Color<Tone;end
@@ -309,41 +310,52 @@ jobs:
           ruby -c /tmp/native_maps.rb
           ruby /tmp/native_maps.rb site build/terrain2x.json build/portal-events.json
 
-      - name: V229R23 Patch ONLY map background sprites; no movement or combat edits
+      - name: V229R24 Fix live Spriteset_Map resolution override; render 2x terrain
         shell: bash
         run: |
           set -euo pipefail
           cat > /tmp/render_chunks.rb <<'RUBY_RENDER'
-          require 'zlib';require 'digest'
-          root=ARGV.fetch(0)
-          path=root+'/knight/gameasync/Data/Scripts.rxdata'
-          original=File.binread(path)
-          scripts=Marshal.load(original)
-          raise 'Spriteset_Map slot changed' unless scripts[32][1]=='Spriteset_Map'
-          source=Zlib::Inflate.inflate(scripts[32][2])
-          init='    @tilemap.priorities = $game_map.priorities'
-          update='    @tilemap.update'
-          dispose='    @tilemap.dispose'
-          raise 'map renderer pattern changed' unless [init,update,dispose].all?{|t|source.scan(t).size==1}
-          source=source.sub(init,init+%q{
-              # V229R23: original 2x terrain shown inside existing game; map physics unchanged.
+          require 'zlib'
+          require 'digest'
+          root = ARGV.fetch(0)
+          path = root + '/knight/gameasync/Data/Scripts.rxdata'
+          original = File.binread(path)
+          scripts = Marshal.load(original)
+          raise 'Missing script 97' unless scripts.length > 97
+          raise 'Wrong resolution script' unless scripts[97][1].dup.force_encoding('UTF-8') == '해상도'
+          raise 'Original Spriteset_Map slot changed' unless scripts[32][1] == 'Spriteset_Map'
+          source = Zlib::Inflate.inflate(scripts[97][2])
+          # Script 97 is loaded AFTER script 32 and redefines initialize, update, dispose.
+          # Never patch script 32: its implementation is overridden before gameplay.
+          raise 'Missing late renderer' unless source.scan('class Spriteset_Map').size == 1
+          raise 'Wrong active viewport' unless source.include?('@tilemap = Tilemap.new(@viewport2)')
+          raise 'Wrong existing panorama viewport' unless source.include?('@panorama = Sprite.new(@viewport2)')
+          init = '    @panorama.z = -2000'
+          update = '    @tilemap4.update'
+          dispose = '    @panorama.dispose'
+          [init, update, dispose].each do |needle|
+            raise "Missing or repeated anchor #{needle}" unless source.scan(needle).size == 1
+          end
+          source = source.sub(init, init + %q{
+              # V229R24: source terrain chunks, attached to the ACTIVE renderer.
               @slti_chunks = {}
               @slti_floor = [45,46].include?($game_map.map_id) ? $game_map.map_id : nil
               @slti_cols = @slti_floor == 45 ? 9 : (@slti_floor == 46 ? 11 : 0)
               @slti_rows = @slti_floor == 45 ? 5 : (@slti_floor == 46 ? 6 : 0)})
-                    source=source.sub(update,update+%q{
+          source = source.sub(update, update + %q{
               slti_update_terrain if @slti_floor})
-                    source=source.sub(dispose,dispose+%q{
+          source = source.sub(dispose, %q{
               if @slti_chunks
                 @slti_chunks.each_value do |sprite|
                   sprite.bitmap.dispose if sprite.bitmap != nil
                   sprite.dispose
                 end
                 @slti_chunks.clear
-              end})
-                    method=%q{
-            # Only 1024x1024 nearby image chunks are decoded; no giant tileset.
-            # Each chunk sits at its original 2x map-pixel coordinates.
+              end
+          } + dispose)
+          method = %q{
+            # Visible terrain background, behind the existing RGSS transparent tilemap
+            # and in front of the existing panorama. No player movement overrides.
             def slti_update_terrain
               sx = $game_map.display_x / 4
               sy = $game_map.display_y / 4
@@ -354,11 +366,11 @@ jobs:
               visible = {}
               for y in top..bottom
                 for x in left..right
-                  key = [x,y]
+                  key = [x, y]
                   visible[key] = true
                   if @slti_chunks[key] == nil
-                    sprite = Sprite.new(@viewport1)
-                    sprite.z = -900
+                    sprite = Sprite.new(@viewport2)
+                    sprite.z = -1500
                     name = "Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}"
                     sprite.bitmap = Bitmap.new(name)
                     @slti_chunks[key] = sprite
@@ -376,21 +388,26 @@ jobs:
               end
             end
           }
-          raise 'unexpected source end' unless source.rstrip.end_with?('end')
-          source=source.rstrip.sub(/end\z/,method+"\nend\n")
-          scripts[32][2]=Zlib::Deflate.deflate(source)
-          File.binwrite(path,Marshal.dump(scripts))
-          rebuilt=Marshal.load(File.binread(path))
-          raise 'other scripts changed' unless scripts.each_index.all?{|i|i==32 || scripts[i]==rebuilt[i]}
-          raise 'base scripts file unchanged' if Digest::SHA256.hexdigest(original)==Digest::SHA256.file(path).hexdigest
-          File.binwrite(ARGV.fetch(1),source)
-          puts 'PASS in-game background image-only 2x; Game_Map, Game_Character, combat untouched'
+          raise 'Unexpected resolution script ending' unless source.rstrip.end_with?('end')
+          source = source.rstrip.sub(/end\z/, method + "\nend\n")
+          scripts[97][2] = Zlib::Deflate.deflate(source)
+          File.binwrite(path, Marshal.dump(scripts))
+          rebuilt = Marshal.load(File.binread(path))
+          raise 'Other Ruby scripts changed' unless scripts.each_index.all?{|i| i == 97 || scripts[i] == rebuilt[i] }
+          baseline = Marshal.load(original)
+          raise 'Unexpected non-renderer script edit' unless scripts.each_index.all?{|i| i == 97 || scripts[i] == baseline[i] }
+          raise 'Base Spriteset_Map was modified' unless scripts[32] == baseline[32]
+          raise 'No actual patch' if original == File.binread(path)
+          raise 'Active viewport not used' unless source.include?('Sprite.new(@viewport2)')
+          raise 'Missing on-frame render call' unless source.include?('slti_update_terrain if @slti_floor')
+          File.binwrite(ARGV.fetch(1), source)
+          puts 'PASS: active script97 renderer connected; base script32, movement, combat unchanged'
           RUBY_RENDER
           ruby -c /tmp/render_chunks.rb
-          ruby /tmp/render_chunks.rb site build/Spriteset_Map_V229R23.rb
-          ruby -c build/Spriteset_Map_V229R23.rb
+          ruby /tmp/render_chunks.rb site build/Spriteset_Map_V229R24.rb
+          ruby -c build/Spriteset_Map_V229R24.rb
 
-      - name: V229R23 Register map assets and visible game version at existing URL
+      - name: V229R24 Register map assets and visible game version at existing URL
         shell: bash
         run: |
           set -euo pipefail
@@ -424,7 +441,7 @@ jobs:
           for file in (root/'index.html',root/'knight/index.html'):
               t=file.read_text(encoding='utf-8')
               assert 'V229R16' in t
-              t=t.replace('V229R16','V229R23').replace('v229r16','v229r23')
+              t=t.replace('V229R16','V229R24').replace('v229r16','v229r24')
               file.write_text(t,encoding='utf-8')
           Path('build/asset-list.json').write_text(json.dumps({'changed':changed,'added':added},indent=2,ensure_ascii=False))
           print('Registered',len(added),'new graphics/maps in EXISTING game site/')
@@ -432,7 +449,7 @@ jobs:
           python3 /tmp/register.py site
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R23 Verify original engine and in-game map/teleporter integration
+      - name: V229R24 Verify original engine and in-game map/teleporter integration
         shell: bash
         run: |
           set -euo pipefail
@@ -453,7 +470,7 @@ jobs:
               for name in d['files']:assert (test/'knight/gameasync'/name).is_file()
           # The game is deployed only at its EXISTING root. No secondary site.
           assert not (site/'test-map-v229r22').exists()
-          assert not (site/'test-map-v229r23').exists()
+          assert not (site/'test-map-v229r24').exists()
           originals={str(p.relative_to(old)):hashlib.sha256(p.read_bytes()).hexdigest()
                      for p in old.rglob('*') if p.is_file()}
           output={str(p.relative_to(site)):hashlib.sha256(p.read_bytes()).hexdigest()
@@ -471,9 +488,9 @@ jobs:
           actual_add=set(output)-set(originals)
           assert actual_add==expected_add,('Missing/unexpected new game assets',actual_add^expected_add)
           assert len(output)==len(originals)+len(expected_add)
-          assert 'V229R23' in (site/'index.html').read_text(encoding='utf-8')
-          assert 'V229R23' in (site/'knight/index.html').read_text(encoding='utf-8')
-          assert 'test-map-v229r23' not in (site/'knight/index.html').read_text(encoding='utf-8')
+          assert 'V229R24' in (site/'index.html').read_text(encoding='utf-8')
+          assert 'V229R24' in (site/'knight/index.html').read_text(encoding='utf-8')
+          assert 'test-map-v229r24' not in (site/'knight/index.html').read_text(encoding='utf-8')
           scripts=site/'knight/gameasync/Data/Scripts.rxdata'
           assert scripts.is_file()
           ruby_check=r"""
@@ -488,19 +505,24 @@ jobs:
             class EventCommand;end;class MoveRoute;end;class MoveCommand;end
           end
           class Table
-            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);end
             def _dump(depth=0);@raw;end
           end
           class Tone
-            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);end
             def _dump(depth=0);@raw;end
           end
           class Color<Tone;end
           root=ARGV[0];pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           a=Marshal.load(File.binread(root+'/knight/gameasync/Data/Scripts.rxdata'))
           b=Marshal.load(File.binread(ARGV[1]+'/knight/gameasync/Data/Scripts.rxdata'))
-          raise 'Unexpected other script modified' unless a.each_index.all?{|i|i==32 || a[i]==b[i]}
-          raise 'Spriteset_Map not changed' if a[32]==b[32]
+          raise 'Unexpected other script modified' unless a.each_index.all?{|i|i==97 || a[i]==b[i]}
+          raise 'Default renderer script 32 changed' unless a[32]==b[32]
+          raise 'Active renderer script 97 not changed' if a[97]==b[97]
+          patched=Zlib::Inflate.inflate(a[97][2])
+          raise 'Renderer not connected to viewport2' unless patched.include?('Sprite.new(@viewport2)')
+          raise 'Renderer update not connected' unless patched.include?('slti_update_terrain if @slti_floor')
+          raise 'Renderer terrain chunk lifetime not installed' unless patched.include?('@slti_chunks.each_value')
           town=Marshal.load(File.binread(root+'/knight/gameasync/Data/'+pre+'Map029.rxdata'))
           e=town.instance_variable_get('@events').fetch(11)
           commands=e.instance_variable_get('@pages').first.instance_variable_get('@list')
@@ -513,7 +535,7 @@ jobs:
             m=Marshal.load(File.binread(path))
             raise 'Missing map event' if m.instance_variable_get('@events').empty?
           end
-          puts 'PASS In-game teleporter to Map045, Map045/046 exist, only Spriteset_Map script modified'
+          puts 'PASS In-game Map045/046, teleporter and live script97 terrain render, base script32 untouched'
           """
           result=subprocess.run(['ruby','-e',ruby_check,str(site),str(old)],text=True,capture_output=True)
           assert result.returncode==0,(result.stdout,result.stderr)
@@ -522,10 +544,10 @@ jobs:
           PY_VALIDATE
           python3 /tmp/validate.py
 
-      - name: V229R23 Upload in-game map build audit
+      - name: V229R24 Upload in-game map build audit
         uses: actions/upload-artifact@v4
         with:
-          name: SLKnight-V229R23-InGame-Sanctuary-2x-Audit
+          name: SLKnight-V229R24-InGame-Sanctuary-2x-Audit
           path: |
             build/terrain2x.json
             build/portal-events.json
@@ -533,7 +555,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: V229R23 Upload UPDATED game to existing GitHub Pages
+      - name: V229R24 Upload UPDATED game to existing GitHub Pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
