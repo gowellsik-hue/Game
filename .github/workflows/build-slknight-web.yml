@@ -143,4 +143,371 @@ jobs:
           assert manifest['version']=='V6.3' and manifest['state']=='INTEGRATION_HANDOFF_NOT_APPLIED'
           assert manifest['passabilityIsOriginalMapToolCandidate'] and not manifest['SanctuaryExecutableRulesVerified']
           assert manifest['sourceRuns']['v62']==39383241136
-          DIRS=((0,-1,1,2),(0,1,2,1),(-1
+          DIRS=((0,-1,1,2),(0,1,2,1),(-1,0,4,8),(1,0,8,4))
+          EXPECT={45:{'floor':1,'dims':(288,144),'native_connected':5955,'route_start':(95,73),'target':(201,76),'length':401,'events':14},
+                  46:{'floor':2,'dims':(336,168),'native_connected':11665,'route_start':(81,94),'target':(156,100),'length':99,'events':13}}
+          results={}
+
+          def make(mid, cfg):
+              floor=cfg['floor']; index=json.loads((HAND/f'native/floor-{floor}-index.json').read_text(encoding='utf-8'))
+              p=HAND/f'native/floor-{floor}-4way.bin'; raw=p.read_bytes()
+              assert hashlib.sha256(raw).hexdigest()==index['passageSHA256']
+              assert index['rgssMapID']==mid and index['directionalEdgeReciprocityVerified']
+              assert (index['size'][0]*index['size'][1])==len(raw)
+              ox,oy=index['origin'];sw,sh=index['size'];RGW,RGH=cfg['dims']
+              old=source[str(mid)];assert (old['width'],old['height'])==(RGW,RGH)
+              assert len(old['events'])==cfg['events'] and len(old['walk'])==RGW*RGH
+              proj=index['visualProjection']['pixelFormula'];offsetx=proj['xOffset'];offsety=proj['yOffset']
+              assert (offsetx,offsety)==(-784128,378 if mid==45 else 762)
+              def nb(x,y):
+                  i=x-ox;j=y-oy
+                  return raw[j*sw+i] if 0<=i<sw and 0<=j<sh else 255
+              def next_world(x,y):
+                  a=nb(x,y)
+                  if a in (0,255):return
+                  for dx,dy,bit,reverse in DIRS:
+                      if a&bit and (nb(x+dx,y+dy)&reverse):
+                          yield (x+dx,y+dy)
+              # Build original four-way graph and retain only verified connected corridors.
+              comps=[];seen=set()
+              for yy in range(oy,oy+sh):
+                  for xx in range(ox,ox+sw):
+                      if (xx,yy) in seen or nb(xx,yy) in (0,255):continue
+                      q=deque([(xx,yy)]);seen.add((xx,yy));group=[]
+                      while q:
+                          xy=q.popleft();group.append(xy)
+                          for z in next_world(*xy):
+                              if z not in seen:
+                                  seen.add(z);q.append(z)
+                      comps.append(group)
+              comps.sort(key=len,reverse=True)
+              assert comps and len(comps[0])==cfg['native_connected'],('native component changed',mid,len(comps[0]) if comps else None)
+              main=set(comps[0]);radius2=16**2
+              reps=[None]*(RGW*RGH)
+              # Actor feet: RGSS native screen center x+16, y+32 at 2x terrain = source (16x+8,16y+16).
+              for y in range(RGH):
+                  py=y*16+16
+                  for x in range(RGW):
+                      px=x*16+8
+                      s=(px-offsetx)/12.0; d=(py-offsety)/6.0
+                      wx=round((s-d)/2);wy=round((s+d)/2)
+                      closest=None
+                      for ddx in range(-5,6):
+                          for ddy in range(-5,6):
+                              nx=wx+ddx;ny=wy+ddy
+                              if (nx,ny) not in main:continue
+                              nxp=12*(nx+ny)+offsetx;nyp=6*(ny-nx)+offsety
+                              distance=(nxp-px)**2+(nyp-py)**2
+                              if distance<=radius2:
+                                  t=(distance,nx,ny)
+                                  if closest is None or t<closest:closest=t
+                      if closest is not None:reps[y*RGW+x]=(closest[1],closest[2])
+              def near_connected(a,b):
+                  if a==b:return True
+                  if abs(a[0]-b[0])+abs(a[1]-b[1])>5:return False
+                  q=deque([(a,0)]);seen_local={a}
+                  while q:
+                      xy,steps=q.popleft()
+                      if steps>=5:continue
+                      for z in next_world(*xy):
+                          if z in seen_local:continue
+                          if z==b:return True
+                          seen_local.add(z);q.append((z,steps+1))
+                  return False
+              # Symmetric RPG edge graph. Both source AND destination flags set in one operation.
+              flags=bytearray(RGW*RGH);walk_edges=0
+              for y in range(RGH):
+                  for x in range(RGW):
+                      i=y*RGW+x;a=reps[i]
+                      if a is None:continue
+                      for dx,dy,bit,reverse in ((1,0,8,4),(0,1,2,1)):
+                          xx=x+dx;yy=y+dy
+                          if xx>=RGW or yy>=RGH:continue
+                          j=yy*RGW+xx;b=reps[j]
+                          if b is not None and near_connected(a,b):
+                              flags[i]|=bit;flags[j]|=reverse;walk_edges+=1
+              # Audit all original event positions, original dungeon entrances and return routes.
+              st=cfg['route_start'];target=cfg['target']
+              def route(src):
+                  q=deque([src]);par={src:None}
+                  while q:
+                      x,y=q.popleft();here=flags[y*RGW+x]
+                      for dx,dy,bit,_ in DIRS:
+                          xx=x+dx;yy=y+dy
+                          if 0<=xx<RGW and 0<=yy<RGH and here&bit and (xx,yy) not in par:
+                              par[xx,yy]=(x,y);q.append((xx,yy))
+                  return par
+              par=route(st)
+              assert target in par,('route disconnected',mid,st,target)
+              path=[];cur=target
+              while cur is not None:path.append(cur);cur=par[cur]
+              path.reverse()
+              assert len(path)-1==cfg['length'],('route length changed',mid,len(path)-1,cfg['length'])
+              for e in old['events']:
+                  assert (e['x'],e['y']) in par,('native edge mask traps old event',mid,e)
+              if mid==46:
+                  boss=next(e for e in old['events'] if e['id']==13)
+                  assert (boss['x'],boss['y'])==(156,100) and '바포메트' in boss['name']
+              for y in range(RGH):
+                  for x in range(RGW):
+                      b=flags[y*RGW+x]
+                      if b&8:assert x+1<RGW and flags[y*RGW+x+1]&4
+                      if b&2:assert y+1<RGH and flags[(y+1)*RGW+x]&1
+              new_open=sum(b!=0 for b in flags);original_open=sum(old['walk'])
+              new_open_over_walls=sum(bool(b) and not old['walk'][i] for i,b in enumerate(flags))
+              old_free_now_denied=sum(bool(old['walk'][i]) and not b for i,b in enumerate(flags))
+              file=OUT/f'r42-map-{mid}-edges.bin';file.write_bytes(flags)
+              with (OUT/f'r42-route-{mid}.csv').open('w',encoding='utf-8-sig') as f:
+                  f.write('step,rgssX,rgssY,nativeX,nativeY\n')
+                  for step,(x,y) in enumerate(path):
+                      native=reps[y*RGW+x]
+                      f.write(f'{step},{x},{y},{native[0]},{native[1]}\n')
+              v={'map':mid,'size':[RGW,RGH],'openTileCount':new_open,'nativeWalkableComponent':len(comps[0]),
+                 'directionalConnections':walk_edges,'oldR41OpenTiles':original_open,
+                 'oldBlockedNewPassable':new_open_over_walls,'oldOpenNewBlocked':old_free_now_denied,
+                 'corridorSource':st,'corridorTarget':target,'corridorSteps':len(path)-1,
+                 'originalEventsReachable':len(old['events']),'maskSHA256':hashlib.sha256(flags).hexdigest(),
+                 'implementation':'RGSS edges projected onto largest native S32 4way component using 16px foot snap and <=5 native steps',
+                 'guarantees':'precomputed 4way symmetric R41 tile edges; verified event/portal reachability; not pixel-exact Sanctuary runtime'}
+              print('R42 MAP',mid, 'native',len(comps[0]),'RGBA? NO','RGSS open',new_open,'edges',walk_edges,
+                    'newly open',new_open_over_walls,'closed',old_free_now_denied,'corridor',len(path)-1,'events',len(old['events']),flush=True)
+              return v
+
+          for mid,c in EXPECT.items():results[str(mid)]=make(mid,c)
+          (OUT/'r42-audit.json').write_text(json.dumps({'version':'V229R42','base':'V229R41','source':'V6.3',
+              'approved_scope':'map 45 and 46 movement collision only','gameChangesApplied':False,
+              'pixelOpacityModified':False,'nativeExecutableVerified':False,'maps':results},indent=2,ensure_ascii=False),encoding='utf-8')
+          print('PASS R42 raw movement graph; all 27 existing map events and two verified corridor paths retained')
+          R42_MAKE
+          python3 /tmp/r42-make.py site v63 build
+      - name: V229R42 Patch ONLY native Game_Map passage script21
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/r42-patch.rb <<'R42_PATCH'
+          #!/usr/bin/env ruby
+          require 'json';require 'base64';require 'zlib';require 'digest'
+          root=ARGV.fetch(0);build=ARGV.fetch(1)
+          path=File.join(root,'knight/gameasync/Data/Scripts.rxdata')
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          base_digest=Digest::SHA256.file(path).hexdigest
+          abort('NOT verified V229R41/R38 script baseline') unless base_digest=='f249b698ae6d1c72535ae2b12559e8bb10494657febc67ba0b23195944f4f7d0'
+          scripts=Marshal.load(File.binread(path));original_scripts=Marshal.load(File.binread(path));original_code=Zlib::Inflate.inflate(scripts.fetch(21).fetch(2))
+          abort('Missing map collision original code') unless original_code.scan('  def passable?(x, y, d, self_event = nil)').size==1
+          abort('Missing single Game_Map class') unless original_code.scan(/^class Game_Map\r?$/).size==1
+          abort('Previous R42 injected twice') if original_code.include?('SLTI_V229R42')
+          code="module SLTI_V229R42\n"
+          [45,46].each do |mid|
+            grid=File.binread(File.join(build,"r42-map-#{mid}-edges.bin"))
+            size=mid==45 ? [288,144] : [336,168]
+            abort("Bad edge geometry #{mid}") unless grid.bytesize==size[0]*size[1]
+            b64=Base64.strict_encode64(grid)
+            code << "  EDGES_#{mid} = [\n"
+            b64.scan(/.{1,120}/).each{|chunk|code << "    #{chunk.dump},\n"}
+            code << "  ].join.unpack('m')[0]\n"
+          end
+          code << <<'R42_RUBY'
+            # Bit meanings are RGSS SCREEN directions: Up=1, Down=2, Left=4, Right=8.
+            # Precomputed from V6.3 original S32 4-way edges, plus RGSS grid bridging.
+            # No per-frame bitmap allocation, no unproven wall transparency.
+            def self.allowed?(map_id, x, y, direction)
+              width = map_id == 45 ? 288 : (map_id == 46 ? 336 : 0)
+              height = map_id == 45 ? 144 : (map_id == 46 ? 168 : 0)
+              return false if x < 0 or y < 0 or x >= width or y >= height
+              raw = map_id == 45 ? EDGES_45 : EDGES_46
+              one = raw[y * width + x, 1]
+              return false if one == nil
+              value = one.unpack('C')[0]
+              bit = direction == 8 ? 1 : direction == 2 ? 2 : direction == 4 ? 4 : direction == 6 ? 8 : 0
+              return bit != 0 && (value & bit) != 0
+            end
+          end
+          R42_RUBY
+          code << "\n"
+          passage=<<'R42_PASSAGE'
+              # V229R42: replace ONLY the static ground-tile passage rule on original
+              # TI dungeon maps 45 and 46 with offline, symmetric S32-derived RGSS edges.
+              # Preserve original event tile priority and character/event occupancy.
+              if (@map_id == 45 or @map_id == 46) and (d == 2 or d == 4 or d == 6 or d == 8)
+                return false unless SLTI_V229R42.allowed?(@map_id, x, y, d)
+                bit = (1 << (d / 2 - 1)) & 0x0f
+                for event in events.values
+                  if event.tile_id >= 0 and event != self_event and
+                     event.x == x and event.y == y and not event.through
+                    if @passages[event.tile_id] & bit != 0
+                      return false
+                    elsif @passages[event.tile_id] & 0x0f == 0x0f
+                      return false
+                    elsif @priorities[event.tile_id] == 0
+                      return true
+                    end
+                  end
+                end
+                return true
+              end
+          R42_PASSAGE
+          anchor='  def passable?(x, y, d, self_event = nil)'
+          updated=original_code.sub("class Game_Map\r\n",code+"class Game_Map\r\n")
+          updated=updated.sub(anchor,anchor+"\n"+passage)
+          abort('R42 missing original method?') unless updated.include?(passage)
+          scripts[21][2]=Zlib::Deflate.deflate(updated)
+          File.binwrite(path,Marshal.dump(scripts))
+          readback=Marshal.load(File.binread(path))
+          abort('Unexpected script moved') unless readback.length==original_scripts.length
+          readback.each_index{|i|abort("Other scripts changed: #{i}") if i!=21 && readback[i]!=original_scripts[i]}
+          abort('No effective patch') if readback[21][2]==original_scripts[21][2]
+          File.binwrite(File.join(build,'r42-script21.rb'),updated)
+          meta={'version'=>'V229R42','patch'=>'Game_Map#passable? only on maps 45/46, d 2/4/6/8','scriptIndex'=>21,
+            'oldScriptSHA256'=>base_digest,'newScriptSHA256'=>Digest::SHA256.file(path).hexdigest,
+            'otherScriptsIdentical'=>true,'scriptCount'=>scripts.length}
+          File.write(File.join(build,'r42-patch.json'),JSON.pretty_generate(meta))
+          puts "PASS R42 Ruby script 21 patched; #{scripts.length-1} other RGSS scripts remain bit-for-bit unchanged"
+          R42_PATCH
+          ruby -c /tmp/r42-patch.rb
+          ruby /tmp/r42-patch.rb site build
+          ruby -c build/r42-script21.rb
+      - name: V229R42 Refresh RGSS script manifest MD5 and version; retain all other code
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/r42-register.py <<'R42_REGISTER'
+          from pathlib import Path
+          import sys,hashlib,re
+          root=Path(sys.argv[1]);mapping=root/'knight/gameasync/mapping.js';file=root/'knight/gameasync/Data/Scripts.rxdata'
+          text=mapping.read_text(encoding='utf-8')
+          name='Data/Scripts.rxdata?h='
+          md5=hashlib.md5(file.read_bytes()).hexdigest()
+          text,count=re.subn(re.escape(name)+'[0-9a-f]{32}',lambda _:name+md5,text)
+          assert count==1,('Old script manifest hash missing or duplicated',count)
+          mapping.write_text(text,encoding='utf-8')
+          for path in (root/'index.html',root/'knight/index.html'):
+           s=path.read_text(encoding='utf-8')
+           assert 'V229R41' in s
+           path.write_text(s.replace('V229R41','V229R42').replace('v229r41','v229r42'),encoding='utf-8')
+          bridge=(root/'knight/index.html').read_text(encoding='utf-8')
+          assert bridge.count("var gain=k==='BGS'?0.20:(k==='BGM'?0.60:1);")==1
+          assert not list((root/'knight/gameasync/Graphics/Panoramas').glob('SLTIW_*.png'))
+          print('PASS R42: scripts file hash updated in original mapping.js; R41 BGM60 & no wall graphics preserved')
+          R42_REGISTER
+          python3 /tmp/r42-register.py site
+          node --check site/knight/gameasync/mapping.js
+      - name: V229R42 Execute patched Ruby collision on two dungeon maps and event blockers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/r42-smoke.rb <<'R42_SMOKE'
+          require 'json'
+          source=File.binread(ARGV[0]);eval(source,TOPLEVEL_BINDING,'R42_Script21')
+          root=ARGV[1]
+          class R42Map;attr_reader :width,:height;def initialize(w,h);@width=w;@height=h;end;end
+          class R42TileEvent
+           attr_accessor :tile_id,:x,:y,:through
+           def initialize(x,y,tile_id,through=false);@x=x;@y=y;@tile_id=tile_id;@through=through;end
+          end
+          map=Game_Map.allocate
+          [45,46].each do |id|
+           w,h=id==45 ? [288,144] : [336,168]
+           mask=File.binread(root+"/r42-map-#{id}-edges.bin")
+           map.instance_variable_set(:@map_id,id)
+           map.instance_variable_set(:@map,R42Map.new(w,h))
+           map.instance_variable_set(:@events,{})
+           passages=Array.new(1000,0);passages[385]=15
+           map.instance_variable_set(:@passages,passages)
+           map.instance_variable_set(:@priorities,Array.new(1000,0))
+           valid=0;invalid=0
+           srand(42+id)
+           1000.times do
+            x=rand(w);y=rand(h)
+            [2,4,6,8].each do |d|
+             bit={2=>2,4=>4,6=>8,8=>1}[d]
+             truth=(mask[y*w+x].ord & bit)!=0
+             result=map.passable?(x,y,d)
+             raise "Collision mismatch at map=#{id} #{x},#{y} #{d}" unless truth==result
+             truth ? valid+=1 : invalid+=1
+            end
+           end
+           raise 'Passable beyond map bounds' if map.passable?(w,0,2) || map.passable?(0,h,6)
+           tilemask=mask[95*w+73,1] if id==45
+           sample_xy=(id==45 ? [92,74] : [86,94]);xx,yy=sample_xy
+           d=[2,4,6,8].find{|dir|map.passable?(xx,yy,dir)}
+           raise 'Missing movement fixture' unless d
+           obstacle=R42TileEvent.new(xx,yy,385)
+           map.instance_variable_set(:@events,{1000=>obstacle})
+           raise 'Original solid tile event no longer blocks' if map.passable?(xx,yy,d)
+           map.instance_variable_set(:@events,{})
+           raise 'Original event removal did not restore movement' unless map.passable?(xx,yy,d)
+           puts "PASS R42 script21 #{id}: #{valid} open and #{invalid} blocked directional probes, engine event tile protection"
+          end
+          R42_SMOKE
+          ruby -c /tmp/r42-smoke.rb
+          ruby /tmp/r42-smoke.rb build/r42-script21.rb build | tee build/r42-runtime-test.txt
+      - name: V229R42 Reject any unapproved edits and verify unchanged native events
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_FINAL'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('site');build=Path('build');sha=lambda f:hashlib.sha256(f.read_bytes()).hexdigest()
+          a=json.loads((build/'r42-baseline.json').read_text())
+          b={str(p.relative_to(root)):sha(p) for p in root.rglob('*') if p.is_file()}
+          assert len(a)==len(b)==5472 and a.keys()==b.keys()
+          changed={p for p in a if a[p]!=b[p]}
+          allowed={'index.html','knight/index.html','knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
+          assert changed==allowed,('UNAPPROVED CHANGES',changed^allowed)
+          assert 'V229R42' in (root/'index.html').read_text(encoding='utf-8')
+          assert 'V229R42' in (root/'knight/index.html').read_text(encoding='utf-8')
+          bridge=(root/'knight/index.html').read_text(encoding='utf-8')
+          assert bridge.count("var gain=k==='BGS'?0.20:(k==='BGM'?0.60:1);")==1
+          assert not list((root/'knight/gameasync/Graphics/Panoramas').glob('SLTIW_*.png'))
+          for mid in (45,46):
+              report=json.loads((build/'r42-audit.json').read_text())['maps'][str(mid)]
+              assert report['originalEventsReachable']==(14 if mid==45 else 13)
+              assert report['corridorSteps']==(401 if mid==45 else 99)
+              assert (build/f'r42-map-{mid}-edges.bin').stat().st_size==report['size'][0]*report['size'][1]
+              assert hashlib.sha256((build/f'r42-map-{mid}-edges.bin').read_bytes()).hexdigest()==report['maskSHA256']
+          scripts=root/'knight/gameasync/Data/Scripts.rxdata'
+          import re
+          mapper=(root/'knight/gameasync/mapping.js').read_text(encoding='utf-8')
+          marker='Data/Scripts.rxdata?h='+hashlib.md5(scripts.read_bytes()).hexdigest()
+          assert mapper.count(marker)==1
+          result={'version':'V229R42','source':'V229R41 + V6.3','changedExistingFiles':sorted(changed),
+                  'unchangedFiles':len(a)-len(changed), 'nativeMapsAndEventsUntouched':True,
+                  'otherRGSSScriptsUntouched':True,'wallTranslucencyApplied':False,
+                  'mobileLiveTestPassed':False,'originalSanctuaryExeCollisionValidated':False}
+          (build/'r42-integrity.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
+          print('PASS V229R42: ONLY four approved files changed, all 5472 R41 files retained, native events unchanged')
+          PY_FINAL
+          node --check site/knight/gameasync/mapping.js
+
+      - name: V229R42 Upload exact movement tests and native route audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: SLKnight-V229R42-Native-Directional-Collision-and-Route-Audit
+          path: |
+            build/r42-audit.json
+            build/r42-patch.json
+            build/r42-integrity.json
+            build/r42-runtime-test.txt
+            build/r42-map-45-edges.bin
+            build/r42-map-46-edges.bin
+            build/r42-route-45.csv
+            build/r42-route-46.csv
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: V229R42 Upload existing game to SAME GitHub Pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v6
+      - id: deployment
+        uses: actions/deploy-pages@v5
