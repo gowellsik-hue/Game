@@ -1,15 +1,13 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V6.7
-# CONTINUES: V6.6 (failed as original first-spawn evidence; external SQL is excluded).
-# GOAL: Locate original Sanctuary first-entry monster placement evidence for native maps 1/2.
-# Original 15,389-file archive inventory: V6.4, run 39402429574.
-# V6.5 found no confirmed spawn list in all 160 original client XML files.
-# Check native executables and archived source types; never infer NPC positions from
-# SQL of a different server, S32 walkable cells, sprite IDX, map icons or RPG events.
-# If an actual map-entry server snapshot/packet capture is absent, state UNKNOWN.
-# READ ONLY: no changes to builds, maps, monsters, Pages, or other workflows.
-name: audit-sanctuary-maps.yml | V6.7 | Original Knight Scale Audit
+# VERSION: V6.8
+# PURPOSE: Recover original Sanctuary executable bytes and disassemble the real
+# native network/packet handling code; not SLKnight, map icons or external SQL.
+# INPUT: original user-provided Sanctuary split ZIP on Game release v1.0.0.
+# OUTPUT: the original recovered binaries, native disassembly and import evidence.
+# LIMIT: static client bytes alone cannot reproduce server-generated first-spawn XY.
+# READ ONLY: does not change any map, engine, monster, Pages or other workflows.
+name: audit-sanctuary-maps.yml | V6.8 | Original Knight Scale Audit
 
 "on":
   workflow_dispatch:
@@ -22,292 +20,154 @@ permissions:
   actions: read
 
 jobs:
-  original-first-spawn-source-gate:
-    name: V6.7 | Native first-entry monster spawn evidence gate
+  original-native-packet-code:
+    name: V6.8 | Recover native Lineage code and trace packet entry points
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: V6.7 Restore verified original 15389-file Sanctuary inventory
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39402429574
-          name: Sanctuary-Map-V6.4-Original-Monster-Spawn-Source-Discovery
-          github-token: ${{ github.token }}
-          path: v64
-
-      - name: V6.7 Fetch exact original Sanctuary ZIP directory and client binaries
+      - name: V6.8 Download original Sanctuary native-code archive volumes
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p source reports
-          for part in \
-            Sanctuary.of.Aden.-.Copy.zip \
-            Sanctuary.of.Aden.-.Copy.z01 \
-            Sanctuary.of.Aden.-.Copy.z35; do
-            gh release download v1.0.0 -R gowellsik-hue/Game \
-              -p "$part" -D source --clobber
-            test -s "source/$part"
-          done
-          test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.zip)" -eq 38808950
+          mkdir -p source native reports
+          gh release download v1.0.0 -R gowellsik-hue/Game \
+            -p 'Sanctuary.of.Aden.-.Copy.z01' \
+            -p 'Sanctuary.of.Aden.-.Copy.zip' \
+            -D source --clobber
           test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.z01)" -eq 100000000
-          test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.z35)" -eq 100000000
-          echo 'Downloaded original Sanctuary client archive volumes (not external L1J).'
+          test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.zip)" -eq 38808950
 
-      - name: V6.7 Inspect authentic client binaries and first-spawn data availability
+      - name: V6.8 Extract genuine Lineage executable modules by ZIP CRC and SHA256
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/v67-original-spawn-source.py <<'PY_V67'
-          #!/usr/bin/env python3
-          """Read-only, original Sanctuary client provenance audit. NOT a spawn generator."""
+          cat > /tmp/v68-extract.py <<'PY'
           from pathlib import Path
-          import csv
-          import hashlib
-          import json
-          import re
-          import struct
-          import subprocess
-          import zlib
-          from collections import Counter
+          import hashlib, json, struct, zlib
 
-          SRC = Path('source')
-          OUT = Path('reports')
-          V64 = Path('v64')
-          STEM = 'Sanctuary.of.Aden.-.Copy'
-          PREFIX = 'Sanctuary of Aden - Copy/'
-          TARGETS = [
-              'Lineage.exe', 'Login.exe', 'Redemption.exe', 'Launcher.exe',
-              'Login.dll', 'Redemption.dll', 'npcipher.dll', 'lin.bin',
-              'TW13032701.exe', 'TW13032701.bin',
-          ]
-          OUT.mkdir(exist_ok=True)
-
-          plan = json.loads((V64 / 'source-extraction-plan.json').read_text('utf-8'))
-          previous = json.loads((V64 / 'v64-spawn-source-results.json').read_text('utf-8'))
-          with (V64 / 'original-archive-all-files.csv').open(encoding='utf-8-sig', newline='') as f:
-              archive_inventory = list(csv.DictReader(f))
-          assert plan['totalZipRecords'] == len(archive_inventory) == 15389
-          assert plan['allNamesInventoried']
-          assert previous['inspectionErrors'] == 0
-          assert previous['csvStructuredSpawnRowsCandidate'] == 0
-          assert previous['candidateFilesNotInspected'] == 8
-          assert all(x['rel'].startswith('Sprite') and x['rel'].endswith('.idx')
-                     for x in plan['notInspected'])
-
-          # Split ZIP: only the last .zip holds the central directory. Reuse the
-          # header/CRC semantics proven by the V6.4 successful archive inspector.
-          directory = (SRC / (STEM + '.zip')).read_bytes()
-          tail = directory.rfind(b'PK\x05\x06')
-          assert tail >= 0, 'Split ZIP end-of-central-directory not found'
-          end = struct.unpack_from('<4s4H2IH', directory, tail)
-          last_disk, central_total = end[1], end[4]
-          assert last_disk == 45 and central_total == 15389
-          entries = {}
-          off = 0
-          while True:
-              off = directory.find(b'PK\x01\x02', off)
-              if off < 0:
-                  break
-              if off + 46 > len(directory):
-                  break
-              h = struct.unpack_from('<4s6H3I5H2I', directory, off)
-              flags, method = h[3], h[4]
-              crc, packed, unpacked = h[7], h[8], h[9]
-              nl, el, cl = h[10], h[11], h[12]
-              disk, offset = h[13], h[16]
-              finish = off + 46 + nl + el + cl
-              if not (0 < nl <= 4096 and finish <= len(directory)):
-                  off += 4
-                  continue
-              raw_name = directory[off + 46:off + 46 + nl]
-              name = raw_name.decode('utf-8' if flags & 0x800 else 'cp949', errors='replace')
-              name = name.replace('\\', '/')
-              rel = name[len(PREFIX):] if name.startswith(PREFIX) else name
-              entries[rel] = (name, flags, method, crc, packed, unpacked, disk, offset)
-              off = finish
-          assert len(entries) == 15389, ('Central directory mismatch', len(entries))
-          assert set(entries) == {x['relativePath'] for x in archive_inventory}
-
-          def volume(index):
-              return SRC / (STEM + ('.zip' if index == last_disk else '.z%02d' % (index + 1)))
-
-          def read_span(disk, position, length):
-              out = bytearray()
-              while len(out) < length:
-                  p = volume(disk)
-                  if not p.is_file():
-                      raise RuntimeError('Missing original archive volume ' + p.name)
-                  size = p.stat().st_size
-                  if position >= size:
-                      position -= size
-                      disk += 1
-                      continue
-                  with p.open('rb') as f:
-                      f.seek(position)
-                      chunk = f.read(min(length - len(out), size - position))
-                  if not chunk:
-                      raise RuntimeError('Truncated original volume ' + p.name)
-                  out.extend(chunk)
-                  position += len(chunk)
-              return bytes(out)
-
-          def authentic_member(rel):
-              name, flags, method, crc, packed, unpacked, disk, offset = entries[rel]
-              assert not flags & 1 and method in (0, 8), rel
-              assert unpacked <= 10_000_000, ('Unexpected huge executable', rel)
-              head = read_span(disk, offset, 30)
-              assert head[:4] == b'PK\x03\x04', ('Bad local header', rel)
-              meta = struct.unpack('<4s5H3I2H', head)
-              local_flags, local_method = meta[2], meta[3]
-              nl, el = meta[9], meta[10]
-              assert local_flags == flags and local_method == method, rel
-              local_head = read_span(disk, offset, 30 + nl + el)
-              local_name = local_head[30:30 + nl].decode(
-                  'utf-8' if flags & 0x800 else 'cp949', errors='replace').replace('\\', '/')
-              assert local_name == name, ('Wrong original source member', rel)
-              packed_data = read_span(disk, offset + 30 + nl + el, packed)
-              raw = packed_data if method == 0 else zlib.decompress(packed_data, -15)
-              assert len(raw) == unpacked, ('Wrong unpacked byte count', rel)
-              assert zlib.crc32(raw) & 0xffffffff == crc, ('Original ZIP CRC fail', rel)
-              return raw
-
-          inspections = []
-          for rel in TARGETS:
-              assert rel in entries, ('Original archive executable is missing', rel)
-              raw = authentic_member(rel)
-              # GitHub artifact contains only findings/hashes, never original binaries.
-              binary = Path('/tmp') / ('v67-' + Path(rel).name)
-              binary.write_bytes(raw)
-              pe = len(raw) > 64 and raw[:2] == b'MZ'
-              if pe:
-                  pos = int.from_bytes(raw[60:64], 'little')
-                  pe = pos + 4 <= len(raw) and raw[pos:pos + 4] == b'PE\x00\x00'
-              proc = subprocess.run(['objdump', '-p', str(binary)], capture_output=True,
-                                    text=True, errors='replace', check=False)
-              imports = sorted({word for word in
-                  ('WSARecv', 'WSASend', 'recv', 'send', 'socket', 'connect', 'WSAStartup')
-                  if re.search(r'(?i)\b' + re.escape(word) + r'\b', proc.stdout)}) if pe else []
-              # Strings and WinSock imports are just reverse-engineering hints, not spawn records.
-              ascii_strings = re.findall(rb'[\x20-\x7e]{6,}', raw)
-              marker_counts = {m: sum(1 for s in ascii_strings if m in s.lower())
-                               for m in (b'spawn', b'monster', b'packet', b'npc')}
-              inspections.append({
-                  'sourceFile': rel, 'sourceBytes': len(raw),
-                  'sourceSHA256': hashlib.sha256(raw).hexdigest(),
-                  'ZIPCRCVerified': True, 'WindowsPE': bool(pe),
-                  'networkImportHints': ','.join(imports),
-                  'spawnStringHints': marker_counts[b'spawn'],
-                  'monsterStringHints': marker_counts[b'monster'],
-                  'packetStringHints': marker_counts[b'packet'],
-                  'npcStringHints': marker_counts[b'npc'],
-                  'isOriginalFirstEntrySpawnRecord': False,
-              })
-              binary.unlink(missing_ok=True)
-              print('CHECKED ORIGINAL', rel, len(raw), 'bytes; PE=', bool(pe),
-                    'imports=', ','.join(imports), flush=True)
-
-          names = list(entries)
-          path_ext = Counter(Path(p).suffix.lower() for p in names)
-          server_db = sorted(p for p in names if Path(p).suffix.lower() in
-                             ('.sql', '.db', '.sqlite', '.sqlite3'))
-          native_packet_captures = sorted(p for p in names if Path(p).suffix.lower() in
-                                          ('.pcap', '.pcapng', '.cap', '.etl'))
-          original_logs = sorted(p for p in names if p.startswith('log/'))
-          # Archived crash/error logs are NOT snapshots of monsters on map entry.
-          # Likewise original S32 map passages and client map NPC UI pins are NOT spawns.
-          verified = False
-          summary = {
-              'version': 'V6.7',
-              'targetNativeMaps': [1, 2],
-              'firstSpawnEvidenceStatus': 'ORIGINAL_RUNTIME_OR_SERVER_SNAPSHOT_NOT_FOUND',
-              'originalArchiveEntries': len(entries),
-              'originalExecutableBinariesCRCChecked': len(inspections),
-              'originalClientXMLAlreadyAuditedInV65': 160,
-              'v64PreviouslySkippedFiles': [x['rel'] for x in plan['notInspected']],
-              'skippedFilesAreSpriteIndexesNotProvenSpawnRecords': True,
-              'serverDatabasePathsInOriginalClientArchive': server_db,
-              'nativePacketCapturePathsInOriginalClientArchive': native_packet_captures,
-              'archivedErrorLogFileCount': len(original_logs),
-              'networkImportsAreOnlyCodeHintsNotSpawnEvidence': True,
-              'verifiedOriginalFirstEntrySpawnSnapshot': verified,
-              'verifiedMonsterIDs': None,
-              'verifiedMonsterNames': None,
-              'verifiedMonsterCountByFloor': None,
-              'verifiedIndividualFirstSpawnXY': None,
-              'noSpawnsObservedMeansEmptyMap': False,
-              'derivedFromExternalL1J': False,
-              'derivedFromMapWalkableCells': False,
-              'derivedFromSLKnightEvents': False,
-              'gameFilesModified': False,
-              'requiredNextSource': 'Real Sanctuary server-side first-entry entity list or a decoded native client map-entry entity stream.',
+          root=Path('source');out=Path('native');out.mkdir(exist_ok=True)
+          stem='Sanctuary.of.Aden.-.Copy';pref='Sanctuary of Aden - Copy/'
+          expected={
+            'Lineage.exe':'2124b3da5f53123e0f94a85bd7f9edb2344925fdb4f53d0fc0653ea5c9241414',
+            'lin.bin':'0d40fdf84d19e0ecc043766455fb9c5a215a5c39bbac858ca602f0bf5259f19e',
+            'Login.dll':'34f438999d3415e1f0b63e204ea1807a223e3dafea9199137d44f55b77cc22ab',
+            'npcipher.dll':'f2fbd16f7e62b2279439e6f753917f0605564c1bc9559ef1b31f7ff90cc69259'
           }
-          assert not server_db and not native_packet_captures
-          assert len(inspections) == len(TARGETS)
-          assert summary['verifiedMonsterCountByFloor'] is None
-          with (OUT / 'v67-native-client-binary-evidence.csv').open('w', encoding='utf-8-sig', newline='') as f:
-              w = csv.DictWriter(f, fieldnames=list(inspections[0]))
-              w.writeheader()
-              w.writerows(inspections)
-          (OUT / 'v67-first-entry-spawn-evidence.json').write_text(
-              json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-          (OUT / 'README.txt').write_text(
-              'V6.7 | ORIGINAL SANCTUARY FIRST-ENTRY SPAWN EVIDENCE GATE\n'
-              'Source: original Sanctuary split ZIP, CRC-verified client binaries.\n'
-              'V6.4: 15,389 files; eight skipped files are Sprite*.idx.\n'
-              'V6.5: 160 original client XML did not confirm initial monster spawns.\n'
-              'No native server spawn DB or original packet capture is in the archive.\n'
-              'PE imports and string hits are analysis hints only; no coordinates inferred.\n'
-              'UNKNOWN is NOT zero monsters. No L1J SQL or SLKnight events were used.\n'
-              'Required next evidence: native server initial entity list or decoded\n'
-              'Sanctuary map-entry packets with NPC IDs and actual first X/Y.\n'
-              'No modification to original client or Game/Pages.\n', encoding='utf-8')
-          print('::warning::V6.7 NO VERIFIED NATIVE FIRST-SPAWN SNAPSHOT: '
-                'exact monster IDs, first X/Y and counts remain UNKNOWN', flush=True)
-          PY_V67
-          python3 -m py_compile /tmp/v67-original-spawn-source.py
-          python3 /tmp/v67-original-spawn-source.py
+          tail=(root/(stem+'.zip')).read_bytes();a=tail.rfind(b'PK\x05\x06')
+          assert a>=0
+          end=struct.unpack_from('<4s4H2IH',tail,a)
+          assert end[1]==45 and end[4]==15389
+          entries={};off=0
+          while True:
+            off=tail.find(b'PK\x01\x02',off)
+            if off<0:break
+            h=struct.unpack_from('<4s6H3I5H2I',tail,off)
+            nl,el,cl=h[10],h[11],h[12];n=off+46+nl+el+cl
+            assert 0<nl<=4096 and n<=len(tail)
+            name=tail[off+46:off+46+nl].decode('utf-8' if h[3]&0x800 else 'cp949',errors='replace').replace('\\','/')
+            rel=name[len(pref):] if name.startswith(pref) else name
+            if rel in expected:entries[rel]=(name,h)
+            off=n
+          assert set(entries)==set(expected)
+          data=(root/(stem+'.z01')).read_bytes()
+          results=[]
+          for rel,(name,h) in entries.items():
+            flags,method,crc,packed,unpacked=h[3],h[4],h[7],h[8],h[9]
+            disk,local_offset=h[13],h[16]
+            assert disk==0 and not flags&1 and method in (0,8)
+            local=struct.unpack_from('<4s5H3I2H',data,local_offset)
+            assert local[0]==b'PK\x03\x04' and local[2]==flags and local[3]==method
+            nl,el=local[9],local[10];p=local_offset+30+nl+el
+            local_name=data[local_offset+30:local_offset+30+nl].decode('utf-8' if flags&0x800 else 'cp949',errors='replace').replace('\\','/')
+            assert local_name==name
+            assert p+packed<=len(data)
+            payload=data[p:p+packed]
+            raw=payload if method==0 else zlib.decompress(payload,-15)
+            digest=hashlib.sha256(raw).hexdigest()
+            assert len(raw)==unpacked and zlib.crc32(raw)&0xffffffff==crc and digest==expected[rel],rel
+            (out/rel).write_bytes(raw)
+            results.append({'filename':rel,'bytes':len(raw),'sha256':digest,'crcVerified':True})
+            print('EXTRACTED ORIGINAL',rel,len(raw),digest,flush=True)
+          Path('reports/native-source-provenance.json').write_text(json.dumps(results,indent=2))
+          PY
+          python3 -m py_compile /tmp/v68-extract.py
+          python3 /tmp/v68-extract.py
 
-      - name: V6.7 Verify evidence has not been mistaken for a monster placement list
+      - name: V6.8 Disassemble original native packet handling and locate call sites
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_CHECK'
-          import csv, json
+          python3 - <<'PY'
           from pathlib import Path
-          p = Path('reports')
-          result = json.loads((p / 'v67-first-entry-spawn-evidence.json').read_text('utf-8'))
-          assert result['version'] == 'V6.7'
-          assert result['originalArchiveEntries'] == 15389
-          assert result['originalExecutableBinariesCRCChecked'] == 10
-          assert result['targetNativeMaps'] == [1, 2]
-          assert result['firstSpawnEvidenceStatus'] == 'ORIGINAL_RUNTIME_OR_SERVER_SNAPSHOT_NOT_FOUND'
-          assert not result['verifiedOriginalFirstEntrySpawnSnapshot']
-          assert result['verifiedIndividualFirstSpawnXY'] is None
-          assert result['verifiedMonsterCountByFloor'] is None
-          assert not result['derivedFromExternalL1J']
-          assert not result['derivedFromMapWalkableCells']
-          assert not result['derivedFromSLKnightEvents']
-          assert not result['gameFilesModified']
-          with (p / 'v67-native-client-binary-evidence.csv').open(encoding='utf-8-sig') as f:
-              assert len(list(csv.DictReader(f))) == 10
-          print('V6.7 AUDIT COMPLETE. Original Sanctuary first-entry spawn remains UNVERIFIED.')
-          PY_CHECK
-          {
-            echo '### V6.7 | Original Sanctuary first-entry spawn'
-            echo 'Native maps: 1F and 2F.'
-            echo 'Original executable files: 10 CRC-verified.'
-            echo 'Result: NO original server entity snapshot or decoded packet capture.'
-            echo 'Monster types, numbers and individual first-spawn X/Y: UNKNOWN, NOT ZERO.'
-            echo 'No gameplay or Pages modifications.'
-          } >> "$GITHUB_STEP_SUMMARY"
+          import collections, csv, hashlib, json, math, re, struct, subprocess
 
-      - name: V6.7 Upload original first-entry spawn source verification report
+          root=Path('native');out=Path('reports')
+          api_rx=re.compile(r'(?i)recv|send|socket|connect|wsa|readfile|writefile|getprocaddress|loadlibrary|decrypt|crypt|packet|npc|spawn|monster')
+          rows=[];probes=[]
+          for binary in ('Lineage.exe','lin.bin','Login.dll','npcipher.dll'):
+            p=root/binary;b=p.read_bytes()
+            assert b[:2]==b'MZ'
+            peoff=struct.unpack_from('<I',b,0x3c)[0]
+            assert b[peoff:peoff+4]==b'PE\0\0'
+            machine,nsec,_,_,_,optsize,_=struct.unpack_from('<HHIIIHH',b,peoff+4)
+            opt=peoff+24;magic=struct.unpack_from('<H',b,opt)[0]
+            entry=struct.unpack_from('<I',b,opt+16)[0]
+            base=struct.unpack_from('<I',b,opt+28)[0] if magic==0x10b else struct.unpack_from('<Q',b,opt+24)[0]
+            sections=[]
+            for i in range(nsec):
+              pos=opt+optsize+i*40
+              name,vsize,va,rsize,rptr,_,_,_,_,flags=struct.unpack_from('<8sIIIIIIHHI',b,pos)
+              data=b[rptr:rptr+rsize];cnt=collections.Counter(data)
+              entropy=-sum((n/len(data))*math.log2(n/len(data)) for n in cnt.values()) if data else 0
+              sections.append({'name':name.rstrip(b'\0').decode('latin1'), 'rva':va,'vsize':vsize,
+                               'rawSize':rsize,'rawOffset':rptr,'entropy':round(entropy,3),
+                               'executable':bool(flags&0x20000000)})
+            dump=subprocess.run(['objdump','-p',str(p)],capture_output=True,text=True,errors='replace')
+            (out/(binary+'.pe-header.txt')).write_text(dump.stdout[-250000:],encoding='utf-8')
+            imported=[line.strip() for line in dump.stdout.splitlines() if api_rx.search(line)]
+            (out/(binary+'.packet-api-hits.txt')).write_text('\n'.join(imported)+'\n',encoding='utf-8')
+            scan=subprocess.run(['strings','-a','-n','6',str(p)],capture_output=True,text=True,errors='replace')
+            hits=[x for x in scan.stdout.splitlines() if api_rx.search(x)]
+            (out/(binary+'.packet-string-hits.txt')).write_text('\n'.join(hits[:1000])+'\n',encoding='utf-8')
+            cmd=['objdump','-d','-M','intel',str(p)]
+            asm_path=out/(binary+'.native-disassembly.asm')
+            with asm_path.open('w') as handle:
+              dis=subprocess.run(cmd,stdout=handle,stderr=subprocess.PIPE,text=True)
+            # The full source disassembly, not merely a signature check, is uploaded.
+            result={'source':binary,'machine':hex(machine),'imageBase':hex(base),
+                    'entryRVA':hex(entry),'entryVA':hex(base+entry),'sections':sections,
+                    'networkImportCandidates':imported[:150],
+                    'networkStringCandidates':hits[:100],
+                    'objdumpReturnCode':dis.returncode,
+                    'sourceSHA256':hashlib.sha256(b).hexdigest()}
+            probes.append(result)
+            rows.append({'binary':binary,'entryVA':hex(base+entry),'nativeSections':len(sections),
+                         'highEntropySections':sum(s['entropy']>7.2 for s in sections),
+                         'networkImportClues':len(imported),'networkStringClues':len(hits),
+                         'nativeDisassemblyBytes':(out/(binary+'.native-disassembly.asm')).stat().st_size})
+            print('ORIGINAL NATIVE CODE',binary,'entry',hex(base+entry),
+                  'imports',len(imported),'strings',len(hits),'ASM bytes',rows[-1]['nativeDisassemblyBytes'],flush=True)
+          (out/'v68-native-entry-and-network-code.json').write_text(json.dumps(probes,indent=2))
+          with (out/'v68-real-client-code-summary.csv').open('w',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+          (out/'README.txt').write_text(
+            'V6.8 original Sanctuary native-code recovery, not SLKnight or external SQL.\n'
+            'Native binaries are source-CRC and SHA256 verified.\n'
+            'PE headers, sections, network API/string clues, full native assembly are output.\n'
+            'Static code locations are not monster first-spawn records.\n'
+            'An actual first-entry packet or server entity table is required for precise XY.\n'
+            'No game or Pages files modified.\n')
+          PY
+
+      - name: V6.8 Upload recovered native code and real disassembly
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V6.7-Native-First-Spawn-Evidence-Gate
-          path: reports/
-          retention-days: 60
+          name: Sanctuary-Map-V6.8-Original-Native-Packet-Code-Extraction
+          path: |
+            native/
+            reports/
+          retention-days: 30
           if-no-files-found: error
+          compression-level: 1
