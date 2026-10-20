@@ -1,404 +1,279 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V6.1
-# PURPOSE: Evidence-only reverse audit of Sanctuary map movement and wall rules.
-# KEEP: existing workflow name format (version number only changed).
-# KEEP: verified V6.0 knight sprite-scale output as a separate evidence job.
-# DO NOT modify build-slknight-web.yml, gameplay, passability or map assets.
-# SOURCE: exact original S32/SEG/XML extracted in the successful V2 run.
-# WARNING: Attribute1 bit0 is a CANDIDATE, not proven Sanctuary collision.
-name: audit-sanctuary-maps.yml | V6.1 | Original Knight Scale Audit
+# VERSION: V6.2
+# INPUT: successful V6.1 artifact 39381626131 (source S32, SEG, Layer3, Layer4, Layer5).
+# PURPOSE: compare original paired horizontal/vertical edge rules with V6.1 raw maps.
+# SOURCE RULE: https://github.com/tony1223/L1MapViewer/blob/main/plans/passrule_txt.md
+# This is a CANDIDATE interpretation, not proof of Sanctuary's actual engine.
+# Layer5 5-byte records are correlated with original Layer4 groups, not redrawn.
+# No build-slknight-web.yml, original binaries, gameplay, map, or engine changes.
+# Preserve original workflow title text, changing ONLY the version from V6.1.
+name: audit-sanctuary-maps.yml | V6.2 | Original Knight Scale Audit
 
-on:
+"on":
   workflow_dispatch:
   push:
     branches: [main]
     paths: [.github/workflows/audit-sanctuary-maps.yml]
 
 permissions:
-  contents: read
   actions: read
+  contents: read
 
 jobs:
-  native-map-rule-evidence:
-    name: V6.1 | Original S32 SEG movement and wall forensic audit
+  analyze-native-direction-and-opacity:
+    name: V6.2 | S32 directional edges and Layer5-to-Layer4 object linkage
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 25
     steps:
-      - name: V6.1 Restore original V2 archive evidence (no new approximations)
+      - name: V6.2 Restore unmodified validated V6.1 map audit
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 39045175890
-          name: Sanctuary-TI-Dungeon-V2-Raw-and-Layer3
+          run-id: 39381626131
+          name: Sanctuary-Map-V6.1-Original-Collision-and-Wall-Rule-Evidence
           github-token: ${{ github.token }}
-          path: original-v2
+          path: v61
 
-      - name: V6.1 Verify original extraction SHA256 and expected file coverage
+      - name: V6.2 Verify source evidence and original provenance
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY_CHECK'
-          from pathlib import Path
-          import json,hashlib
-          root=Path('original-v2')
-          manifest=json.loads((root/'reports/extraction-manifest.json').read_text(encoding='utf-8'))
-          assert len(manifest)==44,('Unexpected source count',len(manifest))
-          for entry in manifest:
-              file=root/'extracted'/entry['path']
-              assert file.is_file(),entry['path']
-              assert file.stat().st_size==entry['bytes'],entry['path']
-              assert hashlib.sha256(file.read_bytes()).hexdigest()==entry['sha256'],entry['path']
-              assert entry['crc32Verified'],entry['path']
-          maps=list((root/'extracted/map').rglob('*.s32'))
-          segs=list((root/'extracted/map').rglob('*.seg'))
-          assert (len(maps),len(segs))==(28,10),(len(maps),len(segs))
-          assert all((root/'extracted/xml'/name).is_file() for name in (
-              'CollisionZone.xml','ExtMapAttr.xml','MapSystem.xml',
-              'MapSystem86.xml','map_config.xml','zone3.xml'))
-          assert sum(e.get('portalCandidateCount',0) for e in manifest)==20
-          print('PASS: 44 authentic map binaries, all SHA256/ZIP CRC verified; 20 unverified portal candidates')
-          PY_CHECK
-
-      - name: V6.1 Decode BOTH Layer3 attributes and preserve ALL layers and XML bytes
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p audit/csv audit/raw-layers audit/xml audit/summary
-          cat > /tmp/audit-map-rules-v61.py <<'PY_V61'
-          from pathlib import Path
-          from collections import Counter,defaultdict,deque
-          import base64,csv,hashlib,json,math,struct,sys,zlib
-          import xml.etree.ElementTree as ET
-
-          source=Path(sys.argv[1]); out=Path(sys.argv[2]);
-          manifest=json.loads((source/'reports/extraction-manifest.json').read_text(encoding='utf-8'))
-          index={e['path']:e for e in manifest}
-          def digest(raw):return hashlib.sha256(raw).hexdigest()
-          def emit(obj,path):
-              path.parent.mkdir(parents=True,exist_ok=True)
-              path.write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
-          def take(data,position,length,where):
-              if length<0 or position<0 or position+length>len(data):
-                  raise ValueError(f'Truncated {where} at {position}: {length}/{len(data)}')
-              return data[position:position+length]
-          def pair_layer(data,pos,fmt):
-              st=struct.Struct(fmt)
-              raw=take(data,pos,4096*st.size,'layer3')
-              pairs=[xy for xy in st.iter_unpack(raw)]
-              assert len(pairs)==4096
-              return pairs,raw
-          def count_components(grid,w,h,bit):
-              # Provisional bit test only, NOT the original engine's movement rule.
-              traversable=[((v[bit]&1)==0) for v in grid]
-              seen=bytearray(w*h);sizes=[]
-              for i,open_ in enumerate(traversable):
-                  if not open_ or seen[i]:continue
-                  q=deque([i]);seen[i]=1;n=0
-                  while q:
-                      cur=q.popleft();n+=1;x=cur%w;y=cur//w
-                      for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
-                          xx=x+dx;yy=y+dy
-                          if 0<=xx<w and 0<=yy<h:
-                              ni=yy*w+xx
-                              if not seen[ni] and traversable[ni]:
-                                  seen[ni]=1;q.append(ni)
-                  sizes.append(n)
-              return {'openCells':sum(traversable),'componentCount':len(sizes),
-                      'topComponentSizes':sorted(sizes,reverse=True)[:12]}
-
-          tile_summary=[]; raw_attrs={}; portals=[]; violations=[]
-          totals=Counter(); all_raw={}; layer3_csv=out/'csv/layer3-all-values.csv'
-          layer4_csv=out/'csv/layer4-objects-raw.csv'
-          layer5_csv=out/'csv/layer5-6-7-candidates.csv'
-          f3=layer3_csv.open('w',encoding='utf-8-sig',newline='')
-          f4=layer4_csv.open('w',encoding='utf-8-sig',newline='')
-          f5=layer5_csv.open('w',encoding='utf-8-sig',newline='')
-          w3=csv.writer(f3);w4=csv.writer(f4);w5=csv.writer(f5)
-          w3.writerow(['floor','sourceFile','format','worldX','worldY','cellX','cellY','attr1','attr2',
-                       'attr1_hex','attr2_hex','firstBitDiffers','fullValueDiffers'])
-          w4.writerow(['floor','sourceFile','format','groupIndex','groupID','objectIndex','rawHex'])
-          w5.writerow(['floor','sourceFile','layer','index','rawHex','parsedValue','confidence'])
-          for filepath in sorted((source/'extracted/map').rglob('*')):
-              if filepath.suffix.lower() not in ('.s32','.seg'):continue
-              floor=int(filepath.parent.name);ext=filepath.suffix.lower()[1:]
-              rel=f'map/{floor}/{filepath.name}'
-              data=filepath.read_bytes()
-              assert digest(data)==index[rel]['sha256'],rel
-              block=filepath.stem;bx=int(block[:4],16);by=int(block[4:],16)
-              startx=(bx-0x7fff)*64+0x7fff-63
-              starty=(by-0x7fff)*64+0x7fff-63
-              stride=4 if ext=='s32' else 2
-              tile_size=64*128*stride
-              l1=take(data,0,tile_size,'layer1')
-              pos=tile_size
-              n2=struct.unpack('<H',take(data,pos,2,'layer2 count'))[0];pos+=2
-              l2_stride=6 if ext=='s32' else 4
-              l2=take(data,pos,n2*l2_stride,'layer2 objects');pos+=len(l2)
-              layer3_start=pos
-              pairs,l3=pair_layer(data,pos,'<HH' if ext=='s32' else '<BB')
-              pos+=len(l3)
-              assert layer3_start==index[rel]['layer3Start'],(rel,'Layer3 offset mismatch')
-              count4=struct.unpack('<i',take(data,pos,4,'layer4 groups'))[0];pos+=4
-              assert 0<=count4<=5000,(rel,'Bad Layer4 group count',count4)
-              groups=[];objects=0;first_groups=[];l4_start=pos-4
-              for gi in range(count4):
-                  groupid,num=struct.unpack('<hH',take(data,pos,4,'layer4 group header'));pos+=4
-                  assert num<=10000,(rel,gi,num)
-                  payload=take(data,pos,num*(7 if ext=='s32' else 5),'layer4 payload')
-                  size=7 if ext=='s32' else 5
-                  for oi in range(num):
-                      w4.writerow([floor,rel,ext,gi,groupid,oi,payload[oi*size:(oi+1)*size].hex()])
-                  pos+=len(payload);objects+=num
-                  if len(first_groups)<10:first_groups.append([groupid,num])
-              l4=take(data,l4_start,pos-l4_start,'layer4 exact binary')
-              after_layer4=pos
-              extensions={'extensionBytes':len(data)-pos,'status':'notDecoded','records':[]}
-              if ext=='s32':
-                  try:
-                      p=pos
-                      n5=struct.unpack('<i',take(data,p,4,'layer5 count'))[0];p+=4
-                      if not 0<=n5<=100000:raise ValueError('layer5 count out of range')
-                      five=take(data,p,n5*5,'layer5 bytes');p+=len(five)
-                      n6=struct.unpack('<i',take(data,p,4,'layer6 count'))[0];p+=4
-                      if not 0<=n6<=100000:raise ValueError('layer6 count out of range')
-                      six=take(data,p,n6*4,'layer6 bytes');p+=len(six)
-                      n7=struct.unpack('<H',take(data,p,2,'layer7 count'))[0];p+=2
-                      if n7>500:raise ValueError('layer7 count out of range')
-                      for k in range(n5):w5.writerow([floor,rel,'layer5',k,five[k*5:k*5+5].hex(),'','raw-only'])
-                      for k in range(n6):w5.writerow([floor,rel,'layer6',k,six[k*4:k*4+4].hex(),'','raw-only'])
-                      for pi in range(n7):
-                          name_len=take(data,p,1,'layer7 name length')[0];p+=1
-                          text_bytes=take(data,p,name_len,'layer7 portal name');p+=name_len
-                          xy_map=take(data,p,8,'layer7 portal fields');p+=8
-                          xx,yy,destination,portalid=struct.unpack('<BBHI',xy_map)
-                          name=text_bytes.decode('cp949',errors='replace')
-                          portal={'floor':floor,'sourceFile':rel,'name':name,'localX':xx,'localY':yy,
-                                  'estimatedWorldX':startx+xx//2,'estimatedWorldY':starty+yy,
-                                  'targetMapID':destination,'portalID':portalid,
-                                  'destinationCoordinateVerified':False}
-                          portals.append(portal)
-                          w5.writerow([floor,rel,'layer7',pi,(bytes([name_len])+text_bytes+xy_map).hex(),
-                                       json.dumps(portal,ensure_ascii=False),'unverified-candidate'])
-                      extensions={'status':'parsed-as-candidates','layer5Count':n5,'layer6Count':n6,
-                                  'layer7Count':n7,'trailingBytes':len(data)-p,
-                                  'trailingSHA256':digest(data[p:]) if p<len(data) else None}
-                  except (ValueError,struct.error) as e:
-                      extensions={'status':'undecoded-extension','reason':str(e),
-                                  'extensionBytes':len(data)-after_layer4}
-              outblock=out/'raw-layers'/f'{floor}-{block}-{ext}'
-              outblock.mkdir(parents=True,exist_ok=True)
-              for name,chunk in [('layer1.bin',l1),('layer2.bin',l2),('layer3.bin',l3),
-                                 ('layer4.bin',l4),('post-layer4.bin',data[after_layer4:])]:
-                  (outblock/name).write_bytes(chunk)
-              diffs=0;bitdiff=0;bits_a=Counter();bits_b=Counter()
-              for i,(a,b) in enumerate(pairs):
-                  x=i%64;y=i//64
-                  worldx=startx+x;worldy=starty+y
-                  delta=int(a!=b);mismatch=int((a&1)!=(b&1))
-                  diffs+=delta;bitdiff+=mismatch
-                  for bit in range(16):
-                      bits_a[bit]+=bool(a&(1<<bit));bits_b[bit]+=bool(b&(1<<bit))
-                  w3.writerow([floor,rel,ext,worldx,worldy,x,y,a,b,hex(a),hex(b),mismatch,delta])
-              counta=Counter(a for a,b in pairs);countb=Counter(b for a,b in pairs)
-              record={'floor':floor,'sourceFile':rel,'extension':ext,
-                      'startWorld':[startx,starty],'bytes':len(data),'sourceSHA256':digest(data),
-                      'layer1Records':8192,'layer1Stride':stride,'layer1SHA256':digest(l1),
-                      'layer2Records':n2,'layer2Stride':l2_stride,'layer2SHA256':digest(l2),
-                      'layer3Offset':layer3_start,'layer3Records':4096,
-                      'attr1Histogram':dict(sorted(counta.items())),
-                      'attr2Histogram':dict(sorted(countb.items())),
-                      'attr1SetBits':dict(sorted(bits_a.items())),
-                      'attr2SetBits':dict(sorted(bits_b.items())),
-                      'attributesDifferent':diffs,'firstBitDifferent':bitdiff,
-                      'layer4Groups':count4,'layer4ObjectCount':objects,
-                      'sampleLayer4Groups':first_groups,'afterLayer4Offset':after_layer4,
-                      'remainingBytes':len(data)-after_layer4,'extensionEvidence':extensions,
-                      'meaningOfAttributes':'UNVERIFIED',
-                      'actualOriginalCollisionRuleVerified':False}
-              tile_summary.append(record)
-              raw_attrs[(floor,block,ext)]=pairs
-              totals['mapBlocks']+=1;totals['cells']+=4096
-              totals['attrDifferent']+=diffs;totals['bit0Different']+=bitdiff
-              totals['objects']+=objects
-              totals['s32' if ext=='s32' else 'seg']+=1
-              print('SOURCE',rel,'A != B:',diffs,'bit0 differs:',bitdiff,
-                    'objects:',objects,'extension:',extensions['status'],flush=True)
-          f3.close();f4.close();f5.close()
-          assert (totals['s32'],totals['seg'])==(28,10),totals
-          # Matched S32/SEG are ALTERNATE FILES, not proven equivalent collision layers.
-          comparisons=[]
-          for floor,block,ext in sorted(raw_attrs):
-              if ext!='s32' or (floor,block,'seg') not in raw_attrs:continue
-              a=raw_attrs[(floor,block,'s32')];b=raw_attrs[(floor,block,'seg')]
-              comparisons.append({'floor':floor,'block':block,
-                                  'attr1Changed':sum(x[0]!=y[0] for x,y in zip(a,b)),
-                                  'attr2Changed':sum(x[1]!=y[1] for x,y in zip(a,b)),
-                                  'eitherChanged':sum(x!=y for x,y in zip(a,b)),
-                                  'semanticsUnverified':True})
-          assert len(comparisons)==10,len(comparisons)
-          emit(tile_summary,out/'summary/source-map-layers.json')
-          emit(comparisons,out/'summary/s32-vs-seg-comparison.json')
-          emit(portals,out/'summary/layer7-portal-candidates.json')
-          # V2's known portal records are ground-truth CANDIDATE counts only.
-          expected_portals=sum(e.get('portalCandidateCount',0) for e in manifest)
-          assert expected_portals==20,expected_portals
-          if len(portals)!=20:
-              violations.append('Layer7 parsing count differs from the V2 candidate tally; do not infer destinations')
-
-          xml_reports=[]
-          def entropy(data):
-              if not data:return 0.0
-              counts=Counter(data)
-              return round(-sum((n/len(data))*math.log2(n/len(data)) for n in counts.values()),4)
-          for path in sorted((source/'extracted/xml').glob('*.xml')):
-              raw=path.read_bytes()
-              # Preserve XML-like named files as bytes; most begin X?xm, NOT plain XML.
-              (out/'xml'/path.name).write_bytes(raw)
-              is_plain=raw.lstrip().startswith((b'<?xml',b'<'))
-              probe=[];actual_xml=False
-              if is_plain:
-                  try:ET.fromstring(raw);actual_xml=True
-                  except ET.ParseError:pass
-              if not actual_xml:
-                  for off in (4,8,16,20,24,32):
-                      try:
-                          raw_dec=zlib.decompress(raw[off:])
-                          if len(raw_dec)>2000000:continue
-                          ET.fromstring(raw_dec)
-                          (out/'xml'/(path.name+'.decoded.xml')).write_bytes(raw_dec)
-                          probe.append({'offset':off,'validXML':True,'decodedBytes':len(raw_dec)})
-                          actual_xml=True;break
-                      except (zlib.error,ET.ParseError):pass
-              xml_reports.append({'file':path.name,'bytes':len(raw),'sha256':digest(raw),
-                                  'signatureASCII':''.join(chr(c) if 32<=c<=126 else '.' for c in raw[:16]),
-                                  'first32Hex':raw[:32].hex(),'entropyBitsPerByte':entropy(raw),
-                                  'startsWithXQuestionXm':raw.startswith(b'X?xm'),
-                                  'headerFirst20Hex':raw[:20].hex(),
-                                  'readableXMLVerified':actual_xml,
-                                  'probe':probe,
-                                  'decodingRule':'UNVERIFIED' if not actual_xml else 'XML syntax verified'})
-          assert len(xml_reports)==6,len(xml_reports)
-          emit(xml_reports,out/'summary/xml-binary-container-evidence.json')
-          # Compare positions of the two independent attributes at a global 1F/2F scale.
-          differences=[]
-          for rec in tile_summary:
-              if rec['extension']!='s32':continue
-              if not rec['attributesDifferent']:continue
-              key=(rec['floor'],Path(rec['sourceFile']).stem,'s32')
-              x0,y0=rec['startWorld']
-              for idx,(a,b) in enumerate(raw_attrs[key]):
-                  if a==b:continue
-                  differences.append([rec['floor'],x0+idx%64,y0+idx//64,a,b,rec['sourceFile']])
-          with (out/'csv/s32-attribute-disagreements.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w=csv.writer(f);w.writerow(['floor','worldX','worldY','attribute1','attribute2','sourceFile'])
-              w.writerows(differences)
-          emit({'version':'V6.1','status':'EVIDENCE_ONLY_UNVERIFIED_RULES',
-                'source':'Sanctuary original V2 map/1 and map/2 (ZIP CRC and SHA256 verified)',
-                'sourceBlocks':dict(totals),'attributeDisagreementsS32':len(differences),
-                'pairwiseS32SegComparisons':len(comparisons),
-                'portalCandidatesV2':expected_portals,'portalCandidatesParsed':len(portals),
-                'xmlNamedBinaryFiles':len(xml_reports),
-                'collisionProven':False,'wallOcclusionProven':False,
-                'originalEngineVerified':False,'sourceRouteVerified':False,
-                'warnings':violations},out/'summary/v61-main.json')
-          note='''V6.1 | Sanctuary map-rule evidence ONLY
-          
-          1. Source files: 28 original S32 and 10 SEG in map/1 and map/2.
-          2. Both independent Layer3 attributes are dumped IN FULL with world coordinates.
-          3. S32 and SEG may represent different layers; differences do NOT establish which is collision.
-          4. Layers1/2/3/4 and all post-Layer4 bytes are preserved for each block.
-          5. Layer4 objects contain unknown binary fields. Do NOT assume wall footprints from them.
-          6. Named XML files are X?xm-format binary; readable-XML probe results are in JSON.
-          7. Layer7 portals are candidate entry records. DESTINATION COORDINATES NOT VERIFIED.
-          8. Source collision algorithm and transparent-wall draw order require executable/code evidence.
-          9. No game/YML runtime files are altered and no inferred collision is applied.
-          
-          PRIMARY RESULTS:
-          summary/v61-main.json
-          csv/layer3-all-values.csv
-          csv/s32-attribute-disagreements.csv
-          csv/layer4-objects-raw.csv
-          csv/layer5-6-7-candidates.csv
-          summary/xml-binary-container-evidence.json
-          summary/s32-vs-seg-comparison.json
-          summary/layer7-portal-candidates.json
-          raw-layers/*/*.bin and xml/*.xml
-          '''
-          (out/'README.txt').write_text('\n'.join(x.strip() for x in note.splitlines())+'\n',encoding='utf-8')
-          print('PASS V6.1 source evidence: 28 S32, 10 SEG, 6 binary XML,',
-                len(differences),'S32 coordinate disagreements; collision NOT yet proven')
-          PY_V61
-          python3 /tmp/audit-map-rules-v61.py original-v2 audit
-
-      - name: V6.1 Check generated audit; forbid guesses or applied game changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_VERIFY'
-          from pathlib import Path
-          import csv,json
-          p=Path('audit')
-          main=json.loads((p/'summary/v61-main.json').read_text(encoding='utf-8'))
-          assert main['status']=='EVIDENCE_ONLY_UNVERIFIED_RULES'
-          assert not main['collisionProven'] and not main['wallOcclusionProven']
-          assert main['sourceBlocks']['s32']==28 and main['sourceBlocks']['seg']==10
-          assert len(json.loads((p/'summary/source-map-layers.json').read_text()))==38
-          assert len(json.loads((p/'summary/s32-vs-seg-comparison.json').read_text()))==10
-          assert len(json.loads((p/'summary/xml-binary-container-evidence.json').read_text()))==6
-          with (p/'csv/layer3-all-values.csv').open(encoding='utf-8-sig',newline='') as f:
-              count=sum(1 for row in csv.reader(f))-1
-          assert count==38*4096,('Missing original layer3 values',count)
-          assert len(list(p.glob('raw-layers/*/layer1.bin')))==38
-          assert len(list(p.glob('raw-layers/*/layer3.bin')))==38
-          assert len(list(p.glob('xml/*.xml')))==6
-          print('PASS 155648 Layer3 full records; 38 original blocks; 6 original binary XML files')
-          PY_VERIFY
-
-      - name: V6.1 Upload map movement and wall rule forensic evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sanctuary-Map-V6.1-Original-Collision-and-Wall-Rule-Evidence
-          path: audit/
-          if-no-files-found: error
-          retention-days: 60
-
-  preserve-v60-knight-evidence:
-    name: V6.1 | Preserve verified V6.0 knight scale evidence
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: V6.1 Restore the last successful V6.0 knight-scale evidence
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39189983981
-          name: Sanctuary-V6.0-Knight-Sprite-Scale-Evidence
-          github-token: ${{ github.token }}
-          path: legacy-v60
-
-      - name: V6.1 Verify preserved V6.0 knight audit is intact
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s legacy-v60/scale-audit.json
-          test -s legacy-v60/frames/character-scale-candidates.json
-          test -s legacy-v60/frames/original-vs-single-knight.png
-          test -s legacy-v60/Sprite.idx.original
-          python3 - <<'PY_SCALE'
           import json
           from pathlib import Path
-          p=Path('legacy-v60')
-          report=json.loads((p/'scale-audit.json').read_text(encoding='utf-8'))
-          assert report, 'Original sprite scale audit was empty'
-          assert len(list((p/'frames').glob('61-*.png')))>=16
-          print('PASS original V6.0 knight-scale evidence preserved. No sprite modifications.')
-          PY_SCALE
+          p=Path('v61')
+          summary=json.loads((p/'summary/v61-main.json').read_text(encoding='utf-8'))
+          assert summary['sourceBlocks']['s32']==28
+          assert summary['sourceBlocks']['seg']==10
+          assert summary['attributeDisagreementsS32']==3742
+          assert not summary['collisionProven'] and not summary['wallOcclusionProven']
+          assert len(list((p/'raw-layers').glob('*-s32/layer3.bin')))==28
+          assert len(list((p/'raw-layers').glob('*-s32/layer4.bin')))==28
+          assert len(list((p/'raw-layers').glob('*-s32/post-layer4.bin')))==28
+          assert (p/'summary/layer7-portal-candidates.json').is_file()
+          print('V6.2 PASS: only the authenticated 28 S32 blocks and V6.1 audit are being used')
+          PY_CHECK
 
-      - name: V6.1 Re-upload preserved original knight scale results
+      - name: V6.2 Compute two-attribute four-direction edges and 39k opacity links
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit
+          cat > /tmp/v62-directional-evidence.py <<'PY_AUDIT'
+          from pathlib import Path
+          from collections import Counter, defaultdict, deque
+          from itertools import product
+          import base64, csv, json, struct, sys, html
+
+          root=Path(sys.argv[1]);out=Path(sys.argv[2]);out.mkdir(parents=True,exist_ok=True)
+          meta=json.loads((root/'summary/v61-main.json').read_text('utf-8'))
+          assert meta['version']=='V6.1' and meta['status']=='EVIDENCE_ONLY_UNVERIFIED_RULES'
+          ports=json.loads((root/'summary/layer7-portal-candidates.json').read_text('utf-8'))
+          assert len(ports)==20
+          source={1:{},2:{}}
+          opacity_rows=[];group_counts={1:Counter(),2:Counter()};l5_totals=Counter();s32_count=0
+          for folder in sorted((root/'raw-layers').iterdir()):
+              if not folder.is_dir() or not folder.name.endswith('-s32'):continue
+              floor_str,block,_=folder.name.split('-')
+              floor=int(floor_str)
+              if floor not in (1,2):continue
+              s32_count+=1
+              bx=int(block[:4],16);by=int(block[4:],16)
+              x0=32704+(bx-32767)*64;y0=32704+(by-32767)*64
+              layer3=(folder/'layer3.bin').read_bytes()
+              assert len(layer3)==16384,(folder,len(layer3))
+              for i,(a,b) in enumerate(struct.iter_unpack('<HH',layer3)):
+                  x=x0+i%64;y=y0+i//64
+                  assert (x,y) not in source[floor]
+                  source[floor][(x,y)]=(a,b)
+              layer4=(folder/'layer4.bin').read_bytes()
+              group_num=struct.unpack_from('<i',layer4,0)[0]
+              pos=4;group_ids=set()
+              for gi in range(group_num):
+                  gid,n=struct.unpack_from('<hH',layer4,pos);pos+=4
+                  group_ids.add(gid);group_counts[floor][gid]+=n
+                  pos+=7*n
+              assert pos==len(layer4)
+              post=(folder/'post-layer4.bin').read_bytes()
+              n5=struct.unpack_from('<i',post,0)[0]; assert 0<=n5<=100000
+              assert 4+n5*5 <= len(post)
+              for i in range(n5):
+                  x,y,gid,t=struct.unpack_from('<BBHB',post,4+i*5)
+                  exists=gid in group_ids
+                  opacity_rows.append((floor,block,x,y,gid,t,int(exists)))
+                  l5_totals[(floor,'total')]+=1
+                  if not exists:l5_totals[(floor,'unlinked')]+=1
+                  l5_totals[(floor,'type_'+str(t))]+=1
+          assert s32_count==28 and {f:len(source[f]) for f in (1,2)}=={1:12*4096,2:16*4096}
+          assert len(opacity_rows)==39789 and all(x[-1]==1 for x in opacity_rows)
+
+          (out/'csv').mkdir(exist_ok=True);(out/'directional').mkdir(exist_ok=True)
+          with (out/'csv/layer5-opacity-group-links.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.writer(f);w.writerow(['floor','block','rawX','rawY','layer4GroupId','type','groupPresentInSameS32'])
+              w.writerows(opacity_rows)
+
+          report={'version':'V6.2','status':'CANDIDATE_ONLY','sourceRun':39381626131,
+                  'sourceMap':'S32 priority; SEG not merged','passageRuleReference':'https://github.com/tony1223/L1MapViewer/blob/main/plans/passrule_txt.md',
+                  'authenticSanctuaryEngineCodeExamined':False,'actualOriginalPassabilityProven':False,
+                  'layer5TransparencyTriggerProven':False,'gameFilesModified':False,
+                  'layer5Total':len(opacity_rows),'layer5AllTypes':dict(Counter(str(x[5]) for x in opacity_rows)),
+                  'layer5AllReferencesResolveInSameBlock':all(x[-1] for x in opacity_rows),
+                  'floorResults':{}}
+          page_maps={}
+          # Candidate FOUR-direction boundary rules according to L1MapViewer/MapTool research:
+          # N(x,y) uses attr1(x,y); S(x,y) uses attr1(x,y+1);
+          # W(x,y) uses attr2(x-1,y); E(x,y) uses attr2(x,y).
+          # The coordinate-system and engine-identity assumptions are explicitly NOT proven.
+          for floor in (1,2):
+              grid=source[floor]
+              xl=min(x for x,y in grid);yl=min(y for x,y in grid)
+              xr=max(x for x,y in grid);yr=max(y for x,y in grid)
+              width=xr-xl+1;height=yr-yl+1
+              moves={};unrecip=[];pass_dir=Counter()
+              dirs=[('N',0,-1,1),('S',0,1,2),('W',-1,0,4),('E',1,0,8)]
+              for x,y in grid:
+                  bits=0
+                  for d,dx,dy,flag in dirs:
+                      if (x+dx,y+dy) not in grid:continue
+                      if d=='N':v=grid[x,y][0]
+                      elif d=='S':v=grid[x,y+1][0]
+                      elif d=='W':v=grid[x-1,y][1]
+                      else:v=grid[x,y][1]
+                      if not(v&1):bits|=flag;pass_dir[d]+=1
+                  moves[x,y]=bits
+              for (x,y),bits in moves.items():
+                  for d,dx,dy,flag in dirs:
+                      if bits&flag:
+                          other=moves.get((x+dx,y+dy),0)
+                          reverse={'N':2,'S':1,'W':8,'E':4}[d]
+                          if not(other&reverse):unrecip.append((x,y,d))
+              assert not unrecip,unrecip[:4]
+              nodes_by_component={};component_of={};cid=0
+              for xy in grid:
+                  if xy in component_of:continue
+                  todo=deque([xy]);component_of[xy]=cid;size=0
+                  while todo:
+                      x,y=todo.popleft();size+=1;bits=moves[x,y]
+                      for d,dx,dy,flag in dirs:
+                          n=(x+dx,y+dy)
+                          if bits&flag and n not in component_of:
+                              component_of[n]=cid;todo.append(n)
+                  nodes_by_component[cid]=size;cid+=1
+              port_reports=[]
+              for p in ports:
+                  if p['floor']!=floor:continue
+                  x=p['estimatedWorldX'];y=p['estimatedWorldY']
+                  own=component_of.get((x,y))
+                  around=Counter(component_of[(x+dx,y+dy)] for dx,dy in product(range(-3,4),repeat=2)
+                                 if (x+dx,y+dy) in component_of and moves[(x+dx,y+dy)]!=0)
+                  port_reports.append({'name':p['name'],'worldX':x,'worldY':y,'targetMapID':p['targetMapID'],
+                                       'tileInExtractedS32':own is not None,'componentAtPortal':own,
+                                       'localNonIsolatedComponents':around.most_common(4),
+                                       'originalWarpDestinationVerified':False})
+              arr=bytearray([255])*(width*height)
+              for (x,y),mask in moves.items():arr[(y-yl)*width+x-xl]=mask
+              (out/f'directional/map-{floor}.bin').write_bytes(arr)
+              old_open=sum(not(a&1) for a,b in grid.values())
+              nedge=sum(z.bit_count() for z in moves.values())
+              pagesize=sum(n>1 for n in nodes_by_component.values())
+              stats={'floor':floor,'originX':xl,'originY':yl,'width':width,'height':height,
+                     'knownCells':len(grid),'candidateEdgesDirected':nedge,
+                     'candidateEdgesUndirected':nedge//2,'directionCounts':dict(pass_dir),
+                     'symmetryViolations':len(unrecip),'graphComponentCount':cid,
+                     'nonSingletonComponents':pagesize,'largestComponentSizes':sorted(nodes_by_component.values(),reverse=True)[:12],
+                     'formerAttr1Bit0ClearCells':old_open,'edgeDerivedNonisolatedCells':sum(z!=0 for z in moves.values()),
+                     'layer5OpacityRecords':l5_totals[(floor,'total')],
+                     'layer5UnlinkedReferences':l5_totals[(floor,'unlinked')],
+                     'portalCandidates':port_reports}
+              report['floorResults'][str(floor)]=stats
+              page_maps[str(floor)]={'originX':xl,'originY':yl,'width':width,'height':height,
+                 'mask64':base64.b64encode(arr).decode(),'portals':[{'x':p['worldX'],'y':p['worldY'],'name':p['name']} for p in port_reports]}
+              print('Map',floor,'known',len(grid),'edges',nedge//2,'components',cid,
+                    'largest',stats['largestComponentSizes'][:3],'layer5',stats['layer5OpacityRecords'],flush=True)
+
+          (out/'summary-v6.2.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          page='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>V6.2 Sanctuary directional passage evidence</title>
+          <style>body{font:14px system-ui;background:#141923;color:#eee;padding:12px}canvas{max-width:98vw;image-rendering:pixelated;background:#080a10;border:1px solid #637}
+          select,button{font:inherit}small{display:block;color:#b9cadb;margin:10px 0}</style>
+          <h2>V6.2 / Sanctuary S32 directional passage candidate</h2>
+          <label>Floor <select id="floor"><option value="1">1F</option><option value="2">2F</option></select></label>
+          <label>View <select id="mode"><option value="directions">4-direction openness</option><option value="solid">isolated vs directional</option></select></label>
+          <p id="stat"></p><canvas id="cv"></canvas><p id="point"></p>
+          <small>Source: V6.1 raw S32 Layer3, candidate rule from public L1MapViewer/MapTool notes. White=4 directions; blue=2-3; amber=1; grey=isolated; yellow=unverified portal. THIS IS NOT A PROVEN NATIVE ENGINE RUNTIME.</small>
+          <script id="data" type="application/json">__DATA__</script><script>
+          'use strict';const maps=JSON.parse(document.getElementById('data').textContent);let m,raw;
+          const sel=document.getElementById('floor'),mode=document.getElementById('mode'),cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+          function paint(){m=maps[sel.value];raw=Uint8Array.from(atob(m.mask64),c=>c.charCodeAt(0));cv.width=m.width;cv.height=m.height;
+          const image=ctx.createImageData(m.width,m.height);let total=0;
+          for(let i=0;i<raw.length;i++){const v=raw[i],k=i*4,degree=(v&1?1:0)+(v&2?1:0)+(v&4?1:0)+(v&8?1:0);
+          let c=v===255?[2,4,8]:v===0?[58,64,77]:degree===1?[231,171,62]:degree===2?[76,135,221]:[224,236,239];
+          if(mode.value==='solid'&&v!==255)c=v===0?[76,78,82]:[114,174,132];
+          image.data[k]=c[0];image.data[k+1]=c[1];image.data[k+2]=c[2];image.data[k+3]=255;if(v!==255)total++}
+          ctx.putImageData(image,0,0);for(const p of m.portals){const x=p.x-m.originX,y=p.y-m.originY;if(x<0||y<0||x>=m.width||y>=m.height)continue;ctx.fillStyle='#ffe04d';ctx.fillRect(x-1,y-1,3,3)}
+          cv.style.width=Math.min(window.innerWidth-45,m.width*2)+'px';
+          document.getElementById('stat').textContent=`floor ${sel.value}: ${total} S32 source cells, ${m.width}x${m.height} bounds`}
+          sel.onchange=paint;mode.onchange=paint;cv.addEventListener('pointerup',e=>{const r=cv.getBoundingClientRect();const x=Math.floor((e.clientX-r.left)/r.width*cv.width),y=Math.floor((e.clientY-r.top)/r.height*cv.height);if(x<0||y<0||x>=cv.width||y>=cv.height)return;const v=raw[y*cv.width+x];document.getElementById('point').textContent=`world ${m.originX+x},${m.originY+y}: ${v===255?'no block': 'candidate directional bits '+v.toString(2).padStart(4,'0')}`});paint();
+          </script>'''
+          (out/'directional-preview-v6.2.html').write_text(page.replace('__DATA__',json.dumps(page_maps,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c')),encoding='utf-8')
+          (out/'README.txt').write_text('''V6.2 S32 candidate analysis ONLY.
+          Passage algorithm source: https://github.com/tony1223/L1MapViewer/blob/main/plans/passrule_txt.md
+          Layer3: attr1 controls N/S edges, attr2 controls W/E edges in cited community algorithm.
+          Layer5: X,Y,GroupId,Type (5 bytes each), group references tested against Layer4.
+          Not verified to be Sanctuary executable client or server movement implementation.
+          Layer5 associations DO NOT prove fade alpha or trigger mechanism.
+          No map collision, rendering, events, or build-slknight-web.yml changes made.
+          ''',encoding='utf-8')
+          assert report['floorResults']['1']['layer5OpacityRecords']==16646
+          assert report['floorResults']['2']['layer5OpacityRecords']==23143
+          print('V6.2 PASS direction data and opacity linkage; all evidence-only, no game code changed')
+          PY_AUDIT
+          python3 /tmp/v62-directional-evidence.py v61 audit
+
+      - name: V6.2 Verify portal connectivity candidate and independent wall references
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_FINAL'
+          import csv,json
+          from pathlib import Path
+          p=Path('audit');r=json.loads((p/'summary-v6.2.json').read_text('utf-8'))
+          assert r['status']=='CANDIDATE_ONLY'
+          assert not r['actualOriginalPassabilityProven']
+          assert not r['layer5TransparencyTriggerProven']
+          assert r['gameFilesModified'] is False
+          assert r['layer5Total']==39789 and r['layer5AllTypes']=={'0':39789}
+          assert r['layer5AllReferencesResolveInSameBlock']
+          counts=[]
+          for f,expected,edge,portals in [('1',49152,9857,6),('2',65536,20876,14)]:
+              z=r['floorResults'][f]
+              assert z['knownCells']==expected and z['candidateEdgesUndirected']==edge
+              assert z['symmetryViolations']==0 and z['layer5UnlinkedReferences']==0
+              assert len(z['portalCandidates'])==portals
+              path=p/f'directional/map-{f}.bin'
+              assert path.stat().st_size==z['width']*z['height']
+              counts.append(z['layer5OpacityRecords'])
+          assert counts==[16646,23143]
+          with (p/'csv/layer5-opacity-group-links.csv').open(encoding='utf-8-sig',newline='') as f:
+              assert sum(1 for _ in csv.reader(f))==39790
+          assert (p/'directional-preview-v6.2.html').stat().st_size>10000
+          print('V6.2 PASS: 2 floors, 30733 symmetric edge connections, 39789 layer5 group links; no game changes')
+          PY_FINAL
+          python3 - <<'PY_JS'
+          from pathlib import Path
+          import re
+          s=Path('audit/directional-preview-v6.2.html').read_text('utf-8')
+          scripts=re.findall(r'<script>(.*?)</script>',s,re.S)
+          assert len(scripts)==1
+          Path('/tmp/v62-preview.js').write_text(scripts[0],encoding='utf-8')
+          PY_JS
+          node --check /tmp/v62-preview.js
+
+      - name: V6.2 Upload candidate passage and original Layer5 object-link audit only
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-V6.1-Preserved-V6.0-Knight-Scale-Evidence
-          path: legacy-v60/
+          name: Sanctuary-Map-V6.2-Original-Directional-and-Opacity-Link-Evidence
+          path: audit/
           if-no-files-found: error
           retention-days: 60
