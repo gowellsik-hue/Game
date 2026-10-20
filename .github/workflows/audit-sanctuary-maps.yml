@@ -1,14 +1,14 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V6.5
-# Original Sanctuary ZIP XML complete decrypt and NPC/spawn reference check.
-# Based on successful MAP V6.4 run 39402429574 and native map V6.3 run 39385472903.
-# V6.4 established 15,389 ZIP members; 160 original XML (159 encrypted, 1 plaintext).
-# AES decryption method verified against six original Sanctuary map configuration files.
-# Open-source algorithm source: tony1223/PakViewer src/Lin.Helper.Core/Xml/XmlCracker.cs
-# MAP NPC pins are NOT live monster spawns. No real monster count assumed.
-# NO changes to build-slknight-web.yml, maps, monsters, stats, pages, or gameplay.
-name: audit-sanctuary-maps.yml | V6.5 | Original Knight Scale Audit
+# VERSION: V6.6
+# PURPOSE: Count REAL spawn SQL records and native coordinate regions for TI Dungeon 1F/2F.
+# Original Sanctuary 1F/2F S32 passability comes from MAP V6.3 (run 39385472903).
+# Spawns are HISTORICAL L1J-TW SERVER REFERENCES, not Sanctuary server originals.
+# Two pinned independent SQL mirrors are cross-compared field-by-field.
+# Distinguish SQL row count, configured population, region size, and passable tiles.
+# Do not infer exact client monster respawn schedule from SQL zero delay values.
+# Does NOT modify game engine, R42 map/events, R43 suggestion, or GitHub Pages.
+name: audit-sanctuary-maps.yml | V6.6 | Original Knight Scale Audit
 
 "on":
   workflow_dispatch:
@@ -21,293 +21,344 @@ permissions:
   actions: read
 
 jobs:
-  decrypt-original-client-xml:
-    name: V6.5 | Original 160 XML decrypted and NPC/spawn reference audit
+  original-map-spawn-zones:
+    name: V6.6 | Native S32 walkable spawn areas and historical SQL points
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 35
     steps:
-      - name: V6.5 Restore successful V6.4 complete ZIP catalog
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39402429574
-          name: Sanctuary-Map-V6.4-Original-Monster-Spawn-Source-Discovery
-          github-token: ${{ github.token }}
-          path: v64
-
-      - name: V6.5 Restore V6.3 original TI dungeon world-coordinate boundaries
+      - name: V6.6 Restore original Sanctuary Map V6.3 native S32 edges
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
           run-id: 39385472903
           name: Sanctuary-Map-V6.3-Native-Passage-and-Wall-Groups-Handoff
           github-token: ${{ github.token }}
-          path: v63
+          path: handoff
 
-      - name: V6.5 Download ONLY Sanctuary original archive z36 for all 160 XML
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: V6.6 Download two pinned L1J-TW public SERVER spawn databases
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p original reports
-          gh release download v1.0.0 -R "$GITHUB_REPOSITORY" \
-            -p 'Sanctuary.of.Aden.-.Copy.z36' -D original --clobber
-          test -s original/Sanctuary.of.Aden.-.Copy.z36
-          command -v openssl
-          openssl version
-          echo 'Ready: source volume containing all original 160 client XML files'
+          mkdir -p source reports
+          # Pinned commits; do not silently use an unrelated fresh database.
+          A=4580bb7438fb2646d53610c9f12e2b2bf45080ab
+          B=0212802a625b36af3a0df2c513acc2713902f4d0
+          curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
+            "https://raw.githubusercontent.com/L1Rj/L1j-TW/$A/db/MyISAM/spawnlist.sql" \
+            -o source/a-spawnlist.sql
+          curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
+            "https://raw.githubusercontent.com/L1Rj/L1j-TW/$A/db/MyISAM/spawnlist_boss.sql" \
+            -o source/a-boss.sql
+          curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
+            "https://raw.githubusercontent.com/tpai/docker-l1jtw-server/$B/L1J-TW_3.80c/db/Taiwan/spawnlist.sql" \
+            -o source/b-spawnlist.sql
+          curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
+            "https://raw.githubusercontent.com/tpai/docker-l1jtw-server/$B/L1J-TW_3.80c/db/Taiwan/spawnlist_boss.sql" \
+            -o source/b-boss.sql
+          test "$(wc -c < source/a-spawnlist.sql)" -gt 200000
+          test "$(wc -c < source/b-spawnlist.sql)" -gt 200000
+          test "$(wc -c < source/a-boss.sql)" -gt 1000
+          test "$(wc -c < source/b-boss.sql)" -gt 1000
+          sha256sum source/*.sql > reports/v66-sql-sha256.txt
+          echo 'Source provenance: historical L1J-TW, NOT Sanctuary server data.'
 
-      - name: V6.5 CRC-verify, decrypt ALL XML and separate NPC UI pins from monster spawn
+      - name: V6.6 Extract ALL 1F/2F spawn rectangles and map valid source cells
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/v65-original-xml-audit.py <<'PY_V65'
+          cat > /tmp/v66-map-spawn-zones.py <<'PY_V66'
           #!/usr/bin/env python3
-          """V6.5: decrypt every source-archive XML, classify original monster spawn references.
-          Source decryption compatible with Lin.Helper.Core.Xml.XmlCracker (PakViewer).
-          Never treat map UI NPC icons or static zones as monster spawns.
+          """V6.6: historical L1J spawn rectangles mapped onto Sanctuary V6.3 S32 candidate walk grid.
+          The historical L1J server is NOT proven to be Sanctuary's live game server.
           """
           from pathlib import Path
-          from collections import Counter
-          import csv, hashlib, json, re, struct, subprocess, sys, zlib
-          import xml.etree.ElementTree as ET
+          from collections import Counter, defaultdict, deque
+          import csv
+          import hashlib
+          import json
+          import re
+          import sys
 
-          PLAN = Path(sys.argv[1]); VOLUME = Path(sys.argv[2]); BOUNDS = Path(sys.argv[3]); OUT = Path(sys.argv[4])
-          OUT.mkdir(parents=True, exist_ok=True)
-          (OUT/'decoded-xml').mkdir(exist_ok=True)
-          meta = json.loads(PLAN.read_text(encoding='utf-8'))
-          assert meta['totalZipRecords']==15389 and meta['allNamesInventoried']
-          assert meta['selectedFiles']==215 and meta['skippedFiles']==8
-          assert VOLUME.stat().st_size==100000000, ('Incorrect source z36 volume size', VOLUME.stat().st_size)
-          items=[x for x in meta['selected'] if x['rel'].startswith('xml/') and x['rel'].lower().endswith('.xml')]
-          assert len(items)==160 and all(x['disk']==35 for x in items)
-          assert not any(x['rel'].startswith('xml/') for x in meta['notInspected'])
+          SRCDIR=Path(sys.argv[1]); HAND=Path(sys.argv[2]); OUT=Path(sys.argv[3]); OUT.mkdir(parents=True,exist_ok=True)
+          SOURCES={
+           'a':('L1Rj/L1j-TW','4580bb7438fb2646d53610c9f12e2b2bf45080ab'),
+           'b':('tpai/docker-l1jtw-server','0212802a625b36af3a0df2c513acc2713902f4d0')
+          }
 
-          bnds={}
-          for mid in (1,2):
-              source=json.loads((BOUNDS/f'native/floor-{mid}-index.json').read_text(encoding='utf-8'))
-              origin=source['origin'];size=source['size']
-              bnds[mid]=(origin[0],origin[1],origin[0]+size[0],origin[1]+size[1])
+          def rows(filename,table):
+              text=filename.read_text(encoding='utf-8-sig')
+              out=[]; total=0
+              expression=re.compile(r'^INSERT\s+INTO\s+`?'+re.escape(table)+r'`?\s+VALUES\s*',re.I)
+              for line in text.splitlines():
+                  s=line.strip()
+                  match=expression.match(s)
+                  if match:s=s[match.end():]
+                  elif not s.startswith('('):continue
+                  if not (s.startswith('(') and (s.endswith('),') or s.endswith(');'))):continue
+                  # SQL dumps used for this audit have one VALUES tuple per line. Count and
+                  # verify all map=1/2 rows independently in both source datasets.
+                  inner=s[1:-2]
+                  try:
+                      values=next(csv.reader([inner],delimiter=',',quotechar="'",doublequote=True,
+                                             skipinitialspace=True,escapechar='\\'))
+                  except csv.Error:continue
+                  if len(values)!=21:continue
+                  total+=1
+                  mapid=int(values[16] if table=='spawnlist' else values[15])
+                  if mapid in (1,2):
+                      if table=='spawnlist':
+                          info={'kind':'normal','sourceRowID':int(values[0]),'name':values[1],
+                                'configuredCount':int(values[2]),'npcID':int(values[3]),'groupID':int(values[4]),
+                                'originX':int(values[5]),'originY':int(values[6]),
+                                'randomX':int(values[7]),'randomY':int(values[8]),
+                                'bbox':[int(v) for v in values[9:13]],'heading':int(values[13]),
+                                'minRespawnRaw':int(values[14]),'maxRespawnRaw':int(values[15]),'mapID':mapid}
+                      else:
+                          info={'kind':'boss','sourceRowID':int(values[0]),'name':values[1],
+                                'configuredCount':int(values[3]),'npcID':int(values[4]),'groupID':int(values[5]),
+                                'originX':int(values[6]),'originY':int(values[7]),
+                                'randomX':int(values[8]),'randomY':int(values[9]),
+                                'bbox':[int(v) for v in values[10:14]],'heading':int(values[14]),
+                                'minRespawnRaw':None,'maxRespawnRaw':None,'mapID':mapid}
+                      out.append(info)
+              print('PARSED',filename.name,table,'allRows',total,'selected1F2F',len(out),flush=True)
+              assert total>=50,(filename,total)
+              return out
 
-          KEY='dc8401212a40200add25b9a70db9c94e'
-          IV='3e0978aac4d53063300c5f9a807f2246'
+          def signature(r):
+              return (r['kind'],r['mapID'],r['npcID'],r['configuredCount'],r['originX'],r['originY'],
+                      r['randomX'],r['randomY'],tuple(r['bbox']))
 
-          def digest(b): return hashlib.sha256(b).hexdigest()
+          normA=rows(SRCDIR/'a-spawnlist.sql','spawnlist')
+          normB=rows(SRCDIR/'b-spawnlist.sql','spawnlist')
+          bossA=rows(SRCDIR/'a-boss.sql','spawnlist_boss')
+          bossB=rows(SRCDIR/'b-boss.sql','spawnlist_boss')
+          assert len(normA)==len(normB)==21,('expected 21 normal rows',len(normA),len(normB))
+          assert Counter(signature(r) for r in normA)==Counter(signature(r) for r in normB),'Two historical SQL normal sources DISAGREE'
+          # Several unrelated bosses may have map IDs 1/2 across revisions. Identify
+          # Baphomet strictly using ID 45573 and compare his original coordinates.
+          bossA=[b for b in bossA if b['npcID']==45573]
+          bossB=[b for b in bossB if b['npcID']==45573]
+          assert len(bossA)==len(bossB)==1
+          assert signature(bossA[0])==signature(bossB[0])
+          assert bossA[0]['mapID']==2 and bossA[0]['configuredCount']==1
+          assert (bossA[0]['originX'],bossA[0]['originY'])==(32706,32846)
+          assert bossA[0]['bbox']==[32704,32842,32711,32849]
+          assert sum(x['configuredCount'] for x in normA if x['mapID']==1)==153
+          assert sum(x['configuredCount'] for x in normA if x['mapID']==2)==210
+          assert sum(x['mapID']==1 for x in normA)==7
+          assert sum(x['mapID']==2 for x in normA)==14
+          records=normA+bossA
 
-          def extract(e,fp):
-              fp.seek(e['offset'])
-              h=fp.read(30)
-              assert len(h)==30 and h[:4]==b'PK\x03\x04', ('Bad ZIP local header',e['rel'])
-              p=struct.unpack('<4s5H3I2H',h)
-              flag,method,nlen,elen=p[2],p[3],p[9],p[10]
-              assert not flag&1 and method==e['method'],e['rel']
-              name=fp.read(nlen).decode('utf-8' if flag&0x800 else 'cp949',errors='replace').replace('\\','/')
-              assert name==e['name'],(name,e['name'])
-              fp.seek(elen,1)
-              compressed=fp.read(e['packed'])
-              assert len(compressed)==e['packed']
-              data=compressed if method==0 else zlib.decompress(compressed,-15)
-              assert len(data)==e['unpacked'] and zlib.crc32(data)&0xffffffff==e['crc32'],e['rel']
-              return data
+          with (HAND/'handoff-manifest.json').open(encoding='utf-8') as f:hand=json.load(f)
+          assert hand['version']=='V6.3'
+          assert hand['passabilityIsOriginalMapToolCandidate']
+          assert not hand['SanctuaryExecutableRulesVerified']
+          assert hand['baphometProjectionVerifiedRGSS']==[156,100]
 
-          def decode(raw):
-              if raw.startswith((b'<?xml',b'<',b'\xef\xbb\xbf')):return raw,'plaintext'
-              if len(raw)<=4 or raw[0]!=0x58:return raw,'unknown-signature'
-              payload=raw[4:]
-              length=(len(payload)//16)*16
-              encrypted=payload[:length]
-              if encrypted:
-                  result=subprocess.run(['openssl','enc','-d','-aes-128-cbc','-nopad','-K',KEY,'-iv',IV],
-                                        input=encrypted,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True)
-                  assert len(result.stdout)==length
-                  block=payload[length-16:length]
-                  decrypted=result.stdout
-              else:
-                  block=bytes.fromhex(IV)
-                  decrypted=b''
-              decrypted+=bytes(a^b for a,b in zip(payload[length:],block))
-              first=b'\xef' if raw[1:4]==b'\xbb\xbf<' else b'<'
-              return first + raw[1:4] + decrypted,'PakViewer-AES128-CBC-tail-XOR'
+          indices={};walks={};reachable={};roots={1:(32669,32802),2:(32665,32788)}
+          for floor in (1,2):
+              j=json.loads((HAND/f'native/floor-{floor}-index.json').read_text(encoding='utf-8'))
+              raw=(HAND/f'native/floor-{floor}-4way.bin').read_bytes()
+              assert hashlib.sha256(raw).hexdigest()==j['passageSHA256']
+              assert j['nativeMapID']==floor and j['directionalEdgeReciprocityVerified']
+              ox,oy=j['origin'];w,h=j['size'];assert len(raw)==w*h
+              def edge_at(x,y, raw=raw, ox=ox,oy=oy,w=w,h=h):
+                  if 0<=x-ox<w and 0<=y-oy<h:return raw[(y-oy)*w+(x-ox)]
+                  return 255
+              start=roots[floor];assert edge_at(*start) not in (0,255)
+              q=deque([start]);visited={start}
+              while q:
+                  x,y=q.popleft();bits=edge_at(x,y)
+                  for dx,dy,b,rev in ((0,-1,1,2),(0,1,2,2,1),(-1,0,4,8),(1,0,8,4)):
+                      xx=x+dx;yy=y+dy
+                      if bits&b and edge_at(xx,yy)&rev and (xx,yy) not in visited:
+                          visited.add((xx,yy));q.append((xx,yy))
+              indices[floor]=j;walks[floor]=raw;reachable[floor]=visited
+              target=(32737,32877) if floor==1 else (32706,32846)
+              assert target in visited,('Original route broken',floor)
+              print('MAP',floor,'original connected tiles',len(visited),flush=True)
 
-          def parse_safe(blob):
-              try:return ET.fromstring(blob),None
-              except (ET.ParseError,LookupError,ValueError) as e:
-                  reason=str(e)
-                  for encoding in ('euc-kr','cp949','big5','shift_jis','utf-8'):
-                      try:
-                          s=blob.decode(encoding)
-                          s=re.sub(r'(<\?xml[^>]*encoding\s*=\s*["\'])[^"\']+(["\'][^>]*\?>)',r'\1utf-8\2',s,count=1,flags=re.I)
-                          return ET.fromstring(s.encode('utf-8')),None
-                      except (UnicodeDecodeError,ET.ParseError,ValueError):continue
-                  return None,reason
+          # Draw a native 1-pixel-per-cell walk mask, and draw genuine external SQL spawn
+          # polygons on top of it. Never treat a rectangle as a fixed spawn coordinate.
+          def native_cell(floor,x,y):
+              j=indices[floor];ox,oy=j['origin'];w,h=j['size']
+              if not (ox<=x<ox+w and oy<=y<oy+h):return 255
+              return walks[floor][(y-oy)*w+(x-ox)]
 
-          def coord(el):
-              a={k.lower():v for k,v in el.attrib.items()}
-              for k in ('loc','pos','coord','position','location'):
-                  if k in a:
-                      numbers=re.match(r'^\s*(\d{3,6})\s*[, ]\s*(\d{3,6})(?:\b|\s*$)',a[k])
-                      if numbers:return tuple(map(int,numbers.groups()))
-              for x,y in (('x','y'),('locx','locy'),('worldx','worldy'),('posx','posy'),('spawnx','spawny')):
-                  if x in a and y in a:
-                      try:return (int(a[x]),int(a[y]))
-                      except ValueError:pass
-              return None
+          def spawn_bbox(row):
+              x1,y1,x2,y2=row['bbox']
+              if x1<=x2 and y1<=y2 and (x2-x1+1)*(y2-y1+1)>1:
+                  return [x1,y1,x2,y2],'source_bbox'
+              rx,ry=row['randomX'],row['randomY']
+              if rx or ry:return [row['originX']-rx,row['originY']-ry,row['originX']+rx,row['originY']+ry],'random_xy'
+              return [row['originX'],row['originY'],row['originX'],row['originY']],'single_point'
 
-          spawn_re=re.compile(r'spawn|respawn|regen|monster|mob|creature',re.I)
-          npc_re=re.compile(r'\bnpc\b|npc[_-]',re.I)
-          summary=[];total_tags=Counter();map_npc=[];candidates=[];decrypt_counts=Counter();parse_fail=[];roots={};
-          with VOLUME.open('rb') as fp:
-              for e in sorted(items,key=lambda x:x['rel']):
-                  raw=extract(e,fp)
-                  plain=raw;layers=0;root=None;error=None
-                  # The *_e.xml copies are double-encrypted; the first decrypt forcibly
-                  # changes byte0 to '<', so restore byte0='X' before the second pass.
-                  for _ in range(4):
-                      root,error=parse_safe(plain)
-                      if root is not None:break
-                      if layers>=3 or not plain or plain[0] not in (0x58,0x3c):break
-                      attempt=plain if plain[0]==0x58 else bytes([0x58])+plain[1:]
-                      updated,method=decode(attempt)
-                      if updated==plain or method in ('plaintext','unknown-signature'):break
-                      plain=updated;layers+=1
-                  decrypt_counts[str(layers)]+=1
-                  path=OUT/'decoded-xml'/e['rel'].split('/',1)[1]
-                  path.write_bytes(plain)
-                  duplicate=e['rel'].endswith('_e.xml')
-                  canonical=e['rel'][:-6] if duplicate else e['rel']
-                  record={'relativePath':e['rel'],'canonicalSource':canonical,
-                          'duplicateReencryptedCopy':duplicate,
-                          'archiveSourceCRC32':e['crc32'],
-                          'encryptedSHA256':digest(raw),'decryptedSHA256':digest(plain),
-                          'bytes':len(raw),'decryptionLayers':layers,
-                          'xmlValid':root is not None,'rootTag':root.tag if root is not None else None,
-                          'xmlError':error,'mapUIIconMarkers':0,'spawnNamedElements':0,'reviewNpcElements':0}
-                  if root is None:
-                      parse_fail.append({'file':e['rel'],'error':error,'signature':plain[:32].hex()})
-                      summary.append(record)
-                      continue
-                  # Keep both physical encrypted variants as evidence, but inventory only
-                  # canonical originals; otherwise map UI NPC labels get counted twice.
-                  if duplicate:
-                      summary.append(record)
-                      continue
-                  roots[e['rel']]=root.tag
-                  for el in root.iter():
-                      tag=el.tag.rsplit('}',1)[-1] if isinstance(el.tag,str) else str(el.tag)
-                      total_tags[tag]+=1
-                      p=coord(el)
-                      matches=[mid for mid,(x0,y0,x1,y1) in bnds.items() if p and x0<=p[0]<x1 and y0<=p[1]]
-                      is_map_ui=e['rel'].startswith('xml/MapSystem') and tag.upper()=='NPC'
-                      if is_map_ui:
-                          record['mapUIIconMarkers']+=1
-                          map_npc.append({'source':e['rel'],'tag':tag,'coordinates':p or '',
-                                          'withinOriginalDungeonMapIDs':','.join(map(str,matches)),
-                                          'attributes':json.dumps(el.attrib,ensure_ascii=False,sort_keys=True),
-                                          'classification':'MAP_UI_NPC_ICON_NOT_LIVE_MONSTER_SPAWN'})
-                          continue
-                      matched_spawn=bool(spawn_re.search(tag) or any(spawn_re.search(k) for k in el.attrib))
-                      matched_npc=bool(npc_re.search(tag) or any(npc_re.search(k) for k in el.attrib))
-                      if matched_spawn or matched_npc:
-                          record['spawnNamedElements']+=int(matched_spawn)
-                          record['reviewNpcElements']+=int(matched_npc)
-                          candidates.append({'source':e['rel'],'tag':tag,'coordinates':p or '',
-                                            'withinOriginalDungeonMapIDs':','.join(map(str,matches)),
-                                            'attributes':json.dumps(el.attrib,ensure_ascii=False,sort_keys=True),
-                                            'classification':'UNVERIFIED_XML_CONFIG_REFERENCE_NOT_SERVER_SPAWN'})
-                  summary.append(record)
+          def screen_poly(floor,b):
+              p=indices[floor]['visualProjection']['pixelFormula']
+              pts=[]
+              for x,y in ((b[0],b[1]),(b[2]+1,b[1]),(b[2]+1,b[3]+1),(b[0],b[3]+1)):
+                  px=p['xSumMultiplier']*(x+y)+p['xOffset']
+                  py=p['yDifferenceMultiplier']*(y-x)+p['yOffset']
+                  pts.append([round(px/16,2),round(py/16,2)])
+              return pts
 
-          (OUT/'xml-source-index.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          (OUT/'xml-parse-errors.json').write_text(json.dumps(parse_fail,ensure_ascii=False,indent=2),encoding='utf-8')
-          with (OUT/'xml-tags.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w=csv.writer(f);w.writerow(['tag','occurrences']);w.writerows(total_tags.most_common())
-          for nm,records in [('npc-map-icons-NOT-spawns.csv',map_npc),('npc-and-spawn-xml-REFERENCES-NOT-verified.csv',candidates)]:
-              with (OUT/nm).open('w',encoding='utf-8-sig',newline='') as f:
-                  columns=['source','tag','coordinates','withinOriginalDungeonMapIDs','attributes','classification']
-                  w=csv.DictWriter(f,fieldnames=columns);w.writeheader();w.writerows(records)
+          zones=defaultdict(lambda:{'records':[],'sumConfiguredPopulation':0})
+          for row in records:
+              floor=row['mapID'];b,mode=spawn_bbox(row)
+              j=indices[floor];ox,oy=j['origin'];w,h=j['size']
+              assert ox<=b[0]<=b[2]<ox+w and oy<=b[1]<=b[3]<oy+h,(row,b,'out of original source map')
+              assert b[0]<=row['originX']<=b[2] and b[1]<=row['originY']<=b[3]
+              row['bboxMode']=mode
+              row['nativeSpawnPolygon']=b
+              row['rgssProjectionPolygon']=screen_poly(floor,b)
+              row['anchorNativePassageByte']=native_cell(floor,row['originX'],row['originY'])
+              row['anchorReachableFromDungeonEntrance']=((row['originX'],row['originY']) in reachable[floor])
+              row['serverOriginVerified']=False
+              key=(floor,row['kind'],tuple(b));zones[key]['records'].append(row)
+              zones[key]['sumConfiguredPopulation']+=row['configuredCount']
 
-          known={'xml/CollisionZone.xml':'CollisionZoneList',
-                 'xml/ExtMapAttr.xml':'ExtendedTileAttributes',
-                 'xml/MapSystem.xml':'Map_System_Configulation',
-                 'xml/MapSystem86.xml':'Map_System_Configulation',
-                 'xml/map_config.xml':'map_config',
-                 'xml/zone3.xml':'zoneinfo'}
-          for name,expected in known.items():assert roots.get(name)==expected,(name,roots.get(name),expected)
-          assert decrypt_counts==Counter({'0':1,'1':80,'2':79}),decrypt_counts
-          assert len(summary)==160 and len(roots)==80
-          hashes={r['relativePath']:r['decryptedSHA256'] for r in summary}
-          for record in summary:
-              if record['duplicateReencryptedCopy']:
-                  assert record['canonicalSource'] in hashes,record['relativePath']
-                  assert record['decryptedSHA256']==hashes[record['canonicalSource']],record['relativePath']
-          assert sum(x['mapUIIconMarkers'] for x in summary)==1122
-          stats={'version':'V6.5','status':'CLIENT_CONFIG_XML_DECODED_NOT_SERVER_SPAWN_DATABASE',
-                 'sourceRunV64':39402429574,'sourceRunV63':39385472903,
-                 'archiveMembersIndexed':15389,'sourceXMLTotal':len(items),
-                 'uniqueCanonicalXML':len(roots),'duplicateReencryptedXML':80,
-                 'xmlDecryptionDepths':dict(decrypt_counts),
-                 'parsedXMLCount':len(roots),'parseFailures':len(parse_fail),
-                 'mapSystemNpcMapIcons':len(map_npc),'nonMapIconNpcOrSpawnXmlReferences':len(candidates),
-                 'originalMonsterSpawnCoordinatesVerified':False,'originalMonsterPopulationVerified':False,
-                 'originalServerSpawnDatabaseFound':False,
-                 'sandboxExecutableLaunched':False,'SLKnightDataModified':False,
-                 'provenance':'PakViewer Lin.Helper.Core.Xml.XmlCracker compatible AES-128 CBC XOR tail, source ZIP CRC verified',
-                 'notice':'Static NPC UI pins and zone definitions are NOT live monster spawn locations.'}
-          (OUT/'v65-results.json').write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding='utf-8')
-          (OUT/'README.txt').write_text('V6.5 XML source decoding / no SLKnight changes\n'
-              'Original archive XML: 160 physical files; 80 unique configs, 80 doubled-encrypted copies.\n\n'
-              'AES-128 CBC + XOR tail algorithm from open-source tony1223/PakViewer.\n'
-              'All raw XML files are CRC-verified from original Sanctuary split ZIP.\n'
-              'MapSystem NPC elements = map UI icon markers, NOT confirmed live monster spawns.\n'
-              'Original LIVE Sanctuary server NPC spawns require authoritative server DB or packet logs.\n'
-              'Any XML NPC/spawn mentions are unverified metadata references, NOT adopted as game monsters.\n'
-              'No modifications to build-slknight-web.yml, monster counts or spawn positions.\n',encoding='utf-8')
-          print('PASS V6.5',json.dumps(stats,ensure_ascii=False),flush=True)
-          PY_V65
-          python3 -m py_compile /tmp/v65-original-xml-audit.py
-          python3 /tmp/v65-original-xml-audit.py \
-            v64/source-extraction-plan.json \
-            original/Sanctuary.of.Aden.-.Copy.z36 \
-            v63 reports
+          zone_rows=[];candidate_rows=[]
+          for (floor,kind,b),g in sorted(zones.items()):
+              x1,y1,x2,y2=b
+              rows=g['records'];count=0;connected=0
+              zone_name=f'M{floor}-'+('BOSS' if kind=='boss' else 'NORMAL')
+              for y in range(y1,y2+1):
+                  for x in range(x1,x2+1):
+                      if native_cell(floor,x,y) in (0,255):continue
+                      count+=1
+                      if (x,y) in reachable[floor]:
+                          connected+=1
+                          candidate_rows.append([zone_name,floor,x,y,kind,'V6.3_NATIVE_4WAY_CANDIDATE_NOT_VERIFIED_LIVE_SPAWN'])
+              assert connected>0,(floor,kind,'no reachable candidate tile')
+              zone_rows.append({'zoneID':zone_name,'floor':floor,'kind':kind,'regionX1':x1,'regionY1':y1,
+                                'regionX2':x2,'regionY2':y2,'areaCells':(x2-x1+1)*(y2-y1+1),
+                                'sourceSQLRows':len(rows),'monsterTypes':len({r['npcID'] for r in rows}),
+                                'configuredPopulation':g['sumConfiguredPopulation'],
+                                'candidatePassableTiles':count,'candidateReachableTiles':connected,
+                                'nativeRectSource':'two independent historical L1J-TW SQL files, NOT Sanctuary server',
+                                'nativeMovementSource':'original Sanctuary S32 MapTool 4way CANDIDATE'})
+              print('ZONE',zone_name, 'rect',b,'rows',len(rows),'configured',g['sumConfiguredPopulation'],
+                    'potential native tiles',count,'reachable',connected,flush=True)
 
-      - name: V6.5 Verify source provenance, original XML decoding and result classification
+          assert len(zone_rows)==3,zone_rows
+          assert len(records)==22
+          assert len({(r['mapID'],r['kind'],tuple(r['bbox'])) for r in records})==3
+
+          # SVG viewer: original walkability and candidate source-server region overlays.
+          for floor in (1,2):
+              j=indices[floor];ox,oy=j['origin'];w,h=j['size']
+              paths=[]
+              for y in range(oy,oy+h):
+                  start=None
+                  for x in range(ox,ox+w+1):
+                      valid=(x<ox+w and native_cell(floor,x,y) not in (0,255))
+                      if valid and start is None:start=x
+                      if not valid and start is not None:
+                          paths.append(f'M{start-ox},{y-oy}h{x-start}')
+                          start=None
+              parts=['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+str(w+340)+' '+str(h+34)+'">',
+                     '<rect width="100%" height="100%" fill="#fff"/>',
+                     '<rect x="0" y="0" width="'+str(w)+'" height="'+str(h)+'" fill="#243446"/>',
+                     '<path d="'+' '.join(paths)+'" stroke="#bcd0df" stroke-width="1" fill="none"/>']
+              for z in zone_rows:
+                  if z['floor']!=floor:continue
+                  x1=z['regionX1']-ox;y1=z['regionY1']-oy;x2=z['regionX2']-ox;y2=z['regionY2']-oy
+                  isboss=z['kind']=='boss';c='#bb3333' if isboss else '#19894a'
+                  parts.append(f'<rect x="{x1}" y="{y1}" width="{x2-x1+1}" height="{y2-y1+1}" stroke="{c}" stroke-width="2" fill="{c}" fill-opacity="0.09"/>')
+              for x,y in [roots[floor],(32737,32877) if floor==1 else (32706,32846)]:
+                  parts.append(f'<circle cx="{x-ox+0.5}" cy="{y-oy+0.5}" r="3" fill="#ee8325" stroke="#fff" stroke-width="0.8"/>')
+              parts.append(f'<g font-family="Arial,sans-serif" fill="#222" font-size="12"><text x="{w+12}" y="25">Sanctuary floor {floor}: original S32 passage</text>')
+              yy=55
+              for z in zone_rows:
+                  if z['floor']!=floor:continue
+                  parts.append(f'<text x="{w+12}" y="{yy}">{z["zoneID"]} / SQL rows {z["sourceSQLRows"]}</text>')
+                  yy+=16
+                  parts.append(f'<text x="{w+12}" y="{yy}">Configured count {z["configuredPopulation"]}</text>')
+                  yy+=16
+                  parts.append(f'<text x="{w+12}" y="{yy}">Reachable source tiles {z["candidateReachableTiles"]}</text>')
+                  yy+=26
+              parts.append(f'<text x="{w+12}" y="{yy}">L1J reference, not Sanctuary</text>')
+              parts.append('</g></svg>')
+              (OUT/f'v66-floor-{floor}-source-spawn-regions.svg').write_text('\n'.join(parts),encoding='utf-8')
+
+          with (OUT/'v66-spawn-all-22-source-rows.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              cols=['mapID','kind','sourceRowID','npcID','name','configuredCount','originX','originY',
+                    'bboxMode','nativeSpawnPolygon','rgssProjectionPolygon','minRespawnRaw','maxRespawnRaw',
+                    'anchorNativePassageByte','anchorReachableFromDungeonEntrance','serverOriginVerified']
+              w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore');w.writeheader()
+              for row in records:
+                  a=dict(row)
+                  for k in ('nativeSpawnPolygon','rgssProjectionPolygon'):a[k]=json.dumps(a[k],ensure_ascii=False)
+                  w.writerow(a)
+          with (OUT/'v66-spawn-areas-and-population.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              cols=list(zone_rows[0].keys());w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(zone_rows)
+          with (OUT/'v66-reachable-source-spawn-cells.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.writer(f);w.writerow(['spawnZoneID','floor','nativeX','nativeY','kind','passageEvidence']);w.writerows(candidate_rows)
+          source_hashes={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in SRCDIR.glob('*.sql')}
+          result={'version':'V6.6','status':'HISTORICAL_L1J_SPAWN_ZONES_MAPPED_TO_SANCTUARY_S32_NOT_ORIGINAL_SERVER',
+                  'sourceSQLRefs':{'a':SOURCES['a'],'b':SOURCES['b']},'sourceSQLSHA256':source_hashes,
+                  'normalSourceRowsByFloor':{'1':7,'2':14},'normalConfiguredCountsByFloor':{'1':153,'2':210},
+                  'baphometSourceCount':1,'bossNativeWorldPosition':[32706,32846],
+                  'bossSpawnRect':[32704,32842,32711,32849],
+                  'independentHistoricalSourceValuesAgree':True,
+                  'spawnZones':zone_rows,
+                  'fullIndividualMonsterCoordinatesKnown':False,
+                  'originalSanctuaryServerSpawnListVerified':False,
+                  'originalSanctuaryExecutable4WayCollisionVerified':False,
+                  'staticConfigCountIsNotObservedConcurrentPopulation':True,
+                  'gameFilesModified':False,'sourceRangeCoordinatesNotIndividualSpawnCells':True,
+                  'nativeCandidateReachableCellRows':len(candidate_rows)}
+          (OUT/'v66-results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'README.txt').write_text(
+           'Sanctuary map audit V6.6, source-region overlay (READ-ONLY).\n'
+           '21 normal + one boss L1J-TW historical SQL rows; not proved original Sanctuary server.\n'
+           'Normal zones: floor1 32640..32767/32768..32895; floor2 32640..32831/32768..32895.\n'
+           'Baphomet: floor2 32704..32711/32842..32849; native boss world position 32706,32846.\n'
+           'SQL configured count (153/210) is NOT the number of distinct spawn coordinates (21 source rows).\n'
+           'Region passable cell count uses candidate V6.3 MapTool S32 4-way; real client rules unconfirmed.\n'
+           'SVGs illustrate source native coordinates and candidate passability.\n'
+           'No movement, R42/R43 game data, event pages, monster stats or Pages changes.\n',encoding='utf-8')
+          print('V6.6 VERIFIED: 21 normal + 1 Baphomet historical rows; all 3 source regions mapped to original Sanctuary native walk graph.',flush=True)
+
+          PY_V66
+          python3 -m py_compile /tmp/v66-map-spawn-zones.py
+          python3 /tmp/v66-map-spawn-zones.py source handoff reports
+
+      - name: V6.6 Verify complete original-coordinate rows and map evidence
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_VERIFY'
+          python3 - <<'PY_CHECK'
           from pathlib import Path
           import csv,json
-          out=Path('reports')
-          result=json.loads((out/'v65-results.json').read_text(encoding='utf-8'))
-          assert result['version']=='V6.5'
-          assert result['sourceXMLTotal']==160
-          assert result['archiveMembersIndexed']==15389
-          assert result['xmlDecryptionDepths']=={'0':1,'1':80,'2':79}
-          assert result['uniqueCanonicalXML']==80
-          assert result['duplicateReencryptedXML']==80
-          assert result['mapSystemNpcMapIcons']==1122
-          assert result['parsedXMLCount']==80
-          assert not result['originalMonsterSpawnCoordinatesVerified']
-          assert not result['originalMonsterPopulationVerified']
-          assert not result['originalServerSpawnDatabaseFound']
-          assert not result['sandboxExecutableLaunched']
-          assert not result['SLKnightDataModified']
-          assert len(list((out/'decoded-xml').glob('*.xml')))==160
-          files={x['relativePath']:x for x in json.loads((out/'xml-source-index.json').read_text(encoding='utf-8'))}
-          assert files['xml/MapSystem.xml']['rootTag']=='Map_System_Configulation'
-          assert files['xml/zone3.xml']['rootTag']=='zoneinfo'
-          assert files['xml/CollisionZone.xml']['rootTag']=='CollisionZoneList'
-          assert files['xml/ExtMapAttr.xml']['rootTag']=='ExtendedTileAttributes'
-          with (out/'npc-map-icons-NOT-spawns.csv').open(encoding='utf-8-sig',newline='') as fp:
-              assert sum(1 for row in csv.reader(fp))==1123
-          print('PASS V6.5: original XML decryption, 1122 map-UI NPC markers excluded from monster spawns')
-          PY_VERIFY
+          p=Path('reports')
+          z=json.loads((p/'v66-results.json').read_text(encoding='utf-8'))
+          assert z['version']=='V6.6' and z['independentHistoricalSourceValuesAgree']
+          assert z['normalSourceRowsByFloor']=={'1':7,'2':14}
+          assert z['normalConfiguredCountsByFloor']=={'1':153,'2':210}
+          assert z['baphometSourceCount']==1 and z['bossNativeWorldPosition']==[32706,32846]
+          assert z['bossSpawnRect']==[32704,32842,32711,32849]
+          assert len(z['spawnZones'])==3
+          assert not z['originalSanctuaryServerSpawnListVerified']
+          assert not z['originalSanctuaryExecutable4WayCollisionVerified']
+          assert not z['gameFilesModified']
+          with (p/'v66-spawn-all-22-source-rows.csv').open(encoding='utf-8-sig') as f:
+              rows=list(csv.DictReader(f));assert len(rows)==22
+          with (p/'v66-spawn-areas-and-population.csv').open(encoding='utf-8-sig') as f:
+              zones=list(csv.DictReader(f));assert len(zones)==3
+          total=sum(z['candidateReachableTiles'] for z in z['spawnZones'])
+          with (p/'v66-reachable-source-spawn-cells.csv').open(encoding='utf-8-sig') as f:
+              assert sum(1 for _ in csv.reader(f))==total+1
+          assert len(list(p.glob('v66-floor-*-source-spawn-regions.svg')))==2
+          print('PASS V6.6: every selected SQL spawn row, source region and reachable native tile enumerated')
+          print('V6.6 original Sanctuary server spawn: NOT verified; no SLKnight changes')
+          PY_CHECK
 
-      - name: V6.5 Upload 160 decrypted original client XML and monster reference report
-        if: always()
+      - name: V6.6 Upload source-coordinate spawn-region report and SVG maps
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V6.5-All-Original-XML-NPC-and-Spawn-Reference-Evidence
+          name: Sanctuary-Map-V6.6-Native-Spawn-Regions-SQL-Provenance
           path: reports/
-          if-no-files-found: error
           retention-days: 60
+          if-no-files-found: error
