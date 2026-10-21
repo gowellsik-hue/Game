@@ -1,12 +1,13 @@
 
 # FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V6.10
-# PURPOSE: Actually unpack 2,430,275 original native bytes using the recovered
-#          V6.9 lin.bin decompressor; do not claim these are monster spawns.
-# INPUT: successful V6.8 run 39455649091 and V6.9 run 39457763824.
-# KEEP: exact workflow filename and Original Knight Scale Audit name.
-# DO NOT modify SLKnight, maps, engine, Pages or any other workflow.
-name: audit-sanctuary-maps.yml | V6.10 | Original Knight Scale Audit
+# VERSION: V6.11
+# PURPOSE: Bypass further WinLicense layer-by-layer updates. Recover the distinct
+#          authentic TW13032701 native client from the original Sanctuary archive;
+#          trace real native socket receive call sites toward monster packet handlers.
+# SOURCE: user-supplied original Sanctuary release, not SLKnight or L1J SQL.
+# IMPORTANT: native socket call sites are NOT original initial monster spawn XY.
+# KEEP: workflow file/title unchanged except version; no changes to game or Pages.
+name: audit-sanctuary-maps.yml | V6.11 | Original Knight Scale Audit
 
 "on":
   workflow_dispatch:
@@ -19,178 +20,200 @@ permissions:
   actions: read
 
 jobs:
-  unpack-native-second-stage:
-    name: V6.10 | Unpack actual original lin.bin second code stage
+  alternate-original-client-receiver:
+    name: V6.11 | Locate native packet receive and its code path
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: V6.10 Restore original verified lin.bin from V6.8
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39455649091
-          name: Sanctuary-Map-V6.8-Original-Native-Packet-Code-Extraction
-          github-token: ${{ github.token }}
-          path: source-v68
-
-      - name: V6.10 Restore original decrypted first-stage bytes from V6.9
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39457763824
-          name: Sanctuary-Map-V6.9-Original-Lin-Bin-Decrypted-Stage1
-          github-token: ${{ github.token }}
-          path: source-v69
-
-      - name: V6.10 Execute the authentic native unpack algorithm
+      - name: V6.11 Download distinct original client volume directly
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p reports
-          cat > /tmp/v610-unpack.py <<'PY_V610'
+          mkdir -p source reports
+          gh release download v1.0.0 -R gowellsik-hue/Game \
+            -p 'Sanctuary.of.Aden.-.Copy.z35' \
+            -D source --clobber
+          test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.z35)" -eq 100000000
+
+      - name: V6.11 Extract original game client and trace packet receiver references
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/v611-native-receiver.py <<'PY_V611'
           from pathlib import Path
-          import hashlib
-          import struct
-          import sys
+          from collections import Counter
+          from math import log2
+          import csv, hashlib, json, re, struct, subprocess, sys, zlib
 
-          v68=Path(sys.argv[1]);v69=Path(sys.argv[2]);output=Path(sys.argv[3]);output.mkdir(parents=True,exist_ok=True)
-          original=(v68/'native/lin.bin').read_bytes()
-          first=(v69/'v69-decrypted-native-stage1.bin').read_bytes()
-          sha=lambda x:hashlib.sha256(x).hexdigest()
-          assert sha(original)=='0d40fdf84d19e0ecc043766455fb9c5a215a5c39bbac858ca602f0bf5259f19e'
-          assert len(first)==4096 and sha(first)=='adad55081945b214b80e9c30788f7b3623aec5ee64ae383d0983a855432502a0'
+          ZIP_VOLUME = 'Sanctuary.of.Aden.-.Copy.z35'
+          EXPECTED = 'Sanctuary of Aden - Copy/TW13032701.bin'
+          EXPECTED_SHA = '049e0579c193a666665eec0c10c4e28e8aa2184f1c0d26c1767e77212e6beda4'
 
-          p=struct.unpack_from('<I',original,0x3c)[0];assert original[p:p+4]==b'PE\0\0'
-          assert struct.unpack_from('<H',original,p+24)[0]==0x10b
-          base=struct.unpack_from('<I',original,p+24+28)[0]
-          count=struct.unpack_from('<H',original,p+6)[0]
-          table=p+24+struct.unpack_from('<H',original,p+20)[0]
-          sections={}
-          for i in range(count):
-              k=table+40*i
-              name=original[k:k+8].rstrip(b'\0').decode('latin1')
-              vsize,va,rsize,roff=struct.unpack_from('<IIII',original,k+8)
-              sections[name]=(base+va,rsize,roff)
-          assert 'hsebmuhf' in sections
-          address,length,offset=sections['hsebmuhf']
-          assert address==0x151e000 and length==0x1afa00
-          assert first[:7]==bytes.fromhex('60 e8 00 00 00 00 58')
-          read_u32=lambda pos:struct.unpack_from('<I',first,pos)[0]
-          start=base+read_u32(0x66)-address
-          unpack_dest=base+read_u32(0x5f)
-          assert start==0x212 and unpack_dest==0x12cb014
-          packed=first+original[offset+4096:offset+length]
+          def unzip_original(volume, out):
+              data = Path(volume).read_bytes()
+              start = 73614956
+              hdr = struct.unpack_from('<IHHHHHIIIHH', data, start)
+              signature, _, flags, method, _, _, _, _, _, name_len, extra_len = hdr
+              assert signature == 0x04034B50, 'Archive local ZIP header mismatch'
+              name = data[start+30:start+30+name_len].decode('utf-8' if flags & 0x800 else 'cp949')
+              assert name.replace('\\', '/') == EXPECTED, name
+              assert method == 8 and not(flags & 1), 'Expected unencrypted deflate'
+              raw_offset = start + 30 + name_len + extra_len
+              packed_size, unpacked_size, crc = 2332239, 2582376, 2104511809
+              assert raw_offset + packed_size <= len(data), 'Unexpected volume boundary'
+              extracted = zlib.decompress(data[raw_offset:raw_offset+packed_size], -15)
+              assert len(extracted) == unpacked_size and zlib.crc32(extracted) & 0xffffffff == crc
+              assert hashlib.sha256(extracted).hexdigest() == EXPECTED_SHA
+              Path(out).write_bytes(extracted)
+              return extracted
 
-          class Reader:
-              def __init__(self, data, start):
-                  self.data=data;self.index=start;self.flags=0x80;self.start=start
-              def byte(self):
-                  if self.index>=len(self.data):raise ValueError('Compressed input ended without native end marker')
-                  value=self.data[self.index];self.index+=1;return value
-              def bit(self):
-                  old=self.flags
-                  self.flags=(old<<1)&255
-                  carry=old>>7
-                  if not self.flags:
-                      new=self.byte()
-                      self.flags=((new<<1)|carry)&255
-                      carry=new>>7
-                  return carry
-              def gamma(self):
-                  value=1
+          def u16(b,o): return struct.unpack_from('<H',b,o)[0]
+          def u32(b,o): return struct.unpack_from('<I',b,o)[0]
+
+          def inspect_exe(data, out):
+              assert data[:2] == b'MZ'
+              peoff = u32(data,0x3c);assert data[peoff:peoff+4] == b'PE\0\0'
+              number = u16(data,peoff+6)
+              opt_size = u16(data,peoff+20)
+              opt = peoff+24
+              magic=u16(data,opt);assert magic == 0x10b, 'Expected native 32-bit PE'
+              base=u32(data,opt+28)
+              entry=base+u32(data,opt+16)
+              import_rva=u32(data,opt+104)
+              sections=[]
+              for i in range(number):
+                  off=opt+opt_size+i*40
+                  name=data[off:off+8].rstrip(b'\0').decode('ascii','replace')
+                  size, rva, packed, raw, _, _, _, _, flags=struct.unpack_from('<IIIIIIHHI',data,off+8)
+                  blob=data[raw:raw+packed]; cnt=Counter(blob)
+                  entropy=round(-sum((n/len(blob))*log2(n/len(blob)) for n in cnt.values()),3) if blob else 0
+                  sections.append(dict(name=name,rva=rva,virtual_size=size,file_offset=raw,raw_size=packed,
+                                       flags=flags,executable=bool(flags & 0x20000000),entropy=entropy))
+              def from_rva(rva):
+                  if rva < u32(data,opt+60): return rva
+                  for sec in sections:
+                      if sec['rva'] <= rva < sec['rva']+max(sec['virtual_size'],sec['raw_size']):
+                          offset = rva-sec['rva']
+                          if offset < sec['raw_size']:
+                              return sec['file_offset']+offset
+                  raise ValueError('Unmapped or BSS RVA '+hex(rva))
+              def string(rva):
+                  pos=from_rva(rva)
+                  end=data.find(b'\0',pos,min(len(data),pos+1024))
+                  assert end>pos
+                  return data[pos:end].decode('latin1','replace')
+              imports=[]
+              if import_rva:
+                  try: desc=from_rva(import_rva)
+                  except ValueError: desc=None
+                  if desc is not None:
+                      for di in range(300):
+                          o=desc+di*20
+                          if o+20>len(data):break
+                          orig, _, _, name_rva, first = struct.unpack_from('<IIIII',data,o)
+                          if not(orig or name_rva or first):break
+                          try:
+                              dll=string(name_rva)
+                              thunk=orig or first
+                              for ti in range(6000):
+                                  to=from_rva(thunk+ti*4)
+                                  val=u32(data,to)
+                                  if not val:break
+                                  if val & 0x80000000:
+                                      imp='#'+str(val & 0xffff)
+                                  else:
+                                      imp=string(val+2)
+                                  imports.append((dll,imp,base+first+ti*4))
+                          except (ValueError,AssertionError,struct.error):
+                              continue
+              pattern=re.compile(r'^(?:recv|recvfrom|wsa(recv|recvfrom|send|sendto|socket[a-z]?)|send|sendto|socket|connect|wsaconnect|select|ioctlsocket|closesocket|gethostbyname|getaddrinfo|ntohl|htons)$',re.I)
+              target=[(dll,api,va) for dll,api,va in imports if re.search(r'ws2_32|wsock32',dll,re.I) and pattern.fullmatch(api)]
+              calls=[]
+              for dll,api,iat_va in target:
+                  if not pattern.fullmatch(api): continue
+                  for sec in sections:
+                      if not sec['executable']:continue
+                      blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
+                      for op in (b'\xff\x15', b'\xff\x25'):
+                          needle=op+struct.pack('<I',iat_va)
+                          pos=0
+                          while True:
+                              hit=blob.find(needle,pos)
+                              if hit<0:break
+                              va=base+sec['rva']+hit
+                              local=data[sec['file_offset']+max(0,hit-40):sec['file_offset']+min(len(blob),hit+50)]
+                              calls.append((dll,api,hex(iat_va),hex(va),'call' if op==b'\xff\x15' else 'jmp',local.hex()))
+                              pos=hit+1
+              # Also resolve near-call instructions which target an import jump thunk.
+              thunks={}
+              for dll,api,iat_va in target:
+                  jmp=b'\xff\x25'+struct.pack('<I',iat_va)
+                  for sec in sections:
+                      if not sec['executable']:continue
+                      blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
+                      pos=0
+                      while True:
+                          hit=blob.find(jmp,pos)
+                          if hit<0:break
+                          thunks[base+sec['rva']+hit]=(dll,api,iat_va)
+                          pos=hit+1
+              for sec in sections:
+                  if not sec['executable']:continue
+                  blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
+                  pos=0
                   while True:
-                      value=(value<<1)|self.bit()
-                      if not self.bit():return value
-                      if value>0x1000000:raise ValueError('Unreasonable match length/offset')
+                      hit=blob.find(b'\xe8',pos)
+                      if hit<0 or hit+5>len(blob):break
+                      source_va=base+sec['rva']+hit
+                      dest=(source_va+5+struct.unpack_from('<i',blob,hit+1)[0])&0xffffffff
+                      if dest in thunks:
+                          dll,api,iat_va=thunks[dest]
+                          lo=max(0,hit-32);hi=min(len(blob),hit+48)
+                          calls.append((dll,api,hex(iat_va),hex(source_va),'call-via-import-thunk',blob[lo:hi].hex()))
+                      pos=hit+1
+              out=Path(out);out.mkdir(exist_ok=True)
+              with (out/'native-packet-call-sites.csv').open('w',newline='') as f:
+                  writer=csv.writer(f);writer.writerow(['DLL','API','importVA','callSiteVA','operation','originalByteContext']);writer.writerows(calls)
+              (out/'native-imports.json').write_text(json.dumps({'imageBase':hex(base),'entryVA':hex(entry),'nativePESections':sections,
+                               'imports':[{'dll':d,'api':a,'iatVA':hex(x)} for d,a,x in imports],
+                               'nativePacketCallSites':len(calls)},indent=2))
+              notes=[f'Original EXE SHA256: {hashlib.sha256(data).hexdigest()}',
+                  f'Native entry: 0x{entry:08X}', f'Native import entries: {len(imports)}',
+                  f'Socket and relevant API imports: {len(target)}',
+                  f'Static native socket call sites: {len(calls)}',
+                  f'Executable sections: {sum(s["executable"] for s in sections)}',
+                  'Spawn IDs, counts and XY: not claimed from API call sites alone.',
+                  'Zero static socket call sites means no native receiver is identifiable from this PE without runtime evidence.']
+              (out/'native-packet-trace-results.txt').write_text('\n'.join(notes)+'\n',encoding='utf-8')
+              print('\n'.join(notes))
+              subprocess.run(['objdump','-d','-M','intel',str(out/'native-game-client.bin')],
+                  stdout=(out/'native-game-client.asm').open('w'),stderr=subprocess.DEVNULL,check=False)
 
-          r=Reader(packed,start)
-          out=bytearray([r.byte()])
-          last_offset=0
-          mode=2
-          limit=8*1024*1024
-
-          def copy_match(distance,nbytes):
-              if not 0<distance<=len(out):
-                  raise ValueError(f'Invalid native match: distance={distance}, written={len(out)}')
-              if not 0<nbytes<=limit or len(out)+nbytes>limit:
-                  raise ValueError('Native unpack output exceeds safety limit')
-              if distance>=nbytes:
-                  src=len(out)-distance
-                  out.extend(out[src:src+nbytes])
+          if __name__ == '__main__':
+              if len(sys.argv)==3 and sys.argv[1]=='--test':
+                  path=Path(sys.argv[2]);dest=Path('reports');dest.mkdir(exist_ok=True)
+                  (dest/'native-game-client.bin').write_bytes(path.read_bytes())
+                  inspect_exe(path.read_bytes(),dest)
               else:
-                  for _ in range(nbytes):out.append(out[-distance])
+                  volume=Path(sys.argv[1]);dest=Path(sys.argv[2]);dest.mkdir(exist_ok=True)
+                  raw=unzip_original(volume,dest/'native-game-client.bin')
+                  inspect_exe(raw,dest)
+          PY_V611
+          python3 -m py_compile /tmp/v611-native-receiver.py
+          python3 /tmp/v611-native-receiver.py \
+            source/Sanctuary.of.Aden.-.Copy.z35 reports
+          test -s reports/native-game-client.bin
+          test -s reports/native-imports.json
+          test -s reports/native-packet-trace-results.txt
+          cat reports/native-packet-trace-results.txt
 
-          iterations=0
-          while True:
-              iterations+=1
-              if iterations>5_000_000:raise ValueError('Native unpacker did not terminate')
-              if r.bit()==0:
-                  out.append(r.byte())
-                  mode=2
-                  continue
-              if r.bit()==0:
-                  candidate=r.gamma()-mode
-                  mode=1
-                  if candidate==0:
-                      count=r.gamma()
-                      copy_match(last_offset,count)
-                  else:
-                      last_offset=((candidate-1)<<8)|r.byte()
-                      count=r.gamma()
-                      if last_offset>=0x7d00:count+=2
-                      elif last_offset>=0x500:count+=1
-                      elif last_offset<=0x7f:count+=2
-                      copy_match(last_offset,count)
-                  continue
-              if r.bit()==0:
-                  value=r.byte()
-                  if value==0:break
-                  last_offset=value>>1
-                  copy_match(last_offset,2+(value&1))
-                  mode=1
-                  continue
-              distance=0
-              for _ in range(4):distance=(distance<<1)|r.bit()
-              out.append(out[-distance] if distance else 0)
-              mode=2
-
-          assert len(out)==2430275,(len(out),'unexpected native output size')
-          assert sha(out)=='861cc32c6070c3643e6c0fa39a1579fc73fe59b1992d3cbc60ccaa454ba264d1','Original unpacked bytes changed'
-          entry_offset=struct.unpack_from('<i',out,1)[0]+5
-          assert out[0]==0xe9 and entry_offset==0x1749,(hex(entry_offset))
-          assert out[0x361:0x36b]==b'WinLicense',out[0x361:0x36b]
-          (output/'v610-native-stage2-decompressed.bin').write_bytes(out)
-          (output/'v610-native-stage2-entry.bin').write_bytes(out[entry_offset:entry_offset+1024])
-          summary=(
-              f'Original lin.bin SHA256: {sha(original)}\n'
-              f'V6.9 stage1 SHA256: {sha(first)}\n'
-              f'Source compressed bytes consumed: {r.index-r.start}\n'
-              f'Original native decompression iterations: {iterations}\n'
-              f'Stage2 destination: 0x{unpack_dest:08X}\n'
-              f'Stage2 bytes: {len(out)}\n'
-              f'Stage2 SHA256: {sha(out)}\n'
-              f'Stage2 actual jump VA: 0x{unpack_dest+entry_offset:08X}\n'
-              'WinLicense string in real decompressed code: yes\n'
-              'Initial monster spawn IDs and XY: not present in this output as a verified spawn table\n'
-              'Neither SLKnight nor external server data used; no game changes.\n'
-          )
-          (output/'v610-native-stage2-result.txt').write_text(summary,encoding='utf-8')
-          print(summary)
-          PY_V610
-          python3 -m py_compile /tmp/v610-unpack.py
-          python3 /tmp/v610-unpack.py source-v68 source-v69 reports
-          objdump -D -b binary -m i386 -M intel \
-            --adjust-vma=0x12CC75D \
-            reports/v610-native-stage2-entry.bin \
-            > reports/v610-native-stage2-entry.asm
-          grep -iq '12cc75d:' reports/v610-native-stage2-entry.asm
-          test "$(wc -c < reports/v610-native-stage2-decompressed.bin)" -eq 2430275
-          cat reports/v610-native-stage2-result.txt
-
-      - name: V6.10 Upload actual original native second-stage code
+      - name: V6.11 Upload genuine client and packet call-site candidates
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V6.10-Original-Lin-Bin-Unpacked-Stage2
+          name: Sanctuary-Map-V6.11-Original-Alternate-Client-Receive-Tracing
           path: reports/
           retention-days: 60
+          compression-level: 1
           if-no-files-found: error
