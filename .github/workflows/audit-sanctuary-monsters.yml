@@ -1,8 +1,8 @@
-
 # FILE: .github/workflows/audit-sanctuary-monsters.yml
-# V44: Correct V43 missing GIF archive path; continue original SPR recheck.
-name: "audit-sanctuary-monsters.yml | V44 | 61CE Physical Motion ID and Bank Review"
-run-name: "audit-sanctuary-monsters.yml | V44 | Sanctuary Full Monster Data Audit / EXP 0-10"
+# V45: Export V49 615 SPR IDs from original V34 + recovered V44 GIFs.
+# Original names and V49 image identities are retained; only exact bytes are deduplicated.
+name: "audit-sanctuary-monsters.yml | V45 | 61CE Physical Motion ID and Bank Review"
+run-name: "audit-sanctuary-monsters.yml | V45 | Sanctuary Full Monster Data Audit / EXP 0-10"
 
 on:
   workflow_dispatch:
@@ -16,283 +16,228 @@ permissions:
 
 jobs:
   original-text:
-    name: "V44 | Original SPR recheck and missing GIF recovery"
+    name: "V45 | Export 615 verified SPR GIFs without duplicates"
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: "V44 | Restore V34 original indexes and GIFs"
+      - name: "V45 | Prepare original GIF database"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full python3-pil python3-yaml
-          mkdir -p source packages v44-output
+          sudo apt-get install -y -qq python3-pil
+          mkdir -p source packages v44
           gh run download 39386289505 -R "$GITHUB_REPOSITORY" \
             -n audit-sanctuary-monsters-v34-all-source-database -D source
           gh run download 39386289505 -R "$GITHUB_REPOSITORY" \
             -n audit-sanctuary-monsters-v34-all-original-cardinal-gifs -D packages
-          test -s source/V34-decoding-errors.csv
-          test -s source/V34-all-source-sprite-index.csv
+          gh run download 39542336785 -R "$GITHUB_REPOSITORY" \
+            -n audit-sanctuary-monsters-v44-original-spr-recheck -D v44
           test -s source/V34-all-cardinal-gif-manifest.csv
           test "$(find packages -type f -name 'V34-*-cardinal-gifs.zip' | wc -l)" -eq 17
-
-      - name: "V44 | Restore the 39 already verified missing actors"
+      - name: "V45 | Select 615 SPRs and verify original GIF files"
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import csv, hashlib, zipfile
-          from pathlib import Path
-
-          wanted = {
-              33, 51, 335, 816, 1520, 2728, 2968, 4478, 4480, 4486,
-              4490, 4826, 4831, 4888, 4933, 4944, 5063, 5085, 5114,
-              5197, 5203, 5244, 5246, 5249, 5256, 5300, 5645, 5767,
-              5802, 7351, 7590, 7621, 7720, 8047, 8057, 8175, 8229,
-              8239, 11490,
-          }
-          manifest = {}
-          with open('source/V34-all-cardinal-gif-manifest.csv', encoding='utf-8-sig', newline='') as f:
-              for row in csv.DictReader(f):
-                  if int(row['actor']) in wanted and row['gif'] and row['byte_verified'] == 'True':
-                      manifest[row['gif'].removeprefix('gifs/')] = (int(row['actor']), row['gif_sha256'])
-          restored = set()
-          recovered_files = 0
-          for path in sorted(Path('packages').rglob('V34-*-cardinal-gifs.zip')):
-              with zipfile.ZipFile(path) as pack:
-                  for name in pack.namelist():
-                      if name not in manifest:
-                          continue
-                      actor, expected = manifest[name]
-                      raw = pack.read(name)
-                      if hashlib.sha256(raw).hexdigest() != expected:
-                          raise RuntimeError('Original GIF digest mismatch: ' + name)
-                      target = Path('v44-output/gifs') / name
-                      target.parent.mkdir(parents=True, exist_ok=True)
-                      if target.exists() and target.read_bytes() != raw:
-                          raise RuntimeError('Conflicting original GIF: ' + name)
-                      target.write_bytes(raw)
-                      restored.add(actor)
-                      recovered_files += 1
-          if restored != wanted:
-              raise RuntimeError('Missing source GIF actors: ' + str(sorted(wanted - restored)))
-          if recovered_files != len(manifest):
-              raise RuntimeError(f'Missing original GIF files: {len(manifest)-recovered_files}')
-          print('Restored original sprite IDs:', len(restored))
-          print('Restored verified GIFs:', recovered_files)
-          PY
-          rm -rf packages
-
-      - name: "V44 | Restore original Sanctuary SPR packs"
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p archive original
-          gh release download v1.0.0 -R "$GITHUB_REPOSITORY" \
-            --pattern 'Sanctuary.of.Aden.-.Copy.*' -D archive
-          7z x archive/Sanctuary.of.Aden.-.Copy.zip \
-            'Sanctuary of Aden - Copy/Sprite*.pak' \
-            -o./original -y
-          test -s 'original/Sanctuary of Aden - Copy/Sprite.pak'
-          test "$(find original -type f -name 'Sprite*.pak' | wc -l)" -eq 17
-          rm -rf archive
-          git show 5c40dc3de28ee879182c6f60802a89432072c138:.github/workflows/audit-sanctuary-monsters.yml > /tmp/v44-original-decoder.yml
-
-      - name: "V44 | Recheck failed SPRs, missing IDs and identical sprites"
-        run: |
-          set -euo pipefail
-          cat > /tmp/v44-recheck.py <<'PY'
-          import ast, csv, io, re, struct
-          from collections import defaultdict
+          import csv, hashlib, io, os, zipfile
+          from collections import Counter
           from pathlib import Path
           from PIL import Image
-          import yaml
 
-          OUT = Path('v44-output')
-          SOURCE = Path('source')
-          SRCROOT = Path('original')
-          # IDs with no V34 four-direction GIF, not all original actors.
-          missing = set(map(int, '''
-            144 146 148 824 1093 1236 2240 2714 2907 2917 2976 3101
-            3136 3520 3783 3860 3864 3867 4003 4516 4786 4787 4800
-            4801 4802 4803 4804 4806 4854 4855 5224 5596 5683 5684
-            5685 5687 5688 5689 5690 5691 5693 5694 5695 5708 5938
-            5939 6283 7557 7558 7845 7869 7870 8054 8115 8416 8429
-            8457 8459 8785 8899 10354 10609 10610 10611 10612 10613
-            10614 10621 10622 10623 10624 10625 10626 10790 10792
-            10793 10794 10796 10797 10798 10800
-          '''.split()))
+          WANTED = set(map(int, """
+          0 29 30 31 32 33 49 51 52 53 54 55 56 95 96 145 152 173 183 185 187 240 246 255 257
+          335 784 786 788 790 816 851 852 865 894 929 931 934 936 938 945 947 951 979 998 999 1002 1003 1011 1014
+          1020 1022 1024 1037 1039 1041 1047 1052 1059 1062 1082 1094 1096 1098 1104 1106 1108 1110 1112 1116 1121 1123 1125 1128 1130
+          1132 1134 1150 1152 1154 1158 1162 1173 1180 1184 1202 1204 1206 1211 1245 1318 1321 1390 1477 1479 1517 1520 1525 1538 1540
+          1542 1555 1569 1571 1572 1574 1576 1578 1580 1584 1586 1590 1595 1597 1600 1603 1610 1612 1614 1616 1623 1626 1628 1632 1634
+          1636 1638 1640 1642 1644 1646 1649 1653 1655 1657 1666 1762 1770 1773 1780 1791 1820 1828 1832 1841 1844 2001 2064 2086 2112
+          2118 2134 2137 2145 2147 2150 2158 2266 2267 2268 2273 2274 2275 2276 2282 2308 2332 2340 2379 2389 2392 2402 2407 2409 2417
+          2419 2421 2443 2457 2460 2468 2489 2495 2513 2516 2524 2533 2535 2538 2541 2544 2716 2727 2728 2738 2741 2747 2749 2752 2755
+          2757 2763 2771 2773 2788 2803 2807 2843 2885 2966 2968 2972 2973 2974 2975 3044 3049 3066 3083 3086 3092 3107 3132 3134 3143
+          3154 3156 3178 3180 3182 3184 3188 3195 3199 3211 3357 3360 3364 3365 3366 3376 3387 3391 3402 3404 3409 3412 3415 3478 3547
+          3566 3568 3582 3596 3644 3652 3654 3659 3664 3678 3694 3698 3744 3747 3783 3912 3914 3916 3918 3920 3922 3926 3928 3930 3957
+          3969 3984 3989 4005 4007 4009 4010 4011 4012 4013 4017 4024 4025 4028 4029 4030 4034 4038 4041 4051 4058 4060 4068 4078 4083
+          4086 4088 4091 4095 4097 4100 4104 4121 4125 4133 4147 4149 4151 4168 4171 4186 4188 4190 4192 4203 4205 4207 4209 4212 4215
+          4218 4364 4403 4404 4405 4407 4408 4410 4417 4420 4423 4426 4429 4457 4460 4463 4466 4472 4475 4478 4480 4482 4484 4486 4488
+          4490 4493 4502 4517 4519 4521 4527 4531 4533 4544 4550 4556 4559 4561 4563 4569 4574 4576 4582 4587 4595 4603 4609 4612 4615
+          4618 4622 4625 4632 4633 4634 4643 4649 4652 4657 4664 4667 4670 4677 4684 4689 4693 4698 4701 4738 4740 4744 4746 4753 4771
+          4788 4790 4796 4820 4822 4826 4831 4851 4867 4888 4910 4912 4915 4930 4933 4935 4937 4942 4944 5008 5014 5033 5063 5065 5072
+          5083 5085 5087 5089 5091 5107 5110 5112 5114 5127 5129 5197 5203 5212 5224 5244 5246 5249 5256 5259 5265 5269 5274 5282 5284
+          5289 5293 5297 5300 5317 5324 5331 5338 5348 5351 5353 5365 5373 5405 5412 5442 5447 5461 5463 5471 5478 5484 5507 5511 5516
+          5547 5554 5567 5574 5608 5620 5645 5655 5657 5677 5724 5739 5742 5745 5751 5754 5760 5767 5778 5781 5786 5802 5818 5912 5969
+          5972 5977 5979 6161 6290 6302 6310 6314 6322 6325 6396 6555 6557 6558 6560 6562 6563 6566 6569 6581 6592 6593 6595 6601 6603
+          6632 6634 6636 6638 6645 6649 6653 6654 6664 6665 6699 6704 6778 7078 7081 7091 7097 7098 7099 7111 7113 7167 7170 7173 7176
+          7184 7186 7193 7196 7234 7236 7335 7351 7362 7365 7369 7481 7489 7496 7503 7509 7539 7559 7566 7573 7580 7587 7590 7593 7596
+          7604 7609 7621 7684 7720 7723 7745 7764 7784 7786 7788 7805 7905 7934 7939 7940 7941 7989 7992 7995 7998 8036 8047 8056 8057
+          8087 8175 8224 8229 8239 8717 10071 10573 10596 10627 10632 10884 10891 10899 11490
+          """.split()))
+          assert len(WANTED) == 615, f"Wrong SPR count: {len(WANTED)}"
+          SRC = Path('source')
+          PACKS = Path('packages')
+          RESTORED = Path('v44')
+          OUT = Path('output-615')
+          OUT.mkdir(exist_ok=True)
 
-          def rows(filename):
-              with (SOURCE / filename).open(encoding='utf-8-sig', newline='') as f:
-                  return list(csv.DictReader(f))
-
-          # Reuse the original Sanctuary decoder, not an unrelated sprite renderer.
-          wf = yaml.safe_load(Path('/tmp/v44-original-decoder.yml').read_text('utf-8'))
-          step = next(s for s in wf['jobs']['identify']['steps']
-                      if s.get('name') == 'Decode all selected monster animation frames')
-          script = step['run'].split("python3 - <<'PY'\n", 1)[1].split('\nPY', 1)[0]
-          cls = next(n for n in ast.parse(script).body
-                     if isinstance(n, ast.ClassDef) and n.name == 'Reader')
-
-          def original_reader(relaxed=False):
-              node = cls
-              if relaxed:
-                  import copy
-                  node = copy.deepcopy(cls)
-                  for n in ast.walk(node):
-                      if isinstance(n, ast.Compare) and len(n.comparators) == 1:
-                          c = n.comparators[0]
-                          if isinstance(c, ast.Constant) and c.value == 1500:
-                              c.value = 4096
-                  ast.fix_missing_locations(node)
-              env = {'struct': struct, 'Image': Image,
-                     'MAX_FRAMES': 255 if relaxed else 240,
-                     'MAX_DIM': 1600 if relaxed else 1000}
-              exec(compile(ast.Module(body=[node], type_ignores=[]),
-                           'original-sanctuary-reader', 'exec'), env)
-              return env['Reader']
-
-          Reader = original_reader()
-          RelaxedReader = original_reader(relaxed=True)
-          index = {}
-          actor_subs = defaultdict(set)
-          for r in rows('V34-all-source-sprite-index.csv'):
-              m = re.fullmatch(r'(\d+)-(\d+)\.spr', r['file'], re.I)
-              if not m:
+          with (SRC / 'V34-all-cardinal-gif-manifest.csv').open(encoding='utf-8-sig', newline='') as handle:
+              manifest = list(csv.DictReader(handle))
+          expected = {}
+          for record in manifest:
+              if int(record['actor']) not in WANTED:
                   continue
-              actor, sub = map(int, m.groups())
-              pak = r['pak'].removeprefix('outer/')
-              key = (pak, r['file'].lower())
-              entry = (int(r['offset']), int(r['bytes']), actor, sub)
-              if key not in index or entry[0] < index[key][0]:
-                  index[key] = entry
-              actor_subs[actor].add(sub)
+              if record['byte_verified'] != 'True' or not record['gif_sha256'] or not record['gif']:
+                  raise RuntimeError('Original source not verified: ' + record['gif'])
+              key = record['gif'].removeprefix('gifs/')
+              if key in expected:
+                  raise RuntimeError('Duplicate GIF path in manifest: ' + key)
+              expected[key] = record
+          if len(expected) != 15968:
+              raise RuntimeError(f'Expected 15,968 V34 GIF records; got {len(expected)}')
 
-          candidates = {}
-          for r in rows('V34-decoding-errors.csv'):
-              key = (r['pak'], r['filename'].lower())
-              candidates[key] = (int(r['actor']), r['decode_error'], 'failed_four_direction')
-          for (pak, filename), (_, _, actor, sub) in index.items():
-              if actor in missing and sub % 8 in (0, 2, 4, 6):
-                  candidates[(pak, filename)] = (actor, 'Previously unexamined', 'other_direction')
+          original_zip_files = sorted(PACKS.rglob('V34-*-cardinal-gifs.zip'))
+          if len(original_zip_files) != 17:
+              raise RuntimeError(f'Expected 17 source ZIPs; got {len(original_zip_files)}')
 
-          def gif_bytes(frames):
-              visible = [f for f in frames if f is not None and f.getbbox()]
-              if not visible:
-                  return None
-              w = max(x.width for x in visible)
-              h = max(x.height for x in visible)
-              if w * h > 1600000 or len(visible) > 255:
-                  return None
-              frames_out = []
-              for frame in visible:
-                  canv = Image.new('RGBA', (w, h))
-                  canv.alpha_composite(frame, ((w-frame.width)//2, (h-frame.height)//2))
-                  pal = canv.convert('RGB').quantize(colors=255)
-                  pal.paste(255, mask=canv.getchannel('A').point(lambda v: 255 if v < 128 else 0))
-                  frames_out.append(pal)
-              target = io.BytesIO()
-              frames_out[0].save(target, 'GIF', save_all=True,
-                  append_images=frames_out[1:], duration=140, loop=0,
-                  disposal=2, transparency=255, optimize=False)
-              return target.getvalue()
+          aliases = {}
+          canonical_by_hash = {}
+          found = set()
+          real_files = []
 
-          results = []
-          opened = {}
-          rescued = 0
-          try:
-              for (pak, filename), (actor, prior, _) in sorted(candidates.items()):
-                  item = index.get((pak, filename))
-                  if not item:
-                      results.append([actor, filename, 'no_index_entry', prior])
-                      continue
-                  offset, size, _, sub = item
-                  path = SRCROOT / pak
-                  if pak not in opened:
-                      opened[pak] = path.open('rb')
-                  stream = opened[pak]
-                  if not (0 < size <= 4194304) or offset + size > path.stat().st_size:
-                      results.append([actor, filename, 'invalid_original_bounds', prior])
-                      continue
-                  stream.seek(offset)
-                  raw = stream.read(size)
-                  if len(raw) != size:
-                      results.append([actor, filename, 'short_original_read', prior])
-                      continue
-                  try:
-                      frames = Reader(raw).decode()
-                  except Exception:
-                      try:
-                          frames = RelaxedReader(raw).decode()
-                      except Exception as second:
-                          results.append([actor, filename, 'unreadable_structure', str(second)[:100]])
+          def store_gif(logical_path, raw, checksum=None):
+              digest = hashlib.sha256(raw).hexdigest()
+              if checksum and checksum != digest:
+                  raise RuntimeError('GIF hash mismatch: ' + logical_path)
+              with Image.open(io.BytesIO(raw)) as img:
+                  if img.format != 'GIF' or img.n_frames < 1:
+                      raise RuntimeError('Invalid original GIF: ' + logical_path)
+                  # Validate the entire animation, including the last frame.
+                  img.seek(img.n_frames - 1)
+                  img.load()
+              canonical = canonical_by_hash.get(digest)
+              if canonical is not None:
+                  aliases[logical_path] = canonical
+                  return
+              canonical_by_hash[digest] = logical_path
+              file = OUT / logical_path
+              file.parent.mkdir(parents=True, exist_ok=True)
+              file.write_bytes(raw)
+              real_files.append(file)
+
+          for part in original_zip_files:
+              with zipfile.ZipFile(part) as bundle:
+                  for entry in bundle.infolist():
+                      record = expected.get(entry.filename)
+                      if record is None:
                           continue
-                  if not any(f is not None and f.getbbox() for f in frames):
-                      results.append([actor, filename, 'no_visible_original_frames', prior])
-                      continue
-                  gif = gif_bytes(frames)
-                  if gif is None:
-                      results.append([actor, filename, 'oversized_frames', prior])
-                      continue
-                  out = OUT / 'rechecked' / Path(pak).stem / str(actor) / filename.replace('.spr', '.gif')
-                  out.parent.mkdir(parents=True, exist_ok=True)
-                  out.write_bytes(gif)
-                  rescued += 1
-                  status = 'recovered_cardinal' if sub % 8 in (1,3,5,7) else 'other_direction_only'
-                  results.append([actor, filename, status, prior])
-          finally:
-              for fp in opened.values():
-                  fp.close()
+                      if entry.filename in found:
+                          raise RuntimeError('Repeated source file: ' + entry.filename)
+                      found.add(entry.filename)
+                      store_gif('gifs/' + entry.filename,
+                                bundle.read(entry), record['gif_sha256'])
+              print('Read:', part.name, 'selected so far:', len(found), flush=True)
+          missing = set(expected) - found
+          if missing:
+              raise RuntimeError(f'Missing V34 GIFs: {len(missing)}; examples {sorted(missing)[:8]}')
 
-          with (OUT/'V44-rechecked-sprites.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w = csv.writer(f)
-              w.writerow(['sprite_id', 'source_spr', 'result', 'previous_result'])
-              w.writerows(results)
+          rechecked = [
+              'rechecked/Sprite/3783/3783-0.gif',
+              'rechecked/Sprite/5224/5224-0.gif',
+          ]
+          for name in rechecked:
+              source_file = RESTORED / name
+              if not source_file.is_file():
+                  raise RuntimeError('Missing V44 original recovery: ' + name)
+              store_gif(name, source_file.read_bytes())
 
-          with (OUT/'V44-missing-sprite-source.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w = csv.writer(f)
-              w.writerow(['sprite_id', 'original_spr_files'])
-              for actor in sorted(missing):
-                  w.writerow([actor, len(actor_subs.get(actor, set()))])
+          if len(found) + len(rechecked) != 15970:
+              raise RuntimeError('Selected GIF count does not equal V49')
+          if len(real_files) + len(aliases) != 15970:
+              raise RuntimeError('Original GIF mapping lost a reference')
 
-          # Only report four-direction sets with identical original GIF hashes.
-          all_banks = defaultdict(dict)
-          for row in rows('V34-all-cardinal-gif-manifest.csv'):
-              if row['gif'] and row['byte_verified'] == 'True':
-                  key = (int(row['actor']), row['pak'], int(row['bank']))
-                  all_banks[key][int(row['direction'])] = row['gif_sha256']
-          signatures = defaultdict(set)
-          for (actor, pak, bank), directions in all_banks.items():
-              if all(d in directions for d in (1,3,5,7)):
-                  signature = tuple(directions[d] for d in (1,3,5,7))
-                  signatures[signature].add(actor)
-          identical = sorted({tuple(sorted(group)) for group in signatures.values()
-                             if len(group) > 1})
-          with (OUT/'V44-identical-four-direction-IDs.csv').open('w',encoding='utf-8-sig',newline='') as f:
-              w = csv.writer(f)
-              w.writerow(['same_four_direction_image_sprite_ids'])
-              for group in identical:
-                  w.writerow([', '.join(map(str, group))])
+          # Keep one physical GIF for equal bytes; retain a mapping for all old paths.
+          alias_report = io.StringIO(newline='')
+          writer = csv.writer(alias_report)
+          writer.writerow(['original_gif_path', 'actual_gif_path'])
+          for original in sorted(aliases):
+              writer.writerow([original, aliases[original]])
+          alias_bytes = alias_report.getvalue().encode('utf-8-sig')
 
-          print('V44 original SPR candidates checked:', len(candidates))
-          print('V44 visible SPR files recovered:', rescued)
-          print('V44 missing actor IDs without source SPR:', sum(not actor_subs.get(a) for a in missing))
-          print('V44 verified identical-image ID groups:', len(identical))
+          # Each ZIP is independently extractable into the same folder. Keep the
+          # maximum safely below the connector's 512 MiB artifact-download limit.
+          PART_LIMIT = 475 * 1024 * 1024
+          part_number = 1
+          parts = []
+          archive = None
+          size_so_far = 0
+
+          def new_archive(number):
+              path = Path(f'part-{number:02d}.zip')
+              package = zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_STORED,
+                                        allowZip64=True)
+              if number == 1:
+                  package.writestr('gif-aliases.csv', alias_bytes)
+              parts.append(path)
+              return package
+
+          archive = new_archive(part_number)
+          size_so_far = len(alias_bytes) + 4096
+          for file in sorted(real_files):
+              rel = file.relative_to(OUT).as_posix()
+              need = file.stat().st_size + len(rel.encode('utf8')) * 2 + 200
+              if size_so_far + need > PART_LIMIT:
+                  archive.close()
+                  part_number += 1
+                  archive = new_archive(part_number)
+                  size_so_far = 4096
+              archive.write(file, arcname=rel, compress_type=zipfile.ZIP_STORED)
+              size_so_far += need
+          archive.close()
+
+          assert len(parts) <= 4, 'Unexpected ZIP part count: ' + str(len(parts))
+          for part in parts:
+              if part.stat().st_size > 485 * 1024 * 1024:
+                  raise RuntimeError('Part too big: ' + str(part))
+              with zipfile.ZipFile(part) as check:
+                  bad = check.testzip()
+                  if bad:
+                      raise RuntimeError('ZIP CRC failure: ' + bad)
+              print(part, 'bytes:', part.stat().st_size, flush=True)
+          print('Original SPR:', len(WANTED), flush=True)
+          print('GIF references:', len(found) + len(rechecked), flush=True)
+          print('Unique GIF files:', len(real_files), flush=True)
+          print('Removed identical GIF files:', len(aliases), flush=True)
           PY
-          python3 /tmp/v44-recheck.py
-
-      - name: "V44 | Upload original image findings"
+      - name: "V45 | Upload GIF ZIP part 01"
         uses: actions/upload-artifact@v4
         with:
-          name: audit-sanctuary-monsters-v44-original-spr-recheck
-          path: v44-output/
+          name: audit-sanctuary-monsters-v45-615-gifs-part-01
+          path: part-01.zip
           if-no-files-found: error
           retention-days: 30
-          compression-level: 6
+          compression-level: 0
+      - name: "V45 | Upload GIF ZIP part 02 (if needed)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-sanctuary-monsters-v45-615-gifs-part-02
+          path: part-02.zip
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 0
+      - name: "V45 | Upload GIF ZIP part 03 (if needed)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-sanctuary-monsters-v45-615-gifs-part-03
+          path: part-03.zip
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 0
+      - name: "V45 | Upload GIF ZIP part 04 (if needed)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-sanctuary-monsters-v45-615-gifs-part-04
+          path: part-04.zip
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 0
