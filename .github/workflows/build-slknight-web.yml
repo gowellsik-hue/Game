@@ -1,25 +1,22 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R59
-# BASE: successful V229R57 deployment (pinned commit 34673bbdae7ceac34c43f3deacf1212106bb1998).
-# FIX: R58 build failed in Ruby regression test, not game patch or PNG processing.
-# R56 removed the Game_Event alias block, but the R58 test still searched for it.
-# Correct the test extraction boundary to the existing Interpreter class.
-# FIX 1: newly added TI monsters use recognition switches 5016..5164, but
-# the original Game_Switches silently rejects all IDs above 5000.
-# FIX 2: refresh event pages once after a new TI recognition switch activates.
-# FIX 3: move Map046 gray smoke/cloud pixels from foreground wall PNGs into
-# the matching ground PNGs; real stone wall foreground and wall collision stay.
-# PERF: skip drawing fully offscreen stone wall sprites; no large new caches.
-# PRESERVE: all 106 TI monsters, spawn positions, 491EV V5.41 balance,
-# common item drops, original movement, wall collision and saved games.
-name: build-slknight-web.yml | V229R59 | Clean Native Events and 2x Terrain
+# VERSION: V229R60
+# BASE: V229R59 successful run 39945570291.
+# FLOOR SOURCE: V229R57 successful run 39894434720.
+# FIX: remove Map046 dark smoke transferred into ground PNGs by R59.
+# Keep R59 cleaned foreground wall PNGs and original R57 ground PNGs.
+# PERF: avoid repeated Map046 floor work while the camera is stationary.
+# KEEP: R59 monster recognition, 491EV balance, loot, collision, walls,
+# 106 TI monsters, spawn positions, UI, saves, and original engine.
+# Keep existing wall fade behavior. Do not shift collision coordinates.
+name: build-slknight-web.yml | V229R60 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/build-slknight-web.yml]
+    paths:
+      - .github/workflows/build-slknight-web.yml
 
 permissions:
   contents: read
@@ -35,536 +32,400 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    steps:
-      - name: V229R59 Locate last successful R57 full-game artifact
-        id: source
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_SOURCE'
-          import os,json,urllib.request
-          root='https://api.github.com/repos/gowellsik-hue/Game'
-          sha='34673bbdae7ceac34c43f3deacf1212106bb1998'
-          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],
-                   'Accept':'application/vnd.github+json',
-                   'X-GitHub-Api-Version':'2022-11-28'}
-          def api(path):
-              req=urllib.request.Request(root+path,headers=headers)
-              with urllib.request.urlopen(req,timeout=30) as response:
-                  return json.load(response)
-          runs=api('/actions/workflows/build-slknight-web.yml/runs?status=success&per_page=100')['workflow_runs']
-          candidates=[r for r in runs if r.get('head_sha')==sha and
-                      r.get('head_branch')=='main' and r.get('conclusion')=='success']
-          assert candidates,'No successful pinned R57 workflow run'
-          run=max(candidates,key=lambda r:r['run_number'])
-          artifacts=api('/actions/runs/'+str(run['id'])+'/artifacts')['artifacts']
-          assert any(a['name']=='github-pages' and not a['expired'] for a in artifacts), 'R57 source artifact expired'
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
-              f.write('run_id='+str(run['id'])+'\n')
-          print('PASS R57 source run',run['id'])
-          PY_SOURCE
 
-      - name: V229R59 Restore complete R57 game
+    steps:
+      - name: V229R60 Restore successful R59 complete game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: ${{ steps.source.outputs.run_id }}
+          run-id: 39945570291
+          name: github-pages
+          github-token: ${{ github.token }}
+          path: r59
+
+      - name: V229R60 Restore original R57 floor reference
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 39894434720
           name: github-pages
           github-token: ${{ github.token }}
           path: r57
 
-      - name: V229R59 Verify original file inventory
+      - name: V229R60 Verify source and preserve original inventory
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p site build
+          mkdir -p site source57 build
+          test -s r59/artifact.tar
           test -s r57/artifact.tar
-          tar -xf r57/artifact.tar -C site
+
+          tar -xf r59/artifact.tar -C site
+          tar -xf r57/artifact.tar -C source57
+
           python3 - <<'PY_BASE'
           from pathlib import Path
-          import hashlib,json
-          root=Path('site')
-          for name in ('index.html','knight/index.html'):
-              assert 'V229R57' in (root/name).read_text('utf-8'),name
-          scripts=root/'knight/gameasync/Data/Scripts.rxdata'
-          assert scripts.is_file() and scripts.stat().st_size>10000
-          pre='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          for mid in (45,46):
-              assert (root/(pre+f'Map{mid:03d}.rxdata')).is_file(),mid
-          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in root.rglob('*') if p.is_file()}
-          assert len(before)==5517,len(before)
-          Path('build/r59-original.json').write_text(json.dumps(before,sort_keys=True))
-          print('PASS 5517 original files and complete Map045/046')
-          PY_BASE
-
-      - name: V229R59 Extend added monster switches and cull invisible walls
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/r59_scripts.rb <<'R59_SCRIPTS'
-          require 'zlib'
-          require 'json'
-          path='site/knight/gameasync/Data/Scripts.rxdata'
-          entries=Marshal.load(File.binread(path))
-          original=Marshal.load(File.binread(path))
-          raise 'Unexpected script count' unless entries.length==136
-          read=lambda{|i| Zlib::Inflate.inflate(entries[i][2]).force_encoding('UTF-8')}
-          write=lambda{|i,t| entries[i][2]=Zlib::Deflate.deflate(t.b)}
-          once=lambda do |s,old,new,label|
-            n=s.scan(old).length
-            raise "#{label}: expected one match, got #{n}" unless n==1
-            s.sub(old,new)
-          end
-
-          s7=read.call(7)
-          raise 'Original switch cap not found twice' unless s7.scan('switch_id <= 5000').length==2
-          s7=s7.gsub('switch_id <= 5000','switch_id <= 6000')
-          write.call(7,s7)
-
-          s134=read.call(134)
-          data=s134[/  DATA=.*\n/]
-          raise 'Missing original 491EV reward data' if data==nil || !data.include?('DATA={2=>{')
-
-          old_range="    slti_r49_original_range(distance,switch_id,mode)\n  end\nend\n"
-          new_range=<<'NEW_RANGE'
-            was_on=$game_switches[switch_id]==true
-            slti_r49_original_range(distance,switch_id,mode)
-            if activating && !was_on && $game_switches[switch_id]==true &&
-               ( $game_map.map_id==45 || $game_map.map_id==46 ) &&
-               switch_id>5000 && SLTI_V229R49.monster?(self)
-              $game_map.need_refresh=true
-            end
-          end
-          end
-          NEW_RANGE
-
-          s134=once.call(s134,old_range,new_range,'First-acquisition map refresh')
-
-          old_wall=<<'OLD_WALL'
-                  s.x=cx*1024+(id%4)*256-sx
-                  s.y=cy*1024+(id/4)*128-sy
-                  # Position the wall by its true painted bounding box, NOT an RPG tile.
-          OLD_WALL
-          new_wall=<<'NEW_WALL'
-                  wall_x=cx*1024+(id%4)*256-sx
-                  wall_y=cy*1024+(id/4)*128-sy
-                  # Keep only actual on-screen wall geometry in the renderer.
-                  if wall_x+256<=0 || wall_y+128<=0 ||
-                     wall_x>=@viewport2.rect.width || wall_y>=@viewport2.rect.height
-                    s.visible=false if s.visible
-                    next
-                  end
-                  s.visible=true unless s.visible
-                  s.x=wall_x
-                  s.y=wall_y
-                  # Position the wall by its true painted bounding box, NOT an RPG tile.
-          NEW_WALL
-
-          s134=once.call(s134,old_wall,new_wall,'Offscreen wall clipping')
-          s134=once.call(s134,
-            "        s.z=4096\n        s.opacity=overlap ? 148 : 255\n",
-            "        s.z=4096 if s.z!=4096\n        wanted_opacity=overlap ? 148 : 255\n        s.opacity=wanted_opacity if s.opacity!=wanted_opacity\n",
-            'Avoid redundant wall setters')
-
-          raise 'Original reward table was altered' unless s134[/  DATA=.*\n/]==data
-          write.call(134,s134)
-
-          raise 'Unrelated Ruby scripts changed' unless entries.each_index.all?{|i| i==7 || i==134 || entries[i]==original[i]}
-          File.binwrite(path,Marshal.dump(entries))
-          File.binwrite('build/r59-switches.rb',read.call(7))
-          File.binwrite('build/r59-runtime.rb',read.call(134))
-
-          parts=s134[/^  PARTS=(\{.*\})$/,1]
-          raise 'Missing original wall piece metadata' if parts==nil
-          File.write('build/r59-wall-parts.json',JSON.generate(eval(parts)))
-          File.write('build/r59-ruby.json',JSON.pretty_generate({
-            version:'V229R59',
-            changed_scripts:[7,134],
-            switch_max:6000,
-            recognition_switches:88,
-            reward_data_unchanged:true
-          }))
-          puts 'PASS extended original switch backend, first recognition refresh, offscreen culling'
-          R59_SCRIPTS
-
-          ruby -c /tmp/r59_scripts.rb
-          ruby /tmp/r59_scripts.rb
-          ruby -c build/r59-switches.rb
-          ruby -c build/r59-runtime.rb
-
-      - name: V229R59 Install PNG processing dependency
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: V229R59 Install Pillow
-        shell: bash
-        run: python -m pip install --quiet pillow==11.3.0
-
-      - name: V229R59 Move Map046 dark ground stains below all monsters
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/r59_ground.py <<'PY_GROUND'
-          from PIL import Image,ImageChops
-          from pathlib import Path
+          import hashlib
           import json
 
-          root=Path('site/knight/gameasync/Graphics/Panoramas')
-          wall_parts=json.loads(Path('build/r59-wall-parts.json').read_text('utf-8'))
-          changed=[]
-          cloud_count=0
-          moved_pixels=0
+          current=Path('site')
+          original=Path('source57')
 
-          for wall_path in sorted(root.glob('SLTI_46_W_C*.png')):
-              coords=wall_path.stem.split('_C')[-1].split('_')
-              key='46:'+coords[0]+':'+coords[1]
-              rendered_ids={entry[0] for entry in wall_parts.get(key,[])}
+          for filename,root,version in (
+              ('index.html',current,'V229R59'),
+              ('knight/index.html',current,'V229R59'),
+              ('index.html',original,'V229R57'),
+              ('knight/index.html',original,'V229R57')
+          ):
+              assert version in (root/filename).read_text('utf-8'),filename
 
-              if not rendered_ids:
-                  continue
+          pre='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          for mid in (45,46):
+              name=pre+f'Map{mid:03d}.rxdata'
+              assert (current/name).is_file(),name
+              assert (current/name).read_bytes()==(original/name).read_bytes(),name
 
-              floor_path=root/wall_path.name.replace('_W_','_')
-              assert floor_path.is_file(),wall_path.name
+          files={
+              str(p.relative_to(current)):
+              hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in current.rglob('*') if p.is_file()
+          }
 
-              wall=Image.open(wall_path).convert('RGBA')
-              ground=Image.open(floor_path).convert('RGBA')
-              assert wall.size==ground.size==(512,512)
-
-              original_wall=wall.copy()
-              original_ground=ground.copy()
-              w,h=wall.size
-              wp=wall.load()
-              gp=ground.load()
-
-              # Neutral gray smoke pixels in actually rendered foreground pieces.
-              # Warm-colored stone wall geometry remains in the foreground.
-              flag=bytearray(
-                  1 if a==255 and r<=g<=b and b-r<=16 and r<=130 and
-                  ((i//w)//64)*4+((i%w)//128) in rendered_ids else 0
-                  for i,(r,g,b,a) in enumerate(wall.getdata())
-              )
-
-              visited=bytearray(w*h)
-
-              for first in range(w*h):
-                  if not flag[first] or visited[first]:
-                      continue
-
-                  visited[first]=1
-                  q=[first]
-                  group=[]
-                  minx=w;miny=h;maxx=0;maxy=0
-
-                  while q:
-                      index=q.pop()
-                      group.append(index)
-                      x=index%w;y=index//w
-                      if x<minx:minx=x
-                      if x>maxx:maxx=x
-                      if y<miny:miny=y
-                      if y>maxy:maxy=y
-
-                      for nx,ny in (
-                          (x-1,y),(x+1,y),(x,y-1),(x,y+1),
-                          (x-1,y-1),(x+1,y-1),(x-1,y+1),(x+1,y+1)
-                      ):
-                          if nx<0 or nx>=w or ny<0 or ny>=h:
-                              continue
-                          ni=ny*w+nx
-                          if flag[ni] and not visited[ni]:
-                              visited[ni]=1
-                              q.append(ni)
-
-                  if len(group)<300 or maxx-minx+1<35 or maxy-miny+1<18:
-                      continue
-
-                  cloud_count+=1
-                  moved_pixels+=len(group)
-
-                  for index in group:
-                      x=index%w;y=index//w
-                      gp[x,y]=wp[x,y]
-                      wp[x,y]=(0,0,0,0)
-
-              if wall.tobytes()==original_wall.tobytes():
-                  continue
-
-              # Composite must remain visually identical with no monsters on top.
-              original_view=Image.alpha_composite(original_ground,original_wall)
-              new_view=Image.alpha_composite(ground,wall)
-              assert ImageChops.difference(
-                  original_view.convert('RGB'),
-                  new_view.convert('RGB')
-              ).getbbox() is None,wall_path.name
-
-              wall.save(wall_path,optimize=True)
-              ground.save(floor_path,optimize=True)
-              changed.extend([wall_path.name,floor_path.name])
-
-          assert cloud_count>=20,('Too few smoke pieces moved',cloud_count)
-          assert moved_pixels>75000,('Too few smoke pixels moved',moved_pixels)
-          assert 'SLTI_46_W_C4_2.png' in changed
-          assert len(changed)==len(set(changed))
-
-          Path('build/r59-ground.json').write_text(json.dumps({
-              'version':'V229R59',
-              'smoke_components':cloud_count,
-              'moved_pixels':moved_pixels,
-              'modified_pngs':sorted(changed)
-          },indent=2))
-
-          print('PASS moved',moved_pixels,'smoke pixels from',cloud_count,
-                'cloud components; changed',len(changed),'PNG files')
-          PY_GROUND
-          python /tmp/r59_ground.py
-
-      - name: V229R59 Test 88 recognition switches and correct R57 class boundary
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/r59_check.rb <<'R59_CHECK'
-          require 'zlib'
-
-          module RPG
-            class Map;end
-            class AudioFile;end
-            class Tileset;end
-            class CommonEvent;end
-            class MapInfo;end
-            class Event
-              class Page
-                class Condition;end
-                class Graphic;end
-              end
-            end
-            class EventCommand;end
-            class MoveRoute;end
-            class MoveCommand;end
-          end
-
-          class Table
-            def self._load(data)
-              o=allocate
-              o.instance_variable_set(:@data,data)
-              o
-            end
-            def _dump(level=0);@data;end
-          end
-          class Tone<Table;end
-          class Color<Table;end
-
-          load 'build/r59-switches.rb'
-          gs=Game_Switches.new
-          $game_switches=gs
-
-          prefix='site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          count=0
-
-          (45..46).each do |mid|
-            map=Marshal.load(File.binread(prefix+format('Map%03d.rxdata',mid)))
-            extras=[]
-
-            map.instance_variable_get(:@events).each do |id,event|
-              next unless event.instance_variable_get(:@name).to_s.start_with?('[ID')
-              pages=event.instance_variable_get(:@pages)
-              next if pages.length<2
-              cond=pages[1].instance_variable_get(:@condition)
-              next unless cond.instance_variable_get(:@switch1_valid)
-              sid=cond.instance_variable_get(:@switch1_id)
-              extras<<sid if sid>5000
-            end
-
-            assert_count=(mid==45 ? 39 : 49)
-            raise "Incorrect Map#{mid} new-monster count" unless extras.length==assert_count
-
-            extras.each do |sid|
-              gs[sid]=true
-              raise "Recognition ON failed #{sid}" unless gs[sid]
-              gs[sid]=false
-              raise "Recognition OFF failed #{sid}" if gs[sid]
-            end
-
-            count+=extras.length
-          end
-
-          raise 'Wrong number of newly added monsters' unless count==88
-          raise 'Original switch 5000 broken' unless (gs[5000]=true;gs[5000])
-          gs[6001]=true
-          raise 'Switch backend no longer bounded' if gs[6001]
-
-          class Game_Character
-            attr_accessor :x,:y
-            def 범위(distance,switch_id,mode)
-              if (x-$game_player.x).abs+(y-$game_player.y).abs<distance && mode==1
-                $game_switches[switch_id]=true
-              end
-            end
-          end
-
-          class Game_Event<Game_Character;end
-
-          module SLTI_V229R49
-            def self.monster?(e);e.is_a?(Game_Event);end
-            def self.first_sight?(*a);true;end
-          end
-
-          src=File.binread('build/r59-runtime.rb').force_encoding('UTF-8')
-          a=src.index("class Game_Character\n  alias slti_r49_original_range")
-
-          # R59 fix: R56 removed the obsolete Game_Event initializer alias.
-          # The next existing class after the range wrapper is Interpreter.
-          # R58 incorrectly searched for the deleted Game_Event class.
-          b=src.index("\nclass Interpreter",a)
-
-          raise 'Recognition wrapper not found' if a==nil || b==nil
-          eval(src[a...b])
-
-          Player=Struct.new(:x,:y)
-          MapMock=Struct.new(:map_id,:need_refresh)
-          $game_player=Player.new(20,20)
-          $game_map=MapMock.new(45,false)
-
-          monster=Game_Event.new
-          monster.x=19
-          monster.y=20
-          monster.범위(10,5016,1)
-          raise 'Failed initial recognition or page refresh' unless gs[5016] && $game_map.need_refresh
-
-          $game_map.need_refresh=false
-          monster.범위(10,5016,1)
-          raise 'Redundant event-page refresh' if $game_map.need_refresh
-
-          gs[5017]=false
-
-          module SLTI_V229R49
-            def self.first_sight?(*a);false;end
-          end
-
-          blocked=Game_Event.new
-          blocked.x=19
-          blocked.y=20
-          blocked.범위(10,5017,1)
-          raise 'Detected monster behind wall' if gs[5017]
-
-          puts 'PASS 88 new-monster switches, legacy switches, one-time refresh, wall-blocked sight'
-
-          # Keep wall geometry loaded but submit only visible pieces to renderer.
-          class Spriteset_Map;end
-
-          start=src.index("  def slti_r49_update_walls\n")
-          finish=src.index("  alias slti_r49_original_dispose dispose",start)
-          raise 'Wall update method missing' if start==nil || finish==nil
-
-          eval("class Spriteset_Map\n"+src[start...finish]+"end\n")
-
-          class Spr
-            attr_accessor :visible,:z,:opacity,:x,:y
-            def initialize
-              @visible=true
-              @z=0
-              @opacity=255
-            end
-          end
-
-          Rect=Struct.new(:width,:height)
-          View=Struct.new(:rect)
-
-          ss=Spriteset_Map.allocate
-          ss.instance_variable_set(:@slti_chunks,{[4,2]=>true})
-
-          sprite=Spr.new
-          ss.instance_variable_set(
-              :@slti_r49_walls,
-              {[4,2]=>[nil,[[sprite,0,0,0,128,64]]]}
+          assert len(files)==5517,len(files)
+          Path('build/r60-baseline.json').write_text(
+              json.dumps(files,sort_keys=True)
           )
-          ss.instance_variable_set(:@viewport2,View.new(Rect.new(640,480)))
-          ss.instance_variable_set(:@character_sprites,nil)
 
-          $game_map.define_singleton_method(:display_x){@display_x || 0}
-          $game_map.define_singleton_method(:display_y){@display_y || 0}
-          $game_map.instance_variable_set(:@display_x,0)
-          $game_map.instance_variable_set(:@display_y,0)
+          print('PASS R59 5517 files, R57 reference, original TI maps')
+          PY_BASE
 
-          ss.slti_r49_update_walls
-          raise 'Offscreen wall still renders' if sprite.visible
-
-          $game_map.instance_variable_set(:@display_x,4*1024*4)
-          $game_map.instance_variable_set(:@display_y,2*1024*4)
-          ss.slti_r49_update_walls
-
-          raise 'Visible wall did not return' unless
-              sprite.visible && sprite.x==0 && sprite.y==0 && sprite.z==4096
-
-          puts 'PASS offscreen wall clipping and visible foreground restoration'
-          R59_CHECK
-
-          ruby -c /tmp/r59_check.rb
-          ruby /tmp/r59_check.rb | tee build/r59-switch-test.txt
-
-      - name: V229R59 Update changed graphics and script cache hashes
+      - name: V229R60 Remove transferred smoke from second-floor ground
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY_MANIFEST'
+          python3 - <<'PY_GROUND'
           from pathlib import Path
-          import hashlib,json,re
+          import hashlib
+          import json
+          import shutil
+          import struct
+
+          target=Path('site/knight/gameasync/Graphics/Panoramas')
+          original=Path('source57/knight/gameasync/Graphics/Panoramas')
+
+          def digest(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          restored=[]
+
+          for source in sorted(original.glob('SLTI_46_C*.png')):
+              destination=target/source.name
+              assert destination.is_file(),source.name
+
+              if digest(source)==digest(destination):
+                  continue
+
+              content=source.read_bytes()
+              assert content.startswith(b'\x89PNG\r\n\x1a\n')
+              width,height=struct.unpack('>II',content[16:24])
+              assert (width,height)==(512,512),source.name
+
+              wall_name=source.name.replace(
+                  'SLTI_46_C','SLTI_46_W_C',1
+              )
+              wall=target/wall_name
+
+              assert wall.is_file(),wall_name
+
+              # R59 already removed the smoke from the foreground.
+              # Restore only R57 ground. Do not roll back the cleaned wall.
+              shutil.copy2(source,destination)
+              assert digest(source)==digest(destination)
+
+              restored.append(source.name)
+
+          assert len(restored)==22,(
+              'Unexpected R59 ground changes',len(restored)
+          )
+
+          result={
+              'version':'V229R60',
+              'source':'V229R59',
+              'ground_reference':'V229R57',
+              'restored_ground_pngs':restored,
+              'restored_count':len(restored),
+              'foreground_walls_preserved':True,
+              'collision_files_modified':False
+          }
+
+          Path('build/r60-ground.json').write_text(
+              json.dumps(result,indent=2)
+          )
+
+          print('PASS restored',len(restored),
+                'original Map046 ground PNGs')
+          PY_GROUND
+
+      - name: V229R60 Optimize stationary second-floor terrain updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/r60_optimize.rb <<'R60_RUBY'
+          require 'zlib'
+          require 'json'
+          require 'digest'
+
+          path='site/knight/gameasync/Data/Scripts.rxdata'
+          original_bytes=File.binread(path)
+          scripts=Marshal.load(original_bytes)
+          baseline=Marshal.load(original_bytes)
+
+          raise 'Unexpected script count' unless scripts.length==136
+
+          index=97
+          code=Zlib::Inflate.inflate(scripts[index][2])
+          code.force_encoding('UTF-8')
+
+          raise 'Original terrain method missing' unless
+            code.include?('def slti_update_terrain')
+
+          old_start=<<'OLD'
+              return if viewport_w <= 0 || viewport_h <= 0
+              left = [sx / 1024, 0].max
+          OLD
+
+          new_start=<<'NEW'
+              return if viewport_w <= 0 || viewport_h <= 0
+              # R60: floor textures are static. No need to recompute the same
+              # visible chunks when camera position and map are unchanged.
+              if @slti_floor==46 &&
+                 @slti_r60_floor_ready &&
+                 @slti_r60_floor_sx==sx &&
+                 @slti_r60_floor_sy==sy &&
+                 @slti_r60_floor_id==@slti_floor
+                return
+              end
+              left = [sx / 1024, 0].max
+          NEW
+
+          raise 'Unexpected terrain entry layout' unless
+            code.scan(old_start).length==1
+
+          code=code.sub(old_start,new_start)
+
+          old_end=<<'OLD'
+                sprite.y=y*1024-sy
+              end
+            end
+
+          end
+          OLD
+
+          new_end=<<'NEW'
+                sprite.y=y*1024-sy
+              end
+              @slti_r60_floor_sx=sx
+              @slti_r60_floor_sy=sy
+              @slti_r60_floor_id=@slti_floor
+              @slti_r60_floor_ready=(
+                @slti_floor==46 &&
+                !@slti_chunk_error &&
+                @slti_chunks.length==required.length
+              )
+            end
+
+          end
+          NEW
+
+          raise 'Unexpected terrain exit layout' unless
+            code.scan(old_end).length==1
+
+          code=code.sub(old_end,new_end)
+
+          raise 'Terrain update method removed' unless
+            code.include?('def slti_update_terrain')
+
+          raise 'Missing camera invalidation' unless
+            code.include?('@slti_r60_floor_sx==sx') &&
+            code.include?('@slti_r60_floor_sy==sy')
+
+          scripts[index][2]=Zlib::Deflate.deflate(code.b)
+
+          raise 'Unrelated Ruby script modified' unless
+            scripts.each_index.all?{|i|
+              i==index || scripts[i]==baseline[i]
+            }
+
+          # R59 runtime including switch 6000, monster recognition,
+          # existing reward data and original wall handling stays intact.
+          raise 'R59 monster runtime changed' unless
+            scripts[134]==baseline[134]
+
+          File.binwrite(path,Marshal.dump(scripts))
+          File.binwrite('build/r60-terrain.rb',code)
+
+          report={
+            version:'V229R60',
+            source_scripts_sha256:Digest::SHA256.hexdigest(original_bytes),
+            changed_script_indexes:[97],
+            source_runtime_134_preserved:true,
+            original_monster_recognition_preserved:true,
+            original_491_reward_data_preserved:true,
+            texture_cache_growth_added:false
+          }
+
+          File.write(
+            'build/r60-performance.json',
+            JSON.pretty_generate(report)
+          )
+
+          puts 'PASS Map046 stationary floor update guard'
+          puts 'PASS script134 and all other Ruby scripts unchanged'
+          R60_RUBY
+
+          ruby -c /tmp/r60_optimize.rb
+          ruby /tmp/r60_optimize.rb
+          ruby -c build/r60-terrain.rb
+
+      - name: V229R60 Verify ground restoration and engine preservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VERIFY'
+          from pathlib import Path
+          import hashlib
+          import json
 
           root=Path('site')
-          mapping=root/'knight/gameasync/mapping.js'
+          base=Path('source57')
+          ground=json.loads(
+              Path('build/r60-ground.json').read_text()
+          )
+          perf=json.loads(
+              Path('build/r60-performance.json').read_text()
+          )
+
+          rel=Path('knight/gameasync/Graphics/Panoramas')
+
+          for name in ground['restored_ground_pngs']:
+              assert (root/rel/name).read_bytes()==(
+                  base/rel/name
+              ).read_bytes(),name
+
+          before=json.loads(
+              Path('build/r60-baseline.json').read_text()
+          )
+
+          # All R59 maps, wall textures and monster events remain unchanged.
+          for filename in before:
+              if filename.startswith('knight/gameasync/Data/Map'):
+                  assert hashlib.sha256(
+                      (root/filename).read_bytes()
+                  ).hexdigest()==before[filename],filename
+
+              if '/Graphics/Panoramas/SLTI_46_W_' in filename:
+                  assert hashlib.sha256(
+                      (root/filename).read_bytes()
+                  ).hexdigest()==before[filename],filename
+
+          assert ground['restored_count']==22
+          assert perf['changed_script_indexes']==[97]
+          assert perf['source_runtime_134_preserved']
+
+          print('PASS 22 original floor PNGs restored')
+          print('PASS R59 foreground walls unchanged')
+          print('PASS original maps, collision and monster events unchanged')
+          PY_VERIFY
+
+      - name: V229R60 Update exact resource hashes and version labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_MANIFEST'
+          from pathlib import Path
+          import hashlib
+          import json
+          import re
+
+          root=Path('site')
+          engine=root/'knight/gameasync'
+          mapping=engine/'mapping.js'
           text=mapping.read_text('utf-8')
 
-          def update(uri,file):
+          def replace_hash(uri,path):
               global text
-              md5=hashlib.md5(file.read_bytes()).hexdigest()
-              old=re.escape(uri)+r'\?h=[0-9a-f]{32}'
-              text,n=re.subn(old,lambda m:uri+'?h='+md5,text)
-              assert n==1,(uri,n)
+              digest=hashlib.md5(path.read_bytes()).hexdigest()
+              pattern=re.escape(uri)+r'\?h=[0-9a-f]{32}'
 
-          update('Data/Scripts.rxdata',root/'knight/gameasync/Data/Scripts.rxdata')
+              updated,count=re.subn(
+                  pattern,
+                  lambda m:uri+'?h='+digest,
+                  text
+              )
 
-          report=json.loads(Path('build/r59-ground.json').read_text())
-          for name in report['modified_pngs']:
-              rel='Graphics/Panoramas/'+name
-              update(rel,root/'knight/gameasync'/rel)
+              assert count==1,(uri,count)
+              text=updated
+
+          replace_hash(
+              'Data/Scripts.rxdata',
+              engine/'Data/Scripts.rxdata'
+          )
+
+          report=json.loads(
+              Path('build/r60-ground.json').read_text()
+          )
+
+          for filename in report['restored_ground_pngs']:
+              relative='Graphics/Panoramas/'+filename
+              replace_hash(relative,engine/relative)
 
           mapping.write_text(text,encoding='utf-8')
 
-          for name in ('index.html','knight/index.html'):
-              page=root/name
-              source=page.read_text('utf-8')
-              assert 'V229R57' in source,name
-              page.write_text(
-                  source.replace('V229R57','V229R59').replace('v229r57','v229r59'),
-                  encoding='utf-8'
+          for filename in ('index.html','knight/index.html'):
+              file=root/filename
+              source=file.read_text('utf-8')
+              assert 'V229R59' in source,filename
+
+              updated=source.replace(
+                  'V229R59','V229R60'
+              ).replace(
+                  'v229r59','v229r60'
               )
 
-          print('PASS script and',len(report['modified_pngs']),'image cache keys updated')
+              file.write_text(updated,encoding='utf-8')
+
+          print('PASS script cache, 22 image hashes, version labels')
           PY_MANIFEST
+
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R59 Verify original game and exact changed files
+      - name: V229R60 Final complete file and rollback safety check
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY_FINAL'
+          python3 - <<'PY_FINAL'
           from pathlib import Path
-          import json,hashlib
+          import hashlib
+          import json
 
           root=Path('site')
-          before=json.loads(Path('build/r59-original.json').read_text('utf-8'))
-          after={
-              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
+          original=json.loads(
+              Path('build/r60-baseline.json').read_text()
+          )
+
+          current={
+              str(f.relative_to(root)):
+              hashlib.sha256(f.read_bytes()).hexdigest()
+              for f in root.rglob('*') if f.is_file()
           }
 
-          assert len(before)==len(after)==5517 and before.keys()==after.keys()
+          assert len(original)==len(current)==5517
+          assert original.keys()==current.keys()
 
-          changed={p for p in before if before[p]!=after[p]}
-          images=json.loads(Path('build/r59-ground.json').read_text())['modified_pngs']
+          changed={
+              name for name in original
+              if original[name]!=current[name]
+          }
 
           allowed={
               'index.html',
@@ -572,35 +433,41 @@ jobs:
               'knight/gameasync/mapping.js',
               'knight/gameasync/Data/Scripts.rxdata'
           }
-          allowed|={
+
+          ground=json.loads(
+              Path('build/r60-ground.json').read_text()
+          )
+
+          allowed.update(
               'knight/gameasync/Graphics/Panoramas/'+name
-              for name in images
-          }
+              for name in ground['restored_ground_pngs']
+          )
 
-          assert changed==allowed,('Unexpected file change',changed^allowed)
+          assert changed==allowed,(
+              'Unexpected modification',changed^allowed
+          )
 
-          for name in ('index.html','knight/index.html'):
-              assert 'V229R59' in (root/name).read_text('utf-8')
+          for filename in ('index.html','knight/index.html'):
+              assert 'V229R60' in (
+                  root/filename
+              ).read_text('utf-8')
 
-          assert Path('build/r59-switch-test.txt').read_text().startswith('PASS 88')
-
-          print('PASS complete 5517-file original game; only scripts, browser hashes, cloud PNGs and version labels changed')
+          print('PASS: all 5517 original game files accounted for')
+          print('PASS: only 22 floor PNGs and 4 web files modified')
+          print('PASS: existing walls, maps, spawns and rewards preserved')
           PY_FINAL
 
-      - name: V229R59 Upload monster recognition and foreground regression report
+      - name: V229R60 Upload terrain and preservation verification
         uses: actions/upload-artifact@v4
         with:
-          name: SLKnight-V229R59-TI-Recognition-Cloud-Layer
+          name: SLKnight-V229R60-Terrain-Performance
           path: |
-            build/r59-original.json
-            build/r59-ruby.json
-            build/r59-wall-parts.json
-            build/r59-ground.json
-            build/r59-switch-test.txt
+            build/r60-ground.json
+            build/r60-performance.json
           retention-days: 30
           if-no-files-found: error
 
-      - name: V229R59 Upload complete game to existing GitHub Pages
+      - name: V229R60 Upload complete game to existing GitHub Pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
