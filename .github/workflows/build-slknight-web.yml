@@ -1,15 +1,14 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R56
-# CAUSE: confirmed save-load TypeError at V230 Boss Respawn 60s 180s:182.
-# Root: aliased Game_Event#initialize calls native super() in mruby context.
-# FIX: move original R49 event gate into Game_Event native initialize,
-# remove R49 and R52 Game_Event initialize aliases. Keep R55 reward behavior.
-# BASE: 491EV V5.41-v2 R52 deployed run 39743709979.
-# KEEP: all 5517 original files; 106 TI monsters, maps, walls, and loot.
-# KEEP: 62 boss Adena bands, 212 native normal RNG, 162 fixed Adena.
-# Only script indexes 26,72,74,134 and two version HTMLs and mapping hash change.
-name: build-slknight-web.yml | V229R56 | Clean Native Events and 2x Terrain
+# VERSION: V229R57
+# CAUSE: confirmed R56 save-load NoMethodError: undefined method 'defined?'.
+# R56 Game_Event refresh and Interpreter reward commands contain 6 mruby-incompatible
+# defined?(SLV541) guards. R57 replaces only these guards with direct calls.
+# BASE: last successful R56 GitHub Pages artifact, exact pinned commit below.
+# Keeps original R56 R49 initialize fix, all 491 V5.41-v2 reward records,
+# 106 TI monsters, walls, maps, graphics, common loot, saves, and movement.
+# Only original scripts 26,72,74 changed, and visible versions + scripts digest.
+name: build-slknight-web.yml | V229R57 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -32,176 +31,126 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R56 Restore entire R52 deployment with V5.41 491EV
+      - name: V229R57 Find last successful R56 source artifact
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_RESOLVE'
+          import json,os,urllib.request
+          repo='gowellsik-hue/Game'
+          commit='b10be26b64c12c5beb59af2c379f9c36b8ad2e4d'
+          base=f'https://api.github.com/repos/{repo}'
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],
+                   'Accept':'application/vnd.github+json',
+                   'X-GitHub-Api-Version':'2022-11-28'}
+          def api(path):
+              with urllib.request.urlopen(urllib.request.Request(base+path,headers=headers),timeout=30) as r:
+                  return json.load(r)
+          records=api('/actions/workflows/build-slknight-web.yml/runs?status=success&per_page=100')['workflow_runs']
+          runs=[x for x in records if x.get('head_sha')==commit and x.get('conclusion')=='success' and x.get('head_branch')=='main']
+          assert runs,'No successful V229R56 workflow run found at pinned commit'
+          run=max(runs,key=lambda x:x['run_number'])
+          items=api(f"/actions/runs/{run['id']}/artifacts")['artifacts']
+          found=[x for x in items if x['name']=='github-pages' and not x['expired']]
+          assert found,'V229R56 GitHub Pages source artifact has expired'
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write(f"run_id={run['id']}\n")
+          print('PASS: verified successful R56 run and unexpired github-pages source artifact:',run['id'])
+          PY_RESOLVE
+      - name: V229R57 Download original R56 GitHub Pages artifact
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 39743709979
+          run-id: ${{ steps.source.outputs.run_id }}
           name: github-pages
           github-token: ${{ github.token }}
-          path: r52
-
-      - name: V229R56 Verify 5517 R52 files and preserve exact baseline
+          path: r56
+      - name: V229R57 Verify exact 5517 R56 source files
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p site build
-          test -s r52/artifact.tar
-          tar -xf r52/artifact.tar -C site
+          test -s r56/artifact.tar
+          tar -xf r56/artifact.tar -C site
           python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
-          script=root/'knight/gameasync/Data/Scripts.rxdata'
-          sha='1692894165d623508c560a537bbcb0d66b9886b7e070b461878ec563353c9644'
-          assert hashlib.sha256(script.read_bytes()).hexdigest()==sha,'Unexpected R52 source'
           for name in ('index.html','knight/index.html'):
-              assert 'V229R52' in (root/name).read_text('utf-8'),name
+              assert 'V229R56' in (root/name).read_text('utf-8'),name
+          scripts=root/'knight/gameasync/Data/Scripts.rxdata'
+          assert scripts.is_file() and scripts.stat().st_size>10000
           pre='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           for mid in (43,44,45,46):
               assert (root/(pre+f'Map{mid:03d}.rxdata')).is_file(),mid
-          old={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
-               for f in root.rglob('*') if f.is_file()}
-          assert len(old)==5517,len(old)
-          Path('build/r56-baseline.json').write_text(json.dumps(old,sort_keys=True))
-          print('PASS original 5517 files and V5.41-v2 R52 source')
+          before={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
+                  for f in root.rglob('*') if f.is_file()}
+          assert len(before)==5517,len(before)
+          Path('build/r57-baseline.json').write_text(json.dumps(before,sort_keys=True))
+          print('PASS: original 5517 V229R56 files recovered, including all 491EV maps')
           PY_BASE
-
-      - name: V229R56 Fix confirmed R49 Event initialize alias and retain 491EV rewards
+      - name: V229R57 Remove six unsupported mruby defined? guards only
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/r56_patch.rb <<'R56_PATCH'
+          cat > /tmp/r57_patch.rb <<'R57_PATCH'
           require 'zlib'
           require 'digest'
           require 'json'
           root=ARGV.fetch(0)
           out=ARGV.fetch(1)
           path=File.join(root,'knight/gameasync/Data/Scripts.rxdata')
-          expected='1692894165d623508c560a537bbcb0d66b9886b7e070b461878ec563353c9644'
-          raise 'R52 source scripts changed' unless Digest::SHA256.file(path).hexdigest==expected
-          scripts=Marshal.load(File.binread(path))
-          raise 'Wrong scripts length' unless scripts.length==136
-          original=Marshal.load(File.binread(path))
-          changed=[]
+          original_bytes=File.binread(path)
+          original_sha=Digest::SHA256.hexdigest(original_bytes)
+          scripts=Marshal.load(original_bytes)
+          raise 'Unexpected scripts count' unless scripts.length==136
+          original=Marshal.load(original_bytes)
           get=lambda{|i| Zlib::Inflate.inflate(scripts[i][2]).force_encoding('UTF-8')}
-          put=lambda{|i,t| scripts[i][2]=Zlib::Deflate.deflate(t.b); changed<<i}
-          replace_once=lambda do |text,old,new,label|
+          put=lambda{|i,t| scripts[i][2]=Zlib::Deflate.deflate(t.b)}
+          # Pin the exact six bad guards seen in R56. No guessing, no new aliases.
+          changes={
+            26=>['SLV541.observe(self) if defined?(SLV541)', 'SLV541.observe(self)', 3],
+            72=>['defined?(SLV541) && SLV541.rewarded?', 'SLV541.rewarded?', 2],
+            74=>['defined?(SLV541) && SLV541.rewarded?', 'SLV541.rewarded?', 1]
+          }
+          changes.each do |i,(old,new,count)|
+            text=get.call(i)
             found=text.scan(old).length
-            raise "#{label}: wanted one match, got #{found}" unless found==1
-            text.sub(old,new)
+            raise "Unexpected R56 guard count at script #{i}: #{found}/#{count}" unless found==count
+            patched=text.gsub(old,new)
+            raise "unsupported defined? remains in script #{i}" if patched.include?('defined?(SLV541)')
+            put.call(i,patched)
           end
-
-          script134=get.call(134)
-          r49_old=<<'OLD'
-          class Game_Event
-            alias slti_r49_original_initialize initialize
-            def initialize(map_id,event)
-              if (map_id==45 || map_id==46) && event.id>=16 && event.name.to_s[0,3]=='[ID'
-                gate=event.pages[1].condition
-                $game_switches[gate.switch1_id]=false if gate.switch1_valid
-              end
-              slti_r49_original_initialize(map_id,event)
-            end
-          end
-          OLD
-          raise 'R49 initializer wrapper appears more than once' unless script134.scan(r49_old).length==1
-          script134=script134.sub(r49_old,'')
-
-          marker='# V229R52: V230 V5.41-v2 authoritative'
-          raise 'R52 reward module absent' unless script134.include?(marker)
-          wrapper_start="\nclass Game_Event\n  alias slv541_original_initialize initialize\n"
-          raise 'Unexpected R52 reward wrapper' unless script134.scan(wrapper_start).size==1
-          prefix,wrapper=script134.split(wrapper_start,2)
-          raise 'Missing R52 old command wrappers' unless ['alias slv541_original_refresh refresh','alias slv541_original_variable_command command_122','alias slv541_original_gold_command command_125','alias slv541_original_exp_command command_315'].all?{|x| wrapper.include?(x)}
-          raise 'Unexpected reward wrapper end' unless wrapper.end_with?("  end\nend\n")
-          old_data=script134[/  DATA=.*\n/]
-          raise 'Source reward data missing' unless old_data && old_data.include?('DATA={2=>{')
-
-          observer=<<'OBSERVER'
-
-          # R56 rewards. Called by ORIGINAL Game_Event#refresh, with no alias-based init.
-          module SLV541
-            def self.observe(event)
-              mid=event.instance_variable_get(:@map_id)
-              eid=event.instance_variable_get(:@id)
-              info=stat(mid,eid)
-              return if info.nil? || $game_variables.nil?
-              maxhp=info[4]
-              hpvar=info[6]
-              if $game_variables[hpvar].to_i < maxhp
-                event.instance_variable_set(:@slv541_saw_live,true)
-                event.instance_variable_set(:@slv541_rewarded,false)
-                return
-              end
-              return unless event.instance_variable_get(:@slv541_saw_live)==true
-              return if event.instance_variable_get(:@slv541_rewarded)==true
-              source=event.instance_variable_get(:@event)
-              death=source.pages[info[5]] unless source.nil?
-              return if death.nil?
-              return unless event.instance_variable_get(:@page).equal?(death)
-              event.instance_variable_set(:@slv541_rewarded,true)
-              pay(event,info)
-            end
-          end
-          OBSERVER
-          script134=(prefix+observer).sub(marker,'# V229R56: V230 V5.41-v2 authoritative')
-          raise 'Reward DATA was changed' unless script134[/  DATA=.*\n/]==old_data
-          raise 'R49 Game_Event initializer alias remains' if script134.include?("class Game_Event\n  alias slti_r49_original_initialize initialize")
-          raise 'R52 initializer alias remains' if script134.include?('alias slv541_original_initialize initialize')
-          raise 'R52 reward command aliases remain' if script134.include?('alias slv541_original_')
-          put.call(134,script134)
-
-          script26=get.call(26)
-          original_header="  def initialize(map_id, event)\r\n    super()\r\n"
-          new_header=<<~'NEW'.gsub("\n","\r\n")
-            def initialize(map_id, event)
-              # R56: original R49 gate setup moved here, before the native super() call.
-              # Do not call an alias of Game_Event#initialize: mruby rejects aliased super.
-              if (map_id==45 || map_id==46) && event.id>=16 && event.name.to_s[0,3]=='[ID'
-                gate=event.pages[1].condition
-                $game_switches[gate.switch1_id]=false if gate.switch1_valid
-              end
-              super()
-          NEW
-          # <<~ removes initial 2 spaces; explicit indent reconstructed below.
-          new_header=new_header.lines.map{|l| '  '+l}.join
-          script26=replace_once.call(script26,original_header,new_header,'Game_Event native initialize')
-          script26=replace_once.call(script26,"    if new_page == @page\r\n","    if new_page == @page\r\n      SLV541.observe(self) if defined?(SLV541)\r\n",'Game_Event refresh unchanged page')
-          script26=replace_once.call(script26,"      @interpreter = nil\r\n      # \uBA54\uC18C\uB4DC \uC885\uB8CC\r\n      return\r\n","      @interpreter = nil\r\n      # \uBA54\uC18C\uB4DC \uC885\uB8CC\r\n      SLV541.observe(self) if defined?(SLV541)\r\n      return\r\n",'Game_Event refresh nil-page exit')
-          script26=replace_once.call(script26,"    check_event_trigger_auto\r\n  end\r\n","    check_event_trigger_auto\r\n    SLV541.observe(self) if defined?(SLV541)\r\n  end\r\n",'Game_Event refresh normal exit')
-          raise 'Game_Event must still use direct native super' unless script26.include?("    super()\r\n    @map_id = map_id\r\n")
-          put.call(26,script26)
-
-          script72=get.call(72)
-          {122=>"    return true if defined?(SLV541) && SLV541.rewarded?(@map_id,@event_id) && (@parameters[0]==333 || @parameters[0]==1926)\r\n",125=>"    return true if defined?(SLV541) && SLV541.rewarded?(@map_id,@event_id)\r\n"}.each do |n,line|
-            tag="  def command_#{n}\r\n"
-            script72=replace_once.call(script72,tag,tag+line,"Interpreter command_#{n}")
-          end
-          put.call(72,script72)
-          script74=get.call(74)
-          tag="  def command_315\r\n"
-          script74=replace_once.call(script74,tag,tag+"    return true if defined?(SLV541) && SLV541.rewarded?(@map_id,@event_id)\r\n",'Interpreter command_315')
-          put.call(74,script74)
-
-          raise 'Unexpected changed indexes' unless changed.sort==[26,72,74,134]
-          raise 'Unrelated scripts changed' unless scripts.each_index.all?{|i|changed.include?(i) || scripts[i]==original[i]}
+          # R56 runtime was already loaded when Game_Map.setup starts. Thus direct
+          # references to its module are valid, and mruby's missing 'defined?' is avoided.
+          module_text=get.call(134)
+          raise 'R56 reward module missing' unless module_text.include?('module SLV541') && module_text.include?('DATA={2=>{')
+          raise 'R56 source runtime was unexpectedly modified' unless scripts[134]==original[134]
+          raise 'R56 native initializer regression' unless get.call(26).include?("    super()\r\n    @map_id = map_id\r\n")
+          raise 'Extra scripts modified' unless scripts.each_index.all?{|i|changes.key?(i) || scripts[i]==original[i]}
           File.binwrite(path,Marshal.dump(scripts))
-          [26,72,74,134].each{|i| File.binwrite(File.join(out,"r56-script#{i}.rb"),get.call(i))}
-          File.write(File.join(out,'r56-runtime.rb'),script134[script134.index('# V229R56:')..-1])
-          File.write(File.join(out,'r56-fix.json'),JSON.pretty_generate({version:'V229R56',base_scripts_sha256:expected,changed_script_indexes:changed.sort,original_game_event_initializer_direct:true,r49_initialize_alias_removed:true,r52_initialize_alias_removed:true,original_491_reward_data_preserved:true,existing_r49_gate_preserved:true}))
-          puts 'PASS: moved R49 gate into original Game_Event#initialize, removed alias chains; reward data unchanged'
-          R56_PATCH
-          ruby -c /tmp/r56_patch.rb
-          ruby /tmp/r56_patch.rb site build
-          for i in 26 72 74 134; do ruby -c "build/r56-script${i}.rb"; done
-          ruby -c build/r56-runtime.rb
-
-      - name: V229R56 Test 490 kills, original super, TI gate and save-load rewards
+          [26,72,74,134].each{|i|File.binwrite(File.join(out,"r57-script#{i}.rb"),get.call(i))}
+          File.write(File.join(out,'r57-runtime.rb'),module_text[module_text.index('# V229R56:')..-1])
+          File.write(File.join(out,'r57-fix.json'),JSON.pretty_generate({
+            version:'V229R57',source_version:'V229R56',source_sha256:original_sha,
+            changed_script_indexes:changes.keys.sort,removed_unsupported_guards:6,
+            preserve_original_event_initializer:true,preserve_reward_module:true,
+            preserve_491_balance_records:true,map_files_modified:false
+          }))
+          puts 'PASS: all 6 unsupported defined? guards removed from scripts 26,72,74; R56 reward module unchanged'
+          R57_PATCH
+          ruby -c /tmp/r57_patch.rb
+          ruby /tmp/r57_patch.rb site build
+          for i in 26 72 74 134; do ruby -c "build/r57-script${i}.rb"; done
+          ruby -c build/r57-runtime.rb
+      - name: V229R57 Test original Game_Event, 490 kills and saved game payouts
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/r56_test.rb <<'R56_TEST'
+          cat > /tmp/r57_test.rb <<'R57_TEST'
           require 'json'
           module RPG
             class Map;end
@@ -266,8 +215,8 @@ jobs:
           $game_switches=Hash.new(false)
           $game_self_switches=Hash.new(false)
           $game_map=MapMock.new(2)
-          [26,72,74].each{|i|load File.join(ENV.fetch('R56_BUILD'),"r56-script#{i}.rb")}
-          load File.join(ENV.fetch('R56_BUILD'),'r56-runtime.rb')
+          [26,72,74].each{|i|load File.join(ENV.fetch('R57_BUILD'),"r57-script#{i}.rb")}
+          load File.join(ENV.fetch('R57_BUILD'),'r57-runtime.rb')
           raise 'R49 event initialize alias remains' if Game_Event.instance_methods(false).include?(:slti_r49_original_initialize)
           raise 'R52 event initialize alias remains' if Game_Event.instance_methods(false).include?(:slv541_original_initialize)
           raise 'R52 event refresh alias remains' if Game_Event.instance_methods(false).include?(:slv541_original_refresh)
@@ -371,14 +320,13 @@ jobs:
             end
           end
           puts 'PASS original TI gate handling and native super constructor'
-          R56_TEST
-          ruby -c /tmp/r56_test.rb
-          R56_BUILD=build ruby /tmp/r56_test.rb site | tee build/r56-kill-regression.txt
-          grep -q 'PASS 491 records 491; kills 490; boss ranges 62; normal rng 212; fixed 162' build/r56-kill-regression.txt
-          grep -q 'PASS cold-dead, alive-save reload, dead-save reload' build/r56-kill-regression.txt
-          grep -q 'PASS original TI gate handling and native super constructor' build/r56-kill-regression.txt
-
-      - name: V229R56 Update only script digest and visible version
+          R57_TEST
+          ruby -c /tmp/r57_test.rb
+          R57_BUILD=build ruby /tmp/r57_test.rb site | tee build/r57-kill-regression.txt
+          grep -q 'PASS 491 records 491; kills 490; boss ranges 62; normal rng 212; fixed 162' build/r57-kill-regression.txt
+          grep -q 'PASS cold-dead, alive-save reload, dead-save reload' build/r57-kill-regression.txt
+          grep -q 'PASS original TI gate handling and native super constructor' build/r57-kill-regression.txt
+      - name: V229R57 Update R57 script digest and browser labels
         shell: bash
         run: |
           set -euo pipefail
@@ -396,13 +344,12 @@ jobs:
           for name in ('index.html','knight/index.html'):
               page=root/name
               content=page.read_text('utf-8')
-              assert 'V229R52' in content,name
-              page.write_text(content.replace('V229R52','V229R56').replace('v229r52','v229r56'),encoding='utf-8')
-          print('PASS only script digest and R56 labels updated')
+              assert 'V229R56' in content,name
+              page.write_text(content.replace('V229R56','V229R57').replace('v229r56','v229r57'),encoding='utf-8')
+          print('PASS only script digest and R57 labels updated')
           PY_MANIFEST
           node --check site/knight/gameasync/mapping.js
-
-      - name: V229R56 Check all maps, walls and files remain unchanged
+      - name: V229R57 Verify untouched maps, loot and 491EV source data
         shell: bash
         run: |
           set -euo pipefail
@@ -410,34 +357,33 @@ jobs:
           from pathlib import Path
           import hashlib,json
           root=Path('site')
-          old=json.loads(Path('build/r56-baseline.json').read_text('utf-8'))
+          old=json.loads(Path('build/r57-baseline.json').read_text('utf-8'))
           new={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
                for f in root.rglob('*') if f.is_file()}
           assert len(old)==len(new)==5517 and old.keys()==new.keys()
           changed={k for k in old if old[k]!=new[k]}
           allowed={'index.html','knight/index.html','knight/gameasync/mapping.js',
                    'knight/gameasync/Data/Scripts.rxdata'}
-          assert changed==allowed,('Unexpected modified files',changed^allowed)
-          meta=json.loads(Path('build/r56-fix.json').read_text('utf-8'))
-          assert meta['changed_script_indexes']==[26,72,74,134]
-          assert meta['r49_initialize_alias_removed'] and meta['r52_initialize_alias_removed']
-          assert meta['original_491_reward_data_preserved'] and meta['existing_r49_gate_preserved']
+          assert changed==allowed,('Unexpected changes',changed^allowed)
+          meta=json.loads(Path('build/r57-fix.json').read_text('utf-8'))
+          assert meta['changed_script_indexes']==[26,72,74]
+          assert meta['removed_unsupported_guards']==6
+          assert meta['preserve_491_balance_records'] and meta['preserve_original_event_initializer']
           for name in ('index.html','knight/index.html'):
-              assert 'V229R56' in (root/name).read_text('utf-8')
-          print('PASS 5517 source files, exact 4 allowed changes, no maps/loot/wall edits')
+              assert 'V229R57' in (root/name).read_text('utf-8')
+          print('PASS: 5517 source files preserved, 4 allowed web files changed; 491EV data untouched')
           PY_FINAL
-
-      - name: V229R56 Upload initializer and reward regression report
+      - name: V229R57 Upload Ruby-compatibility and payout regression report
         uses: actions/upload-artifact@v4
         with:
-          name: SLKnight-V229R56-GameEvent-Super-Fix-491EV
+          name: SLKnight-V229R57-Remove-mruby-defined-Guards
           path: |
-            build/r56-fix.json
-            build/r56-kill-regression.txt
+            build/r57-fix.json
+            build/r57-kill-regression.txt
           retention-days: 30
           if-no-files-found: error
 
-      - name: V229R56 Upload repaired original game to GitHub Pages
+      - name: V229R57 Upload repaired complete game to SAME GitHub Pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
