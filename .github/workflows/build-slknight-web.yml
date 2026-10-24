@@ -1,13 +1,13 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R62
-# BASE: successful V229R61 game run 40077912569.
-# FIX: fire, wind, ice, earth Fang monsters: hit-taken random 1-10 to 1-12.
-# SCOPE: Map035 EV 2,4,5,6,7,8,9,10 and Map043 EV 13,14; 4 directions each.
-# KEEP: variable 334 accuracy random 1-8, all other combat stats, original
-# movement, maps, sprites, 491EV reward data, drops, monster AI, and engine.
-# No extra files are added to the published site.
-name: build-slknight-web.yml | V229R62 | Clean Native Events and 2x Terrain
+# VERSION: V229R63
+# BASE: successful V229R62 deploy, run 40084523234.
+# S32 REFERENCE: V229R60 deploy, run 39984034888.
+# FANG: match working monsters: actor AGI vs random 1..12, actor ATK damage.
+# WALL: retain R61 native floor/door graph and intersect with R60 S32
+# directional wall constraints; preserve R61's image-verified doorway.
+# PRESERVE: 491EV balance, 106 TI monsters, wall art/fade, spawn, items, saves.
+name: build-slknight-web.yml | V229R63 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,217 +30,354 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R62 Restore entire successful R61 game
+      - name: V229R63 Restore complete R62 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40077912569
+          run-id: 40084523234
           name: github-pages
           github-token: ${{ github.token }}
-          path: r61
+          path: r62
 
-      - name: V229R62 Verify source inventory
+      - name: V229R63 Restore original S32 wall graph reference
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 39984034888
+          name: github-pages
+          github-token: ${{ github.token }}
+          path: r60
+
+      - name: V229R63 Verify sources and preserve file inventory
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p site build
-          test -s r61/artifact.tar
-          tar -xf r61/artifact.tar -C site
-          python3 - <<'PY_BASE'
+          mkdir -p site ref60 build
+          test -s r62/artifact.tar
+          test -s r60/artifact.tar
+          tar -xf r62/artifact.tar -C site
+          tar -xf r60/artifact.tar -C ref60
+          python3 - <<'PY_SOURCE'
           from pathlib import Path
           import hashlib,json
-          root=Path('site')
-          for name in ('index.html','knight/index.html'):
-              assert 'V229R61' in (root/name).read_text('utf-8'),name
-          old={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
-               for f in root.rglob('*') if f.is_file()}
-          assert len(old)==5517,len(old)
-          Path('build/r62-baseline.json').write_text(json.dumps(old,sort_keys=True))
-          print('PASS R61 original game: 5517 files verified')
-          PY_BASE
+          game=Path('site')
+          ref=Path('ref60')
+          assert 'V229R62' in (game/'index.html').read_text('utf-8')
+          assert 'V229R60' in (ref/'index.html').read_text('utf-8')
+          for root,expected in ((game,'aed8d9792dfce114a842c7e894c5672b67ba9a6ebcdcdaf41e2b3597484f88cf'),
+                                (ref,'438c7e2741f9dc358ce0392e8e1f9b4cd5944e14a7020f027f1a0898e341f55a')):
+              p=root/'knight/gameasync/Data/Scripts.rxdata'
+              assert hashlib.sha256(p.read_bytes()).hexdigest()==expected,'Unexpected scripts baseline'
+          original={str(p.relative_to(game)):hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in game.rglob('*') if p.is_file()}
+          assert len(original)==5517,len(original)
+          Path('build/r63-baseline.json').write_text(json.dumps(original,sort_keys=True))
+          print('PASS: verified R62 whole game and R60 S32 directional reference')
+          PY_SOURCE
 
-      - name: V229R62 Patch only the ten Fang monster events
+      - name: V229R63 Repair Fang events and align native floor and wall collision
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/r62_patch.rb <<'R62_PATCH'
+          cat > /tmp/r63_fix.rb <<'R63_FIX'
           # encoding: UTF-8
+          require 'zlib'
           require 'digest'
           require 'json'
+          require 'base64'
 
           module RPG
-            class Map; end
-            class AudioFile; end
+            class Map;end
+            class AudioFile;end
             class Event
               class Page
-                class Condition; end
-                class Graphic; end
+                class Condition;end
+                class Graphic;end
               end
             end
-            class EventCommand; end
-            class MoveRoute; end
-            class MoveCommand; end
+            class EventCommand;end
+            class MoveRoute;end
+            class MoveCommand;end
           end
           class Table
             def self._load(raw)
-              item=allocate
-              item.instance_variable_set(:@rgss_bytes,raw)
-              item
+              value=allocate
+              value.instance_variable_set(:@source_bytes,raw)
+              value
             end
-            def _dump(level=0); @rgss_bytes; end
+            def _dump(_level=0);@source_bytes;end
           end
           class Tone
             def self._load(raw)
-              item=allocate
-              item.instance_variable_set(:@rgss_bytes,raw)
-              item
+              value=allocate
+              value.instance_variable_set(:@source_bytes,raw)
+              value
             end
-            def _dump(level=0); @rgss_bytes; end
+            def _dump(_level=0);@source_bytes;end
           end
-          class Color < Tone; end
+          class Color<Tone;end
 
-          root=ARGV.fetch(0)
-          report_path=ARGV.fetch(1)
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          folder=File.join(root,'knight/gameasync/Data')
+          source=ARGV.fetch(0)
+          wall_ref=ARGV.fetch(1)
+          out=ARGV.fetch(2)
+          data=File.join(source,'knight/gameasync/Data')
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          scripts_path=File.join(data,'Scripts.rxdata')
+          original_scripts=Marshal.load(File.binread(scripts_path))
+          scripts=Marshal.load(File.binread(scripts_path))
+          source_ref=Marshal.load(File.binread(File.join(wall_ref,'knight/gameasync/Data/Scripts.rxdata')))
+          raise 'Wrong Ruby script count' unless scripts.length==136 && source_ref.length==136
+          unpack=lambda{|scripts,i|Zlib::Inflate.inflate(scripts[i][2]).force_encoding('UTF-8')}
+          current=unpack.call(scripts,21)
+          old_wall=unpack.call(source_ref,21)
+          raise 'R44 collision method missing' unless current.include?('module SLTI_V229R44') && old_wall.include?('module SLTI_V229R44')
 
-          # Each monster has four directional hit handlers.
-          # Variable 334 is separate accuracy random and remains unchanged.
-          TARGETS={
-            35=>{
-              2=>['화염의 이빨',904],4=>['화염의 이빨',905],
-              5=>['바람의 이빨',906],6=>['바람의 이빨',907],
-              7=>['빙하의 이빨',908],8=>['빙하의 이빨',909],
-              9=>['대지의 이빨',910],10=>['대지의 이빨',911]
-            },
-            43=>{
-              13=>['빙하의 이빨',909],14=>['대지의 이빨',910]
+          decode=lambda do |text,mid|
+            tail=text[text.index('module SLTI_V229R44')..-1]
+            raw=tail[/  EDGES_#{mid} = \[\s*(.*?)\s*\]\.join\.unpack\('m'\)\[0\]/m,1]
+            raise "No map mask #{mid}" if raw.nil?
+            bits=raw.scan(/"([A-Za-z0-9+\/=]+)"/).flatten.join
+            Base64.decode64(bits)
+          end
+
+          report={'version'=>'V229R63','base'=>'V229R62','wall_reference'=>'V229R60',
+                  'graph_strategy'=>'R61 floor+door AND original S32 directions; exception only verified door',
+                  'maps'=>{},'fangs'=>[]}
+
+          [45,46].each do |mid|
+            w,h=(mid==45 ? [288,144] : [336,168])
+            floor=decode.call(current,mid).bytes
+            s32=decode.call(old_wall,mid).bytes
+            raise "Graph length mismatch #{mid}" unless floor.length==w*h && s32.length==w*h
+            safe=Array.new(w*h){|i|floor[i]&s32[i]}
+            # R61 explicitly verified the visible Map045 double doorway.
+            # Restore only the original R61 reciprocal edges incident to its 4 tiles.
+            if mid==45
+              door=[[133,58],[134,58],[133,59],[134,59]]
+              door.each do |x,y|
+                [[0,-1,1,2],[0,1,2,1],[-1,0,4,8],[1,0,8,4]].each do |dx,dy,bit,reverse|
+                  nx=x+dx;ny=y+dy
+                  next if nx<0 || ny<0 || nx>=w || ny>=h
+                  i=y*w+x;j=ny*w+nx
+                  if (floor[i]&bit)!=0 && (floor[j]&reverse)!=0
+                    safe[i]|=bit
+                    safe[j]|=reverse
+                  end
+                end
+              end
+              door.each{|x,y|raise 'Door passage removed' if safe[y*w+x]==0}
+              raise 'Solid door jamb opened' unless safe[58*w+132]==0 && safe[58*w+135]==0
+            end
+            # This is a directional wall restriction, not a whole-game rollback.
+            # The existing R61 floor=385 cells remain blocked, and the visual door stays open.
+            raise 'No wall correction' unless safe!=floor
+            raise 'New path created outside original floor' unless safe.each_index.all?{|i|(safe[i]&floor[i])==safe[i]}
+            h.times do |y|
+              w.times do |x|
+                i=y*w+x
+                if x<w-1
+                  j=i+1
+                  raise "Broken L/R edge #{mid}:#{x},#{y}" unless ((safe[i]&8)!=0)==((safe[j]&4)!=0)
+                end
+                if y<h-1
+                  j=i+w
+                  raise "Broken U/D edge #{mid}:#{x},#{y}" unless ((safe[i]&2)!=0)==((safe[j+w-w]&1)!=0)
+                end
+              end
+            end
+            encoded=Base64.strict_encode64(safe.pack('C*')).scan(/.{1,120}/).map{|part|'    '+part.inspect}.join(",\n")
+            rx=/  EDGES_#{mid} = \[\r?\n.*?\r?\n  \]\.join\.unpack\('m'\)\[0\]/m
+            raise "Wrong mask placement #{mid}" unless current.scan(rx).length>=1
+            start=current.index('module SLTI_V229R44')
+            header=current[0...start]
+            body=current[start..-1]
+            raise "Unexpected #{mid} literal count" unless body.scan(rx).length==1
+            own=/  EDGES_#{mid} = \[\r?\n.*?\r?\n  \]\.join\.unpack\('m'\)\[0\]/m
+            raise "Missing exact #{mid} mask" unless body.scan(own).length==1
+            body=body.sub(own,"  EDGES_#{mid} = [\n#{encoded}\n  ].join.unpack('m')[0]")
+            current=header+body
+            report['maps'][mid.to_s]={
+              'cells'=>w*h,'was_open'=>floor.count{|v|v>0},
+              'now_open'=>safe.count{|v|v>0},
+              'wall_blocked_cells'=>floor.each_index.count{|i|floor[i]>0 && safe[i]==0},
+              'door_preserved'=>(mid==45)
             }
-          }.freeze
-          BASE_SHA={
-            35=>'42b1491a9449959ba6a04d0340e85185d5a8d45e216e400386a26002b34e90dd',
-            43=>'cbdb37f87a40b13e231075a3366690e328e8ffa6eda0c7f321454f4004bcb889'
-          }.freeze
+            File.binwrite(File.join(out,"r63-mask#{mid}.bin"),safe.pack('C*'))
+            puts "PASS Map#{mid}: blocked falsely open wall sections; preserved verified doorway"
+          end
+          scripts[21][2]=Zlib::Deflate.deflate(current.b)
+          raise 'Unexpected Ruby changes' unless scripts.each_index.all?{|i|i==21 || scripts[i]==original_scripts[i]}
+          File.binwrite(scripts_path,Marshal.dump(scripts))
+          written=Marshal.load(File.binread(scripts_path))
+          [45,46].each{|mid|raise "Graph write failed #{mid}" unless decode.call(unpack.call(written,21),mid)==File.binread(File.join(out,"r63-mask#{mid}.bin"))}
+          raise 'Original combat and loot runtime modified' unless written[134]==original_scripts[134]
 
-          def affected_commands(event,variable,maximum,operation=1)
-            pages=event.instance_variable_get(:@pages)
-            expected=[variable,variable,operation,4,1,maximum]
-            pages.each_with_index.flat_map do |page,page_number|
-              Array(page.instance_variable_get(:@list)).each_with_index.filter_map do |command,index|
-                next unless command.instance_variable_get(:@code)==122
-                next unless command.instance_variable_get(:@parameters)==expected
-                [page_number,index,command]
-              end
+          target={
+            35=>{2=>['화염의 이빨',904],4=>['화염의 이빨',905],5=>['바람의 이빨',906],6=>['바람의 이빨',907],
+                 7=>['빙하의 이빨',908],8=>['빙하의 이빨',909],9=>['대지의 이빨',910],10=>['대지의 이빨',911]},
+            43=>{13=>['빙하의 이빨',909],14=>['대지의 이빨',910]}
+          }
+          source_sha={35=>'b7b068a41d700226e95bda219989e3e2bd057e2e5d65b181084cf107ce6f34f4',
+                      43=>'39a1e211e8d342eeef2d8eef9d1a688827ab362561a963cf08c21fbacbd01ae2'}
+          count=0
+          target.each do |mid,table|
+            map_file=File.join(data,pre+format('Map%03d.rxdata',mid))
+            raise "Unexpected R62 map #{mid}" unless Digest::SHA256.file(map_file).hexdigest==source_sha[mid]
+            before=Marshal.load(File.binread(map_file))
+            after=Marshal.load(File.binread(map_file))
+            events=after.instance_variable_get(:@events)
+            table.each do |ev_id,(name,hpvar)|
+              ev=events.fetch(ev_id)
+              raise 'Unexpected monster' unless ev.instance_variable_get(:@name).to_s.force_encoding('UTF-8')=="[ID#{name}]"
+              cmds=ev.instance_variable_get(:@pages)[0].instance_variable_get(:@list)
+              agi=cmds.select{|c|c.instance_variable_get(:@code)==122 && c.instance_variable_get(:@parameters)==[334,334,0,4,1,8]}
+              threshold=cmds.select{|c|c.instance_variable_get(:@code)==122 && c.instance_variable_get(:@parameters)==[335,335,0,0,30]}
+              damage=cmds.select{|c|c.instance_variable_get(:@code)==122 && c.instance_variable_get(:@parameters)==[hpvar,hpvar,1,4,1,12]}
+              checks=cmds.select{|c|c.instance_variable_get(:@code)==111 && c.instance_variable_get(:@parameters)==[1,334,1,335,1]}
+              raise "Mismatch #{mid}:#{ev_id}" unless [agi.size,threshold.size,damage.size,checks.size]==[4,4,4,4]
+              threshold.each{|c|c.instance_variable_set(:@parameters,[335,335,0,2,1,12])}
+              damage.each{|c|c.instance_variable_set(:@parameters,[hpvar,hpvar,1,4,1,10])}
+              count+=1
+              report['fangs']<<{'map'=>mid,'event'=>ev_id,'name'=>name,
+                'hit_threshold'=>'fixed 30 -> random 1..12',
+                'damage_operand'=>'actor MDEF -> actor ATK (same as working monsters)',
+                'directions'=>4}
+            end
+            prior=before.instance_variable_get(:@events)
+            events.each{|id,ev|next if table.key?(id);raise 'Unrelated event changed' unless Marshal.dump(ev)==Marshal.dump(prior[id])}
+            File.binwrite(map_file,Marshal.dump(after))
+            chk=Marshal.load(File.binread(map_file)).instance_variable_get(:@events)
+            table.each do |id,(name,hpvar)|
+              cmds=chk[id].instance_variable_get(:@pages)[0].instance_variable_get(:@list)
+              get=lambda{|code,params|cmds.count{|c|c.instance_variable_get(:@code)==code && c.instance_variable_get(:@parameters)==params}}
+              raise 'Incorrect Fang event' unless get.call(122,[335,335,0,2,1,12])==4 && get.call(122,[hpvar,hpvar,1,4,1,10])==4 && get.call(122,[334,334,0,4,1,8])==4
             end
           end
+          raise 'Wrong number of Fang monsters' unless count==10
+          report['fang_event_count']=10
+          report['fang_directions']=40
+          File.write(File.join(out,'r63-audit.json'),JSON.pretty_generate(report))
+          puts 'PASS 10 Fang events / 40 directions: same AGI and ATK mechanic as working monsters; random 1..12'
+          R63_FIX
+          ruby -c /tmp/r63_fix.rb
+          ruby /tmp/r63_fix.rb site ref60 build
 
-          report={version:'V229R62',base:'V229R61',changed_events:[],
-            changed_commands:0,old_random:'1~10',new_random:'1~12',
-            unchanged_accuracy_random:'1~8'}
-
-          TARGETS.each do |mid,records|
-            path=File.join(folder,prefix+format('Map%03d.rxdata',mid))
-            raw=File.binread(path)
-            raise "Wrong R61 map source: #{mid}" unless Digest::SHA256.hexdigest(raw)==BASE_SHA.fetch(mid)
-            original=Marshal.load(raw)
-            changed=Marshal.load(raw)
-            orig_events=original.instance_variable_get(:@events)
-            events=changed.instance_variable_get(:@events)
-            raise 'Event ID set changed' unless orig_events.keys==events.keys
-            orig_fields=original.instance_variables.reject{|v|v==:@events}.map{|v|[v,Marshal.dump(original.instance_variable_get(v))]}
-            changed_fields=changed.instance_variables.reject{|v|v==:@events}.map{|v|[v,Marshal.dump(changed.instance_variable_get(v))]}
-            raise 'Map non-event content changed' unless orig_fields==changed_fields
-            records.each do |eid,(name,varid)|
-              ev=events.fetch(eid)
-              original_ev=orig_events.fetch(eid)
-              actual_name=ev.instance_variable_get(:@name).to_s.dup.force_encoding('UTF-8')
-              raise "Unexpected name Map#{mid} EV#{eid}: #{actual_name}" unless actual_name=="[ID#{name}]"
-              matches=affected_commands(ev,varid,10)
-              raise "Expected four directional hit-random commands Map#{mid} EV#{eid}, got #{matches.length}" unless matches.length==4
-              raise 'Found hit-random command on wrong event page' unless matches.all?{|page,index,cmd|page==0}
-              accuracy=affected_commands(ev,334,8,0)
-              raise "Accuracy roll mismatch Map#{mid} EV#{eid}" unless accuracy.length==4
-              matches.each do |page,index,command|
-                command.instance_variable_get(:@parameters)[5]=12
-                report[:changed_commands]+=1
-              end
-              restored_ev=Marshal.load(Marshal.dump(ev))
-              affected_commands(restored_ev,varid,12).each do |page,index,command|
-                command.instance_variable_get(:@parameters)[5]=10
-              end
-              raise "Unintended event alteration Map#{mid} EV#{eid}" unless Marshal.dump(restored_ev)==Marshal.dump(original_ev)
-              report[:changed_events] << {map:mid,event:eid,monster:name,variable:varid,directions:4,old:'1~10',new:'1~12'}
-            end
-            events.each do |eid,event|
-              next if records.key?(eid)
-              raise "Unrelated event changed Map#{mid} EV#{eid}" unless Marshal.dump(event)==Marshal.dump(orig_events[eid])
-            end
-            File.binwrite(path,Marshal.dump(changed))
-            verified=Marshal.load(File.binread(path))
-            records.each do |eid,(name,varid)|
-              ev=verified.instance_variable_get(:@events).fetch(eid)
-              raise "New hit-random not written Map#{mid} EV#{eid}" unless affected_commands(ev,varid,12).length==4
-              raise "Old range remains Map#{mid} EV#{eid}" unless affected_commands(ev,varid,10).empty?
-              raise "Accuracy range modified Map#{mid} EV#{eid}" unless affected_commands(ev,334,8,0).length==4
-            end
-            puts "PASS Map#{format('%03d',mid)}: #{records.length} fangs, #{records.length*4} hit-random commands upgraded"
-          end
-          raise 'Expected 10 events / 40 commands' unless report[:changed_events].length==10 && report[:changed_commands]==40
-          File.write(report_path,JSON.pretty_generate(report))
-          puts 'PASS all 10 elemental fangs, 40 directions; accuracy, loot, monster identity and other events unchanged'
-          R62_PATCH
-          ruby -c /tmp/r62_patch.rb
-          ruby /tmp/r62_patch.rb site build/r62-changes.json
-
-      - name: V229R62 Update only two map hashes and verify preservation
+      - name: V229R63 Validate the real event arithmetic and directional walls
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'R62_VERIFY'
-          from pathlib import Path
-          import hashlib,json,re
+          ruby - <<'R63_TEST'
+          require 'json'
+          require 'zlib'
+          report=JSON.parse(File.read('build/r63-audit.json'))
+          raise 'Fang count' unless report['fang_event_count']==10 && report['fang_directions']==40
+          for mid,w,h in [[45,288,144],[46,336,168]]
+            graph=File.binread("build/r63-mask#{mid}.bin")
+            raise 'Grid size mismatch' unless graph.bytesize==w*h
+            h.times do |y|
+              w.times do |x|
+                v=graph.getbyte(y*w+x)
+                raise 'Border right open' if x==w-1 && (v&8)!=0
+                raise 'Border bottom open' if y==h-1 && (v&2)!=0
+                raise 'Nonreciprocal horizontal wall' if x<w-1 && ((v&8)!=0)!=((graph.getbyte(y*w+x+1)&4)!=0)
+                raise 'Nonreciprocal vertical wall' if y<h-1 && ((v&2)!=0)!=((graph.getbyte((y+1)*w+x)&1)!=0)
+              end
+            end
+          end
+          door=File.binread('build/r63-mask45.bin')
+          w=288
+          [133,134].each do |x|
+            [57,58,59].each{|y|raise 'Door north/south blocked' unless (door.getbyte(y*w+x)&2)!=0 && (door.getbyte((y+1)*w+x)&1)!=0}
+          end
+          [58,59].each{|y|raise 'Door jamb open' unless door.getbyte(y*w+132)==0 && door.getbyte(y*w+135)==0}
+          puts 'PASS: entire 97,920-cell graph reciprocal, doorway passable, side walls solid'
 
+          src=Zlib::Inflate.inflate(Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))[72][2]).force_encoding('UTF-8')
+          raise 'Wrong random opcode' unless src.include?('when 2  # 난수') && src.include?('value = @parameters[4] + rand(@parameters[5] - @parameters[4] + 1)')
+          raise 'Wrong actor ATK opcode' unless src.include?('when 10  # 공격력') && src.include?('value = actor.atk')
+          raise 'Wrong AGI opcode' unless src.include?('when 8  # 민첩함') && src.include?('value = actor.agi')
+          puts 'PASS: same native AGI/random/ATK event opcodes as functioning monsters'
+
+          module SLV541
+            def self.rewarded?(*args);false;end
+          end
+          eval(src)
+          actor=Struct.new(:agi,:atk,:mdef).new(15,47,312)
+          $game_actors={1=>actor}
+          $game_variables=Hash.new(0)
+          $game_map=Struct.new(:need_refresh).new(false)
+          interpreter=Interpreter.new
+          interpreter.instance_variable_set(:@map_id,35)
+          interpreter.instance_variable_set(:@event_id,2)
+          apply=lambda{|params|interpreter.instance_variable_set(:@parameters,params);interpreter.command_122}
+          apply.call([334,334,0,4,1,8])
+          raise 'AGI read broken' unless $game_variables[334]==15
+          rolls=Array.new(30){apply.call([335,335,0,2,1,12]);$game_variables[335]}
+          raise 'Bad 1..12 roll' unless rolls.all?{|n|n>=1 && n<=12} && rolls.uniq.size>2
+          $game_variables[904]=0
+          apply.call([904,904,1,4,1,10])
+          raise 'HP must use ATK, not MDEF' unless $game_variables[904]==47
+          puts 'PASS actual RGSS variable commands: AGI, 1..12 random, ATK damage'
+          R63_TEST
+
+      - name: V229R63 Update only modified script and map cache hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CACHE'
+          from pathlib import Path
+          import re,hashlib
           root=Path('site')
           engine=root/'knight/gameasync'
           mapping=engine/'mapping.js'
-          text=mapping.read_text(encoding='utf-8')
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          for mid in (35,43):
-              uri=f'Data/{prefix}Map{mid:03}.rxdata'
-              fp=engine/uri
-              digest=hashlib.md5(fp.read_bytes()).hexdigest()
-              text,n=re.subn(re.escape(uri)+r'\?h=[a-f0-9]{32}',lambda m:uri+'?h='+digest,text)
-              assert n==1,('missing or duplicate hash',uri,n)
+          text=mapping.read_text('utf-8')
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          for uri in ['Data/Scripts.rxdata',*(f'Data/{pre}Map{m:03d}.rxdata' for m in (35,43))]:
+              digest=hashlib.md5((engine/uri).read_bytes()).hexdigest()
+              text,count=re.subn(re.escape(uri)+r'\?h=[0-9a-f]{32}',lambda m:uri+'?h='+digest,text)
+              assert count==1,(uri,count)
           mapping.write_text(text,encoding='utf-8')
           for name in ('index.html','knight/index.html'):
-              page=root/name
-              original=page.read_text(encoding='utf-8')
-              assert 'V229R61' in original,name
-              page.write_text(original.replace('V229R61','V229R62').replace('v229r61','v229r62'),encoding='utf-8')
-          base=json.loads(Path('build/r62-baseline.json').read_text(encoding='utf-8'))
-          now={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert len(base)==len(now)==5517 and base.keys()==now.keys()
-          changed={p for p in base if base[p]!=now[p]}
-          expected={'index.html','knight/index.html','knight/gameasync/mapping.js',*(f'knight/gameasync/Data/{prefix}Map{mid:03}.rxdata' for mid in (35,43))}
-          assert changed==expected,('unexpected file change',sorted(changed^expected))
-          report=json.loads(Path('build/r62-changes.json').read_text(encoding='utf-8'))
-          assert len(report['changed_events'])==10 and report['changed_commands']==40
-          assert sorted((x['map'],x['event']) for x in report['changed_events'])==sorted([(35,i) for i in (2,4,5,6,7,8,9,10)]+[(43,13),(43,14)])
-          assert hashlib.sha256((engine/'Data/Scripts.rxdata').read_bytes()).hexdigest()==base['knight/gameasync/Data/Scripts.rxdata']
-          print('PASS 5517 preserved files, only two fang maps, mapping hash and two labels changed')
-          print('PASS 10 fang events / 40 hit random commands; untouched accuracy and original runtime')
-          R62_VERIFY
+              p=root/name
+              before=p.read_text('utf-8')
+              assert 'V229R62' in before,name
+              p.write_text(before.replace('V229R62','V229R63').replace('v229r62','v229r63'),encoding='utf-8')
+          print('PASS current game scripts/map digest updated and title version incremented')
+          PY_CACHE
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R62 Upload 10-event hit-random audit
+      - name: V229R63 Verify all other maps monster data and walls are untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_FINAL'
+          from pathlib import Path
+          import hashlib,json
+          root=Path('site')
+          original=json.loads(Path('build/r63-baseline.json').read_text('utf-8'))
+          current={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+          assert len(original)==len(current)==5517 and original.keys()==current.keys()
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          expected={'index.html','knight/index.html','knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata',
+                    *(f'knight/gameasync/Data/{pre}Map{mid:03d}.rxdata' for mid in (35,43))}
+          changed={f for f in original if original[f]!=current[f]}
+          assert changed==expected,('Unexpected files',changed^expected)
+          report=json.loads(Path('build/r63-audit.json').read_text('utf-8'))
+          assert report['fang_event_count']==10 and report['fang_directions']==40
+          assert all(m['now_open']<m['was_open'] for m in report['maps'].values())
+          assert 'V229R63' in (root/'index.html').read_text('utf-8')
+          print('PASS: 5517 files intact; exactly 6 changed, original events, images, 491EV rewards preserved')
+          PY_FINAL
+
+      - name: V229R63 Upload Fang and wall correction audit
         uses: actions/upload-artifact@v4
         with:
-          name: SLKnight-V229R62-Fang-Hit-Random
-          path: build/r62-changes.json
+          name: SLKnight-V229R63-Fang-and-Wall-Regression
+          path: build/r63-audit.json
           retention-days: 30
           if-no-files-found: error
 
-      - name: V229R62 Upload complete game to original GitHub Pages
+      - name: V229R63 Upload full corrected game to existing GitHub Pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
