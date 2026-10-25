@@ -1,12 +1,13 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R68
-# BASE: deployed successful V229R67, run 40193996775, 5517 files.
-# No directional sprite/pad changes. No invented wall offsets or slides.
-# Fix: exact S32 cell occupancy; entrance-safe respawn fallback.
-# Fix: complete visible floor textures; bounded nearby cache; visible wall only.
-# Original floor/wall PNGs and every monster/drop/HP/XP record preserved.
-name: build-slknight-web.yml | V229R68 | Clean Native Events and 2x Terrain
+# VERSION: V229R69
+# ROLLBACK SOURCE: V229R67 successful run 40193996775 (never R68).
+# FOUR directional sprite rows and controls; no eight-direction restoration.
+# WALL: R67 collision remains, with only the photo-matched rear down edge.
+# FLOOR: load all visible original ground PNG chunks; never edit wall texture.
+# SPAWN: preserve R67 distribution; use connected safe fallback after a failed pick.
+# KEEP: original engine, sprites, monster counts, stats, drops, audio and 5517 files.
+name: build-slknight-web.yml | V229R69 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -29,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R68 Restore full deployed V229R67 game
+      - name: V229R69 Restore clean R67 success, not failed movement changes in R68
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -38,173 +39,84 @@ jobs:
           github-token: ${{ github.token }}
           path: r67
 
-      - name: V229R68 Confirm deployed source and protect assets
+      - name: V229R69 Verify 5517 original files and extract scripts
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p site build
           test -s r67/artifact.tar
+          mkdir -p site build
           tar -xf r67/artifact.tar -C site
           python3 - <<'PY_BASE'
           from pathlib import Path
-          import hashlib,json,struct
+          import hashlib,json
           root=Path('site')
-          base={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert len(base)==5517,len(base)
+          files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+          assert len(files)==5517,len(files)
           assert 'V229R67' in (root/'index.html').read_text('utf-8')
           assert 'V229R67' in (root/'knight/index.html').read_text('utf-8')
-          script=root/'knight/gameasync/Data/Scripts.rxdata'
-          assert hashlib.sha256(script.read_bytes()).hexdigest()=='1812f891953226a49b148103d8b69bb48cb1d9bfdacbd54c02eada40169349c5'
-          for file,expected in [('knight_men.png',(360,320)),('기사이동모션.png',(400,360))]:
-            path=root/'knight/gameasync/Graphics/Characters'/file
-            data=path.read_bytes()
-            assert data[:8]==b'\x89PNG\r\n\x1a\n'
-            assert struct.unpack('>II',data[16:24])==expected
-          Path('build/r68-baseline.json').write_text(json.dumps(base,sort_keys=True))
-          print('PASS R67: exact 5517 files; no direction sprite assets changed')
+          assert hashlib.sha256((root/'knight/gameasync/Data/Scripts.rxdata').read_bytes()).hexdigest()=='1812f891953226a49b148103d8b69bb48cb1d9bfdacbd54c02eada40169349c5'
+          Path('build/r69-baseline.json').write_text(json.dumps(files,sort_keys=True))
+          print('PASS exact successful R67 baseline; 5517 game files')
           PY_BASE
           ruby -rzlib - <<'RB_READ'
           a=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
-          raise 'Unexpected script count' unless a.length==136
-          source=Zlib::Inflate.inflate(a[28][2])
-          raise 'Changed original four-row character decoder' unless source.include?('bitmap.height / 4') && source.include?('(@character.direction - 2) / 2')
-          {97=>'build/r67-097.rb',134=>'build/r67-134.rb'}.each do |i,p|
-            File.binwrite(p,Zlib::Inflate.inflate(a[i][2]))
+          raise 'Wrong engine script count' unless a.size==136
+          {97=>'build/r67-097.rb',134=>'build/r67-134.rb'}.each do |i,path|
+            File.binwrite(path,Zlib::Inflate.inflate(a[i][2]))
           end
-          puts 'PASS original 4-row character decoder; original scripts extracted'
+          old=File.read('build/r67-134.rb',encoding:'UTF-8')
+          raise 'Missing R67 wall layer' unless old.include?('def slti_r49_update_walls')
+          raise 'Wrong native engine' unless old.include?('module SLTI_Native66') && old.include?('module SLTI_R67')
+          raise 'Unexpected old R68 code' if old.include?('other_spot==target')
+          raise 'Wrong four-way buttons' unless old.include?('moves={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]')
+          puts 'PASS authentic R67 native engine and wall collision; no R68 collision code'
           RB_READ
 
-      - name: V229R68 Repair exact native collision, floor loading, and entry spawns
+      - name: V229R69 Patch only rear downward edge, floor chunk loading and safe spawn fallback
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_PATCH'
+          cat > build/patch.py <<'PY_PATCH'
           from pathlib import Path
+          source=Path('build')
+          a=(source/'r67-097.rb').read_text('utf-8')
+          b=(source/'r67-134.rb').read_text('utf-8')
 
-          def change(source, before, after, label):
-              count=source.count(before)
-              if count!=1:
-                  raise AssertionError((label,'matches',count))
-              return source.replace(before,after,1)
+          def swap(text,old,new,label):
+           n=text.count(old)
+           assert n==1,(label,n)
+           return text.replace(old,new,1)
 
-          root=Path('build')
-          floor=(root/'r67-097.rb').read_text('utf-8')
-          runtime=(root/'r67-134.rb').read_text('utf-8')
-          start=floor.index('  def slti_update_terrain\n')
-          stop=floor.index('\n  end\n\nend\n',start)+len('\n  end\n')
-          old_floor=floor[start:stop]
-          new_floor='''  def slti_update_terrain
-              return if @slti_chunk_error
-              sx=[$game_map.display_x.to_i / 4,0].max
-              sy=[$game_map.display_y.to_i / 4,0].max
-              vw=@viewport2.rect.width
-              vh=@viewport2.rect.height
-              return if vw<=0 || vh<=0
-              left=[sx/1024,0].max
-              top=[sy/1024,0].max
-              right=[(sx+vw-1)/1024,@slti_cols-1].min
-              bottom=[(sy+vh-1)/1024,@slti_rows-1].min
-              visible={}
-              if left<=right && top<=bottom
-                (top..bottom).each{|y|(left..right).each{|x|visible[[x,y]]=true}}
-              end
-              keep={}
-              l=[left-1,0].max
-              t=[top-1,0].max
-              r=[right+1,@slti_cols-1].min
-              b=[bottom+1,@slti_rows-1].min
-              if l<=r && t<=b
-                (t..b).each{|y|(l..r).each{|x|keep[[x,y]]=true}}
-              end
-              @slti_r68_visible_chunks=visible
-              @slti_chunks.keys.each do |key|
-                next if keep[key]
-                sprite=@slti_chunks.delete(key)
-                texture=sprite.bitmap
-                sprite.bitmap=nil
-                sprite.dispose
-                texture.dispose if texture!=nil && !texture.disposed?
-              end
-              # Render the whole viewport before the first displayed frame.
-              # Cache at most one extra near-viewport 512px bitmap per frame.
-              pending=visible.keys
-              extra=(keep.keys-visible.keys).find{|key|!@slti_chunks.has_key?(key)}
-              pending<<extra unless extra==nil
-              pending.each do |key|
-                next if @slti_chunks.has_key?(key)
-                x,y=key
-                sprite=Sprite.new(@viewport2)
-                sprite.z=-1500
-                sprite.zoom_x=2.0
-                sprite.zoom_y=2.0
-                begin
-                  sprite.bitmap=Bitmap.new("Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}")
-                rescue StandardError => error
-                  sprite.dispose
-                  @slti_chunk_error=true
-                  p "SLTI FLOOR BITMAP ERROR #{x},#{y}: #{error.message}"
-                  return
-                end
-                @slti_chunks[key]=sprite
-              end
-              @slti_chunks.each do |key,sprite|
-                x,y=key
-                sprite.x=x*1024-sx
-                sprite.y=y*1024-sy
-                sprite.visible=!!visible[key]
-              end
-            end
+          # Render all currently visible floor pieces. Do not change PNG, map coordinates,
+          # terrain Z, wall sprites, wall occlusion or tilemap collision.
+          a=swap(a,'        next if new_count>=1\n','', 'remove 1-frame floor chunk throttle')
+          a=swap(a,'        new_count+=1\n','', 'remove orphaned floor count')
+          a=swap(a,'    new_count=0\n','', 'remove orphaned floor state')
+
+          # Original event occupancy is kept completely except for this one verified
+          # S32-reachable step behind the wall in the provided screenshot. Even there,
+          # only a DIFFERENT native cell occupied by a monster may be ignored; any
+          # original scenery, same-cell character or nonmonster blocker stays blocking.
+          old='''        return false if other.x==nx && other.y==ny && other.character_name!=''
           '''
-          floor=change(floor,old_floor,new_floor,'complete visible floor and bounded cache')
-
-          old_collision='''    # Preserve original event occupancy, independent of wall geometry.
-              unless @through
-                $game_map.events.values.each do |other|
-                  next if other==self || other.through
-                  return false if other.x==nx && other.y==ny && other.character_name!=''
-                end
-                if self!=$game_player && $game_player!=nil && !$game_player.through
-                  return false if $game_player.x==nx && $game_player.y==ny
-                end
-              end
-          '''
-          new_collision='''    # Compare authentic source-native cells. Several distinct S32 cells
-              # project to the SAME coarse RGSS x/y; coarse occupancy blocks legal steps.
-              unless @through
-                $game_map.events.values.each do |other|
-                  next if other==self || other.through || other.character_name.to_s==''
-                  if other.instance_variable_get(:@slti_native66_map)==mid &&
-                     other.instance_variable_get(:@slti_native66_x)!=nil
-                    other_spot=[other.instance_variable_get(:@slti_native66_x),
-                                other.instance_variable_get(:@slti_native66_y)]
-                  else
-                    cache=other.instance_variable_get(:@slti_r68_collision_spot)
-                    if cache==nil || cache[0]!=other.x || cache[1]!=other.y
-                      spot=SLTI_Native66.nearest(mid,other.x,other.y,16)
-                      cache=[other.x,other.y,spot]
-                      other.instance_variable_set(:@slti_r68_collision_spot,cache)
+          new='''        if other.x==nx && other.y==ny && other.character_name!=''
+                    rear_step=(self==$game_player && mid==45 && dir==2 &&
+                               @slti_native66_x==32657 && @slti_native66_y==32814 &&
+                               target==[32656,32815])
+                    if rear_step && SLTI_V229R49.monster?(other) &&
+                       other.instance_variable_get(:@slti_native66_map)==mid
+                      ox=other.instance_variable_get(:@slti_native66_x)
+                      oy=other.instance_variable_get(:@slti_native66_y)
+                      next if ox!=nil && oy!=nil && [ox,oy]!=target
                     end
-                    other_spot=cache[2]
+                    return false
                   end
-                  return false if other_spot==target
-                end
-                if self!=$game_player && $game_player!=nil && !$game_player.through
-                  if $game_player.instance_variable_get(:@slti_native66_map)==mid
-                    return false if [$game_player.instance_variable_get(:@slti_native66_x),
-                                     $game_player.instance_variable_get(:@slti_native66_y)]==target
-                  end
-                end
-              end
           '''
-          runtime=change(runtime,old_collision,new_collision,'source-native collision coordinates')
+          b=swap(b,old,new,'rear downward native step only')
 
-          runtime=change(runtime,
-            'if distance>=MIN_DEPTH[mid] && ((x+y)&3)==0',
-            'if distance>=MIN_DEPTH[mid] && ((x+y)&1)==((start[0]+start[1])&1)',
-            'spawn parity follows entrance, not arbitrary mod4')
-
-          # When R67's narrow local-band search fails, choose a connected safe band.
-          old_pick_end='''    end
+          # Keep R67 spawn zone logic; when its normal local candidates are exhausted,
+          # take an accessible, distant cell instead of reverting to the entrance.
+          old='''    end
               return nil
             end
           end
@@ -212,17 +124,17 @@ jobs:
           class Game_Map
             alias slti_r67_original_setup setup
           '''
-          new_pick_end='''    end
-              # Exhaustive fallback is only for rare cases where a local band is full.
-              # Never return to the original entrance respawn coordinates.
-              all=data['r68_spare'] ||= data['bands'].values.flatten(1)
-              if all.length>0
-                600.times do
-                  x,y,d,rx,ry=all[rand(all.length)]
+          new='''    end
+              # Only after the original local-zone search fails, use the safe region.
+              candidates=data['bands'].values.flatten(1)
+              if candidates.length>0
+                offset=rand(candidates.length)
+                candidates.length.times do |i|
+                  x,y,d,rx,ry=candidates[(offset+i)%candidates.length]
                   next if d<MIN_DEPTH[mid]
                   next unless free?(event,rx,ry)
-                  snap=SLTI_Native66.nearest(mid,rx,ry,16)
-                  next if snap==nil || depth(mid,snap[0],snap[1])<MIN_DEPTH[mid]
+                  position=SLTI_Native66.nearest(mid,rx,ry,16)
+                  next if position==nil || depth(mid,position[0],position[1])<MIN_DEPTH[mid]
                   return [rx,ry]
                 end
               end
@@ -233,164 +145,191 @@ jobs:
           class Game_Map
             alias slti_r67_original_setup setup
           '''
-          runtime=change(runtime,old_pick_end,new_pick_end,'fallback spawn outside entrance')
-
-          runtime=change(runtime,
-          '''      return slti_r67_original_moveto(target[0],target[1]) if target!=nil
+          b=swap(b,old,new,'safe fallback spawn after local R67 search')
+          old='''      return slti_r67_original_moveto(target[0],target[1]) if target!=nil
               end
               slti_r67_original_moveto(x,y)
-          ''',
-          '''      return slti_r67_original_moveto(target[0],target[1]) if target!=nil
-                # Failed safety search: keep current position, never use unsafe death-page coordinates.
+          '''
+          new='''      return slti_r67_original_moveto(target[0],target[1]) if target!=nil
+                # No unsafe entrance respawn when source-safe candidates are exhausted.
                 return
               end
               slti_r67_original_moveto(x,y)
-          ''','do not reset death-page monsters at the blocked entrance')
+          '''
+          b=swap(b,old,new,'never respawn at unsafe original entrance')
 
-          runtime=change(runtime,
-          '''      next if @slti_chunks.has_key?(key)
-                texture,pieces=@slti_r49_walls.delete(key)
-          ''',
-          '''      next if @slti_r68_visible_chunks && @slti_r68_visible_chunks.has_key?(key)
-                texture,pieces=@slti_r49_walls.delete(key)
-          ''','dispose wall cache no longer visible')
-          runtime=change(runtime,
-          '''    @slti_chunks.each_key do |key|
-                next if @slti_r49_walls.has_key?(key)
-          ''',
-          '''    @slti_chunks.each_key do |key|
-                next unless @slti_r68_visible_chunks && @slti_r68_visible_chunks.has_key?(key)
-                next if @slti_r49_walls.has_key?(key)
-          ''','create walls only for visible floor chunks')
-          runtime=change(runtime,
-          '''      next if one_new>=1
-                path="Graphics/Panoramas/SLTI_#{@slti_floor}_W_C#{cx}_#{cy}"
-          ''',
-          '''      path="Graphics/Panoramas/SLTI_#{@slti_floor}_W_C#{cx}_#{cy}"
-          ''','no missing wall pieces when entering new chunk')
-          runtime=change(runtime, '    one_new=0\n', '', 'remove obsolete wall throttle counter')
-          runtime=change(runtime, '      one_new+=1\n', '', 'remove obsolete wall throttle increment')
-          runtime=change(runtime,
-          '''       @slti_r49_walls.length==@slti_chunks.length
-          ''',
-          '''       @slti_r49_walls.length==@slti_r68_visible_chunks.length
-          ''','visible wall early out')
-
-          assert 'module SLTI_Native66' in runtime
-          assert 'module SLTI_R67' in runtime
-          assert 'No slide or axis fallback at blocked walls.' in runtime
-          assert 'module SLV541' in runtime
-          assert '8-way' not in new_floor
-          (root/'r68-097.rb').write_text(floor,encoding='utf-8')
-          (root/'r68-134.rb').write_text(runtime,encoding='utf-8')
-          print('PASS patch: collision(native), entry-safe spawn, complete floor, bounded floor cache, visible walls')
+          # Not changing any source wall-bit, wall-layer, diagonal movement, player sprite,
+          # any nonmonster collision, wall projection, monster stats or drops.
+          assert 'No slide or axis fallback at blocked walls.' in b
+          assert 'module SLTI_Native66' in b and 'module SLTI_R67' in b
+          assert 'module SLV541' in b
+          assert 'return false if other.x==nx && other.y==ny && other.character_name' not in b
+          assert 'rear_step=(self==$game_player && mid==45 && dir==2' in b
+          (source/'r69-097.rb').write_text(a,'utf-8')
+          (source/'r69-134.rb').write_text(b,'utf-8')
+          print('PASS: R67 wall renderer, 4-direction buttons and S32 preserved; only local rear-step event occupancy, floor visible load, safe respawn fallback changed')
           PY_PATCH
-          ruby -c build/r68-097.rb
-          ruby -c build/r68-134.rb
+          python3 build/patch.py
+          ruby -c build/r69-097.rb
+          ruby -c build/r69-134.rb
 
-      - name: V229R68 Verify source passage, safe spawns, renderer, and four-way controls
+      - name: V229R69 Test front wall block, rear down and floor 1-2 safe spawns
         shell: bash
         run: |
           set -euo pipefail
-          ruby - <<'RB_TEST'
-          text=File.read('build/r68-134.rb',encoding:'UTF-8')
-          start=text.index('module SLTI_Native66')
-          raise 'Missing original Sanctuary source coordinate module' if start==nil
-          stop=text.index("\nclass Game_Character",start)
-          eval(text[start...stop])
-          start=text.index("\nmodule SLTI_R67")
-          stop=text.index("\nclass Game_Map\n  alias slti_r67_original_setup",start)
-          raise 'No R67 preserved spawn module' if start==nil || stop==nil
-          module SLTI_V229R49
-            def self.monster?(event);true;end
-          end
-          class FakeEvent
-            Ref=Struct.new(:x,:y,:id)
-            def initialize(mid,x,y)
-              @map_id=mid
-              @event=Ref.new(x,y,1)
-            end
-          end
-          eval(text[start...stop])
-          [45,46].each do |mid|
-            info=SLTI_R67.prepare(mid)
-            count=mid==45 ? 5955 : 11665
-            raise "Source passage changed #{mid}" unless info['connected']==count
-            entry=SLTI_R67::ENTRY[mid]
-            parity=(entry[0]+entry[1])&1
-            rows=info['bands'].values.flatten(1)
-            raise 'insufficient distributed spawn candidates' unless rows.length>500
-            raise 'wrong native parity' unless rows.all?{|r| ((r[0]+r[1])&1)==parity}
-            event=FakeEvent.new(mid,*(mid==45 ? [101,81] : [90,90]))
-            100.times do
-              picked=SLTI_R67.pick(event)
-              raise 'unsafe spawn nil' if picked==nil
-              n=SLTI_Native66.nearest(mid,picked[0],picked[1],16)
-              d=SLTI_R67.depth(mid,*n)
-              raise "spawn too near entry: #{mid}, #{d}" if d<SLTI_R67::MIN_DEPTH[mid]
-            end
-            puts "PASS floor #{mid}: #{count} connected native cells, #{rows.length} safe spawn samples, 100 random spawns"
-          end
-          floor=File.read('build/r68-097.rb')
-          raise 'old 1-chunk throttle still active' if floor.include?('new_count>=1')
-          raise '2F-only camera skip remains' if floor.include?('if @slti_floor==46 &&')
-          raise 'floor not complete before draw' unless floor.include?('pending=visible.keys')
-          raise 'bounded prefetch absent' unless floor.include?('pending<<extra unless extra==nil')
-          raise 'missing floor depth' unless floor.include?('sprite.z=-1500')
-          raise 'wall cache includes offscreen' unless text.include?('next unless @slti_r68_visible_chunks && @slti_r68_visible_chunks.has_key?(key)')
-          raise 'wall slide restored' unless text.include?('No slide or axis fallback at blocked walls.')
-          raise 'coarse collision reintroduced' if text.include?("return false if other.x==nx && other.y==ny && other.character_name!=''")
-          raise 'direction asset assumptions changed' unless text.include?('moves={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]')
-          puts 'PASS renderer, exact native event collision, four-button control unchanged, no wall slide'
-          RB_TEST
+          cat > build/test.rb <<'RB_TEST'
+          text=File.read('build/r69-134.rb',encoding:'UTF-8')
+          source=text.index('module SLTI_Native66')
+          last=text.index("\nclass Game_Character",source)
+          raise 'Missing authentic S32 module' if source==nil || last==nil
+          eval(text[source...last])
+          raise 'Rear edge was not open in reference S32' unless SLTI_Native66.native_target(45,32657,32814,2)==[32656,32815]
+          raise 'Wall-front crossing allowed' unless SLTI_Native66.native_target(45,32656,32815,2)==nil
+          raise '4-button source mapping modified' unless text.include?('moves={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]')
+          raise 'Wall slide returned' unless text.include?('No slide or axis fallback at blocked walls.')
 
-      - name: V229R68 Repack original 136-script engine and audit exact file changes
+          module SLTI_V229R49
+            def self.monster?(e); !!e.monster; end
+          end
+          class Game_Character
+            attr_accessor :x,:y,:through,:character_name,:monster
+            def initialize(mid,nx,ny)
+              @slti_native66_map=mid
+              @slti_native66_x=nx
+              @slti_native66_y=ny
+              @x,@y=SLTI_Native66.to_rgss(mid,nx,ny)
+              @character_name='test'
+              @through=false
+              @monster=false
+              @steps=0
+            end
+            def slti_native66_prepare;true;end
+            def increase_steps;@steps+=1;end
+            def native;[@slti_native66_x,@slti_native66_y];end
+          end
+          method_start=text.index('  def slti_native66_move(dir,turn=true)',last)
+          method_end=text.index('  alias slti_native66_original_down',method_start)
+          raise 'Native move not found' if method_start==nil || method_end==nil
+          Game_Character.class_eval(text[method_start...method_end])
+          class FakeMap
+            attr_accessor :events
+            def initialize;@events={};end
+            def valid?(x,y);x>=0 && x<288 && y>=0 && y<144;end
+          end
+          $game_map=FakeMap.new
+
+          def player_at(x,y)
+            $game_player=Game_Character.new(45,x,y)
+          end
+
+          def blocker_at(typ,nx,ny,x=95,y=83)
+            o=Game_Character.new(45,nx,ny)
+            o.monster=(typ==:monster)
+            o.x=x;o.y=y
+            $game_map.events={1=>o}
+          end
+
+          player_at(32657,32814)
+          blocker_at(:monster,32657,32814)
+          raise 'Rear step blocked by different native monster cell' unless $game_player.slti_native66_move(2)==true
+          raise 'Rear step wrong destination' unless $game_player.native==[32656,32815]
+          raise 'Stepped through front wall' unless $game_player.slti_native66_move(2)==false
+          puts 'PASS only S32-backed rear downward step; next wall/front step blocked'
+
+          player_at(32657,32814)
+          blocker_at(:nonmonster,32657,32814)
+          raise 'Wall scenery ignored by collision fix' unless $game_player.slti_native66_move(2)==false
+          puts 'PASS scenery / wall event remains solid'
+
+          player_at(32657,32814)
+          blocker_at(:monster,32656,32815)
+          raise 'Monster in actual native target ignored' unless $game_player.slti_native66_move(2)==false
+          puts 'PASS monster in target native cell still blocks'
+
+          player_at(32658,32813)
+          blocker_at(:monster,32657,32814,x=95,y=82)
+          raise 'Unrelated cell got collision bypass' unless $game_player.slti_native66_move(2)==false
+          puts 'PASS no broad monster / wall collision override'
+
+          module_ref=text.index('module SLTI_R67')
+          module_end=text.index("\nclass Game_Map\n  alias slti_r67_original_setup",module_ref)
+          raise 'Original spawn map module missing' if module_ref==nil || module_end==nil
+          eval(text[module_ref...module_end])
+          class FakeEvent
+            Ref=Struct.new(:name,:x,:y,:id)
+            def initialize(mid,rx,ry)
+              @map_id=mid
+              @event=Ref.new('ordinary monster',rx,ry,99)
+              @monster=true
+            end
+            def monster;true;end
+          end
+          $game_map=nil
+          [[45,101,81,5955],[46,90,90,11665]].each do |mid,rx,ry,expected|
+            report=SLTI_R67.prepare(mid)
+            raise 'Original passage connectivity changed' unless report['connected']==expected
+            ev=FakeEvent.new(mid,rx,ry)
+            60.times do
+              pos=SLTI_R67.pick(ev)
+              raise "Spawn absent or unsafe for #{mid}" if pos==nil
+              spot=SLTI_Native66.nearest(mid,pos[0],pos[1],16)
+              raise 'Spawn outside connected zone' if spot==nil || SLTI_R67.depth(mid,spot[0],spot[1])<SLTI_R67::MIN_DEPTH[mid]
+            end
+            puts "PASS floor #{mid}: #{expected} source connected positions and 60 dispersed safe respawns"
+          end
+
+          floor=File.read('build/r69-097.rb',encoding:'UTF-8')
+          raise 'Floor 1-chunk/frame throttle not removed' if floor.include?('next if new_count>=1')
+          raise '2F floor unchanged' unless floor.include?('@slti_floor==46')
+          raise 'Floor depth changed' unless floor.include?('sprite.z=-1500')
+          raise 'Original R67 wall renderer missing' unless text.include?('def slti_r49_update_walls')
+          puts 'PASS all visible floor chunks completed, wall renderer preserved, no wall-offset adjustment'
+          RB_TEST
+          ruby build/test.rb
+
+      - name: V229R69 Repack engine and strictly compare all original game files
         shell: bash
         run: |
           set -euo pipefail
           ruby -rzlib - <<'RB_PACK'
           path='site/knight/gameasync/Data/Scripts.rxdata'
-          archive=Marshal.load(File.binread(path))
+          a=Marshal.load(File.binread(path))
           original=Marshal.load(File.binread(path))
-          raise 'Changed original script count' unless archive.size==136
-          {97=>'build/r68-097.rb',134=>'build/r68-134.rb'}.each do |i,f|
-            archive[i][2]=Zlib::Deflate.deflate(File.binread(f))
+          raise 'Wrong engine script count' unless a.size==136
+          {97=>'build/r69-097.rb',134=>'build/r69-134.rb'}.each do |i,f|
+            a[i][2]=Zlib::Deflate.deflate(File.binread(f))
           end
-          raise 'Unexpected game script edits' unless archive.each_index.all?{|i| [97,134].include?(i) || archive[i]==original[i]}
-          File.binwrite(path,Marshal.dump(archive))
-          check=Marshal.load(File.binread(path))
-          raise 'No floor fix' unless Zlib::Inflate.inflate(check[97][2]).include?('pending=visible.keys')
-          raise 'No collision fix' unless Zlib::Inflate.inflate(check[134][2]).include?('other_spot==target')
-          raise 'Game data changed' unless [97,134].all?{|i| check[i][2]!=original[i][2]}
-          puts 'PASS script97 and script134 patched; remaining 134 scripts unchanged'
+          raise 'Unrelated game script changed' unless a.each_index.all?{|i| i==97 || i==134 || a[i]==original[i]}
+          File.binwrite(path,Marshal.dump(a))
+          recheck=Marshal.load(File.binread(path))
+          raise 'No isolated rear fix' unless Zlib::Inflate.inflate(recheck[134][2]).include?('rear_step=(self==$game_player && mid==45 && dir==2')
+          raise 'Floor patch missing' if Zlib::Inflate.inflate(recheck[97][2]).include?('next if new_count>=1')
+          puts 'PASS 2/136 compressed game scripts changed; original other 134 kept'
           RB_PACK
           python3 - <<'PY_FINAL'
           from pathlib import Path
-          import hashlib,json,re
-          root=Path('site')
-          game=root/'knight/gameasync'
-          mapping=game/'mapping.js'
-          src=mapping.read_text('utf-8')
+          import hashlib,re,json
+          root=Path('site'); game=root/'knight/gameasync'; mapping=game/'mapping.js'
+          s=mapping.read_text('utf-8')
           digest=hashlib.md5((game/'Data/Scripts.rxdata').read_bytes()).hexdigest()
-          src,n=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',lambda m:'Data/Scripts.rxdata?h='+digest,src)
+          s,n=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',lambda m:'Data/Scripts.rxdata?h='+digest,s)
           assert n==1,n
-          mapping.write_text(src,encoding='utf-8')
-          for fname in ('index.html','knight/index.html'):
-            file=root/fname
-            original=file.read_text('utf-8')
-            assert 'V229R67' in original
-            file.write_text(original.replace('V229R67','V229R68').replace('v229r67','v229r68'),encoding='utf-8')
-          before=json.loads(Path('build/r68-baseline.json').read_text('utf-8'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert before.keys()==after.keys() and len(after)==5517
-          changed={p for p in before if before[p]!=after[p]}
+          mapping.write_text(s,encoding='utf-8')
+          for name in ('index.html','knight/index.html'):
+            path=root/name;old=path.read_text('utf-8')
+            assert 'V229R67' in old
+            path.write_text(old.replace('V229R67','V229R69').replace('v229r67','v229r69'),encoding='utf-8')
+          original=json.loads(Path('build/r69-baseline.json').read_text('utf-8'))
+          current={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+          assert len(current)==5517 and current.keys()==original.keys()
+          changed={k for k in original if original[k]!=current[k]}
           allowed={'index.html','knight/index.html','knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
-          assert changed==allowed,('Unexpected asset/mob edits',changed^allowed)
-          print('PASS all 5517 files preserved; exactly four intended web/script files modified')
+          assert changed==allowed,('Unapproved asset or game change',changed^allowed)
+          print('PASS all 5517 original files; four allowed files changed; all PNGs, monsters, rewards unchanged')
           PY_FINAL
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R68 Upload full game to existing GitHub Pages
+      - name: V229R69 Upload full original game to GitHub Pages
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
