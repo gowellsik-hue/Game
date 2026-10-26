@@ -1,12 +1,13 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R98
-# BASE: successfully deployed V229R97 (run 40326370483).
-# FIX: remove only the smooth gray matte baked into 2F floor C panoramas.
-# Preserve the original stone texture using clean source pixels from 2F C3_1.
-# No 2F floor deletion, no wall W edits, no engine, monster, S32 or D-pad edits.
-# All V229R97 movement, UI and terrain corrections are retained byte-for-byte.
-name: build-slknight-web.yml | V229R98 | Clean Native Events and 2x Terrain
+# VERSION: V229R99
+# BASE: verified deployed V229R97 (run 40326370483).
+# TEST: do NOT load the 28 identified map46 C floor image chunks containing the gray blotches.
+# No PNG edits, no transparency manipulation, no replacement texture, no fill.
+# Only those 28 C chunks will be absent; the other 38 C chunks remain unchanged.
+# Maintain empty @slti_chunks sprites for these positions so original W walls still load.
+# Preserve R97 gameplay, S32, monsters, walls, 1F alignment, and D-pad byte-for-byte.
+name: build-slknight-web.yml | V229R99 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -29,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R98 Restore successful deployed R97 without changing the engine
+      - name: V229R99 Restore last working image data and game from R97
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -38,7 +39,7 @@ jobs:
           github-token: ${{ github.token }}
           path: r97
 
-      - name: V229R98 Remove only 2F baked-in floor smear
+      - name: V229R99 Skip only gray-blotched 2F floor chunk loading
         shell: bash
         run: |
           set -euo pipefail
@@ -47,137 +48,227 @@ jobs:
           tar -xf r97/artifact.tar -C site
           python3 - <<'PY_BASE'
           from pathlib import Path
-          import json,hashlib
+          import hashlib,json
           root=Path('site')
           files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          assert len(files)==5517, ('Unexpected R97 file count',len(files))
-          assert 'V229R97' in (root/'index.html').read_text('utf-8')
-          assert 'V229R97' in (root/'knight/index.html').read_text('utf-8')
-          assert (root/'knight/js/dpad.js').is_file()
-          assert (root/'knight/gameasync/Data/Scripts.rxdata').is_file()
-          Path('build/r97-files.json').write_text(json.dumps(files,sort_keys=True))
-          print('PASS restored R97: 5517 files, original D-pad and engine')
+          assert len(files)==5517, ('Wrong R97 file count',len(files))
+          engine=root/'knight/gameasync/Data/Scripts.rxdata'
+          assert hashlib.sha256(engine.read_bytes()).hexdigest()==\
+            '62b575db7e96c954d0076d20642208880b46e9ae481246390031ec0c10015534'
+          for name in ('index.html','knight/index.html'):
+            assert 'V229R97' in (root/name).read_text('utf-8'), name
+          Path('build/r97-baseline.json').write_text(json.dumps(files,sort_keys=True))
+          print('PASS unmodified R97 base, all original PNGs and pad preserved')
           PY_BASE
 
-          python3 -m venv build/clean-venv
-          build/clean-venv/bin/pip install --disable-pip-version-check --quiet pillow numpy opencv-python-headless
-          build/clean-venv/bin/python - <<'PY_CLEAN'
+          ruby -rzlib -rdigest - <<'RB_EDIT'
+          path='site/knight/gameasync/Data/Scripts.rxdata'
+          scripts=Marshal.load(File.binread(path))
+          raise 'Wrong script count' unless scripts.length==136
+          original=Zlib::Inflate.inflate(scripts[97][2])
+          raise 'Wrong R97 renderer baseline' unless
+            Digest::SHA256.hexdigest(original)==
+              'bf4e69bba9a04e6eb16820e09c77bea7597cd2933822d961353dd272155dbb20'
+          raise 'R97 native movement changed' unless
+            Digest::SHA256.hexdigest(Zlib::Inflate.inflate(scripts[134][2]))==
+              '3717984b3ee7ec1151d8041b6d9c427812a9a5508d8bdce8967f561ba6afcfa4'
+
+          # These are the 28 source C files that contain the unwanted gray image.
+          # Do not edit image bytes or draw anything to replace them.
+          skip_module=<<'SKIP_MODULE'
+          module SLTI_V229R99Skip
+            C46={
+              [1,2]=>true,
+              [1,3]=>true,
+              [2,2]=>true,
+              [2,3]=>true,
+              [3,1]=>true,
+              [3,2]=>true,
+              [3,3]=>true,
+              [3,4]=>true,
+              [4,1]=>true,
+              [4,2]=>true,
+              [4,3]=>true,
+              [4,4]=>true,
+              [5,0]=>true,
+              [5,1]=>true,
+              [5,2]=>true,
+              [5,3]=>true,
+              [5,4]=>true,
+              [6,0]=>true,
+              [6,1]=>true,
+              [6,2]=>true,
+              [6,3]=>true,
+              [6,4]=>true,
+              [7,1]=>true,
+              [7,2]=>true,
+              [7,3]=>true,
+              [8,1]=>true,
+              [8,2]=>true,
+              [8,3]=>true
+            }.freeze
+          end
+          SKIP_MODULE
+          raise 'Wrong skip list count' unless skip_module.scan(/=>true/).length==28
+          raise 'Renderer insert point changed' unless original.scan("class Spriteset_Map\n").length==1
+          modified=original.sub("class Spriteset_Map\n",skip_module+"\nclass Spriteset_Map\n")
+
+          old_load=<<'OLD_LOAD'
+                  filename="Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}"
+                  begin
+                    sprite.bitmap=Bitmap.new(filename)
+                  rescue StandardError => error
+                    sprite.dispose
+                    @slti_chunk_error=true
+                    p "SLTI CHUNK LOAD ERROR: #{filename}: #{error.message}"
+                    return
+                  end
+          OLD_LOAD
+          new_load=<<'NEW_LOAD'
+                  # Do not even request a bitmap for a gray-blotched 2F chunk.
+                  # Keep the Sprite entry so the existing wall W layer still loads.
+                  unless @slti_floor==46 && SLTI_V229R99Skip::C46.has_key?([x,y])
+                    filename="Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}"
+                    begin
+                      sprite.bitmap=Bitmap.new(filename)
+                    rescue StandardError => error
+                      sprite.dispose
+                      @slti_chunk_error=true
+                      p "SLTI CHUNK LOAD ERROR: #{filename}: #{error.message}"
+                      return
+                    end
+                  end
+          NEW_LOAD
+          raise 'Cannot uniquely locate C image load' unless modified.scan(old_load).length==1
+          modified=modified.sub(old_load,new_load)
+          File.binwrite('build/script97-r99.rb',modified)
+          scripts[97][2]=Zlib::Deflate.deflate(modified)
+          File.binwrite(path,Marshal.dump(scripts))
+          reread=Marshal.load(File.binread(path))
+          raise 'Script 97 not saved' unless Zlib::Inflate.inflate(reread[97][2])==modified
+          raise 'Wrong S32 script changed' unless reread[134][2]==scripts[134][2]
+          puts 'PASS only original C loader bypassed for 28 chunks; no image altered'
+          RB_EDIT
+          ruby -c build/script97-r99.rb
+
+          python3 - <<'PY_CACHE'
           from pathlib import Path
-          import re,hashlib,json
-          import cv2
-          import numpy as np
-          from PIL import Image
-
-          pano=Path('site/knight/gameasync/Graphics/Panoramas')
-          chunks=sorted(pano.glob('SLTI_46_C*.png'))
-          assert len(chunks)==66, ('Wrong 2F floor chunk count',len(chunks))
-          walls=sorted(pano.glob('SLTI_46_W_*.png'))
-          assert len(walls)>=20, ('Original 2F walls are missing',len(walls))
-          wall_hash={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in walls}
-
-          # Sample original 2F stone texture, not generated graphics or black fill.
-          with Image.open(pano/'SLTI_46_C3_1.png') as image:
-            clean=np.asarray(image.convert('RGB'),dtype=np.uint8)[:320,:320].copy()
-          assert clean.shape==(320,320,3)
-          gclean=cv2.cvtColor(clean,cv2.COLOR_RGB2GRAY).astype(np.float32)
-          mean=cv2.boxFilter(gclean,-1,(9,9))
-          var=cv2.boxFilter(gclean*gclean,-1,(9,9))-mean*mean
-          assert np.count_nonzero(var<70)<1000, 'Original clean floor sample failed'
-
-          mapping_path=Path('site/knight/gameasync/mapping.js')
-          mapping=mapping_path.read_text('utf-8')
-          nine=np.ones((9,9),np.uint8)
-          seven=np.ones((7,7),np.uint8)
-          changed=[]
-          total_replaced=0
-          for path in chunks:
-            match=re.fullmatch(r'SLTI_46_C(\d+)_(\d+)\.png',path.name)
-            assert match, ('Wrong 2F chunk name',path.name)
-            cx,cy=map(int,match.groups())
-            assert 0<=cx<11 and 0<=cy<6
-            with Image.open(path) as image:
-              pixels=np.asarray(image.convert('RGBA'),dtype=np.uint8).copy()
-            h,w=pixels.shape[:2]
-            assert (w,h)==(512,512)
-            grayscale=cv2.cvtColor(pixels[:,:,:3],cv2.COLOR_RGB2GRAY).astype(np.float32)
-            avg=cv2.boxFilter(grayscale,-1,(9,9))
-            variance=cv2.boxFilter(grayscale*grayscale,-1,(9,9))-avg*avg
-            # Smooth low-texture blobs: exclude rock, stairs, walls and transparency.
-            matte=((variance<70)&(grayscale>15)&(pixels[:,:,3]>200)).astype(np.uint8)*255
-            matte=cv2.morphologyEx(matte,cv2.MORPH_CLOSE,nine)
-            n,labels,stats,_=cv2.connectedComponentsWithStats(matte,8)
-            selected=np.zeros((h,w),np.uint8)
-            for label in range(1,n):
-              if stats[label,cv2.CC_STAT_AREA]>=800:
-                selected[labels==label]=255
-            selected=cv2.dilate(selected,seven)
-            selected=(selected!=0)&(pixels[:,:,3]>200)&(grayscale>15)
-            amount=int(selected.sum())
-            if not amount:
-              continue
-            yy,xx=np.indices((h,w))
-            original_alpha=pixels[:,:,3].copy()
-            floor=clean[(cy*512+yy+180)%320,(cx*512+xx+70)%320]
-            pixels[selected,:3]=floor[selected]
-            assert np.array_equal(pixels[:,:,3],original_alpha)
-            Image.fromarray(pixels).save(path,optimize=True)
-            changed.append(path.name)
-            total_replaced+=amount
-            digest=hashlib.md5(path.read_bytes()).hexdigest()
-            pattern=rf'(Graphics/Panoramas/{re.escape(path.name)}\?h=)[0-9a-f]{{32}}'
-            mapping,count=re.subn(pattern,lambda m:m.group(1)+digest,mapping)
-            assert count==1, ('Missing changed chunk cache entry',path.name,count)
-
-          assert len(changed)>=20 and total_replaced>=1000000, (
-            '2F stain removal unexpectedly incomplete',len(changed),total_replaced)
-          assert {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in walls}==wall_hash
-          mapping_path.write_text(mapping,encoding='utf-8')
-          Path('build/r98-floor-stats.json').write_text(json.dumps({
-            'changed':changed,'replaced_pixels':total_replaced},sort_keys=True))
-          print('PASS 2F smear removal:',len(changed),'floor chunks,',total_replaced,
-                'gray pixels; original wall chunks and floor alpha retained')
-          PY_CLEAN
-
-          python3 - <<'PY_VERSION'
-          from pathlib import Path
+          import hashlib,re
+          root=Path('site')
+          engine=root/'knight/gameasync/Data/Scripts.rxdata'
+          mapping=root/'knight/gameasync/mapping.js'
+          js=mapping.read_text('utf-8')
+          digest=hashlib.md5(engine.read_bytes()).hexdigest()
+          js,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',
+                           lambda m:'Data/Scripts.rxdata?h='+digest,js)
+          assert count==1, ('Engine cache URL not found',count)
+          mapping.write_text(js,encoding='utf-8')
           for name in ('index.html','knight/index.html'):
-            path=Path('site')/name
-            text=path.read_text('utf-8')
-            assert 'V229R97' in text and 'V229R98' not in text
-            path.write_text(text.replace('V229R97','V229R98')
-                                .replace('v229r97','v229r98'),encoding='utf-8')
-          PY_VERSION
+            path=root/name
+            html=path.read_text('utf-8')
+            assert 'V229R97' in html and 'V229R99' not in html
+            path.write_text(html.replace('V229R97','V229R99').replace('v229r97','v229r99'),encoding='utf-8')
+          print('PASS cache and version labels updated')
+          PY_CACHE
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/dpad.js
 
-      - name: V229R98 Verify only floor matte and cache were modified
+      - name: V229R99 Audit no-load and untouched 2F walls and game
         shell: bash
         run: |
           set -euo pipefail
+          ruby -rzlib - <<'RB_AUDIT'
+          scripts=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
+          source=Zlib::Inflate.inflate(scripts[97][2])
+          start=source.index("module SLTI_V229R99Skip\n")
+          stop=source.index("\nclass Spriteset_Map\n",start)
+          raise 'Missing skip module' unless start && stop
+          Object.class_eval(source[start...stop])
+          skip=SLTI_V229R99Skip::C46
+          raise 'Wrong no-load count' unless skip.length==28
+          raise 'Required affected chunk missing' unless skip[[5,2]] && skip[[2,2]]
+          raise 'Accidental C0_0 suppression' if skip[[0,0]]
+          raise 'Absent no-load condition' unless
+            source.include?('unless @slti_floor==46 && SLTI_V229R99Skip::C46.has_key?([x,y])')
+          raise 'Original W index removed' unless
+            source.include?('@slti_chunks[key]=sprite')
+          raise 'Original wall loader lost' unless
+            Zlib::Inflate.inflate(scripts[134][2]).include?('@slti_chunks.each_key do |key|')
+          raise 'Original player and monster code changed' unless
+            Zlib::Inflate.inflate(scripts[134][2]).include?('return self==$game_player')
+
+          # Execute the actual terrain loader using minimal graphics stubs.
+          class Sprite
+            attr_accessor :bitmap,:z,:zoom_x,:zoom_y,:x,:y
+            def initialize(viewport); @bitmap=nil; end
+            def dispose; end
+          end
+          class Bitmap
+            @@calls=[]
+            def initialize(filename); @@calls << filename; end
+            def self.calls; @@calls; end
+          end
+          class SLTI_R99MapStub
+            attr_accessor :display_x,:display_y
+          end
+          class SLTI_R99ViewportStub
+            attr_reader :rect
+            def initialize
+              @rect=Struct.new(:width,:height).new(512,512)
+            end
+          end
+          meth=source.index("  def slti_update_terrain\n")
+          raise 'Real terrain method missing' unless meth
+          Object.class_eval("class Spriteset_Map\n"+source[meth..-1])
+          $game_map=SLTI_R99MapStub.new
+
+          def audit_load(mid,x,y)
+            obj=Spriteset_Map.allocate
+            obj.instance_variable_set(:@slti_floor,mid)
+            obj.instance_variable_set(:@slti_cols,mid==46 ? 11 : 9)
+            obj.instance_variable_set(:@slti_rows,mid==46 ? 6 : 5)
+            obj.instance_variable_set(:@slti_chunks,{})
+            obj.instance_variable_set(:@slti_chunk_error,false)
+            obj.instance_variable_set(:@viewport2,SLTI_R99ViewportStub.new)
+            $game_map.display_x=x*4096
+            $game_map.display_y=y*4096
+            before=Bitmap.calls.length
+            obj.slti_update_terrain
+            sprite=obj.instance_variable_get(:@slti_chunks)[[x,y]]
+            raise 'Missing W-compatible chunk entry' unless sprite
+            return [sprite.bitmap,Bitmap.calls.length-before]
+          end
+
+          bitmap,calls=audit_load(46,5,2)
+          raise 'Gray C chunk was loaded' unless bitmap.nil? && calls==0
+          bitmap,calls=audit_load(46,0,0)
+          raise 'Clean C chunk was not loaded' unless bitmap && calls==1
+          bitmap,calls=audit_load(45,5,2)
+          raise '1F chunk was not loaded' unless bitmap && calls==1
+          puts 'PASS actual renderer: gray 2F C not loaded, clean 2F/1F loaded, walls indexed'
+          RB_AUDIT
+
           python3 - <<'PY_AUDIT'
           from pathlib import Path
-          import json,hashlib
+          import hashlib,json
           root=Path('site')
-          original=json.loads(Path('build/r97-files.json').read_text('utf-8'))
-          result={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in root.rglob('*') if p.is_file()}
-          assert len(result)==5517 and result.keys()==original.keys()
-          modified={name for name in result if result[name]!=original[name]}
-          stats=json.loads(Path('build/r98-floor-stats.json').read_text('utf-8'))
-          floor={f'knight/gameasync/Graphics/Panoramas/{name}' for name in stats['changed']}
-          expected={'index.html','knight/index.html','knight/gameasync/mapping.js'}|floor
-          assert modified==expected, ('Unexpected changed files',modified^expected)
-          assert len(floor)>=20 and stats['replaced_pixels']>=1000000
-          assert result['knight/gameasync/Data/Scripts.rxdata']==original['knight/gameasync/Data/Scripts.rxdata']
-          assert result['knight/js/dpad.js']==original['knight/js/dpad.js']
-          assert not any('/SLTI_46_W_' in name for name in modified)
-          assert not any('/SLTI_45_' in name for name in modified)
-          print('PASS only 2F floor matte, mapping cache and 2 version labels changed')
-          print('PASS 1F, 2F walls, monster movement, S32, D-pad and game engine unchanged')
+          before=json.loads(Path('build/r97-baseline.json').read_text('utf-8'))
+          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.rglob('*') if p.is_file()}
+          assert before.keys()==after.keys() and len(after)==5517
+          changed={f for f in before if before[f]!=after[f]}
+          expected={'index.html','knight/index.html',
+                    'knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
+          assert changed==expected, ('Unexpected modification',changed^expected)
+          for name in before:
+            if '/Graphics/Panoramas/' in name:
+              assert before[name]==after[name], ('Image changed',name)
+          assert before['knight/js/dpad.js']==after['knight/js/dpad.js']
+          print('PASS only 4 deployment files changed; not a single PNG pixel altered')
           PY_AUDIT
 
-      - name: V229R98 Publish cleaned 2F with original gameplay
+      - name: V229R99 Publish no-load test without image editing
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
