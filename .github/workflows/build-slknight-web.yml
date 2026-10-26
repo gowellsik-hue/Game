@@ -1,16 +1,12 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
 # VERSION: V229R80
-# BASE: user-provided V229R66 game, reconstructed and verified byte-for-byte.
-# INPUT: currently existing R77 Actions artifact is used ONLY as a file transport.
-# R77 wall collision additions are removed and original R66 SHA-256 verified.
-# EDIT 1: wall_depth +32 -> +56 in original R49 wall painter.
-# EDIT 2: delete native_target's blocked-direction axis fallback (no sliding).
-# NEVER CHANGE: S32 passability, monster/event collision, wall bitmap, spawns,
-# stats, rewards, player movement or any other unrelated game logic.
-# No manual release upload, new tags, new assets, or repository writes.
-# The R77 transport artifact expires 2026-10-26 23:32:40 UTC.
-name: build-slknight-web.yml | V229R79 | Clean Native Events and 2x Terrain
+# BASE: exact successfully deployed V229R79 game (original R66 engine).
+# CHANGE: wall_depth=wall_y+by1*2+56 -> +20, exactly one occurrence.
+# KEEP: V229R79 no-sliding movement, S32 passability, all other scripts,
+# original R49 graphics, monsters, events, spawns and game assets.
+# Do not rebuild native collision or invent new wall geometry.
+name: build-slknight-web.yml | V229R80 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -33,129 +29,88 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R79 Get existing GitHub deployment as archive transport
+      - name: V229R80 Restore verified R79 deployed game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40245215458
+          run-id: 40254399979
           name: github-pages
           github-token: ${{ github.token }}
-          path: r77
+          path: r79
 
-      - name: V229R79 Verify the game and original R77 transport
+      - name: V229R80 Change only wall depth from 56 to 20
         shell: bash
         run: |
           set -euo pipefail
+          test -s r79/artifact.tar
           mkdir -p site build
-          test -s r77/artifact.tar
-          tar -xf r77/artifact.tar -C site
+          tar -xf r79/artifact.tar -C site
           python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
           files={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest() for f in root.rglob('*') if f.is_file()}
-          assert len(files)==5517,('Wrong deployed game file count',len(files))
-          assert all('V229R77' in (root/name).read_text('utf-8') for name in ('index.html','knight/index.html'))
+          assert len(files)==5517, ('unexpected game files',len(files))
+          assert all('V229R79' in (root/name).read_text('utf-8') for name in ('index.html','knight/index.html'))
           p=root/'knight/gameasync/Data/Scripts.rxdata'
-          assert hashlib.sha256(p.read_bytes()).hexdigest()=='3754388dbbe66c24353842edc9442eab77bf8b87c3ba60666afecb96406229ae', 'Wrong input game'
-          Path('build/base-hashes.json').write_text(json.dumps(files,sort_keys=True))
-          print('PASS official GitHub R77 deployment, original 5517 game files loaded')
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='872fa1efbbe5c44e7d651e76e1e023090a00695580eb0d4b3d3fd53c46c84558', 'wrong R79 engine: abort'
+          Path('build/original-files.json').write_text(json.dumps(files,sort_keys=True))
+          print('PASS verified R79 deployment, 5517 unchanged input files')
           PY_BASE
-          ruby -rzlib -rdigest - <<'RB_SOURCE'
-          a=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
-          raise 'Wrong game archive script count' unless a.size==136
-          s=Zlib::Inflate.inflate(a[134][2]).force_encoding('UTF-8')
-          raise 'Wrong R77 source script' unless Digest::SHA256.hexdigest(s)=='6fcff07a422ced594b10b95b6e6cdcff85e935af3abb055965ec5963286be130'
-          File.binwrite('build/r77-script134.rb',s)
-          RB_SOURCE
-
-      - name: V229R79 Restore authentic R66 and apply only approved changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/patch.py <<'PY_PATCH'
-          from pathlib import Path
-          import hashlib
-
-          # R77 is an artifact TRANSPORT ONLY. Remove its added wall collision graph first.
-          source=Path('build/r77-script134.rb').read_text('utf-8')
-          assert hashlib.sha256(source.encode()).hexdigest() == '6fcff07a422ced594b10b95b6e6cdcff85e935af3abb055965ec5963286be130'
-          layer_start='  # V229R77: shared dungeon physical COLLISION LAYER, built once from\n'
-          layer_end='  def self.active_map?(mid)\n'
-          assert source.count(layer_start)==1 and source.count(layer_end)==1
-          start=source.index(layer_start)
-          stop=source.index(layer_end,start)
-          assert 'WALL_BASE77' in source[start:stop]
-          restored=source[:start]+source[stop:]
-          method_start='  def self.native_target(mid,x,y,dir)\n'
-          method_end='  def self.native_line?(mid,ax,ay,bx,by)\n'
-          assert restored.count(method_start)==1 and restored.count(method_end)==1
-          start=restored.index(method_start)
-          stop=restored.index(method_end,start)
-          original_method='  def self.native_target(mid,x,y,dir)\n    # Isometric source: screen diagonals are one native S32 cardinal move.\n    moves={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1],\n      1=>[-1,0],3=>[0,1],7=>[0,-1],9=>[1,0]}\n    d=moves[dir]\n    return nil if d==nil\n    dx,dy=d\n    if dx==0 || dy==0\n      return edge?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil\n    end\n    if move_path?(mid,x,y,dx,dy)\n      return [x+dx,y+dy]\n    end\n    # Input pad has four buttons: use ONE original open edge to slide\n    # along a wall; never pretend a route through the blocked wall exists.\n    if edge?(mid,x,y,dx,0)\n      return [x+dx,y]\n    end\n    if edge?(mid,x,y,0,dy)\n      return [x,y+dy]\n    end\n    return nil\n  end\n'
-          restored=restored[:start]+original_method+restored[stop:]
-          # Do not proceed unless this is byte-for-byte identical to original R66.
-          assert hashlib.sha256(restored.encode()).hexdigest()=='6d0b554feef7dfbab436dc9804476ea9952e0d00089a0bbb4a83eb0176c1a10c', 'R66 original not recovered: reject build'
-          Path('build/r66-script134.rb').write_text(restored,encoding='utf-8')
-
-          # Only the two changes the user requested; do not change S32 data, walls or movement masks.
-          old_depth='wall_depth=wall_y+by1*2+32'
+          ruby -rzlib -rdigest - <<'RB_PATCH'
+          path='site/knight/gameasync/Data/Scripts.rxdata'
+          scripts=Marshal.load(File.binread(path))
+          before=Marshal.load(File.binread(path))
+          raise 'wrong game script count' unless scripts.length==136
+          src=Zlib::Inflate.inflate(scripts[134][2])
+          raise 'wrong R79 original game script' unless Digest::SHA256.hexdigest(src)=='efbcc1d32b045207b42a53fe7847dc7dd4170c5a608a55c7684158c3da6d41c1'
+          old_depth='wall_depth=wall_y+by1*2+56'
           new_depth='wall_depth=wall_y+by1*2+20'
-          slide='    # Input pad has four buttons: use ONE original open edge to slide\n    # along a wall; never pretend a route through the blocked wall exists.\n    if edge?(mid,x,y,dx,0)\n      return [x+dx,y]\n    end\n    if edge?(mid,x,y,0,dy)\n      return [x,y+dy]\n    end\n    return nil\n'
-          assert restored.count(old_depth)==1 and restored.count(slide)==1
-          patched=restored.replace(old_depth,new_depth,1).replace(slide,'    return nil\n',1)
-          # A reversible two-edit proof ensures no accidental third edit exists.
-          assert patched.replace(new_depth,old_depth,1).replace('    return nil\n  end\n  def self.native_line?',slide+'  end\n  def self.native_line?',1)==restored
-          assert hashlib.sha256(patched.encode()).hexdigest()=='efbcc1d32b045207b42a53fe7847dc7dd4170c5a608a55c7684158c3da6d41c1', 'Unexpected engine change'
-          assert 'WALL_BASE77' not in patched
-          assert 'wall_depth=wall_y+by1*2+32' not in patched
-          Path('build/r79-script134.rb').write_text(patched,encoding='utf-8')
-          print('PASS original R66 recovered exactly; only wall_depth +56 and blocked-direction slide removal')
-          PY_PATCH
-          python3 build/patch.py
-          ruby -c build/r79-script134.rb
-          ruby -rzlib -rdigest - <<'RB_PACK'
-          p='site/knight/gameasync/Data/Scripts.rxdata'
-          a=Marshal.load(File.binread(p))
-          orig=Marshal.load(File.binread(p))
-          raise 'Wrong script count' unless a.size==136
-          r66=File.binread('build/r66-script134.rb')
-          a[134][2]=Zlib::Deflate.deflate(r66)
-          raise 'Failed byte-exact R66 restoration' unless Digest::SHA256.hexdigest(Marshal.dump(a))=='fe661024a9decb09a6d392594614005722ae7d9ee585c74f79a4f14975cbe678'
-          fixed=File.binread('build/r79-script134.rb')
-          a[134][2]=Zlib::Deflate.deflate(fixed)
-          raise 'Wrong final engine archive' unless Digest::SHA256.hexdigest(Marshal.dump(a))=='872fa1efbbe5c44e7d651e76e1e023090a00695580eb0d4b3d3fd53c46c84558'
-          raise 'Other game scripts modified' unless a.each_index.all?{|i|i==134 || a[i]==orig[i]}
-          File.binwrite(p,Marshal.dump(a))
-          puts 'PASS R66 restored and only one game script modified with exactly two changes'
-          RB_PACK
-          python3 - <<'PY_FINAL'
+          raise 'expected exactly one wall depth calculation' unless src.scan(old_depth).length==1
+          raise 'target depth already present' unless src.scan(new_depth).empty?
+          patched=src.sub(old_depth,new_depth)
+          raise 'other engine change detected' unless patched.sub(new_depth,old_depth)==src
+          raise 'R49 renderer missing' unless patched.include?('def slti_r49_update_walls')
+          part=patched.split('  def self.native_target(mid,x,y,dir)',2)
+          raise 'native movement missing' unless part.length==2
+          method=part[1].split('  def self.native_line?',2)[0]
+          raise 'wall sliding unexpectedly present' if method.include?('return [x+dx,y]') || method.include?('return [x,y+dy]')
+          File.binwrite('build/r80-script134.rb',patched)
+          scripts[134][2]=Zlib::Deflate.deflate(patched)
+          raise 'another script changed' unless scripts.each_index.all?{|i|i==134 || scripts[i]==before[i]}
+          File.binwrite(path,Marshal.dump(scripts))
+          again=Marshal.load(File.binread(path))
+          raise 'patch did not survive save' unless Zlib::Inflate.inflate(again[134][2])==patched
+          puts 'PASS one wall_depth substitution, no changes to original collision or other scripts'
+          RB_PATCH
+          ruby -c build/r80-script134.rb
+          python3 - <<'PY_FINISH'
           from pathlib import Path
           import hashlib,json,re
-          root=Path('site'); game=root/'knight/gameasync'
-          script=game/'Data/Scripts.rxdata'
-          assert hashlib.sha256(script.read_bytes()).hexdigest()=='872fa1efbbe5c44e7d651e76e1e023090a00695580eb0d4b3d3fd53c46c84558'
+          root=Path('site');game=root/'knight/gameasync'
+          archive=game/'Data/Scripts.rxdata'
           mapping=game/'mapping.js'
-          s=mapping.read_text('utf-8')
-          md5=hashlib.md5(script.read_bytes()).hexdigest()
-          s,n=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',lambda m:'Data/Scripts.rxdata?h='+md5,s)
-          assert n==1,n
-          mapping.write_text(s,encoding='utf-8')
+          old=mapping.read_text('utf-8')
+          digest=hashlib.md5(archive.read_bytes()).hexdigest()
+          new,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',lambda m:'Data/Scripts.rxdata?h='+digest,old)
+          assert count==1, 'engine cache hash missing'
+          mapping.write_text(new,encoding='utf-8')
           for name in ('index.html','knight/index.html'):
-              p=root/name;old=p.read_text('utf-8')
-              assert 'V229R77' in old
-              p.write_text(old.replace('V229R77','V229R79').replace('v229r77','v229r79'),encoding='utf-8')
-          before=json.loads(Path('build/base-hashes.json').read_text('utf-8'))
-          after={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest() for f in root.rglob('*') if f.is_file()}
-          assert len(after)==5517 and before.keys()==after.keys()
-          changed={x for x in before if before[x]!=after[x]}
-          allowed={'knight/gameasync/Data/Scripts.rxdata','knight/gameasync/mapping.js','knight/index.html','index.html'}
-          assert changed==allowed,('Unexpected game content changed',changed)
-          print('PASS 5517 files retained: engine script, cache hash, and only version labels updated')
-          PY_FINAL
+            p=root/name
+            value=p.read_text('utf-8')
+            assert 'V229R79' in value, name
+            p.write_text(value.replace('V229R79','V229R80').replace('v229r79','v229r80'),encoding='utf-8')
+          original=json.loads(Path('build/original-files.json').read_text('utf-8'))
+          now={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest() for f in root.rglob('*') if f.is_file()}
+          assert len(now)==5517 and original.keys()==now.keys()
+          changed={name for name in now if now[name]!=original[name]}
+          expected={'index.html','knight/index.html','knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
+          assert changed==expected, ('unapproved file modifications',changed^expected)
+          print('PASS 5517 game files preserved; only engine, cache hash and two version labels changed')
+          PY_FINISH
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R79 Deploy original game with corrected wall-depth and no slide
+      - name: V229R80 Publish full game for depth 20 test
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
