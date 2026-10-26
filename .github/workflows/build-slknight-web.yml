@@ -1,13 +1,14 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R84
-# BASE: verified V229R82 deployed game, before the R83 8-way player/pad change.
-# ROLLBACK 1: original Input.dir4 and original 4-button round pad (R82 originals).
-# ROLLBACK 2: remove the R82 native projection / nearest override that shifted
-# the whole S32 grid screen-left/down by one cell; restore original door alignment.
-# KEEP: R82 continuous green-cell movement, no-slide, original S32 data,
-# wall depth +32, attack in 4 facings, monsters, events, rewards and all assets.
-name: build-slknight-web.yml | V229R84 | Clean Native Events and 2x Terrain
+# VERSION: V229R85
+# BASE: deployed V229R84 (run 40265029580), original 4-way player and pad.
+# MAP45 ONLY: 3+-cell concave S32=0 corners gain directional links.
+# Right-side yellow corners: screen UP/RIGHT only; LEFT/DOWN blocked.
+# Left-side yellow corners: screen DOWN/LEFT only; UP/RIGHT blocked.
+# A green neighboring tile may enter only from the allowed direction;
+# the reverse step is allowed. No one-way movement and no wall sliding.
+# All other S32 movement, wall drawing, map46, combat, monsters and assets stay.
+name: build-slknight-web.yml | V229R85 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,42 +31,129 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R84 Restore deployed R82 original 4-way controls
+      - name: V229R85 Restore verified deployed R84
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40262441759
+          run-id: 40265029580
           name: github-pages
           github-token: ${{ github.token }}
-          path: r82
+          path: r84
 
-      - name: V229R84 Remove one-cell map shift only
+      - name: V229R85 Apply only direction-gated floor-1 corner cuts
         shell: bash
         run: |
           set -euo pipefail
-          test -s r82/artifact.tar
+          test -s r84/artifact.tar
           mkdir -p site build
-          tar -xf r82/artifact.tar -C site
-          python3 - <<'PY_INPUT'
+          tar -xf r84/artifact.tar -C site
+          python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
-          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in root.rglob('*') if p.is_file()}
-          assert len(before)==5517,('Wrong R82 file count',len(before))
-          archive=root/'knight/gameasync/Data/Scripts.rxdata'
-          assert hashlib.sha256(archive.read_bytes()).hexdigest()==\
-            'c240b3ad3a292831e60b7a4425b8e038a882fc2c629034f8691c64ac8dd01c4a',\
-            'Not the verified R82 engine: abort'
+          files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.rglob('*') if p.is_file()}
+          assert len(files)==5517,('Wrong R84 file count',len(files))
+          engine=root/'knight/gameasync/Data/Scripts.rxdata'
+          assert hashlib.sha256(engine.read_bytes()).hexdigest()==\
+            '118878b132665f3128146c2e8ca4c426739a98e6e9a5ecb3f9f9d387592f8f4d',\
+            'Not verified R84 engine: abort'
           pad=root/'knight/js/dpad.js'
           assert hashlib.sha256(pad.read_bytes()).hexdigest()==\
             'a313791be0ef8eeb5edcf57088cf39b860662a318cdb11c2170c70f846688acb',\
-            'Not the original 4-way round pad'
-          assert all('V229R82' in (root/p).read_text('utf-8')
-                     for p in ('index.html','knight/index.html'))
-          Path('build/base-hashes.json').write_text(json.dumps(before,sort_keys=True))
-          print('PASS R82 baseline: 5517 files, original 4-way direction pad')
-          PY_INPUT
+            'Four-direction pad changed unexpectedly'
+          for name in ('index.html','knight/index.html'):
+            assert 'V229R84' in (root/name).read_text('utf-8'),name
+          Path('build/r84-hashes.json').write_text(json.dumps(files,sort_keys=True))
+          print('PASS byte-verified R84 baseline, 5517 files')
+          PY_BASE
+
+          cat > build/corner85.rb <<'RB_CORNER'
+          # These are screen directions on the original isometric floor.
+          # Original Sanctuary S32 bytes are read-only. A yellow tile stays 0.
+          module SLTI_V229R85Corner
+            DELTA={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]}.freeze
+            OPPOSITE={2=>8,4=>6,6=>4,8=>2}.freeze
+            BIT={2=>1,4=>2,6=>4,8=>8}.freeze
+            NATIVE={:L=>[-1,0],:R=>[1,0],:U=>[0,-1],:D=>[0,1]}.freeze
+            # Screen RIGHT/UP for the right-facing cut; LEFT/DOWN for left.
+            RIGHT_MASK=BIT[6]|BIT[8]
+            LEFT_MASK=BIT[4]|BIT[2]
+            PAIRS=[[:L,:U],[:R,:D],[:L,:D],[:R,:U]].freeze
+
+            def self.original_open?(x,y)
+              SLTI_Native66.value(45,x,y)!=0
+            end
+            def self.corners
+              result={}
+              ox=SLTI_Native66::ORIGIN_X
+              oy=SLTI_Native66::ORIGIN_Y
+              width=SLTI_Native66::WIDTH.fetch(45)
+              height=SLTI_Native66::HEIGHT.fetch(45)
+              (oy...(oy+height)).each do |y|
+                (ox...(ox+width)).each do |x|
+                  next if original_open?(x,y)
+                  flags={}
+                  NATIVE.each do |side,(dx,dy)|
+                    flags[side]=original_open?(x+dx,y+dy)
+                  end
+                  PAIRS.each do |a,b|
+                    next unless flags[a] && flags[b]
+                    blocked=NATIVE.keys-[a,b]
+                    next unless blocked.all?{|side| !flags[side]}
+                    # The blocked walls must continue for at least THREE cells
+                    # counting the yellow corner itself; 2-cell bends stay closed.
+                    next unless blocked.all? do |side|
+                      dx,dy=NATIVE.fetch(side)
+                      !original_open?(x+dx,y+dy) &&
+                        !original_open?(x+2*dx,y+2*dy)
+                    end
+                    mask=(a==:R || b==:R) ? RIGHT_MASK : LEFT_MASK
+                    raise 'Ambiguous corner' if result.key?([x,y])
+                    result[[x,y]]=mask
+                  end
+                end
+              end
+              raise "Wrong source or corner count: #{result.length}" unless
+                result.length==419 && result.values.count(RIGHT_MASK)==201 &&
+                result.values.count(LEFT_MASK)==218
+              result.freeze
+            end
+            CUTS=corners
+          end
+
+          module SLTI_Native66
+            class << self
+              alias_method :slti_r85_original_native_target, :native_target
+              def native_target(mid,x,y,dir)
+                step=SLTI_V229R85Corner::DELTA[dir]
+                return slti_r85_original_native_target(mid,x,y,dir) if
+                  mid!=45 || step==nil
+                tx=x+step[0]
+                ty=y+step[1]
+                cuts=SLTI_V229R85Corner::CUTS
+                from=cuts[[x,y]]
+                into=cuts[[tx,ty]]
+                # Every movement not touching a yellow tile remains R84 exact.
+                return slti_r85_original_native_target(mid,x,y,dir) if
+                  from==nil && into==nil
+                # Never cut through two unapproved wall tiles consecutively.
+                return nil if from!=nil && into!=nil
+                bits=SLTI_V229R85Corner::BIT
+                opposite=SLTI_V229R85Corner::OPPOSITE
+                if from!=nil
+                  return nil if (from & bits.fetch(dir))==0
+                  return nil if value(mid,tx,ty)==0
+                end
+                if into!=nil
+                  return nil if (into & bits.fetch(opposite.fetch(dir)))==0
+                  return nil if value(mid,x,y)==0
+                end
+                [tx,ty]
+              end
+            end
+          end
+          RB_CORNER
 
           ruby -rzlib -rdigest - <<'RB_PATCH'
           path='site/knight/gameasync/Data/Scripts.rxdata'
@@ -73,133 +161,157 @@ jobs:
           before=Marshal.load(File.binread(path))
           raise 'Wrong script count' unless scripts.size==136
           player=Zlib::Inflate.inflate(scripts[27][2])
-          raise 'Not the original four-way player' unless
+          raise 'Four-way player changed' unless
             Digest::SHA256.hexdigest(player)==
-            'a6b344b8b8b6a83c9f77529eb333d16053ceb32483e6336eb082ad8f03e74ced'
-          raise 'Player input is not 4-way' unless player.include?('case Input.dir4') &&
-            !player.include?('case Input.dir8')
+              'a6b344b8b8b6a83c9f77529eb333d16053ceb32483e6336eb082ad8f03e74ced' &&
+            player.include?('case Input.dir4') && !player.include?('case Input.dir8')
           src=Zlib::Inflate.inflate(scripts[134][2])
-          raise 'Wrong R82 native engine' unless Digest::SHA256.hexdigest(src)==
-            'bc11e61704567a83c999e657a1af89ae16592cc1e5068b86d1febd9e09a41422'
-          header=<<'OLD_HEADER'
-          # V229R82: user-directed native continuity patch.
-          # 1) remove any one-axis sliding fallback.
-          # 2) shift the native cell projection one tile to screen left/down.
-          # 3) if nonzero S32 cells are visually continuous, connect them.
-          OLD_HEADER
-          replacement=<<'NEW_HEADER'
-          # V229R84: R82 green-cell continuity and no-slide are retained.
-          # Original native projection and nearest-tile mapping are restored.
-          NEW_HEADER
-          raise 'Wrong patch header' unless src.scan(header).size==1
-          changed=src.sub(header,replacement)
-          shift=<<'SHIFT_MODULE'
-          module SLTI_V229R82Patch
-            SHIFT_X=-1
-            SHIFT_Y=0
-          end
-
-          SHIFT_MODULE
-          raise 'Missing original shift module' unless changed.scan(shift).size==1
-          changed=changed.sub(shift,'')
-          begin_mark="module SLTI_Native66\n  def self.walkable?(mid,x,y)\n"
-          anchor=changed.index(begin_mark)
-          raise 'R82 extension missing' unless anchor
-          start=changed.index("\n  def self.project(mid,x,y)\n",anchor)
-          finish=changed.index("\n  def self.continuous_path?(mid,x,y,dx,dy)\n",anchor)
-          raise 'Wrong shift override range' unless start && finish && start<finish
-          removed=changed[start...finish]
-          %w[project real to_rgss nearest].each do |method|
-            raise "Missing shifted #{method}" unless
-              removed.include?("def self.#{method}(")
-          end
-          raise 'Unexpected movement code in shift block' if
-            removed.include?('def self.move_path?') ||
-            removed.include?('def self.native_target(')
-          changed=changed[0...start]+changed[finish..-1]
-          raise 'Shift references remain' if changed.include?('SLTI_V229R82Patch') ||
-            changed.include?('SHIFT_X=-1')
-          raise 'Green continuity lost' unless changed.include?('def self.continuous_path?') &&
-            changed.include?('return continuous_path?(mid,x,y,dx,dy)')
-          raise 'Original wall depth lost' unless changed.include?('wall_depth=wall_y+by1*2+32')
-          raise 'Original S32 EDGES lost' unless changed.include?('def self.edge?(mid,x,y,dx,dy)')
-          File.binwrite('build/native134.rb',changed)
+          raise 'Unexpected R84 engine' unless
+            Digest::SHA256.hexdigest(src)==
+              '3f646769ca61efb2f8645b3b150386d2314e8696ce11149c669db1ef5a89ad03'
+          raise 'R84 green connectivity missing' unless
+            src.include?('def self.continuous_path?(mid,x,y,dx,dy)')
+          raise 'R84 native coordinates missing' unless
+            src.include?('px=12*(x+y)-784128') &&
+            src.include?('py=6*(y-x)+YOFFSET[mid]')
+          raise 'Wrong wall painter' unless src.include?('wall_depth=wall_y+by1*2+32')
+          raise 'Another corner edit already exists' if src.include?('SLTI_V229R85Corner')
+          addon=File.binread('build/corner85.rb')
+          changed=src+"\n"+addon
+          File.binwrite('build/script134-r85.rb',changed)
           scripts[134][2]=Zlib::Deflate.deflate(changed)
-          raise 'Other scripts changed' unless scripts.each_index.all?{|i|
-            i==134 || scripts[i]==before[i]
-          }
+          raise 'Unapproved RGSS script changed' unless
+            scripts.each_index.all?{|i|i==134 || scripts[i]==before[i]}
           File.binwrite(path,Marshal.dump(scripts))
-          verified=Marshal.load(File.binread(path))
-          raise 'Patch not persisted' unless
-            Zlib::Inflate.inflate(verified[134][2])==changed
-          puts 'PASS restored original projection and nearest; retained R82 continuity'
+          reloaded=Marshal.load(File.binread(path))
+          raise 'R85 patch not saved' unless
+            Zlib::Inflate.inflate(reloaded[134][2])==changed
+          puts 'PASS R85 map45-only directional corner rule inserted'
           RB_PATCH
-          ruby -c build/native134.rb
+          ruby -c build/corner85.rb
+          ruby -c build/script134-r85.rb
 
-          python3 - <<'PY_CACHE'
+          python3 - <<'PY_VERSION'
           from pathlib import Path
           import hashlib,re
           root=Path('site')
           archive=root/'knight/gameasync/Data/Scripts.rxdata'
           mapping=root/'knight/gameasync/mapping.js'
-          text=mapping.read_text('utf-8')
-          cache=hashlib.md5(archive.read_bytes()).hexdigest()
-          text,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',
-                             lambda m:'Data/Scripts.rxdata?h='+cache,text)
-          assert count==1,('Wrong script cache entry count',count)
-          mapping.write_text(text,encoding='utf-8')
+          code=mapping.read_text('utf-8')
+          md5=hashlib.md5(archive.read_bytes()).hexdigest()
+          code,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',
+                             lambda m:'Data/Scripts.rxdata?h='+md5,code)
+          assert count==1,('Missing script cache entry',count)
+          mapping.write_text(code,encoding='utf-8')
           for name in ('index.html','knight/index.html'):
-            p=root/name
-            old=p.read_text('utf-8')
-            assert 'V229R82' in old and 'V229R84' not in old
-            p.write_text(old.replace('V229R82','V229R84')
-                              .replace('v229r82','v229r84'),encoding='utf-8')
-          print('PASS script cache and version labels updated')
-          PY_CACHE
+            path=root/name
+            before=path.read_text('utf-8')
+            assert 'V229R84' in before and 'V229R85' not in before,name
+            path.write_text(before.replace('V229R84','V229R85')
+                                  .replace('v229r84','v229r85'),encoding='utf-8')
+          print('PASS engine hash and page version updated')
+          PY_VERSION
           node --check site/knight/js/dpad.js
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R84 Verify four-way controls and native door coordinates
+      - name: V229R85 Audit all 419 two-way corner links and original controls
         shell: bash
         run: |
           set -euo pipefail
-          ruby -rzlib - <<'RB_CHECK'
+          cat > build/audit85.rb <<'RB_AUDIT'
+          require 'zlib'
+          require 'digest'
           a=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
           src=Zlib::Inflate.inflate(a[134][2])
-          player=Zlib::Inflate.inflate(a[27][2])
-          raise 'Eight-way movement remains' if player.include?('case Input.dir8')
-          raise 'Four-way player missing' unless player.include?('case Input.dir4')
-          raise 'Projection still shifted' if src.include?('SLTI_V229R82Patch')
-          raise 'Green continuity lost' unless src.include?('def self.continuous_path?')
-          raise 'Original native projection lost' unless
-            src.include?('px=12*(x+y)-784128') &&
-            src.include?('py=6*(y-x)+YOFFSET[mid]')
-          raise 'No-slide movement missing' unless
-            src.include?('return move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil')
-          puts 'PASS original 4-way player and native map projection; R82 movement retained'
-          RB_CHECK
-          python3 - <<'PY_FINAL'
-          from pathlib import Path
-          import hashlib,json
-          root=Path('site')
-          before=json.loads(Path('build/base-hashes.json').read_text('utf-8'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                 for p in root.rglob('*') if p.is_file()}
-          assert len(after)==5517 and before.keys()==after.keys()
-          changed={p for p in after if before[p]!=after[p]}
-          expected={'index.html','knight/index.html',
-                    'knight/gameasync/mapping.js',
-                    'knight/gameasync/Data/Scripts.rxdata'}
-          assert changed==expected,('Unexpected file changes',changed^expected)
-          pad=(root/'knight/js/dpad.js').read_text('utf-8')
-          assert pad.count('dirButton(dpad,')==4
-          assert 'sl-ul' not in pad and 'bindEightWayPad' not in pad
-          assert 'function attackButton(parent)' in pad
-          assert 'js/dpad.js?v=v229r84' in (root/'knight/index.html').read_text('utf-8')
-          print('PASS 5517 game files retained; only 4 authorized files changed')
-          PY_FINAL
+          original_start=src.index("module SLTI_Native66\n")
+          original_end=src.index("\nclass Game_Character",original_start)
+          raise 'Native engine extraction failed' unless original_start && original_end
+          Object.class_eval(src[original_start...original_end])
+          r84_start=src.index("\nmodule SLTI_Native66\n  def self.walkable?(mid,x,y)\n",original_end)
+          r85_start=src.index("\n# These are screen directions on the original isometric floor.",r84_start)
+          raise 'Version patches not found' unless r84_start && r85_start
+          Object.class_eval(src[r84_start...r85_start])
+          Object.class_eval(src[r85_start..-1])
+          nav=SLTI_Native66
+          cut=SLTI_V229R85Corner
+          raise 'Wrong corner total' unless cut::CUTS.length==419
+          # The packed R84 archive was SHA-verified before patching; here verify
+          # that the embedded native map still has its 5,957 original open cells.
+          original_nonzero=0
+          nav::HEIGHT.fetch(45).times do |dy|
+            nav::WIDTH.fetch(45).times do |dx|
+              original_nonzero+=1 if nav.value(45,nav::ORIGIN_X+dx,nav::ORIGIN_Y+dy)!=0
+            end
+          end
+          raise 'Wrong S32 floor 1' unless original_nonzero==5957
+          verified=0
+          cut::CUTS.each do |(x,y),mask|
+            raise 'Candidate was already open' unless nav.value(45,x,y)==0
+            cut::DELTA.each do |dir,(dx,dy)|
+              nx=x+dx;ny=y+dy
+              allowed=(mask & cut::BIT.fetch(dir))!=0 && nav.value(45,nx,ny)!=0
+              expected=allowed ? [nx,ny] : nil
+              actual=nav.native_target(45,x,y,dir)
+              raise "Wrong outgoing #{x},#{y},#{dir}" unless actual==expected
+              if nav.value(45,nx,ny)!=0
+                incoming=nav.native_target(45,nx,ny,cut::OPPOSITE.fetch(dir))
+                raise "Wrong incoming #{x},#{y},#{dir}" unless
+                  incoming==(allowed ? [x,y] : nil)
+              end
+              verified+=1
+            end
+          end
+          raise 'Corner audit incomplete' unless verified==1676
+          # User-approved reference: rightmost yellow receives DOWN from above,
+          # LEFT from right, but never UP from below.
+          raise 'Rightmost top approach failed' unless
+            nav.native_target(45,32660,32806,2)==[32659,32807]
+          raise 'Rightmost right approach failed' unless
+            nav.native_target(45,32660,32808,4)==[32659,32807]
+          raise 'Blocked lower approach leaked' unless
+            nav.native_target(45,32658,32808,8)==nil
+          raise 'Lower-left bottom approach failed' unless
+            nav.native_target(45,32656,32808,8)==[32657,32807]
+          raise 'Lower-left upper approach leaked' unless
+            nav.native_target(45,32658,32806,2)==nil
+          # No change to other green-to-green steps or 2F movement.
+          [45,46].each do |mid|
+            nav::HEIGHT.fetch(mid).times do |dy|
+              nav::WIDTH.fetch(mid).times do |dx|
+                x=nav::ORIGIN_X+dx;y=nav::ORIGIN_Y+dy
+                next if nav.value(mid,x,y)==0
+                cut::DELTA.each do |dir,(mx,my)|
+                  if mid==45 && cut::CUTS.key?([x+mx,y+my])
+                    next
+                  end
+                  observed=nav.native_target(mid,x,y,dir)
+                  previous=nav.slti_r85_original_native_target(mid,x,y,dir)
+                  raise "Other movement altered: #{mid}/#{x}/#{y}/#{dir}" unless observed==previous
+                end
+              end
+            end
+          end
+          puts 'PASS 419 original-zero corners, 1676 direction tests, bidirectional allowed links'
+          puts 'PASS prohibited approaches, 2-cell corners, all other 1F steps and all 2F steps'
+          RB_AUDIT
+          ruby build/audit85.rb
 
-      - name: V229R84 Publish original 4-way pad and door-aligned coordinates
+          python3 - <<'PY_FILES'
+          from pathlib import Path
+          import json,hashlib
+          root=Path('site')
+          before=json.loads(Path('build/r84-hashes.json').read_text('utf-8'))
+          after={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
+                 for f in root.rglob('*') if f.is_file()}
+          assert len(after)==5517 and after.keys()==before.keys()
+          changed={p for p in before if before[p]!=after[p]}
+          allowed={'index.html','knight/index.html',
+                   'knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
+          assert changed==allowed,('Unexpected file changes',changed^allowed)
+          print('PASS 5517 files and original dpad intact; changed only four authorized files')
+          PY_FILES
+
+      - name: V229R85 Publish direction-gated floor-1 corner build
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
