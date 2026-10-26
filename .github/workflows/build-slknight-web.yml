@@ -1,11 +1,12 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R86
+# VERSION: V229R87
 # BASE: deployed V229R84 (run 40265029580), original 4-way player and pad.
-# FIX: remove R85's boot-time scan and singleton-method alias from live RGSS.
+# FIX: verify actual movement rejections at native-target, RGSS-bound and event gates.
+# Runtime: a short diagnostic appears ONLY after a player attempts a blocked S32=0 corner.
 # MAP45 ONLY: original S32=0 concave corners permit direction-gated crossing.
 # No changed S32 passability, no wall sliding, no 2F/monster/combat/pad edits.
-name: build-slknight-web.yml | V229R86 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V229R87 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -28,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R86 Restore verified R84 baseline
+      - name: V229R87 Restore verified R84 baseline
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -37,7 +38,7 @@ jobs:
           github-token: ${{ github.token }}
           path: r84
 
-      - name: V229R86 Build static native corner table and integrate movement
+      - name: V229R87 Build static native corner table and integrate movement
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +81,7 @@ jobs:
             Digest::SHA256.hexdigest(src)==
               '3f646769ca61efb2f8645b3b150386d2314e8696ce11149c669db1ef5a89ad03'
           raise 'Prior corner patch present' if
-            src.include?('SLTI_V229R85Corner') || src.include?('SLTI_V229R86Corner')
+            src.include?('SLTI_V229R85Corner') || src.include?('SLTI_V229R87Corner')
           first=src.index("module SLTI_Native66\n")
           last=src.index("\nclass Game_Character",first)
           raise 'R84 source map not found' unless first && last
@@ -124,13 +125,13 @@ jobs:
           raise 'Bad corner payload' unless data.bytesize==1257
           encoded=[data].pack('m0')
 
-          module_text=<<'R86_MODULE'
-          # V229R86: preverified original-S32=0 corners; no boot-time map scan.
-          module SLTI_V229R86Corner
+          module_text=<<'R87_MODULE'
+          # V229R87: preverified original-S32=0 corners; no boot-time map scan.
+          module SLTI_V229R87Corner
             DELTA={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]}.freeze
             BIT={2=>1,4=>2,6=>4,8=>8}.freeze
             OPPOSITE={2=>8,4=>6,6=>4,8=>2}.freeze
-            data='__R86_DATA__'.unpack('m')[0].unpack('C*')
+            data='__R87_DATA__'.unpack('m')[0].unpack('C*')
             MASKS={}
             i=0
             while i<data.length
@@ -139,8 +140,8 @@ jobs:
             end
             MASKS.freeze
           end
-          R86_MODULE
-          module_text=module_text.sub('__R86_DATA__',encoded)
+          R87_MODULE
+          module_text=module_text.sub('__R87_DATA__',encoded)
           old_method=<<'R84_METHOD'
             def self.native_target(mid,x,y,dir)
               moves={
@@ -153,7 +154,7 @@ jobs:
               return move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil
             end
           R84_METHOD
-          new_method=<<'R86_METHOD'
+          new_method=<<'R87_METHOD'
             def self.native_target(mid,x,y,dir)
               moves={
                 2=>[-1,1], 4=>[-1,-1], 6=>[1,1], 8=>[1,-1],
@@ -164,12 +165,12 @@ jobs:
                 nil
               else
                 dx,dy=d
-                if mid!=45 || !SLTI_V229R86Corner::DELTA.key?(dir)
+                if mid!=45 || !SLTI_V229R87Corner::DELTA.key?(dir)
                   move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil
                 else
                   tx=x+dx
                   ty=y+dy
-                  cuts=SLTI_V229R86Corner::MASKS
+                  cuts=SLTI_V229R87Corner::MASKS
                   from=cuts[[x,y]]
                   into=cuts[[tx,ty]]
                   if from==nil && into==nil
@@ -177,27 +178,111 @@ jobs:
                   elsif from!=nil && into!=nil
                     nil
                   elsif from!=nil
-                    bits=SLTI_V229R86Corner::BIT
+                    bits=SLTI_V229R87Corner::BIT
                     ((from & bits.fetch(dir))!=0 && value(mid,tx,ty)!=0) ? [tx,ty] : nil
                   else
-                    bits=SLTI_V229R86Corner::BIT
-                    opposite=SLTI_V229R86Corner::OPPOSITE
+                    bits=SLTI_V229R87Corner::BIT
+                    opposite=SLTI_V229R87Corner::OPPOSITE
                     ((into & bits.fetch(opposite.fetch(dir)))!=0 && value(mid,x,y)!=0) ? [tx,ty] : nil
                   end
                 end
               end
             end
-          R86_METHOD
+          R87_METHOD
           raise 'Cannot safely locate R84 movement method' unless
             src.scan(old_method).length==1
           changed=src.sub(old_method,new_method)
+          # Replace the movement caller as well: its later RGSS/event gates were
+          # never exercised by the prior 419-corner unit audit.
+          old_move=<<'R84_MOVE'
+            def slti_native66_move(dir,turn=true)
+              return false unless slti_native66_prepare
+              mid=@slti_native66_map
+              target=SLTI_Native66.native_target(mid,@slti_native66_x,@slti_native66_y,dir)
+              return false if target==nil
+              nx,ny=SLTI_Native66.to_rgss(mid,target[0],target[1])
+              return false unless $game_map.valid?(nx,ny)
+              # Preserve original event occupancy, independent of wall geometry.
+              unless @through
+                $game_map.events.values.each do |other|
+                  next if other==self || other.through
+                  return false if other.x==nx && other.y==ny && other.character_name!=''
+                end
+                if self!=$game_player && $game_player!=nil && !$game_player.through
+                  return false if $game_player.x==nx && $game_player.y==ny
+                end
+              end
+              @slti_native66_x=target[0]
+              @slti_native66_y=target[1]
+              @slti_native66_tx,@slti_native66_ty=SLTI_Native66.real(mid,target[0],target[1])
+              @x=nx;@y=ny
+              increase_steps
+              return true
+            end
+          R84_MOVE
+          new_move=<<'R87_MOVE'
+            def slti_r87_probe(mid,fx,fy,tx,ty,dir,why)
+              return unless self==$game_player && mid==45
+              return if fx==nil || fy==nil || tx==nil || ty==nil
+              table=SLTI_V229R87Corner::MASKS
+              return unless table.key?([fx,fy]) || table.key?([tx,ty]) ||
+                SLTI_Native66.value(mid,tx,ty)==0
+              key=[fx,fy,tx,ty,dir,why].join(',')
+              return if @slti_r87_last_probe==key
+              @slti_r87_last_probe=key
+              puts('SLMOVE87|'+why+'|map='+mid.to_s+
+                '|from='+fx.to_s+','+fy.to_s+'|to='+tx.to_s+','+ty.to_s+
+                '|dir='+dir.to_s+'|frommask='+table[[fx,fy]].to_s+
+                '|tomask='+table[[tx,ty]].to_s)
+            end
+            def slti_native66_move(dir,turn=true)
+              return false unless slti_native66_prepare
+              mid=@slti_native66_map
+              fx=@slti_native66_x;fy=@slti_native66_y
+              delta=SLTI_V229R87Corner::DELTA[dir] if mid==45
+              tx=delta ? fx+delta[0] : nil
+              ty=delta ? fy+delta[1] : nil
+              target=SLTI_Native66.native_target(mid,fx,fy,dir)
+              if target==nil
+                slti_r87_probe(mid,fx,fy,tx,ty,dir,'BLOCK_NATIVE')
+                return false
+              end
+              tx=target[0];ty=target[1]
+              nx,ny=SLTI_Native66.to_rgss(mid,tx,ty)
+              unless $game_map.valid?(nx,ny)
+                slti_r87_probe(mid,fx,fy,tx,ty,dir,'BLOCK_BOUNDS')
+                return false
+              end
+              unless @through
+                $game_map.events.values.each do |other|
+                  next if other==self || other.through
+                  if other.x==nx && other.y==ny && other.character_name!=''
+                    slti_r87_probe(mid,fx,fy,tx,ty,dir,'BLOCK_EVENT')
+                    return false
+                  end
+                end
+                if self!=$game_player && $game_player!=nil && !$game_player.through
+                  return false if $game_player.x==nx && $game_player.y==ny
+                end
+              end
+              @slti_native66_x=tx;@slti_native66_y=ty
+              @slti_native66_tx,@slti_native66_ty=SLTI_Native66.real(mid,tx,ty)
+              @x=nx;@y=ny
+              increase_steps
+              slti_r87_probe(mid,fx,fy,tx,ty,dir,'MOVE_OK')
+              return true
+            end
+          R87_MOVE
+          raise 'Cannot safely locate R84 movement caller' unless
+            changed.scan(old_move).length==1
+          changed=changed.sub(old_move,new_move)
           marker="\n# V229R84: R82 green-cell continuity and no-slide are retained."
           raise 'Missing unique R84 extension point' unless changed.scan(marker).length==1
           changed=changed.sub(marker,"\n"+module_text+marker)
           raise 'Original projection lost' unless
             changed.include?('px=12*(x+y)-784128') &&
             changed.include?('py=6*(y-x)+YOFFSET[mid]')
-          File.binwrite('build/script134-r86.rb',changed)
+          File.binwrite('build/script134-r87.rb',changed)
           a[134][2]=Zlib::Deflate.deflate(changed)
           raise 'Unapproved RGSS changed' unless
             a.each_index.all?{|i|i==134 || a[i]==before[i]}
@@ -206,7 +291,7 @@ jobs:
             Zlib::Inflate.inflate(Marshal.load(File.binread(path))[134][2])==changed
           puts 'PASS: offline 419-corner table, direct native_target method, no runtime alias'
           RB_PATCH
-          ruby -c build/script134-r86.rb
+          ruby -c build/script134-r87.rb
 
           python3 - <<'PY_VERSION'
           from pathlib import Path
@@ -223,30 +308,41 @@ jobs:
           for name in ('index.html','knight/index.html'):
             path=root/name
             text=path.read_text('utf-8')
-            assert 'V229R84' in text and 'V229R86' not in text,name
-            path.write_text(text.replace('V229R84','V229R86')
-                                .replace('v229r84','v229r86'),encoding='utf-8')
-          print('PASS: cache digest and R86 page version')
+            assert 'V229R84' in text and 'V229R87' not in text,name
+            if name=='knight/index.html':
+              needle='if(/SLRUNTIMEERR|SLSCRIPTERR/.test(t))err(t);'
+              assert text.count(needle)==1
+              diagnostic="""if(/^SLMOVE87\\|/.test(t)){
+                var d=document.getElementById('slmove87');
+                if(!d){d=document.createElement('div');d.id='slmove87';
+                  d.style='position:fixed;left:8px;top:155px;z-index:999998;max-width:calc(100vw - 16px);padding:4px;background:rgba(0,0,0,.82);color:#b8ffb0;font:11px monospace;overflow-wrap:anywhere;pointer-events:none';
+                  document.body.appendChild(d);}
+                d.textContent=t;d.style.display='block';
+              }"""
+              text=text.replace(needle,diagnostic+'\n    '+needle)
+            path.write_text(text.replace('V229R84','V229R87')
+                                .replace('v229r84','v229r87'),encoding='utf-8')
+          print('PASS: cache digest and R87 page version')
           PY_VERSION
           node --check site/knight/js/dpad.js
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R86 Audit 419 directional cuts and unchanged R84 engine
+      - name: V229R87 Audit 419 directional cuts and unchanged R84 engine
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/audit86.rb <<'RB_AUDIT'
+          cat > build/audit87.rb <<'RB_AUDIT'
           require 'zlib'
           a=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
           src=Zlib::Inflate.inflate(a[134][2])
           first=src.index("module SLTI_Native66\n")
           last=src.index("\nclass Game_Character",first)
-          patch=src.index("\nmodule SLTI_V229R86Corner\n",last)
+          patch=src.index("\nmodule SLTI_V229R87Corner\n",last)
           raise 'Source sections unavailable' unless first && last && patch
           Object.class_eval(src[first...last])
           Object.class_eval(src[patch..-1])
           nav=SLTI_Native66
-          cut=SLTI_V229R86Corner
+          cut=SLTI_V229R87Corner
           raise 'Wrong corner masks' unless
             cut::MASKS.length==419 && cut::MASKS.values.count(12)==201 &&
             cut::MASKS.values.count(3)==218
@@ -302,9 +398,50 @@ jobs:
             end
           end
           puts 'PASS 419 corners, 1676 outgoing checks, reverse links and samples'
+          # Exercise the actual player movement caller, not just native_target.
+          class SLTI_R87AuditMap
+            def map_id;45;end
+            def valid?(x,y); x>=0 && y>=0 && x<288 && y<144;end
+            def events;{};end
+          end
+          class Game_Character
+            def slti_native66_prepare;true;end
+            def increase_steps;end
+            def through;false;end
+            def character_name;'PLAYER';end
+          end
+          beg=src.index("  def slti_r87_probe(mid,fx,fy,tx,ty,dir,why)\n")
+          fin=src.index("\n  alias slti_native66_original_down",beg)
+          raise 'Runtime movement caller missing' unless beg && fin
+          Game_Character.class_eval(src[beg...fin])
+          # Suppress probe output inside the offline movement audit only.
+          class Game_Character
+            def slti_r87_probe(*args);end
+          end
+          $game_map=SLTI_R87AuditMap.new
+          cut::MASKS.each do |(x,y),mask|
+            cut::DELTA.each do |dir,(dx,dy)|
+              nx=x+dx;ny=y+dy
+              allowed=(mask & cut::BIT.fetch(dir))!=0 && nav.value(45,nx,ny)!=0
+              next unless allowed
+              obj=Game_Character.allocate
+              obj.instance_variable_set(:@slti_native66_map,45)
+              obj.instance_variable_set(:@slti_native66_x,nx)
+              obj.instance_variable_set(:@slti_native66_y,ny)
+              rg=nav.to_rgss(45,nx,ny)
+              obj.instance_variable_set(:@x,rg[0])
+              obj.instance_variable_set(:@y,rg[1])
+              obj.instance_variable_set(:@through,false)
+              $game_player=obj
+              reverse=cut::OPPOSITE.fetch(dir)
+              raise 'Actual player corner entry failed' unless obj.slti_native66_move(reverse)
+              raise 'Actual player corner exit failed' unless obj.slti_native66_move(dir)
+            end
+          end
+          puts 'PASS actual player move caller: corner entry + exit for every open direction'
           puts 'PASS untouched green links, original S32 and unchanged 2F'
           RB_AUDIT
-          ruby build/audit86.rb
+          ruby build/audit87.rb
 
           python3 - <<'PY_FILES'
           from pathlib import Path
@@ -321,7 +458,7 @@ jobs:
           print('PASS 5517 files; modified only engine, cache and two version labels')
           PY_FILES
 
-      - name: V229R86 Publish preserved game with offline corner table
+      - name: V229R87 Publish preserved game with offline corner table
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
