@@ -1,12 +1,15 @@
-
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R80
-# BASE: exact successfully deployed V229R79 game (original R66 engine).
-# CHANGE: wall_depth=wall_y+by1*2+56 -> +20, exactly one occurrence.
-# KEEP: V229R79 no-sliding movement, S32 passability, all other scripts,
-# original R49 graphics, monsters, events, spawns and game assets.
-# Do not rebuild native collision or invent new wall geometry.
-name: build-slknight-web.yml | V229R80 | Clean Native Events and 2x Terrain
+# VERSION: V229R82
+# BASE: verified successful V229R80 deployment, same original R66 engine.
+# GAME CHANGE 1: restore wall_depth to original +32.
+# GAME CHANGE 2: keep no-slide movement.
+# GAME CHANGE 3: shift the native wall-grid one cell to screen left/down
+# (same visual move discussed with the user).
+# GAME CHANGE 4: where nonzero S32 cells form one continuous green region,
+# treat them as connected for movement; do NOT invent a separate wall-base layer.
+# KEEP: original Sanctuary S32 EDGES data, existing wall drawings, events,
+# monsters, spawns, rewards, controls and all published assets.
+name: build-slknight-web.yml | V229R82 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -29,88 +32,227 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R80 Restore verified R79 deployed game
+      - name: V229R82 Restore the verified R80 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40254399979
+          run-id: 40255790148
           name: github-pages
           github-token: ${{ github.token }}
-          path: r79
+          path: r80
 
-      - name: V229R80 Change only wall depth from 56 to 20
+      - name: V229R82 Patch only script134 with shifted continuity and no-slide
         shell: bash
         run: |
           set -euo pipefail
-          test -s r79/artifact.tar
+          test -s r80/artifact.tar
           mkdir -p site build
-          tar -xf r79/artifact.tar -C site
+          tar -xf r80/artifact.tar -C site
+
           python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
-          files={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest() for f in root.rglob('*') if f.is_file()}
-          assert len(files)==5517, ('unexpected game files',len(files))
-          assert all('V229R79' in (root/name).read_text('utf-8') for name in ('index.html','knight/index.html'))
-          p=root/'knight/gameasync/Data/Scripts.rxdata'
-          assert hashlib.sha256(p.read_bytes()).hexdigest()=='872fa1efbbe5c44e7d651e76e1e023090a00695580eb0d4b3d3fd53c46c84558', 'wrong R79 engine: abort'
-          Path('build/original-files.json').write_text(json.dumps(files,sort_keys=True))
-          print('PASS verified R79 deployment, 5517 unchanged input files')
+          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.rglob('*') if p.is_file()}
+          assert len(before)==5517, ('Wrong R80 game count', len(before))
+          assert all('V229R80' in (root/n).read_text('utf-8')
+                     for n in ('index.html','knight/index.html'))
+          archive=root/'knight/gameasync/Data/Scripts.rxdata'
+          assert hashlib.sha256(archive.read_bytes()).hexdigest()==\
+              '3ddb0e32a9dd655d2d38d2691be60ed91ebf4e41950ebbb7cb80da6b769c872b',\
+              'Not the verified R80 archive: abort'
+          Path('build/original-files.json').write_text(json.dumps(before,sort_keys=True))
+          print('PASS verified original R80: 5517 files and exact Scripts.rxdata')
           PY_BASE
+
           ruby -rzlib -rdigest - <<'RB_PATCH'
           path='site/knight/gameasync/Data/Scripts.rxdata'
           scripts=Marshal.load(File.binread(path))
           before=Marshal.load(File.binread(path))
-          raise 'wrong game script count' unless scripts.length==136
-          src=Zlib::Inflate.inflate(scripts[134][2])
-          raise 'wrong R79 original game script' unless Digest::SHA256.hexdigest(src)=='efbcc1d32b045207b42a53fe7847dc7dd4170c5a608a55c7684158c3da6d41c1'
-          old_depth='wall_depth=wall_y+by1*2+56'
-          new_depth='wall_depth=wall_y+by1*2+20'
-          raise 'expected exactly one wall depth calculation' unless src.scan(old_depth).length==1
-          raise 'target depth already present' unless src.scan(new_depth).empty?
-          patched=src.sub(old_depth,new_depth)
-          raise 'other engine change detected' unless patched.sub(new_depth,old_depth)==src
-          raise 'R49 renderer missing' unless patched.include?('def slti_r49_update_walls')
-          part=patched.split('  def self.native_target(mid,x,y,dir)',2)
-          raise 'native movement missing' unless part.length==2
-          method=part[1].split('  def self.native_line?',2)[0]
-          raise 'wall sliding unexpectedly present' if method.include?('return [x+dx,y]') || method.include?('return [x,y+dy]')
-          File.binwrite('build/r80-script134.rb',patched)
-          scripts[134][2]=Zlib::Deflate.deflate(patched)
-          raise 'another script changed' unless scripts.each_index.all?{|i|i==134 || scripts[i]==before[i]}
+          raise 'Wrong script count' unless scripts.size==136
+
+          src=Zlib::Inflate.inflate(scripts[134][2]).force_encoding('UTF-8')
+          raise 'Wrong R80 engine' unless Digest::SHA256.hexdigest(src)==
+            '4f4e1beed08cfe417f2fe2cff9f66c0b5a1ea3c574d72fc8e402d35a0b4556a9'
+          raise 'Patch already present' if src.include?('module SLTI_V229R82Patch')
+
+          if src.include?('wall_depth=wall_y+by1*2+20')
+            src=src.sub('wall_depth=wall_y+by1*2+20','wall_depth=wall_y+by1*2+32')
+          elsif src.include?('wall_depth=wall_y+by1*2+32')
+            # keep
+          else
+            raise 'Wall depth source not found'
+          end
+
+          patch = <<'R82_PATCH'
+
+          # V229R82: user-directed native continuity patch.
+          # 1) remove any one-axis sliding fallback.
+          # 2) shift the native cell projection one tile to screen left/down.
+          # 3) if nonzero S32 cells are visually continuous, connect them.
+          module SLTI_V229R82Patch
+            SHIFT_X=-1
+            SHIFT_Y=0
+          end
+
+          module SLTI_Native66
+            def self.walkable?(mid,x,y)
+              value(mid,x,y)!=0
+            end
+
+            def self.project(mid,x,y)
+              sx=x+SLTI_V229R82Patch::SHIFT_X
+              sy=y+SLTI_V229R82Patch::SHIFT_Y
+              px=12*(sx+sy)-784128
+              py=6*(sy-sx)+YOFFSET[mid]
+              return [px,py]
+            end
+
+            def self.real(mid,x,y)
+              px,py=project(mid,x,y)
+              return [px*8-64,py*8-128]
+            end
+
+            def self.to_rgss(mid,x,y)
+              px,py=project(mid,x,y)
+              return [px/16,py/16]
+            end
+
+            def self.nearest(mid,rx,ry,radius=16)
+              return nil unless active_map?(mid)
+              u=rx*16+8
+              v=ry*16+16
+              a=(u+784128).to_f/12
+              b=(v-YOFFSET[mid]).to_f/6
+              x0=((a-b)/2).round-SLTI_V229R82Patch::SHIFT_X
+              y0=((a+b)/2).round-SLTI_V229R82Patch::SHIFT_Y
+              best=nil
+              for dx in -4..4
+                for dy in -4..4
+                  x=x0+dx
+                  y=y0+dy
+                  next if value(mid,x,y)==0
+                  px,py=project(mid,x,y)
+                  dist2=(u-px)*(u-px)+(v-py)*(v-py)
+                  next if dist2>radius*radius
+                  candidate=[dist2,x,y]
+                  best=candidate if best==nil || candidate[0]<best[0]
+                end
+              end
+              return nil if best==nil
+              return [best[1],best[2]]
+            end
+
+            def self.continuous_path?(mid,x,y,dx,dy)
+              tx=x+dx
+              ty=y+dy
+              return false unless walkable?(mid,x,y) && walkable?(mid,tx,ty)
+              if dx==0 || dy==0
+                return true
+              end
+              return true if walkable?(mid,x+dx,y)
+              return true if walkable?(mid,x,y+dy)
+              return false
+            end
+
+            def self.move_path?(mid,x,y,dx,dy)
+              if dx==0 || dy==0
+                return true if edge?(mid,x,y,dx,dy)
+                return continuous_path?(mid,x,y,dx,dy)
+              end
+              return false unless dx.abs==1 && dy.abs==1
+              return true if edge?(mid,x,y,dx,0) && edge?(mid,x+dx,y,0,dy)
+              return true if edge?(mid,x,y,0,dy) && edge?(mid,x,y+dy,dx,0)
+              return continuous_path?(mid,x,y,dx,dy)
+            end
+
+            def self.native_target(mid,x,y,dir)
+              moves={
+                2=>[-1,1], 4=>[-1,-1], 6=>[1,1], 8=>[1,-1],
+                1=>[-1,0], 3=>[0,1], 7=>[0,-1], 9=>[1,0]
+              }
+              d=moves[dir]
+              return nil if d==nil
+              dx,dy=d
+              return move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil
+            end
+          end
+          R82_PATCH
+
+          src = src + "\n" + patch
+          File.binwrite('build/script134.rb', src)
+
+          scripts[134][2]=Zlib::Deflate.deflate(src.b)
+          raise 'Other script modified' unless scripts.each_index.all?{|i| i==134 || scripts[i]==before[i]}
           File.binwrite(path,Marshal.dump(scripts))
-          again=Marshal.load(File.binread(path))
-          raise 'patch did not survive save' unless Zlib::Inflate.inflate(again[134][2])==patched
-          puts 'PASS one wall_depth substitution, no changes to original collision or other scripts'
+
+          actual=Marshal.load(File.binread(path))
+          restored=Zlib::Inflate.inflate(actual[134][2]).force_encoding('UTF-8')
+          raise 'Patch not saved correctly' unless restored.include?('module SLTI_V229R82Patch')
+          raise 'Wrong wall depth after patch' unless restored.include?('wall_depth=wall_y+by1*2+32')
+          raise 'No-slide patch missing' unless restored.include?('return move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil')
+          raise 'Shift patch missing' unless restored.include?('SHIFT_X=-1') && restored.include?('SHIFT_Y=0')
+          raise 'Continuity patch missing' unless restored.include?('def self.continuous_path?(mid,x,y,dx,dy)')
+          puts 'PASS V229R82 appended: depth +32, shift left/down, continuous green connection, no slide'
           RB_PATCH
-          ruby -c build/r80-script134.rb
-          python3 - <<'PY_FINISH'
+
+          ruby -c build/script134.rb
+
+          python3 - <<'PY_VERSION'
           from pathlib import Path
           import hashlib,json,re
-          root=Path('site');game=root/'knight/gameasync'
+          root=Path('site')
+          game=root/'knight/gameasync'
           archive=game/'Data/Scripts.rxdata'
           mapping=game/'mapping.js'
-          old=mapping.read_text('utf-8')
-          digest=hashlib.md5(archive.read_bytes()).hexdigest()
-          new,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',lambda m:'Data/Scripts.rxdata?h='+digest,old)
-          assert count==1, 'engine cache hash missing'
-          mapping.write_text(new,encoding='utf-8')
+          code=mapping.read_text('utf-8')
+          cache=hashlib.md5(archive.read_bytes()).hexdigest()
+          code,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',
+                             lambda m:'Data/Scripts.rxdata?h='+cache, code)
+          assert count==1, ('Wrong cache entry count', count)
+          mapping.write_text(code, encoding='utf-8')
+
           for name in ('index.html','knight/index.html'):
             p=root/name
-            value=p.read_text('utf-8')
-            assert 'V229R79' in value, name
-            p.write_text(value.replace('V229R79','V229R80').replace('v229r79','v229r80'),encoding='utf-8')
-          original=json.loads(Path('build/original-files.json').read_text('utf-8'))
-          now={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest() for f in root.rglob('*') if f.is_file()}
-          assert len(now)==5517 and original.keys()==now.keys()
-          changed={name for name in now if now[name]!=original[name]}
-          expected={'index.html','knight/index.html','knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
-          assert changed==expected, ('unapproved file modifications',changed^expected)
-          print('PASS 5517 game files preserved; only engine, cache hash and two version labels changed')
-          PY_FINISH
+            text=p.read_text('utf-8')
+            assert 'V229R80' in text, name
+            text=text.replace('V229R80','V229R82').replace('v229r80','v229r82')
+            p.write_text(text, encoding='utf-8')
+
+          before=json.loads(Path('build/original-files.json').read_text('utf-8'))
+          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.rglob('*') if p.is_file()}
+          assert len(after)==5517 and before.keys()==after.keys()
+          changed={name for name in after if before[name]!=after[name]}
+          allowed={
+            'index.html',
+            'knight/index.html',
+            'knight/gameasync/mapping.js',
+            'knight/gameasync/Data/Scripts.rxdata'
+          }
+          assert changed==allowed, ('Unapproved file changes', changed ^ allowed)
+          print('PASS 5517 files preserved; only Scripts.rxdata, mapping.js and two version labels changed')
+          PY_VERSION
+
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R80 Publish full game for depth 20 test
+      - name: V229R82 Sanity-check embedded patch flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -rzlib - <<'RB'
+          scripts=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
+          src=Zlib::Inflate.inflate(scripts[134][2]).force_encoding('UTF-8')
+          raise 'Patch module missing' unless src.include?('module SLTI_V229R82Patch')
+          raise 'Shift flag missing' unless src.include?('SHIFT_X=-1') && src.include?('SHIFT_Y=0')
+          raise 'Continuity method missing' unless src.include?('def self.continuous_path?(mid,x,y,dx,dy)')
+          raise 'Native target still sliding' if src.include?('return [x+dx,y]') || src.include?('return [x,y+dy]')
+          raise 'Wrong wall depth' unless src.scan('wall_depth=wall_y+by1*2+32').size>=1
+          puts 'PASS V229R82 sanity check'
+          RB
+
+      - name: V229R82 Publish shifted continuity build
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
