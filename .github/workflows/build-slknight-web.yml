@@ -1,13 +1,14 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R91
+# VERSION: V229R92
 # BASE: deployed V229R84 (run 40265029580), original 4-way player and pad.
-# FIX: remove R89 parity shift; open only the user-identified S32 edge.
-# TARGET: map45 (32655,32806), map pixel (1404,1284), S32=0.
-# Retain player and monster original spawn positions and 4-way movement.
+# FIX: shift all map45 S32-projected positions one screen up-left cell (-12,-6 source px).
+# TARGET: map45 (32655,32806), S32=0, original (1404,1284), shifted (1392,1278).
+# Keep native S32 data and 4-way rules; update 1F inverse nearest mapping to match.
 # MAP45 ONLY: 419 original corners + 32 prior bridges + one manual edge.
 # No changed S32 passability, no wall sliding, no 2F/monster/combat/pad edits.
-name: build-slknight-web.yml | V229R91 | Clean Native Events and 2x Terrain
+# One native S32 up-left cell = -12px/-6px source (-24/-12 at 2x).
+name: build-slknight-web.yml | V229R92 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R91 Restore verified R84 baseline
+      - name: V229R92 Restore verified R84 baseline
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -39,7 +40,7 @@ jobs:
           github-token: ${{ github.token }}
           path: r84
 
-      - name: V229R91 Restore parity and open one verified S32 edge
+      - name: V229R92 Shift floor-1 projection up-left one S32 cell
         shell: bash
         run: |
           set -euo pipefail
@@ -82,7 +83,7 @@ jobs:
             Digest::SHA256.hexdigest(src)==
               '3f646769ca61efb2f8645b3b150386d2314e8696ce11149c669db1ef5a89ad03'
           raise 'Prior corner patch present' if
-            src.include?('SLTI_V229R85Corner') || src.include?('SLTI_V229R91Corner')
+            src.include?('SLTI_V229R85Corner') || src.include?('SLTI_V229R92Corner')
           first=src.index("module SLTI_Native66\n")
           last=src.index("\nclass Game_Character",first)
           raise 'R84 source map not found' unless first && last
@@ -168,13 +169,13 @@ jobs:
           raise 'Bad corner and bridge payload' unless data.bytesize==1356
           encoded=[data].pack('m0')
 
-          module_text=<<'R91_MODULE'
-          # V229R91: 419 corners, 32 bridges, one manual edge; no boot scan.
-          module SLTI_V229R91Corner
+          module_text=<<'R92_MODULE'
+          # V229R92: 419 corners, 32 bridges, one manual edge; no boot scan.
+          module SLTI_V229R92Corner
             DELTA={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]}.freeze
             BIT={2=>1,4=>2,6=>4,8=>8}.freeze
             OPPOSITE={2=>8,4=>6,6=>4,8=>2}.freeze
-            data='__R91_DATA__'.unpack('m')[0].unpack('C*')
+            data='__R92_DATA__'.unpack('m')[0].unpack('C*')
             MASKS={}
             i=0
             while i<data.length
@@ -183,8 +184,8 @@ jobs:
             end
             MASKS.freeze
           end
-          R91_MODULE
-          module_text=module_text.sub('__R91_DATA__',encoded)
+          R92_MODULE
+          module_text=module_text.sub('__R92_DATA__',encoded)
 
           old_method=<<'R84_METHOD'
             def self.native_target(mid,x,y,dir)
@@ -199,7 +200,7 @@ jobs:
             end
           R84_METHOD
 
-          new_method=<<'R91_METHOD'
+          new_method=<<'R92_METHOD'
             def self.native_target(mid,x,y,dir)
               moves={
                 2=>[-1,1], 4=>[-1,-1], 6=>[1,1], 8=>[1,-1],
@@ -210,12 +211,12 @@ jobs:
                 nil
               else
                 dx,dy=d
-                if mid!=45 || !SLTI_V229R91Corner::DELTA.key?(dir)
+                if mid!=45 || !SLTI_V229R92Corner::DELTA.key?(dir)
                   move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil
                 else
                   tx=x+dx
                   ty=y+dy
-                  cuts=SLTI_V229R91Corner::MASKS
+                  cuts=SLTI_V229R92Corner::MASKS
                   from=cuts[[x,y]]
                   into=cuts[[tx,ty]]
                   if from==nil && into==nil
@@ -223,28 +224,78 @@ jobs:
                   elsif from!=nil && into!=nil
                     nil
                   elsif from!=nil
-                    bits=SLTI_V229R91Corner::BIT
+                    bits=SLTI_V229R92Corner::BIT
                     ((from & bits.fetch(dir))!=0 && value(mid,tx,ty)!=0) ? [tx,ty] : nil
                   else
-                    bits=SLTI_V229R91Corner::BIT
-                    opposite=SLTI_V229R91Corner::OPPOSITE
+                    bits=SLTI_V229R92Corner::BIT
+                    opposite=SLTI_V229R92Corner::OPPOSITE
                     ((into & bits.fetch(opposite.fetch(dir)))!=0 && value(mid,x,y)!=0) ? [tx,ty] : nil
                   end
                 end
               end
             end
-          R91_METHOD
+          R92_METHOD
 
           raise 'Cannot safely locate R84 movement method' unless
             src.scan(old_method).length==1
           changed=src.sub(old_method,new_method)
+
+          # Shift only the 1F S32-to-screen alignment. Do not alter wall/floor art,
+          # raw S32 passability, direction masks, event spawns, or floor 2.
+          old_project=<<'R84_PROJECT'
+            def self.project(mid,x,y)
+              px=12*(x+y)-784128
+              py=6*(y-x)+YOFFSET[mid]
+              return [px,py]
+            end
+          R84_PROJECT
+          new_project=<<'R92_PROJECT'
+            def self.project(mid,x,y)
+              px=12*(x+y)-784128
+              py=6*(y-x)+YOFFSET[mid]
+              if mid==45
+                px-=12
+                py-=6
+              end
+              return [px,py]
+            end
+          R92_PROJECT
+          raise 'Original projection not unique' unless changed.scan(old_project).length==1
+          changed=changed.sub(old_project,new_project)
+
+          # Inverse mapping must follow the same one-cell displacement; retain
+          # original world pixel (u,v) for nearest-distance comparison.
+          old_inverse=<<'R84_INVERSE'
+              u=rx*16+8
+              v=ry*16+16
+              a=(u+784128).to_f/12
+              b=(v-YOFFSET[mid]).to_f/6
+          R84_INVERSE
+          new_inverse=<<'R92_INVERSE'
+              u=rx*16+8
+              v=ry*16+16
+              native_u=u
+              native_v=v
+              if mid==45
+                native_u+=12
+                native_v+=6
+              end
+              a=(native_u+784128).to_f/12
+              b=(native_v-YOFFSET[mid]).to_f/6
+          R92_INVERSE
+          raise 'Original inverse projection not unique' unless
+            changed.scan(old_inverse).length==1
+          changed=changed.sub(old_inverse,new_inverse)
+          raise 'Floor-1 shift patch missing' unless changed.include?('px-=12') &&
+            changed.include?('py-=6') && changed.include?('native_u+=12') &&
+            changed.include?('native_v+=6')
           marker="\n# V229R84: R82 green-cell continuity and no-slide are retained."
           raise 'Missing unique R84 extension point' unless changed.scan(marker).length==1
           changed=changed.sub(marker,"\n"+module_text+marker)
           raise 'Original projection lost' unless
             changed.include?('px=12*(x+y)-784128') &&
             changed.include?('py=6*(y-x)+YOFFSET[mid]')
-          File.binwrite('build/script134-r91.rb',changed)
+          File.binwrite('build/script134-r92.rb',changed)
           a[134][2]=Zlib::Deflate.deflate(changed)
           raise 'Unapproved RGSS changed' unless
             a.each_index.all?{|i|i==134 || a[i]==before[i]}
@@ -253,7 +304,7 @@ jobs:
             Zlib::Inflate.inflate(Marshal.load(File.binread(path))[134][2])==changed
           puts 'PASS: offline 452-mask table, direct native_target method, no runtime alias'
           RB_PATCH
-          ruby -c build/script134-r91.rb
+          ruby -c build/script134-r92.rb
 
           python3 - <<'PY_VERSION'
           from pathlib import Path
@@ -270,30 +321,30 @@ jobs:
           for name in ('index.html','knight/index.html'):
             path=root/name
             text=path.read_text('utf-8')
-            assert 'V229R84' in text and 'V229R91' not in text,name
-            path.write_text(text.replace('V229R84','V229R91')
-                                .replace('v229r84','v229r91'),encoding='utf-8')
-          print('PASS: cache digest and R91 page version')
+            assert 'V229R84' in text and 'V229R92' not in text,name
+            path.write_text(text.replace('V229R84','V229R92')
+                                .replace('v229r84','v229r92'),encoding='utf-8')
+          print('PASS: cache digest and R92 page version')
           PY_VERSION
           node --check site/knight/js/dpad.js
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R91 Audit original parity and one restricted edge
+      - name: V229R92 Audit one-cell projection shift and original wall rules
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/audit91.rb <<'RB_AUDIT'
+          cat > build/audit92.rb <<'RB_AUDIT'
           require 'zlib'
           a=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
           src=Zlib::Inflate.inflate(a[134][2])
           first=src.index("module SLTI_Native66\n")
           last=src.index("\nclass Game_Character",first)
-          patch=src.index("\nmodule SLTI_V229R91Corner\n",last)
+          patch=src.index("\nmodule SLTI_V229R92Corner\n",last)
           raise 'Source sections unavailable' unless first && last && patch
           Object.class_eval(src[first...last])
           Object.class_eval(src[patch..-1])
           nav=SLTI_Native66
-          cut=SLTI_V229R91Corner
+          cut=SLTI_V229R92Corner
           raise 'Wrong corner masks' unless
             cut::MASKS.length==452 && cut::MASKS.values.count(12)==220 &&
             cut::MASKS.values.count(3)==232
@@ -304,6 +355,30 @@ jobs:
             end
           end
           raise 'Original S32 changed' unless nonzero==5957
+
+          # A single S32 up-left step changes projection by (-12,-6) source px.
+          # All map-46 projections, raw S32 values and 452 movement rules stay.
+          [[32734,32793],[32655,32806],[32657,32807],[32660,32808]].each do |x,y|
+            old_x=12*(x+y)-784128
+            old_y=6*(y-x)+nav::YOFFSET[45]
+            raise "Wrong 1F up-left shift #{x},#{y}" unless
+              nav.project(45,x,y)==[old_x-12,old_y-6]
+            raise "1F render coordinate not synchronized #{x},#{y}" unless
+              nav.real(45,x,y)==[(old_x-12)*8-64,(old_y-6)*8-128]
+            raise "Wrong 2F projection #{x},#{y}" unless
+              nav.project(46,x,y)==[12*(x+y)-784128,
+                6*(y-x)+nav::YOFFSET[46]]
+          end
+          raise 'Reported 1F wall target not shifted up-left' unless
+            nav.project(45,32734,32793)==[2184,726]
+          raise 'Nearest inverse does not find the shifted walkable floor' unless
+            (lambda do
+              px,py=nav.project(45,32734,32793)
+              found=nav.nearest(45,px/16,py/16,32)
+              found!=nil && nav.value(45,*found)!=0
+            end).call
+          puts 'PASS one S32 screen up-left (-12,-6), inverse nearest and 2F unchanged'
+
           count=0
           cut::MASKS.each do |(x,y),mask|
             raise 'Cut changed tile value' unless nav.value(45,x,y)==0
@@ -345,7 +420,7 @@ jobs:
           raise 'Wrong target or pixel' unless
             cut::MASKS[[32655,32806]]==12 &&
             nav.value(45,32655,32806)==0 &&
-            nav.project(45,32655,32806)==[1404,1284]
+            nav.project(45,32655,32806)==[1392,1278]
           raise 'Approach from lower-right blocked' unless
             nav.native_target(45,32656,32807,4)==[32655,32806]
           raise 'Return to lower-right blocked' unless
@@ -364,7 +439,7 @@ jobs:
             src.include?('SLTI_V229R89Parity') || src.include?('slti_r89_checked')
 
           # Exercise the same native + RGSS + event/bounds caller as the player.
-          class SLTI_R91AuditMap
+          class SLTI_R92AuditMap
             def map_id;45;end
             def valid?(x,y); x>=0 && y>=0 && x<288 && y<144;end
             def events;{};end
@@ -377,7 +452,7 @@ jobs:
           fin=src.index("\n  alias slti_native66_original_down",beg)
           raise 'Cannot find original character movement path' unless beg && fin
           Game_Character.class_eval(src[beg...fin])
-          $game_map=SLTI_R91AuditMap.new
+          $game_map=SLTI_R92AuditMap.new
           [
             [32656,32807,8,32657,32806],
             [32657,32806,2,32656,32807],
@@ -421,7 +496,7 @@ jobs:
           puts 'PASS 419 corners plus 32 bridges and one edge, 1808 direction checks and reverse links'
           puts 'PASS untouched green links, original S32 and unchanged 2F'
           RB_AUDIT
-          ruby build/audit91.rb
+          ruby build/audit92.rb
 
           python3 - <<'PY_FILES'
           from pathlib import Path
@@ -438,7 +513,7 @@ jobs:
           print('PASS 5517 files; modified only engine, cache and two version labels')
           PY_FILES
 
-      - name: V229R91 Publish original parity plus one verified edge
+      - name: V229R92 Publish floor-1 up-left one-cell alignment
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
