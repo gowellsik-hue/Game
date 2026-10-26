@@ -1,13 +1,13 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R90
+# VERSION: V229R91
 # BASE: deployed V229R84 (run 40265029580), original 4-way player and pad.
 # FIX: remove R89 parity shift; open only the user-identified S32 edge.
 # TARGET: map45 (32655,32806), map pixel (1404,1284), S32=0.
 # Retain player and monster original spawn positions and 4-way movement.
 # MAP45 ONLY: 419 original corners + 32 prior bridges + one manual edge.
 # No changed S32 passability, no wall sliding, no 2F/monster/combat/pad edits.
-name: build-slknight-web.yml | V229R90 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V229R91 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R90 Restore verified R84 baseline
+      - name: V229R91 Restore verified R84 baseline
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -39,7 +39,7 @@ jobs:
           github-token: ${{ github.token }}
           path: r84
 
-      - name: V229R90 Restore parity and open one verified S32 edge
+      - name: V229R91 Restore parity and open one verified S32 edge
         shell: bash
         run: |
           set -euo pipefail
@@ -82,7 +82,7 @@ jobs:
             Digest::SHA256.hexdigest(src)==
               '3f646769ca61efb2f8645b3b150386d2314e8696ce11149c669db1ef5a89ad03'
           raise 'Prior corner patch present' if
-            src.include?('SLTI_V229R85Corner') || src.include?('SLTI_V229R90Corner')
+            src.include?('SLTI_V229R85Corner') || src.include?('SLTI_V229R91Corner')
           first=src.index("module SLTI_Native66\n")
           last=src.index("\nclass Game_Character",first)
           raise 'R84 source map not found' unless first && last
@@ -104,8 +104,353 @@ jobs:
               end
               pairs.each do |aa,bb|
                 next unless flags[aa] && flags[bb]
-                blocked=native.keys-[aa,b]
+                blocked=native.keys-[aa,bb]
+                next unless blocked.all?{|side| !flags[side]}
+                next unless blocked.all? do |side|
+                  dx,dy=native.fetch(side)
+                  nav.value(45,x+dx,y+dy)==0 &&
+                    nav.value(45,x+2*dx,y+2*dy)==0
+                end
+                mask=(aa==:R || bb==:R) ? 12 : 3
+                raise 'Ambiguous corner' if cuts.key?([x,y])
+                cuts[[x,y]]=mask
               end
             end
           end
+          raise "Unexpected base corner count #{cuts.length}" unless
+            cuts.length==419 && cuts.values.count(12)==201 &&
+            cuts.values.count(3)==218
+
+          # A straight wall-edge gap was absent from the 419 corner filter.
+          # Extend only when BOTH adjacent approved zero corners agree on
+          # the same allowed side, and that side contains original floor.
+          # Never permit traffic on the opposite side of a wall.
+          bridges={}
+          (oy...(oy+nav::HEIGHT.fetch(45))).each do |y|
+            (ox...(ox+nav::WIDTH.fetch(45))).each do |x|
+              next unless nav.value(45,x,y)==0 && !cuts.key?([x,y])
+              up=cuts[[x,y-1]]
+              down=cuts[[x,y+1]]
+              next unless up && up==down && (up==3 || up==12)
+              side_x=(up==3 ? x-1 : x+1)
+              next unless nav.value(45,side_x,y)!=0
+              bridges[[x,y]]=up
+            end
+          end
+          raise "Unexpected bridge count #{bridges.size}" unless
+            bridges.size==32 && bridges.values.count(3)==14 &&
+            bridges.values.count(12)==18 && bridges[[32657,32806]]==3
+          cuts.merge!(bridges)
+          raise 'Wrong merged masks' unless
+            cuts.size==451 && cuts.values.count(3)==232 &&
+            cuts.values.count(12)==219
+
+          # Permit exactly two original adjacent floor cells into the requested point.
+          # R89 odd-to-even character relocation is deliberately NOT present.
+          edge=[32655,32806]
+          raise 'User edge already selected' if cuts.key?(edge)
+          raise 'Wrong original S32 edge value' unless nav.value(45,*edge)==0
+          raise 'Wrong connected floor values' unless
+            nav.value(45,32656,32805)==3 && nav.value(45,32656,32807)==3
+          raise 'Opposite wall unexpectedly open' unless
+            nav.value(45,32654,32805)==0 && nav.value(45,32654,32807)==0
+          raise 'Wrong pixel projection' unless nav.project(45,*edge)==[1404,1284]
+          # Direction 6/8 outward, direction 4/2 inward via the two floors.
+          cuts[edge]=12
+          raise 'Wrong mask count' unless
+            cuts.size==452 && cuts.values.count(12)==220 &&
+            cuts.values.count(3)==232
+          puts 'PASS 419 original corners, 32 bridges, one extra restricted tile'
+
+          data=cuts.sort_by{|(x,y),mask|[y,x]}.flat_map do |(x,y),mask|
+            [x-ox,y-oy,mask]
+          end.pack('C*')
+          raise 'Bad corner and bridge payload' unless data.bytesize==1356
+          encoded=[data].pack('m0')
+
+          module_text=<<'R91_MODULE'
+          # V229R91: 419 corners, 32 bridges, one manual edge; no boot scan.
+          module SLTI_V229R91Corner
+            DELTA={2=>[-1,1],4=>[-1,-1],6=>[1,1],8=>[1,-1]}.freeze
+            BIT={2=>1,4=>2,6=>4,8=>8}.freeze
+            OPPOSITE={2=>8,4=>6,6=>4,8=>2}.freeze
+            data='__R91_DATA__'.unpack('m')[0].unpack('C*')
+            MASKS={}
+            i=0
+            while i<data.length
+              MASKS[[32576+data[i],32704+data[i+1]]]=data[i+2]
+              i+=3
+            end
+            MASKS.freeze
+          end
+          R91_MODULE
+          module_text=module_text.sub('__R91_DATA__',encoded)
+
+          old_method=<<'R84_METHOD'
+            def self.native_target(mid,x,y,dir)
+              moves={
+                2=>[-1,1], 4=>[-1,-1], 6=>[1,1], 8=>[1,-1],
+                1=>[-1,0], 3=>[0,1], 7=>[0,-1], 9=>[1,0]
+              }
+              d=moves[dir]
+              return nil if d==nil
+              dx,dy=d
+              return move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil
+            end
+          R84_METHOD
+
+          new_method=<<'R91_METHOD'
+            def self.native_target(mid,x,y,dir)
+              moves={
+                2=>[-1,1], 4=>[-1,-1], 6=>[1,1], 8=>[1,-1],
+                1=>[-1,0], 3=>[0,1], 7=>[0,-1], 9=>[1,0]
+              }
+              d=moves[dir]
+              if d==nil
+                nil
+              else
+                dx,dy=d
+                if mid!=45 || !SLTI_V229R91Corner::DELTA.key?(dir)
+                  move_path?(mid,x,y,dx,dy) ? [x+dx,y+dy] : nil
+                else
+                  tx=x+dx
+                  ty=y+dy
+                  cuts=SLTI_V229R91Corner::MASKS
+                  from=cuts[[x,y]]
+                  into=cuts[[tx,ty]]
+                  if from==nil && into==nil
+                    move_path?(mid,x,y,dx,dy) ? [tx,ty] : nil
+                  elsif from!=nil && into!=nil
+                    nil
+                  elsif from!=nil
+                    bits=SLTI_V229R91Corner::BIT
+                    ((from & bits.fetch(dir))!=0 && value(mid,tx,ty)!=0) ? [tx,ty] : nil
+                  else
+                    bits=SLTI_V229R91Corner::BIT
+                    opposite=SLTI_V229R91Corner::OPPOSITE
+                    ((into & bits.fetch(opposite.fetch(dir)))!=0 && value(mid,x,y)!=0) ? [tx,ty] : nil
+                  end
+                end
+              end
+            end
+          R91_METHOD
+
+          raise 'Cannot safely locate R84 movement method' unless
+            src.scan(old_method).length==1
+          changed=src.sub(old_method,new_method)
+          marker="\n# V229R84: R82 green-cell continuity and no-slide are retained."
+          raise 'Missing unique R84 extension point' unless changed.scan(marker).length==1
+          changed=changed.sub(marker,"\n"+module_text+marker)
+          raise 'Original projection lost' unless
+            changed.include?('px=12*(x+y)-784128') &&
+            changed.include?('py=6*(y-x)+YOFFSET[mid]')
+          File.binwrite('build/script134-r91.rb',changed)
+          a[134][2]=Zlib::Deflate.deflate(changed)
+          raise 'Unapproved RGSS changed' unless
+            a.each_index.all?{|i|i==134 || a[i]==before[i]}
+          File.binwrite(path,Marshal.dump(a))
+          raise 'Patch not saved' unless
+            Zlib::Inflate.inflate(Marshal.load(File.binread(path))[134][2])==changed
+          puts 'PASS: offline 452-mask table, direct native_target method, no runtime alias'
           RB_PATCH
+          ruby -c build/script134-r91.rb
+
+          python3 - <<'PY_VERSION'
+          from pathlib import Path
+          import hashlib,re
+          root=Path('site')
+          engine=root/'knight/gameasync/Data/Scripts.rxdata'
+          mapping=root/'knight/gameasync/mapping.js'
+          code=mapping.read_text('utf-8')
+          digest=hashlib.md5(engine.read_bytes()).hexdigest()
+          code,count=re.subn(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}',
+                             lambda m:'Data/Scripts.rxdata?h='+digest,code)
+          assert count==1,('Wrong cache entry count',count)
+          mapping.write_text(code,encoding='utf-8')
+          for name in ('index.html','knight/index.html'):
+            path=root/name
+            text=path.read_text('utf-8')
+            assert 'V229R84' in text and 'V229R91' not in text,name
+            path.write_text(text.replace('V229R84','V229R91')
+                                .replace('v229r84','v229r91'),encoding='utf-8')
+          print('PASS: cache digest and R91 page version')
+          PY_VERSION
+          node --check site/knight/js/dpad.js
+          node --check site/knight/gameasync/mapping.js
+
+      - name: V229R91 Audit original parity and one restricted edge
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/audit91.rb <<'RB_AUDIT'
+          require 'zlib'
+          a=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
+          src=Zlib::Inflate.inflate(a[134][2])
+          first=src.index("module SLTI_Native66\n")
+          last=src.index("\nclass Game_Character",first)
+          patch=src.index("\nmodule SLTI_V229R91Corner\n",last)
+          raise 'Source sections unavailable' unless first && last && patch
+          Object.class_eval(src[first...last])
+          Object.class_eval(src[patch..-1])
+          nav=SLTI_Native66
+          cut=SLTI_V229R91Corner
+          raise 'Wrong corner masks' unless
+            cut::MASKS.length==452 && cut::MASKS.values.count(12)==220 &&
+            cut::MASKS.values.count(3)==232
+          nonzero=0
+          nav::HEIGHT.fetch(45).times do |dy|
+            nav::WIDTH.fetch(45).times do |dx|
+              nonzero+=1 if nav.value(45,nav::ORIGIN_X+dx,nav::ORIGIN_Y+dy)!=0
+            end
+          end
+          raise 'Original S32 changed' unless nonzero==5957
+          count=0
+          cut::MASKS.each do |(x,y),mask|
+            raise 'Cut changed tile value' unless nav.value(45,x,y)==0
+            cut::DELTA.each do |dir,(dx,dy)|
+              nx=x+dx;ny=y+dy
+              allowed=(mask & cut::BIT.fetch(dir))!=0 && nav.value(45,nx,ny)!=0
+              expected=allowed ? [nx,ny] : nil
+              actual=nav.native_target(45,x,y,dir)
+              raise "Wrong outgoing #{x}/#{y}/#{dir}" unless actual==expected
+              if nav.value(45,nx,ny)!=0
+                incoming=nav.native_target(45,nx,ny,cut::OPPOSITE.fetch(dir))
+                raise "Wrong reverse #{x}/#{y}/#{dir}" unless
+                  incoming==(allowed ? [x,y] : nil)
+              end
+              count+=1
+            end
+          end
+          raise 'Missing direction audits' unless count==1808
+          raise 'Rightmost upper approach missing' unless
+            nav.native_target(45,32660,32806,2)==[32659,32807]
+          raise 'Rightmost right approach missing' unless
+            nav.native_target(45,32660,32808,4)==[32659,32807]
+          raise 'Rightmost lower approach leaked' unless
+            nav.native_target(45,32658,32808,8)==nil
+          raise 'Left corner lower approach missing' unless
+            nav.native_target(45,32656,32808,8)==[32657,32807]
+          raise 'Left corner upper approach leaked' unless
+            nav.native_target(45,32658,32806,2)==nil
+          # The user-reported failure (R87 BLOCK_NATIVE) must now pass.
+          raise 'Reported screen-up bridge not repaired' unless
+            nav.native_target(45,32656,32807,8)==[32657,32806]
+          raise 'Reported bridge reverse step failed' unless
+            nav.native_target(45,32657,32806,2)==[32656,32807]
+          raise 'Opposite side of middle wall was opened' unless
+            nav.native_target(45,32657,32806,6)==nil &&
+            nav.native_target(45,32657,32806,8)==nil
+
+          # Confirm requested odd-parity point from both original adjacent floors.
+          raise 'Wrong target or pixel' unless
+            cut::MASKS[[32655,32806]]==12 &&
+            nav.value(45,32655,32806)==0 &&
+            nav.project(45,32655,32806)==[1404,1284]
+          raise 'Approach from lower-right blocked' unless
+            nav.native_target(45,32656,32807,4)==[32655,32806]
+          raise 'Return to lower-right blocked' unless
+            nav.native_target(45,32655,32806,6)==[32656,32807]
+          raise 'Approach from upper-right blocked' unless
+            nav.native_target(45,32656,32805,2)==[32655,32806]
+          raise 'Return to upper-right blocked' unless
+            nav.native_target(45,32655,32806,8)==[32656,32805]
+          raise 'Opposite solid wall breached' unless
+            nav.native_target(45,32655,32806,2)==nil &&
+            nav.native_target(45,32655,32806,4)==nil
+          raise 'Parity unexpectedly changed' unless
+            (32655+32806)%2==(32656+32805)%2 &&
+            (32655+32806)%2==(32656+32807)%2
+          raise 'R89 relocation code remains' if
+            src.include?('SLTI_V229R89Parity') || src.include?('slti_r89_checked')
+
+          # Exercise the same native + RGSS + event/bounds caller as the player.
+          class SLTI_R91AuditMap
+            def map_id;45;end
+            def valid?(x,y); x>=0 && y>=0 && x<288 && y<144;end
+            def events;{};end
+          end
+          class Game_Character
+            def slti_native66_prepare;true;end
+            def increase_steps;end
+          end
+          beg=src.index("  def slti_native66_move(dir,turn=true)\n")
+          fin=src.index("\n  alias slti_native66_original_down",beg)
+          raise 'Cannot find original character movement path' unless beg && fin
+          Game_Character.class_eval(src[beg...fin])
+          $game_map=SLTI_R91AuditMap.new
+          [
+            [32656,32807,8,32657,32806],
+            [32657,32806,2,32656,32807],
+            [32656,32807,4,32655,32806],
+            [32655,32806,6,32656,32807],
+            [32656,32805,2,32655,32806],
+            [32655,32806,8,32656,32805],
+          ].each do |fx,fy,dir,tx,ty|
+            obj=Game_Character.allocate
+            obj.instance_variable_set(:@slti_native66_map,45)
+            obj.instance_variable_set(:@slti_native66_x,fx)
+            obj.instance_variable_set(:@slti_native66_y,fy)
+            xx,yy=nav.to_rgss(45,fx,fy)
+            obj.instance_variable_set(:@x,xx)
+            obj.instance_variable_set(:@y,yy)
+            obj.instance_variable_set(:@through,false)
+            $game_player=obj
+            raise 'Actual player move rejected' unless obj.slti_native66_move(dir)
+            raise 'Actual player ended in wrong cell' unless
+              obj.instance_variable_get(:@slti_native66_x)==tx &&
+              obj.instance_variable_get(:@slti_native66_y)==ty
+          end
+          puts 'PASS actual Game_Character both entry/exit routes (no parity shift)'
+
+          # Verify unmodified green links, all non-corner steps, and all of floor 2.
+          [45,46].each do |mid|
+            nav::HEIGHT.fetch(mid).times do |dy|
+              nav::WIDTH.fetch(mid).times do |dx|
+                x=nav::ORIGIN_X+dx;y=nav::ORIGIN_Y+dy
+                next if nav.value(mid,x,y)==0
+                cut::DELTA.each do |dir,(mx,my)|
+                  next if mid==45 && cut::MASKS.key?([x+mx,y+my])
+                  expected=nav.move_path?(mid,x,y,mx,my) ? [x+mx,y+my] : nil
+                  observed=nav.native_target(mid,x,y,dir)
+                  raise "Unapproved move changed: #{mid}/#{x}/#{y}/#{dir}" unless
+                    observed==expected
+                end
+              end
+            end
+          end
+          puts 'PASS 419 corners plus 32 bridges and one edge, 1808 direction checks and reverse links'
+          puts 'PASS untouched green links, original S32 and unchanged 2F'
+          RB_AUDIT
+          ruby build/audit91.rb
+
+          python3 - <<'PY_FILES'
+          from pathlib import Path
+          import json,hashlib
+          root=Path('site')
+          before=json.loads(Path('build/r84-hashes.json').read_text('utf-8'))
+          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.rglob('*') if p.is_file()}
+          assert len(after)==5517 and after.keys()==before.keys()
+          changed={p for p in before if before[p]!=after[p]}
+          allowed={'index.html','knight/index.html',
+                   'knight/gameasync/mapping.js','knight/gameasync/Data/Scripts.rxdata'}
+          assert changed==allowed,('Unexpected file modifications',changed^allowed)
+          print('PASS 5517 files; modified only engine, cache and two version labels')
+          PY_FILES
+
+      - name: V229R91 Publish original parity plus one verified edge
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+          retention-days: 30
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v6
+      - id: deployment
+        uses: actions/deploy-pages@v5
