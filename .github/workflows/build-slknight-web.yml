@@ -1,13 +1,15 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R101
-# BASE: successful V229R97 game, run 40326370483.
-# ORIGINAL: Sanctuary V4.1 native S32 terrain sheets, run 39100619927.
-# FIX: undo only V229R48's cv2.inpaint replacement of pixel RGB behind walls.
-# Restore exact original source pixels (not new textures) in 17 Map45 + 28 Map46 C chunks.
-# No C chunk deletion, no W edits, no paint, no new overlay, no alpha change.
-# Keep R97 movement, monster animations, events, original S32 and D-pad byte-for-byte.
-name: build-slknight-web.yml | V229R101 | Clean Native Events and 2x Terrain
+# VERSION: V229R102
+# SOURCE: native Sanctuary .s32 (V2), original Tile.idx/Tile.pak (v1.0.0),
+#         and the verified V3.6 native TIL renderer.
+# FIX: omit map46 original object layer 161 at SOURCE DRAW TIME, 3499 native
+#      objects, TIL IDs 3189..3193. They are the black smoke overlays.
+# NO pixel masks, no RGB replacements, no transparency edits, no inpaint,
+# no hidden chunk suppression, no substitute floors or new overlays.
+# BASE: successful V229R101 run 40354211601. Preserve its W walls, native
+#       S32, movement, spawns, monster animation, controls and full map45.
+name: build-slknight-web.yml | V229R102 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -28,162 +30,244 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: V229R101 Restore verified R97 game
+      - name: V229R102 Restore successful R101 game without changing its code
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40326370483
+          run-id: 40354211601
           name: github-pages
           github-token: ${{ github.token }}
-          path: r97
+          path: r101
 
-      - name: V229R101 Fetch original Sanctuary S32 terrain sheets
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 39100619927
-          name: Sanctuary-TI-Dungeon-V4.1-Original-Terrain-Walk
-          github-token: ${{ github.token }}
-          path: original-ti
-
-      - name: V229R101 Undo only the R48 artificial ground behind walls
+      - name: V229R102 Restore original Sanctuary layer data and graphics
         shell: bash
         run: |
           set -euo pipefail
-          test -s r97/artifact.tar
+          test -s r101/artifact.tar
+          mkdir -p site build source previous/v2 previous/v3-2 original-ti reports
+          tar -xf r101/artifact.tar -C site
+          gh run download 39045175890 -R "$GITHUB_REPOSITORY" \
+            -n Sanctuary-TI-Dungeon-V2-Raw-and-Layer3 -D previous/v2
+          gh run download 39049871058 -R "$GITHUB_REPOSITORY" \
+            -n Sanctuary-TI-Dungeon-V3.2-Verified-Partial-Terrain -D previous/v3-2
+          gh run download 39100619927 -R "$GITHUB_REPOSITORY" \
+            -n Sanctuary-TI-Dungeon-V4.1-Original-Terrain-Walk -D original-ti
+          for part in zip z32 z33 z34 z35; do
+            gh release download v1.0.0 -R "$GITHUB_REPOSITORY" \
+              -p "Sanctuary.of.Aden.-.Copy.$part" -D source --clobber
+            test -s "source/Sanctuary.of.Aden.-.Copy.$part"
+          done
+          test -s previous/v2/extracted/map/2/7fff8000.s32
+          test -s previous/v3-2/preview/map-index.json
           test -s original-ti/preview/terrain-walk-v4.1.html
-          mkdir -p site build
-          tar -xf r97/artifact.tar -C site
-          python3 - <<'PY_CHECK'
+          python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
-          original={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                    for p in root.rglob('*') if p.is_file()}
-          assert len(original)==5517, ('Wrong R97 count',len(original))
-          expected={'knight/gameasync/Data/Scripts.rxdata':
-                     '62b575db7e96c954d0076d20642208880b46e9ae481246390031ec0c10015534'}
-          for name,sha in expected.items():
-            assert original[name]==sha, ('Wrong original engine',name)
-          for name in ('index.html','knight/index.html'):
-            assert 'V229R97' in (root/name).read_text('utf-8')
-          Path('build/baseline.json').write_text(json.dumps(original,sort_keys=True))
-          print('PASS R97 original engine, pad, both native maps and all wall graphics')
-          PY_CHECK
+          hashes={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.rglob('*') if p.is_file()}
+          assert len(hashes)==5517,('Unexpected R101 file count',len(hashes))
+          assert hashes['knight/gameasync/Data/Scripts.rxdata']==\
+            '62b575db7e96c954d0076d20642208880b46e9ae481246390031ec0c10015534'
+          assert 'V229R101' in (root/'index.html').read_text('utf-8')
+          assert 'V229R101' in (root/'knight/index.html').read_text('utf-8')
+          assert len(list((root/'knight/gameasync/Graphics/Panoramas').glob('SLTI_46_C*_*.png')))==66
+          Path('build/before.json').write_text(json.dumps(hashes,sort_keys=True))
+          print('PASS original R101 game and original Sanctuary map files available')
+          PY_BASE
 
-          python3 -m venv build/env
-          build/env/bin/pip install --quiet --disable-pip-version-check pillow numpy
-          build/env/bin/python - <<'PY_UNDO'
+      - name: V229R102 Verify native S32 layer 161 is unique to 2F smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_LAYERS'
           from pathlib import Path
-          import json,re,hashlib
-          import numpy as np
-          from PIL import Image
-
-          src=Path('original-ti/preview')
-          html=(src/'terrain-walk-v4.1.html').read_text('utf-8')
-          data=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S).group(1))
-          pano=Path('site/knight/gameasync/Graphics/Panoramas')
-          mapping_path=Path('site/knight/gameasync/mapping.js')
-          mapping=mapping_path.read_text('utf-8')
+          import struct,collections,json
+          root=Path('previous/v2/extracted/map')
           report={}
-          for floor,mid,cols,rows,nexpected,pexpected in [
-              ('1',45,9,5,17,1461666),('2',46,11,6,28,2209829)]:
-            blocks=data[floor]['tiles']
-            x0=min(t['x'] for t in blocks);y0=min(t['y'] for t in blocks)
-            sw=max(t['x']+1536 for t in blocks)-x0
-            sh=max(t['y']+768 for t in blocks)-y0
-            assert (sw,sh)==((4608,2304) if mid==45 else (5376,2688))
-            # Reassemble the pixel-perfect V4.1 map images from the native S32 sheets.
-            full=Image.new('RGBA',(sw,sh))
-            original_walls=Image.new('RGBA',(sw,sh))
-            for tile in blocks:
-              offset=(tile['x']-x0,tile['y']-y0)
-              with Image.open(src/tile['src']) as im:
-                full.alpha_composite(im.convert('RGBA'),offset)
-              with Image.open(src/'baseline'/tile['src']) as im:
-                original_walls.alpha_composite(im.convert('RGBA'),offset)
-            original_pixels=np.asarray(full)
-            wall_alpha=np.asarray(original_walls.getchannel('A'))
-            changed=[];rgb_pixels=0
-            for cy in range(rows):
-              for cx in range(cols):
-                yy=512*cy;xx=512*cx
-                native=np.zeros((512,512,4),np.uint8)
-                patch=original_pixels[yy:min(yy+512,sh),xx:min(xx+512,sw)]
-                native[:patch.shape[0],:patch.shape[1]]=patch
-                mask=np.zeros((512,512),bool)
-                wall=wall_alpha[yy:min(yy+512,sh),xx:min(xx+512,sw)]>0
-                mask[:wall.shape[0],:wall.shape[1]]=wall
-                path=pano/f'SLTI_{mid}_C{cx}_{cy}.png'
-                assert path.exists(),path
-                with Image.open(path) as im: current=np.asarray(im.convert('RGBA'))
-                # Verify R48's only artificial edit before changing any graphics.
-                assert np.array_equal(current[:,:,3],native[:,:,3]), ('Original alpha changed',path.name)
-                edited=np.any(current[:,:,:3]!=native[:,:,:3],axis=2)
-                assert not np.any(edited&(~mask)), ('Unexpected source difference',path.name)
-                n=int(edited.sum())
-                if not n:continue
-                # Undo the entire source-verified inpaint: original RGBA, no fill or approximation.
-                Image.fromarray(native,'RGBA').save(path,compress_level=1)
-                with Image.open(path) as verify:
-                  assert np.array_equal(np.asarray(verify.convert('RGBA')),native)
-                changed.append(path.name);rgb_pixels+=n
+          for mid in (1,2):
+            total=0;ids=collections.Counter();sources={}
+            for path in sorted((root/str(mid)).glob('*.s32')):
+              data=path.read_bytes()
+              off=32768
+              layer2=struct.unpack_from('<H',data,off)[0]
+              off+=2+6*layer2+4*4096
+              groups=struct.unpack_from('<I',data,off)[0]
+              off+=4
+              n=0
+              for _ in range(groups):
+                _,count=struct.unpack_from('<hH',data,off)
+                off+=4
+                for _ in range(count):
+                  x,y,layer,frame,tid,flags=struct.unpack_from('<BBBBhB',data,off)
+                  off+=7
+                  if layer==161 and tid>=0:
+                    assert tid in (3189,3190,3191,3192,3193),(mid,path.name,tid)
+                    ids[tid]+=1;n+=1;total+=1
+              if n:sources[path.name]=n
+            report[str(mid)]={'layer161Objects':total,'tileIds':dict(ids),'sourceS32':sources}
+          assert report['1']['layer161Objects']==0
+          assert report['2']['layer161Objects']==3499
+          assert {int(k):v for k,v in report['2']['tileIds'].items()}=={
+            3189:141,3190:1888,3191:581,3192:570,3193:319}
+          assert len(report['2']['sourceS32'])==6
+          Path('build/source-layer161.json').write_text(json.dumps(report,indent=2,sort_keys=True))
+          print('PASS 2F original native S32 layer 161: 3499 smoke pieces, zero on 1F')
+          PY_LAYERS
 
-                # The renderer's MD5 query must reflect the original art, not cached R48.
-                digest=hashlib.md5(path.read_bytes()).hexdigest()
-                expr=rf'(Graphics/Panoramas/{re.escape(path.name)}\?h=)[0-9a-f]{{32}}'
-                mapping,count=re.subn(expr,lambda m:m.group(1)+digest,mapping)
-                assert count==1, ('Missing cache entry',path.name,count)
-            assert len(changed)==nexpected and rgb_pixels==pexpected, (
-              'Unexpected native source comparison',mid,len(changed),rgb_pixels)
-            report[str(mid)]={'restored_original_C':changed,'removed_R48_inpaint_pixels':rgb_pixels}
-            print('PASS map',mid,'removed R48-only inpaint:',len(changed),'C chunks /',rgb_pixels,'RGB pixels')
-          mapping_path.write_text(mapping,encoding='utf-8')
-          Path('build/undo-R48-audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
-          PY_UNDO
+      - name: V229R102 Re-render original S32 and TIL while omitting layer 161
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/audit-sanctuary-maps.yml?ref=f31b3ebb3197820186cb5db752bed62ba8c9c131" \
+            --jq .content | base64 -d > build/v3.3-original-workflow.yml
+          python3 -m venv build/til-env
+          build/til-env/bin/pip --disable-pip-version-check -q install Pillow==11.3.0
+          python3 - <<'PY_RENDERER'
+          from pathlib import Path
+          import re,textwrap
+          workflow=Path('build/v3.3-original-workflow.yml').read_text('utf-8')
+          m=re.search(r"(?ms)^ *cat > /tmp/ti-map-v3-3\.py <<'PY_V33'\n(.*?)^ *PY_V33\s*$",workflow)
+          assert m, 'Pinned original S32/TIL renderer not available'
+          code=textwrap.dedent(m.group(1))
+          # Reuse the original successful V3.6 diamond decoder repair verbatim.
+          pattern=r'(?m)^([ \t]*)count\s*=\s*2\s*\*\s*\(\s*y\s*\+\s*1\s+if\s+y\s*<\s*dim\s*//\s*2\s+else\s+dim\s*-\s*y\s*\)'
+          replacement='count = (2*min(y,dim-1-y)+1 if dim==24 and len(blob)==577 else 2*(y+1 if y<dim//2 else dim-y))'
+          code,n=re.subn(pattern,lambda found:found.group(1)+replacement,code)
+          assert n==1, ('Expected exactly one V3.6 floor decoder site',n)
+          # Do not draw these SOURCE objects. No pixel modification or masking.
+          object_pattern=r'items \+= \[\s*\(x,y,tid,index,False\)\s*for layer,x,y,tid,index\s*in objects\s*\]'
+          matches=list(re.finditer(object_pattern,code,re.S))
+          assert len(matches)==1,('Original layer enumeration changed',len(matches))
+          old=matches[0].group(0)
+          assert old.count('in objects')==1
+          code=code.replace(old,old.replace('in objects','in objects if layer != 161'))
+          assert code.count('if layer != 161')==1
+          Path('build/render-sanctuary-no-smoke.py').write_text(code,encoding='utf-8')
+          print('PASS native source rendering skip: layer 161 only; all other original assets included')
+          PY_RENDERER
+          python3 -m py_compile build/render-sanctuary-no-smoke.py
+          build/til-env/bin/python build/render-sanctuary-no-smoke.py
+          test -s reports/preview/map-index.json
+          test -s reports/preview/tiles/2/7fff8000.png
+          python3 - <<'PY_RENDER_AUDIT'
+          from pathlib import Path
+          import json
+          root=Path('reports')
+          result=json.loads((root/'summary.json').read_text('utf-8'))
+          counts=result['counts']
+          assert counts['floor']==229376 and counts['floorDrawn']==229376,counts
+          assert counts['objects']==158149,counts
+          assert counts['objectDrawn']==158149-3499,counts
+          assert counts['decodeError']==0,counts
+          assert len(list((root/'preview/tiles/1').glob('*.png')))==12
+          assert len(list((root/'preview/tiles/2').glob('*.png')))==16
+          print('PASS complete original S32 rendered, all floor tiles kept, 3499 source smoke objects omitted')
+          PY_RENDER_AUDIT
 
+      - name: V229R102 Replace only 2F panorama from original smoke-free draw
+        shell: bash
+        run: |
+          set -euo pipefail
+          build/til-env/bin/python - <<'PY_MERGE'
+          from pathlib import Path
+          from PIL import Image,ImageChops
+          import json,re,hashlib
+          html=Path('original-ti/preview/terrain-walk-v4.1.html').read_text('utf-8')
+          source=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html,re.S).group(1))
+          records=source['2']['tiles']
+          x0=min(t['x'] for t in records);y0=min(t['y'] for t in records)
+          width=max(t['x']+1536 for t in records)-x0
+          height=max(t['y']+768 for t in records)-y0
+          assert (width,height)==(5376,2688)
+          original=Image.new('RGBA',(width,height))
+          smoke_free=Image.new('RGBA',(width,height))
+          for item in records:
+            xy=(item['x']-x0,item['y']-y0)
+            with Image.open(Path('original-ti/preview')/item['src']) as raw:
+              original.alpha_composite(raw.convert('RGBA'),xy)
+            with Image.open(Path('reports/preview')/item['src']) as clean:
+              smoke_free.alpha_composite(clean.convert('RGBA'),xy)
+          def is_different(a,b):
+            return any(channel.getbbox() is not None for channel in ImageChops.difference(a,b).split())
+          assert is_different(original,smoke_free), \
+            'Native source-layer removal had no visible result'
+
+          pano=Path('site/knight/gameasync/Graphics/Panoramas')
+          mapping=Path('site/knight/gameasync/mapping.js')
+          js=mapping.read_text('utf-8')
+          changed=[]
+          removed_rgba_pixels=0
+          for cy in range(6):
+            for cx in range(11):
+              name=f'SLTI_46_C{cx}_{cy}.png'
+              path=pano/name
+              with Image.open(path) as current_file:
+                before=current_file.convert('RGBA')
+              box=(cx*512,cy*512,(cx+1)*512,(cy+1)*512)
+              reference=original.crop(box)
+              clean=smoke_free.crop(box)
+              assert not is_different(before,reference), \
+                ('R101 ground is not the native Sanctuary reference',name)
+              if not is_different(before,clean):continue
+              # SAVE the result of omitting a SOURCE S32 object layer.
+              # No masks, no pixel replacement, no filters, no alpha tricks.
+              clean.save(path,compress_level=1)
+              changed.append(name)
+              digest=hashlib.md5(path.read_bytes()).hexdigest()
+              pat=rf'(Graphics/Panoramas/{re.escape(name)}\?h=)[0-9a-f]{{32}}'
+              js,n=re.subn(pat,lambda m:m.group(1)+digest,js)
+              assert n==1,('Missing cache entry',name,n)
+              with Image.open(path) as saved:
+                assert not is_different(saved.convert('RGBA'),clean)
+          assert changed, 'No 2F source objects changed'
+          assert len(changed)<=66
+          mapping.write_text(js,encoding='utf-8')
+          Path('build/r102-changed-C.json').write_text(json.dumps(changed,indent=2))
+          print('PASS 2F real original source draw without layer161; changed C assets:',len(changed))
+          print('PASS source objects excluded: 3499; 1F, original W layers and engine untouched')
+          PY_MERGE
           python3 - <<'PY_VERSION'
           from pathlib import Path
           for name in ('index.html','knight/index.html'):
-            path=Path('site')/name
-            original=path.read_text('utf-8')
-            assert 'V229R97' in original and 'V229R101' not in original
-            path.write_text(original.replace('V229R97','V229R101')
-                                    .replace('v229r97','v229r101'),encoding='utf-8')
+            p=Path('site')/name
+            text=p.read_text('utf-8')
+            assert 'V229R101' in text and 'V229R102' not in text
+            p.write_text(text.replace('V229R101','V229R102').replace('v229r101','v229r102'),encoding='utf-8')
           PY_VERSION
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/dpad.js
 
-      - name: V229R101 Verify exact change set and intact native game
+      - name: V229R102 Verify source-only deletion and no collateral game changes
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_VERIFY'
+          python3 - <<'PY_AUDIT'
           from pathlib import Path
-          import hashlib,json
+          import json,hashlib
           root=Path('site')
-          before=json.loads(Path('build/baseline.json').read_text('utf-8'))
+          before=json.loads(Path('build/before.json').read_text('utf-8'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          assert len(after)==5517 and after.keys()==before.keys()
-          changed={p for p in before if before[p]!=after[p]}
-          stats=json.loads(Path('build/undo-R48-audit.json').read_text('utf-8'))
-          allowed={'index.html','knight/index.html','knight/gameasync/mapping.js'}
-          for mid in (45,46):
-            allowed|={f'knight/gameasync/Graphics/Panoramas/{x}'
-                      for x in stats[str(mid)]['restored_original_C']}
-          assert changed==allowed, ('Unexpected changed files',changed^allowed)
-          assert after['knight/gameasync/Data/Scripts.rxdata']==before['knight/gameasync/Data/Scripts.rxdata']
-          assert after['knight/js/dpad.js']==before['knight/js/dpad.js']
-          assert all('/SLTI_45_W_' not in x and '/SLTI_46_W_' not in x for x in changed)
-          assert all('Map045.rxdata' not in x and 'Map046.rxdata' not in x for x in changed)
-          print('PASS R48 inpaint removed only: 17+28 original C chunks and 3 cache/version files')
-          print('PASS original S32, 1F/2F wall W, monster code, D-pad and events byte-identical')
-          PY_VERIFY
+          assert len(before)==len(after)==5517 and before.keys()==after.keys()
+          changes={p for p in before if before[p]!=after[p]}
+          chunks=set(json.loads(Path('build/r102-changed-C.json').read_text('utf-8')))
+          expected={'index.html','knight/index.html','knight/gameasync/mapping.js'}
+          expected|={f'knight/gameasync/Graphics/Panoramas/{p}' for p in chunks}
+          assert changes==expected,('Unapproved changed files',changes^expected)
+          assert before['knight/gameasync/Data/Scripts.rxdata']==after['knight/gameasync/Data/Scripts.rxdata']
+          assert before['knight/js/dpad.js']==after['knight/js/dpad.js']
+          assert not any('/SLTI_45_' in p or '/SLTI_46_W_' in p for p in changes)
+          assert not any('Map045.rxdata' in p or 'Map046.rxdata' in p for p in changes)
+          print('PASS only map46 original source-layer-less C files, cache and labels updated')
+          print('PASS walls, original S32, game scripts, events, monsters and mobile pad byte-identical')
+          PY_AUDIT
 
-      - name: V229R101 Publish source-verified floor without R48 inpaint
+      - name: V229R102 Publish native Sanctuary without layer161 smoke
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
