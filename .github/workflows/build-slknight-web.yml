@@ -1,9 +1,12 @@
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R108
+# VERSION: V229R109
 # BASE: successfully deployed R104, run 40448777417 (complete working game).
 # LOAD: restore unchanged R104 common map loader and standard background preloader.
 #        No synchronous texture gate, no intercepted callbacks, no world-Z override.
-# PERFORMANCE: do not ALLOCATE four hidden RPG Tilemaps on Sanctuary 1F/2F;
+# COORDINATES: 60 Sanctuary monster events use the SAME S32 native grid as the hero.
+# PERFORMANCE: retain up to 12 native floor/wall texture chunks per floor;
+#              prewarm adjacent chunks at idle, not on every camera scroll.
+#              do not ALLOCATE four hidden RPG Tilemaps on Sanctuary 1F/2F;
 #              do not recalculate wall section sprites if camera and actor are unchanged.
 # INITIAL MOBS: keep all existing 30 per floor; shift only two mobs per floor to
 #               reachable ground 7-13 tiles from entry, without blocking the gate.
@@ -12,7 +15,7 @@
 #          Invoked only at death/respawn, never from the game frame update.
 # KEEP: V229R104 clean original floor C and wall W byte-identical; boss, NPCs,
 #       player 4-way movement, S32 data, speed, UI and other maps unchanged.
-name: build-slknight-web.yml | V229R108 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V229R109 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -35,7 +38,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R108 Restore verified R104 without graphics edits
+      - name: V229R109 Restore verified R104 without graphics edits
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -44,7 +47,7 @@ jobs:
           github-token: ${{ github.token }}
           path: r104
 
-      - name: V229R108 Remove hidden terrain work and repair monster distribution
+      - name: V229R109 Remove hidden terrain work and repair monster distribution
         shell: bash
         run: |
           set -euo pipefail
@@ -71,7 +74,7 @@ jobs:
           print('PASS R104 complete original game, S32, wall and floor graphics')
           PY_BASE
 
-          cat > build/r108_patch.rb <<'R108_PATCH'
+          cat > build/r109_patch.rb <<'R109_PATCH'
           require 'zlib'
           require 'digest'
           path='site/knight/gameasync/Data/Scripts.rxdata'
@@ -113,6 +116,116 @@ jobs:
           raise 'Wrong hidden tilemap creation count' unless old97.scan(/Tilemap\.new/).size==4
           raise 'Native tilemap guards absent' unless old97.scan('unless @slti_floor').size==3
 
+          # Retain nearby native floor textures and prewarm one adjacent texture
+          # per idle frame; never decode the same tile after a minor backtrack.
+          # Only this special renderer changes. Other maps keep original Tilemap.
+          from=old97.index("  def slti_update_terrain\n")
+          finish=old97.index("\n  end\n\nend",from)
+          raise 'Missing original terrain method' unless from && finish
+          floor=<<'FLOOR'
+            def slti_update_terrain
+              return if @slti_chunk_error
+              sx=[$game_map.display_x.to_i/4,0].max
+              sy=[$game_map.display_y.to_i/4,0].max
+              vw=@viewport2.rect.width
+              vh=@viewport2.rect.height
+              return if vw<=0 || vh<=0
+              left=[sx/1024,0].max
+              top=[sy/1024,0].max
+              right=[(sx+vw-1)/1024,@slti_cols-1].min
+              bottom=[(sy+vh-1)/1024,@slti_rows-1].min
+              required={}
+              if left<=right && top<=bottom
+                (top..bottom).each do |y|
+                  (left..right).each{|x|required[[x,y]]=true}
+                end
+              end
+              @slti_r109_active_chunks=required
+              @slti_r109_lru=[] if @slti_r109_lru==nil
+              @slti_r109_prefetch_failed={} if @slti_r109_prefetch_failed==nil
+              camera=[sx,sy,@slti_floor]
+              @slti_r109_prefetch_failed.clear if @slti_r109_camera!=camera
+              if @slti_r109_camera==camera
+                @slti_r109_idle=@slti_r109_idle.to_i+1
+              else
+                @slti_r109_idle=0
+              end
+              @slti_r109_camera=camera
+              @slti_chunks.each do |key,sprite|
+                active=required.has_key?(key)
+                sprite.visible=active if sprite.visible!=active
+                if active
+                  sprite.x=key[0]*1024-sx
+                  sprite.y=key[1]*1024-sy
+                  @slti_r109_lru.delete(key)
+                  @slti_r109_lru << key
+                end
+              end
+              # Visible terrain always takes priority over optional adjacent prewarm.
+              target=required.keys.find{|key|!@slti_chunks.has_key?(key)}
+              if target==nil && @slti_r109_idle>=5 && @slti_chunks.length<12
+                neighbors={}
+                required.each_key do |key|
+                  x,y=key
+                  [[x-1,y],[x+1,y],[x,y-1],[x,y+1]].each do |candidate|
+                    cx,cy=candidate
+                    next if cx<0 || cy<0 || cx>=@slti_cols || cy>=@slti_rows
+                    next if required.has_key?(candidate)
+                    neighbors[candidate]=true
+                  end
+                end
+                cx=sx+vw/2
+                cy=sy+vh/2
+                candidates=neighbors.keys.sort_by do |key|
+                  dx=key[0]*1024+512-cx
+                  dy=key[1]*1024+512-cy
+                  dx*dx+dy*dy
+                end
+                target=candidates.find{|key|!@slti_chunks.has_key?(key) && !@slti_r109_prefetch_failed.has_key?(key)}
+              end
+              if target!=nil
+                x,y=target
+                sprite=Sprite.new(@viewport2)
+                sprite.z=-1500
+                sprite.zoom_x=2.0
+                sprite.zoom_y=2.0
+                sprite.visible=required.has_key?(target)
+                filename="Graphics/Panoramas/SLTI_#{@slti_floor}_C#{x}_#{y}"
+                begin
+                  sprite.bitmap=Bitmap.new(filename)
+                rescue StandardError=>error
+                  sprite.dispose
+                  if required.has_key?(target)
+                    @slti_chunk_error=true
+                    p "SLTI CHUNK LOAD ERROR: #{filename}: #{error.message}"
+                  else
+                    @slti_r109_prefetch_failed[target]=true
+                  end
+                  return
+                end
+                sprite.x=x*1024-sx
+                sprite.y=y*1024-sy
+                @slti_chunks[target]=sprite
+                @slti_r109_lru.delete(target)
+                @slti_r109_lru << target
+              end
+              # Keep at most 12 decoded chunks, never evict a currently visible one.
+              while @slti_chunks.length>12
+                victim=@slti_r109_lru.find{|key|!required.has_key?(key)}
+                break if victim==nil
+                @slti_r109_lru.delete(victim)
+                sprite=@slti_chunks.delete(victim)
+                bmp=sprite.bitmap
+                sprite.bitmap=nil
+                sprite.dispose
+                bmp.dispose if bmp!=nil && !bmp.disposed?
+              end
+              @slti_r60_floor_ready=required.keys.all?{|key|@slti_chunks.has_key?(key)}
+            end
+          FLOOR
+          old97=old97[0...from]+floor.chomp+old97[(finish+6)..-1]
+          raise 'R109 terrain cache absent' unless old97.include?('slti_r109_active_chunks') && old97.include?('@slti_chunks.length>12')
+
           old_anchor="    @slti_r49_walls={} if @slti_r49_walls==nil\n    return if @slti_chunks==nil\n"
           cache=<<'CACHE'
               @slti_r49_walls={} if @slti_r49_walls==nil
@@ -128,18 +241,68 @@ jobs:
                 wall_state += [actor.x,actor.y,actor.z,actor.ox,actor.oy,
                                actor.src_rect.width,actor.src_rect.height,actor.bitmap!=nil]
               end
-              return if @slti_r108_last_wall_state==wall_state &&
+              return if @slti_r109_last_wall_state==wall_state &&
                         @slti_r49_walls.size==@slti_chunks.size
-              @slti_r108_last_wall_state=wall_state
+              @slti_r109_last_wall_state=wall_state
           CACHE
           old134=change_once(old134,old_anchor,cache,'wall update cache')
 
+          # Previous builds used S32 projection for the hero only. Monsters
+          # used the 32px RGSS grid, displacing their drawn feet from floor art.
+          # Give only native Sanctuary monsters the SAME real/native state as hero.
+          old134=change_once(old134,
+            "    return self==$game_player\n",
+            "    return self==$game_player || SLTI_V229R49.monster?(self)\n",
+            'shared native feet and movement')
+          old_occupancy=<<'OLD_OCC'
+              unless @through
+                $game_map.events.values.each do |other|
+                  next if other==self || other.through
+                  return false if other.x==nx && other.y==ny && other.character_name!=''
+                end
+                if self!=$game_player && $game_player!=nil && !$game_player.through
+                  return false if $game_player.x==nx && $game_player.y==ny
+                end
+              end
+          OLD_OCC
+          new_occupancy=<<'NEW_OCC'
+              unless @through
+                $game_map.events.each_value do |other|
+                  next if other==self || other.through || other.character_name==''
+                  if SLTI_V229R49.monster?(other)
+                    # Monster and hero now occupy native S32 cells. Their rounded RGSS
+                    # coordinates may coincide even when real S32 cells do not.
+                    other.slti_native66_prepare
+                    return false if other.instance_variable_get(:@slti_native66_x)==target[0] &&
+                                    other.instance_variable_get(:@slti_native66_y)==target[1]
+                  else
+                    # NPC and scripted events still use their original RGSS coordinates.
+                    return false if other.x==nx && other.y==ny
+                  end
+                end
+                if self!=$game_player && $game_player!=nil && !$game_player.through
+                  $game_player.slti_native66_prepare
+                  return false if $game_player.instance_variable_get(:@slti_native66_x)==target[0] &&
+                                  $game_player.instance_variable_get(:@slti_native66_y)==target[1]
+                end
+              end
+          NEW_OCC
+          old134=change_once(old134,old_occupancy,new_occupancy,'native actor occupancy')
+          old134=change_once(old134,
+            "    return if @slti_chunks==nil\n    # Wall sections",
+            "    return if @slti_chunks==nil\n    @slti_r109_active_chunks={} if @slti_r109_active_chunks==nil\n    # Wall sections",
+            'wall active chunk map')
+          old134=change_once(old134,
+            "      cx,cy=key\n      item[1].each do |part|\n",
+            "      cx,cy=key\n      unless @slti_r109_active_chunks.has_key?(key)\n        item[1].each{|part|part[0].visible=false if part[0].visible}\n        next\n      end\n      item[1].each do |part|\n",
+            'skip cached invisible wall slices')
+
           addition=<<'RESPAWN'
 
-          # V229R108: select a different traversable position near each monster's own
+          # V229R109: select a different traversable position near each monster's own
           # event region only when its original death event calls command_202.
           # Never scan terrain or search spawn candidates on the frame update path.
-          module SLTI_R108Respawn
+          module SLTI_R109Respawn
             ENTRY={45=>[92,74],46=>[74,94]}.freeze
             def self.pick(event)
               map=$game_map
@@ -150,7 +313,8 @@ jobs:
               original=event.instance_variable_get(:@event)
               return nil if original==nil
               x0=original.x;y0=original.y
-              last=event.instance_variable_get(:@slti_r108_last_spawn)
+              last=event.instance_variable_get(:@slti_r109_last_spawn)
+              last_native=event.instance_variable_get(:@slti_r109_last_native)
               player=$game_player
               96.times do
                 x=x0+rand(25)-12
@@ -160,16 +324,24 @@ jobs:
                 next if (x-entrance[0]).abs+(y-entrance[1]).abs<9
                 next if player!=nil && (x-player.x).abs+(y-player.y).abs<9
                 next if last!=nil && last[0]==x && last[1]==y
-                next if SLTI_Native66.nearest(mid,x,y,16)==nil
+                native=SLTI_Native66.nearest(mid,x,y,16)
+                next if native==nil || last_native==native
                 occupied=false
                 map.events.each_value do |other|
-                  if other!=event && other.x==x && other.y==y && other.character_name!=''
-                    occupied=true
-                    break
+                  next if other==event || other.character_name==''
+                  if SLTI_V229R49.monster?(other)
+                    other.slti_native66_prepare
+                    ox=other.instance_variable_get(:@slti_native66_x)
+                    oy=other.instance_variable_get(:@slti_native66_y)
+                    occupied=(ox==native[0] && oy==native[1])
+                  else
+                    occupied=(other.x==x && other.y==y)
                   end
+                  break if occupied
                 end
                 next if occupied
-                event.instance_variable_set(:@slti_r108_last_spawn,[x,y])
+                event.instance_variable_set(:@slti_r109_last_spawn,[x,y])
+                event.instance_variable_set(:@slti_r109_last_native,native)
                 return [x,y]
               end
               nil
@@ -177,16 +349,16 @@ jobs:
           end
 
           class Interpreter
-            alias slti_r108_original_command_202 command_202
+            alias slti_r109_original_command_202 command_202
             def command_202
-              if $game_map!=nil && SLTI_R108Respawn::ENTRY.has_key?($game_map.map_id) &&
+              if $game_map!=nil && SLTI_R109Respawn::ENTRY.has_key?($game_map.map_id) &&
                  @parameters!=nil && @parameters[0]==0 && @parameters[1]==0
                 event=$game_map.events[@event_id]
                 if event!=nil && SLTI_V229R49.monster?(event)
                   original=event.instance_variable_get(:@event)
                   if original!=nil && original.pages.size==4 &&
                      event.instance_variable_get(:@page).equal?(original.pages[-1])
-                    pos=SLTI_R108Respawn.pick(event)
+                    pos=SLTI_R109Respawn.pick(event)
                     if pos!=nil
                       event.moveto(pos[0],pos[1])
                       return true
@@ -194,26 +366,26 @@ jobs:
                   end
                 end
               end
-              slti_r108_original_command_202
+              slti_r109_original_command_202
             end
           end
           RESPAWN
-          raise 'Already patched' if old134.include?('SLTI_R108Respawn')
+          raise 'Already patched' if old134.include?('SLTI_R109Respawn')
           old134+=addition
           scripts[97][2]=Zlib::Deflate.deflate(old97)
           scripts[134][2]=Zlib::Deflate.deflate(old134)
           File.binwrite(path,Marshal.dump(scripts))
-          File.binwrite('build/97-r108.rb',old97)
-          File.binwrite('build/134-r108.rb',old134)
+          File.binwrite('build/97-r109.rb',old97)
+          File.binwrite('build/134-r109.rb',old134)
           raise 'Unexpected texture preload override' if old97.include?('SANCTUARY_TEXTURE_PRELOAD') || old134.include?('slti_r107_original_screen_z')
-          puts "PASS R108 native tilemaps gated, wall state caching, original death respawn interception"
-          R108_PATCH
-          ruby -c build/r108_patch.rb
-          ruby build/r108_patch.rb
-          ruby -c build/97-r108.rb
-          ruby -c build/134-r108.rb
+          puts "PASS R109 native tilemaps gated, wall state caching, original death respawn interception"
+          R109_PATCH
+          ruby -c build/r109_patch.rb
+          ruby build/r109_patch.rb
+          ruby -c build/97-r109.rb
+          ruby -c build/134-r109.rb
 
-          cat > build/r108_map.rb <<'R108_MAP'
+          cat > build/r109_map.rb <<'R109_MAP'
           require 'digest'
           module RPG
             class Map;end;class MapInfo;end;class AudioFile;end;class Tileset;end
@@ -257,9 +429,9 @@ jobs:
             raise 'Spawn persistence failed' unless positions.all?{|id,xy|ev=again.instance_variable_get(:@events)[id];[ev.instance_variable_get(:@x),ev.instance_variable_get(:@y)]==xy}
             puts "PASS Map#{mid} exactly #{positions.size} nearby monster entries, original 30 mobs, NPCs/boss and events unchanged"
           end
-          R108_MAP
-          ruby -c build/r108_map.rb
-          ruby build/r108_map.rb
+          R109_MAP
+          ruby -c build/r109_map.rb
+          ruby build/r109_map.rb
 
           python3 - <<'PY_CACHE'
           from pathlib import Path
@@ -280,19 +452,19 @@ jobs:
           for name in ('index.html','knight/index.html'):
             path=root/name
             content=path.read_text('utf-8')
-            assert 'V229R104' in content and 'V229R108' not in content
-            path.write_text(content.replace('V229R104','V229R108')
-                                   .replace('v229r104','v229r108'),encoding='utf-8')
+            assert 'V229R104' in content and 'V229R109' not in content
+            path.write_text(content.replace('V229R104','V229R109')
+                                   .replace('v229r104','v229r109'),encoding='utf-8')
           print('PASS only engine, two native map caches and version labels refreshed')
           PY_CACHE
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/dpad.js
 
-      - name: V229R108 Audit native floor pools, engine guards and exact change set
+      - name: V229R109 Audit native floor pools, engine guards and exact change set
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/r108-audit.rb <<'R108_AUDIT'
+          cat > build/r109-audit.rb <<'R109_AUDIT'
           require 'zlib'
           module RPG
            class Map;end; class MapInfo;end;class AudioFile;end;class Tileset;end
@@ -313,7 +485,7 @@ jobs:
           raise 'Missing native source' unless a && b
           Object.class_eval(src[a...b])
           from=src.index("module SLTI_V229R97Corner\n")
-          till=src.index("# V229R108: select",from)
+          till=src.index("# V229R109: select",from)
           raise 'Missing source extension' unless from && till
           Object.class_eval(src[from...till])
           expected={45=>[[99,74],[93,81]],46=>[[84,94],[86,95]]}
@@ -325,6 +497,8 @@ jobs:
             events=m.instance_variable_get(:@events)
             mobs=events.values.select{|e|e.instance_variable_get(:@name).start_with?('[ID') && !(mid==45 && e.instance_variable_get(:@id)==13) && !(mid==46 && e.instance_variable_get(:@id)==3)}
             raise "Wrong monster count #{mid}" unless mobs.size==30
+            native_origins=mobs.map{|e|SLTI_Native66.nearest(mid,e.instance_variable_get(:@x),e.instance_variable_get(:@y),16)}
+            raise 'Duplicate native monster spawn' unless native_origins.compact.uniq.size==30
             names=mobs.map{|ev|ev.instance_variable_get(:@name).dup.force_encoding('UTF-8')}.tally
             min=100000
             mobs.each do |e|
@@ -332,6 +506,11 @@ jobs:
               raise 'Monster on an RPG wall' unless raw[20+2*(oy*w+ox),2].unpack('v')[0]==384
               near=SLTI_Native66.nearest(mid,ox,oy,16)
               raise "Monster anchor cannot find original S32 floor #{mid} #{e.instance_variable_get(:@id)} #{ox},#{oy}" unless near
+              # Real S32 pixel position, shared by player and R109 native monsters.
+              px,py=SLTI_Native66.project(mid,near[0],near[1])
+              real=SLTI_Native66.real(mid,near[0],near[1])
+              raise 'Native X feet misaligned' unless real[0]/4+16==px*2
+              raise 'Native Y feet misaligned' unless real[1]/4+32==py*2
               pool=0
               (-12..12).each do |dy|
                 (-12..12).each do |dx|
@@ -351,8 +530,8 @@ jobs:
             end
             puts "PASS map#{mid}: #{mobs.size} living monster events, random spots min #{min}, near entrance #{nearby.inspect}, types #{names.inspect}"
           end
-          R108_AUDIT
-          ruby build/r108-audit.rb site/knight/gameasync/Data
+          R109_AUDIT
+          ruby build/r109-audit.rb site/knight/gameasync/Data
           python3 - <<'PY_CHANGES'
           from pathlib import Path
           import hashlib,json
@@ -368,8 +547,18 @@ jobs:
                      for mid in (45,46)}
           assert changed==expected,('Unexpected modifications',changed^expected)
           assert after['knight/js/dpad.js']==before['knight/js/dpad.js']
+          # Monster/player S32 motion + bounded local terrain cache must be present.
+          assert b'R109' not in (root/'knight/js/drive.js').read_bytes()
+          import subprocess
+          ruby_src=subprocess.check_output(['ruby','-e',
+            'require "zlib"; a=Marshal.load(File.binread(ARGV[0])); print Zlib::Inflate.inflate(a[134][2])',
+            str(root/'knight/gameasync/Data/Scripts.rxdata')])
+          assert b'return self==$game_player || SLTI_V229R49.monster?(self)' in ruby_src
+          assert b'SLTI_R109Respawn' in ruby_src
+          assert b'@slti_r109_active_chunks' in ruby_src
+          print('PASS native monster feet, collision in same S32 grid, bounded cached wall/floor')
           # R106/R107 intercepted the wasm map-loading callback and blocked entry.
-          # Prove R108 has the original immediate map callback and preload pipeline.
+          # Prove R109 has the original immediate map callback and preload pipeline.
           html=(root/'knight/index.html').read_text('utf-8')
           original=(root/'knight/js/drive.js').read_bytes()
           assert after['knight/js/drive.js']==before['knight/js/drive.js']
@@ -390,7 +579,7 @@ jobs:
           print('PASS complete original 1F/2F C/W art, S32 and four-direction D-pad unchanged')
           PY_CHANGES
 
-      - name: V229R108 Publish original graphics and lighter native terrain renderer
+      - name: V229R109 Publish original graphics and lighter native terrain renderer
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
