@@ -1,12 +1,17 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R104
-# FIX: V229R103 rewrote Map045/Map046 Table values as ordinary Ruby objects.
-# Restore RPG Maker's original Marshal user-defined Table encoding (u:Table).
-# Keep all R103 source-layer smoke cleanup, 2F W graphics, monster positions,
-# performance code, UI, 1F/2F floors, wall passability, and 4-way D-pad unchanged.
-# No new graphics processing, no extra map events, no gameplay code patches.
-name: build-slknight-web.yml | V229R104 | Clean Native Events and 2x Terrain
+# VERSION: V229R105
+# BASE: successfully deployed R104, run 40448777417 (complete working game).
+# PERFORMANCE: do not ALLOCATE four hidden RPG Tilemaps on Sanctuary 1F/2F;
+#              do not recalculate wall section sprites if camera and actor are unchanged.
+# INITIAL MOBS: keep all existing 30 per floor; shift only two mobs per floor to
+#               reachable ground 7-13 tiles from entry, without blocking the gate.
+# RESPAWN: existing monster death event code 202 chooses a random validated floor
+#          near its own home region, instead of 3 stale fixed event-page points.
+#          Invoked only at death/respawn, never from the game frame update.
+# KEEP: V229R104 clean original floor C and wall W byte-identical; boss, NPCs,
+#       player 4-way movement, S32 data, speed, UI and other maps unchanged.
+name: build-slknight-web.yml | V229R105 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -29,177 +34,324 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R104 Restore deployed R103 including source-clean dungeon art
+      - name: V229R105 Restore verified R104 without graphics edits
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40446050339
+          run-id: 40448777417
           name: github-pages
           github-token: ${{ github.token }}
-          path: r103
+          path: r104
 
-      - name: V229R104 Verify baseline and repair only two native map Tables
+      - name: V229R105 Remove hidden terrain work and repair monster distribution
         shell: bash
         run: |
           set -euo pipefail
-          test -s r103/artifact.tar
+          test -s r104/artifact.tar
           mkdir -p site build
-          tar -xf r103/artifact.tar -C site
+          tar -xf r104/artifact.tar -C site
           python3 - <<'PY_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
           files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          assert len(files)==5517,('Wrong R103 baseline file count',len(files))
-          assert files['knight/gameasync/Data/Scripts.rxdata']==\
-            '5444d9f3994324ef114c4c4330221b6671fcab9a7af3cbc5df575a3f9accd109'
-          assert files['knight/js/dpad.js']==\
-            '2bd401adf130339d154ce6a8efd0127cefd9b1bc58bc60d1de68e8b6d8b7a791'
-          for n in ('index.html','knight/index.html'):
-            assert 'V229R103' in (root/n).read_text('utf-8'),n
-
-          pano=root/'knight/gameasync/Graphics/Panoramas'
-          assert len(list(pano.glob('SLTI_46_C*_*.png')))==66
-          assert len(list(pano.glob('SLTI_46_W_C*_*.png')))==28
+          assert len(files)==5517,('Wrong R104 baseline',len(files))
+          expected={
+            'knight/gameasync/Data/Scripts.rxdata':'5444d9f3994324ef114c4c4330221b6671fcab9a7af3cbc5df575a3f9accd109',
+            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
+            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c',
+            'knight/js/dpad.js':'2bd401adf130339d154ce6a8efd0127cefd9b1bc58bc60d1de68e8b6d8b7a791'}
+          for name,sha in expected.items():
+            assert files[name]==sha,('Wrong game baseline',name)
+          for name in ('index.html','knight/index.html'):
+            assert 'V229R104' in (root/name).read_text('utf-8')
           Path('build/before.json').write_text(json.dumps(files,sort_keys=True))
-          print('PASS exact R103 game and 2F floor/wall graphics restored')
+          print('PASS R104 complete original game, S32, wall and floor graphics')
           PY_BASE
 
-          cat > build/repair-table.rb <<'RB_FIX'
+          cat > build/r105_patch.rb <<'R105_PATCH'
+          require 'zlib'
+          require 'digest'
+          path='site/knight/gameasync/Data/Scripts.rxdata'
+          scripts=Marshal.load(File.binread(path))
+          raise 'Wrong scripts count' unless scripts.size==136
+          old97=Zlib::Inflate.inflate(scripts[97][2])
+          old134=Zlib::Inflate.inflate(scripts[134][2])
+          raise 'Unrecognized R104 engine' unless Digest::SHA256.hexdigest(File.binread(path))=='5444d9f3994324ef114c4c4330221b6671fcab9a7af3cbc5df575a3f9accd109'
+          raise 'R104 native renderer changed' unless old97.include?('if @slti_floor') && old97.include?('@tilemap4.dispose')
+          raise 'R104 wall code changed' unless old134.include?('def slti_r49_update_walls')
+
+          def change_once(source,old,new,label)
+            raise "Unexpected #{label} occurrences: #{source.scan(old).length}" unless source.scan(old).length==1
+            source.sub(old,new)
+          end
+
+          def wrap(source,starting,ending,label)
+            a=source.index(starting)
+            raise "Missing #{label} opening" unless a
+            b=source.index(ending,a)
+            raise "Missing #{label} closing" unless b
+            body=source[a...b]
+            source[0...a]+"    unless @slti_floor\n"+body.lines.map{|l|'  '+l}.join+"    end\n"+source[b..-1]
+          end
+
+          floor_line="    @slti_floor = [45,46].include?($game_map.map_id) ? $game_map.map_id : nil\n"
+          old97=change_once(old97,floor_line,'','floor assignment relocation')
+          old97=change_once(old97,"    @character_sprites.push(Sprite_Character.new(@viewport2, $game_player))\n", "    @character_sprites.push(Sprite_Character.new(@viewport2, $game_player))\n"+floor_line,'actor init')
+          old97=wrap(old97,"    @tilemap = Tilemap.new(@viewport2)\n","    @panorama = Sprite.new(@viewport2)\n",'fourfold first tilemap')
+          hidden1="    if @slti_floor\n      [@tilemap, @tilemap2, @tilemap3, @tilemap4].each do |layer|\n        layer.visible = false if layer != nil && layer.respond_to?(:visible=)\n      end\n    end\n"
+          old97=change_once(old97,hidden1,'','redundant hidden tilemap')
+          a=old97.index("    @tilemap2 = Tilemap.new(@viewport4)\n")
+          b=old97.index("    if @slti_floor\n      [@tilemap2,@tilemap3,@tilemap4].each do |layer|\n",a)
+          c=old97.index("    update\n",b)
+          raise 'Missing secondary tilemap area' unless a && b && c
+          body=old97[a...b]
+          old97=old97[0...a]+"    unless @slti_floor\n"+body.lines.map{|l|'  '+l}.join+"    end\n"+old97[c..-1]
+          old97=wrap(old97,"    @tilemap.tileset.dispose\n","    if @slti_chunks\n",'disposal of hidden tilemaps')
+          raise 'Wrong hidden tilemap creation count' unless old97.scan(/Tilemap\.new/).size==4
+          raise 'Native tilemap guards absent' unless old97.scan('unless @slti_floor').size==3
+
+          old_anchor="    @slti_r49_walls={} if @slti_r49_walls==nil\n    return if @slti_chunks==nil\n"
+          cache=<<'CACHE'
+              @slti_r49_walls={} if @slti_r49_walls==nil
+              return if @slti_chunks==nil
+              # Wall sections and alpha depend only on camera/hero geometry, not frame count.
+              # While a texture is pending (@slti_r49_walls.size < @slti_chunks.size),
+              # keep the original one-new-texture-per-frame behavior.
+              wall_camera_x=[$game_map.display_x.to_i/4,0].max
+              wall_camera_y=[$game_map.display_y.to_i/4,0].max
+              actor=@character_sprites && @character_sprites[-1]
+              wall_state=[wall_camera_x,wall_camera_y,@slti_chunks.size]
+              if actor!=nil
+                wall_state += [actor.x,actor.y,actor.z,actor.ox,actor.oy,
+                               actor.src_rect.width,actor.src_rect.height,actor.bitmap!=nil]
+              end
+              return if @slti_r105_last_wall_state==wall_state &&
+                        @slti_r49_walls.size==@slti_chunks.size
+              @slti_r105_last_wall_state=wall_state
+          CACHE
+          old134=change_once(old134,old_anchor,cache,'wall update cache')
+
+          addition=<<'RESPAWN'
+
+          # V229R105: select a different traversable position near each monster's own
+          # event region only when its original death event calls command_202.
+          # Never scan terrain or search spawn candidates on the frame update path.
+          module SLTI_R105Respawn
+            ENTRY={45=>[92,74],46=>[74,94]}.freeze
+            def self.pick(event)
+              map=$game_map
+              return nil if map==nil
+              mid=map.map_id
+              entrance=ENTRY[mid]
+              return nil if entrance==nil
+              original=event.instance_variable_get(:@event)
+              return nil if original==nil
+              x0=original.x;y0=original.y
+              last=event.instance_variable_get(:@slti_r105_last_spawn)
+              player=$game_player
+              96.times do
+                x=x0+rand(25)-12
+                y=y0+rand(25)-12
+                next if x<0 || y<0 || x>=map.width || y>=map.height
+                next unless map.data[x,y,0]==384
+                next if (x-entrance[0]).abs+(y-entrance[1]).abs<9
+                next if player!=nil && (x-player.x).abs+(y-player.y).abs<9
+                next if last!=nil && last[0]==x && last[1]==y
+                next if SLTI_Native66.nearest(mid,x,y,16)==nil
+                occupied=false
+                map.events.each_value do |other|
+                  if other!=event && other.x==x && other.y==y && other.character_name!=''
+                    occupied=true
+                    break
+                  end
+                end
+                next if occupied
+                event.instance_variable_set(:@slti_r105_last_spawn,[x,y])
+                return [x,y]
+              end
+              nil
+            end
+          end
+
+          class Interpreter
+            alias slti_r105_original_command_202 command_202
+            def command_202
+              if $game_map!=nil && SLTI_R105Respawn::ENTRY.has_key?($game_map.map_id) &&
+                 @parameters!=nil && @parameters[0]==0 && @parameters[1]==0
+                event=$game_map.events[@event_id]
+                if event!=nil && SLTI_V229R49.monster?(event)
+                  original=event.instance_variable_get(:@event)
+                  if original!=nil && original.pages.size==4 &&
+                     event.instance_variable_get(:@page).equal?(original.pages[-1])
+                    pos=SLTI_R105Respawn.pick(event)
+                    if pos!=nil
+                      event.moveto(pos[0],pos[1])
+                      return true
+                    end
+                  end
+                end
+              end
+              slti_r105_original_command_202
+            end
+          end
+          RESPAWN
+          raise 'Already patched' if old134.include?('SLTI_R105Respawn')
+          old134+=addition
+          scripts[97][2]=Zlib::Deflate.deflate(old97)
+          scripts[134][2]=Zlib::Deflate.deflate(old134)
+          File.binwrite(path,Marshal.dump(scripts))
+          File.binwrite('build/97-r105.rb',old97)
+          File.binwrite('build/134-r105.rb',old134)
+          puts "PASS R105 native tilemaps gated, wall state caching, original death respawn interception"
+          R105_PATCH
+          ruby -c build/r105_patch.rb
+          ruby build/r105_patch.rb
+          ruby -c build/97-r105.rb
+          ruby -c build/134-r105.rb
+
+          cat > build/r105_map.rb <<'R105_MAP'
           require 'digest'
           module RPG
-            class Map; end; class MapInfo; end; class AudioFile; end
-            class Tileset; end
+            class Map;end;class MapInfo;end;class AudioFile;end;class Tileset;end
             class Event
               class Page
-                class Condition; end; class Graphic; end
+                class Condition;end;class Graphic;end
               end
             end
-            class EventCommand; end; class MoveRoute; end; class MoveCommand; end
+            class EventCommand;end;class MoveRoute;end;class MoveCommand;end
           end
-          # R103 had _load only. Without _dump it encoded the Table as o:Table.
-          # RPG Maker expects a user-defined Table with its original raw data.
           class Table
-            def self._load(bytes)
-              result=allocate
-              result.instance_variable_set(:@raw,bytes)
-              result
-            end
-            def _dump(depth=0)
-              @raw
-            end
+            def self._load(data);o=allocate;o.instance_variable_set(:@raw,data);o;end
+            def _dump(limit=0);@raw;end
           end
-
           base='site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap'
-          old_hash={
-            45=>'dfa393a1a39da3f147e480836b12eb85d3c76644e7a2b0880edce84d531cce64',
-            46=>'e944fc52437afed515018bfdca76f5411cfd2e3af563f8a8f47ba1af7a42357c'
-          }
-          original_table_hash={
-            45=>'1ee818d246aed62838744cd54b06c56792d5ba4dc5de1ef82eaa2ff01a3fd74c',
-            46=>'8cd370e5bfc6e9dc483f5e35a03c6f9abac89539a35f8f8d06697771e827606c'
-          }
-          expected_events={45=>35,46=>34}
-          [45,46].each do |mid|
-            file=sprintf('%s%03d.rxdata',base,mid)
-            bytes=File.binread(file)
-            raise "Wrong R103 map #{mid}" unless Digest::SHA256.hexdigest(bytes)==old_hash.fetch(mid)
-            raise "Missing original broken Table #{mid}" unless bytes.scan("o:\nTable").length==1
-            raise "Unexpected preexisting Table #{mid}" if bytes.include?("u:\nTable")
-
-            map=Marshal.load(bytes)
-            grid=map.instance_variable_get(:@data)
-            raise 'Not an RPG Table' unless grid.instance_of?(Table)
-            payload=grid.instance_variable_get(:@raw)
-            raise "R103 S32 grid was altered #{mid}" unless
-              Digest::SHA256.hexdigest(payload)==original_table_hash.fetch(mid)
-            events=map.instance_variable_get(:@events)
-            raise "R103 events missing #{mid}" unless events.size==expected_events.fetch(mid)
-            event_digest=Digest::SHA256.hexdigest(Marshal.dump(events))
-
-            repaired=Marshal.dump(map)
-            raise "Native Table not restored #{mid}" unless
-              repaired.scan("u:\nTable").length==1 && !repaired.include?("o:\nTable")
-            check=Marshal.load(repaired)
-            raise "Event pages or coordinates changed #{mid}" unless
-              Digest::SHA256.hexdigest(Marshal.dump(check.instance_variable_get(:@events)))==event_digest
-            raise "Collision table bytes changed #{mid}" unless
-              check.instance_variable_get(:@data).instance_variable_get(:@raw)==payload
-            raise "Map geometry changed #{mid}" unless
-              check.instance_variable_get(:@width)==map.instance_variable_get(:@width) &&
-              check.instance_variable_get(:@height)==map.instance_variable_get(:@height)
-            File.binwrite(file,repaired)
-            puts "PASS Map#{mid}: o:Table -> u:Table; #{events.size} events and original S32 grid intact"
+          changes={45=>{20=>[99,74],38=>[93,81]},46=>{20=>[84,94],19=>[86,95]}}
+          original_hash={45=>'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',46=>'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'}
+          counts={45=>35,46=>34}
+          changes.each do |mid,positions|
+            path=sprintf('%s%03d.rxdata',base,mid)
+            before=File.binread(path)
+            raise 'Wrong R104 Map' unless Digest::SHA256.hexdigest(before)==original_hash[mid]
+            map=Marshal.load(before);events=map.instance_variable_get(:@events)
+            raise 'Map event count lost' unless events.size==counts[mid]
+            saved=events.transform_values{|e|Marshal.dump(e)}
+            grid=map.instance_variable_get(:@data).instance_variable_get(:@raw)
+            w=map.instance_variable_get(:@width);h=map.instance_variable_get(:@height)
+            raise 'Bad native grid' unless grid[0,20].unpack('V5')==[3,w,h,3,w*h*3]
+            positions.each do |id,(x,y)|
+              ev=events.fetch(id)
+              raise 'Not a regular monster' unless ev.instance_variable_get(:@name).start_with?('[ID')
+              raise 'Wrong spawn tile' unless grid[20+2*(y*w+x),2].unpack('v')[0]==384
+              ev.instance_variable_set(:@x,x)
+              ev.instance_variable_set(:@y,y)
+            end
+            raise 'Altered unrelated event' unless events.all?{|id,e|positions.has_key?(id) || saved[id]==Marshal.dump(e)}
+            File.binwrite(path,Marshal.dump(map))
+            again=Marshal.load(File.binread(path))
+            raise 'Bad Table encoding' unless File.binread(path).include?("u:\nTable")
+            raise 'Table bytes changed' unless again.instance_variable_get(:@data).instance_variable_get(:@raw)==grid
+            raise 'Spawn persistence failed' unless positions.all?{|id,xy|ev=again.instance_variable_get(:@events)[id];[ev.instance_variable_get(:@x),ev.instance_variable_get(:@y)]==xy}
+            puts "PASS Map#{mid} exactly #{positions.size} nearby monster entries, original 30 mobs, NPCs/boss and events unchanged"
           end
-          RB_FIX
-          ruby -c build/repair-table.rb
-          ruby build/repair-table.rb
+          R105_MAP
+          ruby -c build/r105_map.rb
+          ruby build/r105_map.rb
 
-      - name: V229R104 Refresh only two map cache entries and version labels
-        shell: bash
-        run: |
-          set -euo pipefail
           python3 - <<'PY_CACHE'
           from pathlib import Path
           import hashlib,re
           root=Path('site')
-          assets=root/'knight/gameasync'
-          mapping=assets/'mapping.js'
+          base=root/'knight/gameasync'
+          mapping=base/'mapping.js'
           code=mapping.read_text('utf-8')
-          for mid in (45,46):
-            name=f'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap{mid:03d}.rxdata'
-            digest=hashlib.md5((assets/name).read_bytes()).hexdigest()
+          names=['Data/Scripts.rxdata']
+          names += [f'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap{mid:03d}.rxdata'
+                    for mid in (45,46)]
+          for name in names:
+            md5=hashlib.md5((base/name).read_bytes()).hexdigest()
             pattern=rf'({re.escape(name)}\?h=)[0-9a-f]{{32}}'
-            code,count=re.subn(pattern,lambda m:m.group(1)+digest,code)
-            assert count==1,('Missing native map cache entry',name,count)
+            code,n=re.subn(pattern,lambda m:m.group(1)+md5,code)
+            assert n==1,('Missing game cache entry',name,n)
           mapping.write_text(code,encoding='utf-8')
           for name in ('index.html','knight/index.html'):
             path=root/name
-            html=path.read_text('utf-8')
-            assert 'V229R103' in html and 'V229R104' not in html,name
-            path.write_text(html.replace('V229R103','V229R104')
-                                .replace('v229r103','v229r104'),encoding='utf-8')
-          print('PASS native map caches and R104 labels refreshed')
+            content=path.read_text('utf-8')
+            assert 'V229R104' in content and 'V229R105' not in content
+            path.write_text(content.replace('V229R104','V229R105')
+                                   .replace('v229r104','v229r105'),encoding='utf-8')
+          print('PASS only engine, two native map caches and version labels refreshed')
           PY_CACHE
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/dpad.js
 
-      - name: V229R104 Audit exact change set and native Table round trip
+      - name: V229R105 Audit native floor pools, engine guards and exact change set
         shell: bash
         run: |
           set -euo pipefail
-          ruby - <<'RB_TABLE_CHECK'
+          cat > build/r105-audit.rb <<'R105_AUDIT'
+          require 'zlib'
           module RPG
-            class Map; end; class MapInfo; end; class AudioFile; end
-            class Tileset; end
-            class Event
-              class Page
-                class Condition; end; class Graphic; end
-              end
+           class Map;end; class MapInfo;end;class AudioFile;end;class Tileset;end
+           class Event
+            class Page
+             class Condition;end;class Graphic;end
             end
-            class EventCommand; end; class MoveRoute; end; class MoveCommand; end
+           end
+           class EventCommand;end;class MoveRoute;end;class MoveCommand;end
           end
           class Table
-            def self._load(bytes)
-              result=allocate
-              result.instance_variable_set(:@raw,bytes)
-              result
-            end
-            def _dump(depth=0); @raw; end
+           def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+           def _dump(limit=0);@raw;end
           end
+          root=ARGV.fetch(0)
+          script=Marshal.load(File.binread(root+'/Scripts.rxdata'))
+          src=Zlib::Inflate.inflate(script[134][2]);a=src.index("module SLTI_Native66\n");b=src.index("\nclass Game_Character",a)
+          raise 'Missing native source' unless a && b
+          Object.class_eval(src[a...b])
+          from=src.index("module SLTI_V229R97Corner\n")
+          till=src.index("# V229R105: select",from)
+          raise 'Missing source extension' unless from && till
+          Object.class_eval(src[from...till])
+          expected={45=>[[99,74],[93,81]],46=>[[84,94],[86,95]]}
           [45,46].each do |mid|
-            file=sprintf('site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap%03d.rxdata',mid)
-            raw=File.binread(file)
-            raise 'Table is not native user-defined type' unless
-              raw.scan("u:\nTable").size==1 && raw.scan("o:\nTable").empty?
-            map=Marshal.load(raw)
-            raise 'Table not recoverable' unless map.instance_variable_get(:@data).is_a?(Table)
-            raise 'RPG map round trip unstable' unless Marshal.dump(map)==raw
-            puts "PASS fresh Map#{mid} load and native Table marshal round trip"
+            m=Marshal.load(File.binread(root+sprintf('/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap%03d.rxdata',mid)))
+            w=m.instance_variable_get(:@width);h=m.instance_variable_get(:@height)
+            raw=m.instance_variable_get(:@data).instance_variable_get(:@raw)
+            entry=mid==45 ? [92,74] : [74,94]
+            events=m.instance_variable_get(:@events)
+            mobs=events.values.select{|e|e.instance_variable_get(:@name).start_with?('[ID') && !(mid==45 && e.instance_variable_get(:@id)==13) && !(mid==46 && e.instance_variable_get(:@id)==3)}
+            raise "Wrong monster count #{mid}" unless mobs.size==30
+            names=mobs.map{|ev|ev.instance_variable_get(:@name).dup.force_encoding('UTF-8')}.tally
+            min=100000
+            mobs.each do |e|
+              ox=e.instance_variable_get(:@x);oy=e.instance_variable_get(:@y)
+              raise 'Monster on an RPG wall' unless raw[20+2*(oy*w+ox),2].unpack('v')[0]==384
+              near=SLTI_Native66.nearest(mid,ox,oy,16)
+              raise "Monster anchor cannot find original S32 floor #{mid} #{e.instance_variable_get(:@id)} #{ox},#{oy}" unless near
+              pool=0
+              (-12..12).each do |dy|
+                (-12..12).each do |dx|
+                  x=ox+dx;y=oy+dy
+                  next unless x>=0 && y>=0 && x<w && y<h
+                  next if (x-entry[0]).abs+(y-entry[1]).abs<9
+                  next unless raw[20+2*(y*w+x),2].unpack('v')[0]==384
+                  pool+=1 if SLTI_Native66.nearest(mid,x,y,16)!=nil
+                end
+              end
+              min=[min,pool].min
+              raise "Too few random respawn cells #{mid} ev #{e.instance_variable_get(:@id)} #{pool}" if pool<20
+            end
+            nearby=mobs.map{|e|x=e.instance_variable_get(:@x);y=e.instance_variable_get(:@y);[e.instance_variable_get(:@id),(x-entry[0]).abs+(y-entry[1]).abs]}.select{|id,d|d<=18}.sort_by{|x|x[1]}
+            expected[mid].each do |xy|
+              raise "Moved near entrance wrong #{mid} #{xy}" unless mobs.any?{|e|e.instance_variable_get(:@x)==xy[0] && e.instance_variable_get(:@y)==xy[1]}
+            end
+            puts "PASS map#{mid}: #{mobs.size} living monster events, random spots min #{min}, near entrance #{nearby.inspect}, types #{names.inspect}"
           end
-          RB_TABLE_CHECK
-          python3 - <<'PY_DIFF'
+          R105_AUDIT
+          ruby build/r105-audit.rb site/knight/gameasync/Data
+          python3 - <<'PY_CHANGES'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
@@ -207,16 +359,19 @@ jobs:
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
           assert len(after)==len(before)==5517 and after.keys()==before.keys()
-          changed={name for name in before if before[name]!=after[name]}
-          expected={'index.html','knight/index.html','knight/gameasync/mapping.js'}
+          changed={x for x in after if after[x]!=before[x]}
+          expected={'index.html','knight/index.html','knight/gameasync/mapping.js',
+                    'knight/gameasync/Data/Scripts.rxdata'}
           expected|={f'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap{mid:03d}.rxdata'
-                    for mid in (45,46)}
-          assert changed==expected,('Unexpected changes',changed^expected)
-          print('PASS exactly 2 native map files, 1 cache, 2 HTML labels changed')
-          print('PASS scripts, 1F/2F C and W images, monsters, 4-way D-pad all unchanged')
-          PY_DIFF
+                     for mid in (45,46)}
+          assert changed==expected,('Unexpected modifications',changed^expected)
+          assert after['knight/js/dpad.js']==before['knight/js/dpad.js']
+          assert not any('/Graphics/' in x for x in changed)
+          print('PASS only six expected deployment files differ from R104')
+          print('PASS complete original 1F/2F C/W art, S32 and four-direction D-pad unchanged')
+          PY_CHANGES
 
-      - name: V229R104 Publish fixed native Tables and preserved R103 game
+      - name: V229R105 Publish original graphics and lighter native terrain renderer
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
