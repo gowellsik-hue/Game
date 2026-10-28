@@ -1,13 +1,13 @@
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R120
-# BASE: successfully deployed V229R117, run 40624859427 (not R118/R119).
-# R119 FAILURE: incorrect hash for knight/js/dpad.js; use actual R117 SHA256.
-# REMOVE ONLY: added Game_Character movement/real-coordinate overrides.
-# KEEP: approved R97 passage masks, extra opening, R44/R49 wall constraints,
-#       original native map graph, doors, events, respawn rules, load packs.
-# ART ONLY: move both Map045/046 floor and wall sprite images +24,+12 screen pixels.
-# Never reposition players, monsters, collision cells, doors or map data.
-name: build-slknight-web.yml | V229R120 | Clean Native Events and 2x Terrain
+# VERSION: V229R121
+# BASE: verified deployed R120, run 40639112118. Do not use R118/R119.
+# RESTORE: R93 S32 map projection (+12,+6) relative to ORIGINAL floor and wall art.
+# R120 ERROR: moving both floor and wall images (+24,+12) cancelled that alignment.
+# KEEP: Map045/046 S32 projection and inverse, 452 approved direction masks,
+#       added passable corner, wall occlusion, player/monster actor cleanup,
+#       original maps, doors, respawns, sprites, input and R115 preloading.
+# CHANGE: undo ONLY R120's 8 floor and 2 wall artwork-position expressions.
+name: build-slknight-web.yml | V229R121 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,212 +30,179 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R120 Restore deployed R117, preserving maps and packages
+      - name: V229R121 Restore deployed R120 without reverting approved game features
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 40624859427
+          run-id: 40639112118
           name: github-pages
           github-token: ${{ github.token }}
-          path: r117
+          path: r120
 
-      - name: V229R120 Verify baseline and patch ONLY actor coordinates and art placement
+      - name: V229R121 Revert only the incorrect floor and wall image offsets
         shell: bash
         run: |
           set -euo pipefail
-          test -s r117/artifact.tar
+          test -s r120/artifact.tar
           mkdir -p site build
-          tar -xf r117/artifact.tar -C site
-          python3 - <<'R120_BASE'
+          tar -xf r120/artifact.tar -C site
+          python3 - <<'R121_BASE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
           before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in root.rglob('*') if p.is_file()}
-          assert len(before)==5566,('Wrong R117 baseline',len(before))
+          assert len(before)==5566,('R120 file count',len(before))
           expected={
+            'knight/gameasync/Data/Scripts.rxdata':'ff780a370fda1c07657b7ce504eb9e099706bcf8afa02223a29beaba6f93643b',
             'knight/js/dpad.js':'2bd401adf130339d154ce6a8efd0127cefd9b1bc58bc60d1de68e8b6d8b7a791',
-            'knight/gameasync/Data/Scripts.rxdata':'26e9eab43df5ea98406db49881ba45b3eb27af72ada6781ec317f3f4aa6db599',
             'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
             'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'}
-          for path,sha in expected.items():assert before[path]==sha,('Wrong R117 file',path)
-          assert 'V229R117' in (root/'knight/index.html').read_text('utf8')
-          (Path('build')/'before.json').write_text(json.dumps(before,sort_keys=True))
-          print('PASS R117 baseline, correct dpad checksum and approved map data')
-          R120_BASE
-          cat > build/r120_patch.rb <<'R120_RUBY'
+          for p,sha in expected.items():assert before[p]==sha,('Wrong R120 baseline',p)
+          assert 'V229R120' in (root/'knight/index.html').read_text('utf8')
+          Path('build/before.json').write_text(json.dumps(before,sort_keys=True))
+          print('PASS exact deployed R120 and both original map files')
+          R121_BASE
+          cat > build/r121.rb <<'R121_RUBY'
           require 'zlib'
-          file=ARGV.fetch(0)
-          scripts=Marshal.load(File.binread(file))
-          raise 'Unexpected scripts count' unless scripts.size==136
-          old97=Zlib::Inflate.inflate(scripts[97][2])
-          old134=Zlib::Inflate.inflate(scripts[134][2])
-          s=old134;t=old97
+          require 'digest'
+          path='site/knight/gameasync/Data/Scripts.rxdata'
+          scripts=Marshal.load(File.binread(path))
+          raise 'Wrong scripts count' unless scripts.size==136
+          original97=Zlib::Inflate.inflate(scripts[97][2])
+          original134=Zlib::Inflate.inflate(scripts[134][2])
+          floor=original97.dup
+          walls=original134.dup
 
-          def cut(s,left,right,label)
-            a=s.index(left)
-            b=a && s.index(right,a)
-            raise "#{label}: missing boundaries" unless a && b && a<b
-            [s[0...a]+s[b..-1],s[a...b]]
+          def replace_one(source,old,new_value)
+            count=source.scan(Regexp.new(Regexp.escape(old))).length
+            raise "Expected exactly one image coordinate: #{old} (found #{count})" unless count==1
+            source.sub(old,new_value)
           end
 
-          def once(s,old,new_text,label)
-            n=s.scan(Regexp.new(Regexp.escape(old))).size
-            raise "#{label}: count #{n}" unless n==1
-            s.sub(old,new_text)
-          end
-
-          # Remove only the extra character movement/real-coordinate block.
-          s,actor=cut(s,"\nclass Game_Character\n  alias slti_native66_original_moveto moveto", "\n# Replace the old R42/R44 graph", 'actor mover')
-          %w[slti_native66_prepare slti_native66_move slti_native66_original_moveto slti_native66_original_update_move].each do |key|
-            raise "Missing actor method #{key}" unless actor.include?(key)
-          end
-          # Retain the approved Game_Map passability, R97 passage masks and wall rendering.
-          # Remove only Game_Character override that calls the deleted character state.
-          s,actor_pass=cut(s,"\nclass Game_Character\n  alias slti_native66_original_passable passable?", "\n# V229R97:", 'character passable')
-          raise 'Wrong character passable block' unless actor_pass.include?('slti_native66_prepare')
-
-          # These helpers existed only to place characters at custom real coordinates.
-          convert=<<'CONVERT'
-            def self.real(mid,x,y)
-              px,py=project(mid,x,y)
-              # screen_x=real_x/4+16, screen_y=real_y/4+32, terrain=source x2
-              return [px*8-64,py*8-128]
-            end
-            def self.to_rgss(mid,x,y)
-              px,py=project(mid,x,y)
-              return [px/16,py/16]
-            end
-          CONVERT
-          s=once(s,convert,'','actor coordinate helpers')
-
-          # Keep random spawn positions, native bounds tests, entrance exclusion,
-          # and last-native no-repeat filter. Only replace references to removed actor state.
-          occupied=<<'OCCUPIED'
-                  if SLTI_V229R49.monster?(other)
-                    other.slti_native66_prepare
-                    ox=other.instance_variable_get(:@slti_native66_x)
-                    oy=other.instance_variable_get(:@slti_native66_y)
-                    occupied=(ox==native[0] && oy==native[1])
-                  else
-                    occupied=(other.x==x && other.y==y)
-                  end
-          OCCUPIED
-          s=once(s,occupied,"        occupied=(other.x==x && other.y==y)\n",'respawn occupancy actor reference')
-
-          # The Map045/046 one-cell visual shift must be applied to FLOOR & WALL only.
-          # Artwork is 2x original: one source pixel offset (+12,+6) => (+24,+12).
-          # Keep original camera/world/event coordinates and all passability functions.
+          # Restore the unshifted R93/R117 artwork, not actor or map coordinates.
           {
-            'left=[sx/1024,0].max'=>'left=[(sx-24)/1024,0].max',
-            'top=[sy/1024,0].max'=>'top=[(sy-12)/1024,0].max',
-            'right=[(sx+vw-1)/1024,@slti_cols-1].min'=>'right=[(sx+vw-1-24)/1024,@slti_cols-1].min',
-            'bottom=[(sy+vh-1)/1024,@slti_rows-1].min'=>'bottom=[(sy+vh-1-12)/1024,@slti_rows-1].min',
-            'sprite.x=key[0]*1024-sx'=>'sprite.x=key[0]*1024-sx+24',
-            'sprite.y=key[1]*1024-sy'=>'sprite.y=key[1]*1024-sy+12',
-            'sprite.x=x*1024-sx'=>'sprite.x=x*1024-sx+24',
-            'sprite.y=y*1024-sy'=>'sprite.y=y*1024-sy+12'
-          }.each{|a,b|t=once(t,a,b,'floor art')}
+            'left=[(sx-24)/1024,0].max'=>'left=[sx/1024,0].max',
+            'top=[(sy-12)/1024,0].max'=>'top=[sy/1024,0].max',
+            'right=[(sx+vw-1-24)/1024,@slti_cols-1].min'=>'right=[(sx+vw-1)/1024,@slti_cols-1].min',
+            'bottom=[(sy+vh-1-12)/1024,@slti_rows-1].min'=>'bottom=[(sy+vh-1)/1024,@slti_rows-1].min',
+            'sprite.x=key[0]*1024-sx+24'=>'sprite.x=key[0]*1024-sx',
+            'sprite.y=key[1]*1024-sy+12'=>'sprite.y=key[1]*1024-sy',
+            'sprite.x=x*1024-sx+24'=>'sprite.x=x*1024-sx',
+            'sprite.y=y*1024-sy+12'=>'sprite.y=y*1024-sy'
+          }.each{|old,new_value|floor=replace_one(floor,old,new_value)}
           {
-            'wall_x=cx*1024+(id%4)*256-sx'=>'wall_x=cx*1024+(id%4)*256-sx+24',
-            'wall_y=cy*1024+(id/4)*128-sy'=>'wall_y=cy*1024+(id/4)*128-sy+12'
-          }.each{|a,b|s=once(s,a,b,'wall art')}
+            'wall_x=cx*1024+(id%4)*256-sx+24'=>'wall_x=cx*1024+(id%4)*256-sx',
+            'wall_y=cy*1024+(id/4)*128-sy+12'=>'wall_y=cy*1024+(id/4)*128-sy'
+          }.each{|old,new_value|walls=replace_one(walls,old,new_value)}
 
-          # Verify that only actor movement and a single actor-dependent occupancy
-          # expression changed in the gameplay logic. No passage/wall masks altered.
-          raise 'Native map graph removed' unless s.include?('module SLTI_Native66') && s.include?('module SLTI_V229R97Corner')
-          raise 'Map passability removed' unless s.include?("class Game_Map\n  alias slti_native66_original_passable passable?")
-          raise 'Approved R49 wall constraints removed' unless s.include?('module SLTI_V229R49') && s.include?('SLTI_V229R44.allowed?')
-          raise 'Actor coordinate references remain' if s.include?('slti_native66_prepare') || s.include?('@slti_native66_') || s.include?('slti_native66_move')
-          raise 'Respawn changed too far' unless s.include?('module SLTI_R111Respawn') && s.include?('last_native==native')
-          raise 'Original map graph changed' unless old134[/  EDGES=\{.*?\n  \}/m]==s[/  EDGES=\{.*?\n  \}/m]
-          raise 'R97 masks changed' unless old134[/# V229R97:.*?(?=\n# V229R84:)/m]==s[/# V229R97:.*?(?=\n# V229R84:)/m]
-          raise 'Map projection changed' unless old134[/  def self.project\(mid,x,y\).*?^  end/m]==s[/  def self.project\(mid,x,y\).*?^  end/m]
-          raise 'Map inverse changed' unless old134[/  def self.nearest\(mid,rx,ry,radius=16\).*?^  end/m]==s[/  def self.nearest\(mid,rx,ry,radius=16\).*?^  end/m]
-          raise 'Unexpected floor offsets' unless t.include?('sprite.x=x*1024-sx+24') && t.include?('sprite.y=y*1024-sy+12')
-          raise 'Unexpected wall offsets' unless s.include?('wall_x=cx*1024+(id%4)*256-sx+24') && s.include?('wall_y=cy*1024+(id/4)*128-sy+12')
-          scripts[97][2]=Zlib::Deflate.deflate(t)
-          scripts[134][2]=Zlib::Deflate.deflate(s)
-          File.binwrite(file,Marshal.dump(scripts))
-          File.binwrite('build/97-r120.rb',t)
-          File.binwrite('build/134-r120.rb',s)
-          puts "PASS R117 script134 #{old134.lines.size} -> #{s.lines.size}; script97 #{old97.lines.size} -> #{t.lines.size}"
-          puts 'PASS actor coordinate overrides removed; all approved mask and wall graph retained; both floors images +24,+12'
-          R120_RUBY
-          ruby -c build/r120_patch.rb
-          ruby build/r120_patch.rb site/knight/gameasync/Data/Scripts.rxdata
-          ruby -c build/97-r120.rb
-          ruby -c build/134-r120.rb
+          # Reference: unmodified floor renderer from deployed R117.
+          expected_floor_sha='da4bbbcafc4744274d3dc5e9e5e1e4d348f81d688c302360371131ff84f8443f'
+          raise 'Floor no longer matches original renderer' unless
+            Digest::SHA256.hexdigest(floor)==expected_floor_sha
+          # Absolutely no other RPG scripts, character state, collision,
+          # S32 projection, direction mask or monster behavior is changed.
+          raise 'Wall edit extended beyond two image coordinates' unless
+            walls==original134.sub('wall_x=cx*1024+(id%4)*256-sx+24',
+                                  'wall_x=cx*1024+(id%4)*256-sx')
+                              .sub('wall_y=cy*1024+(id/4)*128-sy+12',
+                                   'wall_y=cy*1024+(id/4)*128-sy')
+          raise 'Original map projection lost' unless
+            walls.include?("if mid==45 || mid==46\n      px+=12\n      py+=6") &&
+            walls.include?("if mid==45 || mid==46\n      native_u-=12\n      native_v-=6")
+          raise 'Extra passage or wall logic missing' unless
+            walls.include?('module SLTI_V229R97Corner') &&
+            walls.include?('module SLTI_V229R49') &&
+            walls.include?('module SLTI_R111Respawn') &&
+            walls.include?('def slti_r49_update_walls')
+          raise 'Deleted character coordinate correction unexpectedly restored' if
+            walls.include?('slti_native66_prepare') ||
+            walls.include?('@slti_native66_') ||
+            walls.include?('slti_native66_original_moveto')
 
-      - name: V229R120 Update script cache and labels, audit all 5566 files
+          scripts[97][2]=Zlib::Deflate.deflate(floor)
+          scripts[134][2]=Zlib::Deflate.deflate(walls)
+          File.binwrite(path,Marshal.dump(scripts))
+          File.binwrite('build/97-r121.rb',floor)
+          File.binwrite('build/134-r121.rb',walls)
+          puts 'PASS restored 8 floor + 2 wall image expressions; no game logic edits'
+          R121_RUBY
+          ruby -c build/r121.rb
+          ruby build/r121.rb
+          ruby -c build/97-r121.rb
+          ruby -c build/134-r121.rb
+
+      - name: V229R121 Verify R93 mapping, protected passages and file changes
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'R120_AUDIT'
+          cat > build/r121_audit.rb <<'R121_AUDIT'
+          require 'zlib'
+          s=File.binread('build/134-r121.rb')
+          a=s.index("module SLTI_Native66\n")
+          b=s.index("\n# Replace the old R42/R44 graph",a||0)
+          raise 'Missing original S32 grid module' unless a && b
+          Object.class_eval(s[a...b])
+          c=s.index("module SLTI_V229R97Corner\n")
+          d=s.index("\n# V229R84:",c||0)
+          raise 'Missing approved passage masks' unless c && d
+          Object.class_eval(s[c...d])
+          e=s.index("module SLTI_Native66\n",d)
+          f=s.index("\n# V229R111:",e||0)
+          raise 'Missing directional passage module' unless e && f
+          Object.class_eval(s[e...f])
+          raise 'R93 Map045 coordinate lost' unless SLTI_Native66.project(45,32655,32806)==[1416,1290]
+          raise 'Map046 coordinate not shifted one cell' unless SLTI_Native66.project(46,32655,32806)==[1416,1674]
+          masks=SLTI_V229R97Corner::MASKS
+          raise 'Approved 452 masks changed' unless masks.size==452 && masks[[32655,32806]]==12
+          raise 'Extra opening base tile lost' unless SLTI_Native66.value(45,32655,32806)==0
+          puts 'PASS R93 Map045 (1416,1290), 2F same vector, approved 452 masks and extra passage'
+          R121_AUDIT
+          ruby build/r121_audit.rb
+          python3 - <<'R121_FILES'
           from pathlib import Path
           import hashlib,json,re
           root=Path('site')
-          code=root/'knight/gameasync/Data/Scripts.rxdata'
+          scripts=root/'knight/gameasync/Data/Scripts.rxdata'
           mapping=root/'knight/gameasync/mapping.js'
-          src=mapping.read_text('utf8')
-          md5=hashlib.md5(code.read_bytes()).hexdigest()
-          src,n=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
-                        lambda m:m.group(1)+md5,src)
-          assert n==1,('Wrong script cache mapping count',n)
-          mapping.write_text(src,encoding='utf8')
+          text=mapping.read_text('utf8')
+          text,n=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
+             lambda m:m.group(1)+hashlib.md5(scripts.read_bytes()).hexdigest(),text)
+          assert n==1,('Missing script cache key',n)
+          mapping.write_text(text,encoding='utf8')
           for name in ('index.html','knight/index.html'):
-            p=root/name
-            html=p.read_text('utf8')
-            assert 'V229R117' in html and 'V229R120' not in html
-            p.write_text(html.replace('V229R117','V229R120')
-                .replace('v229r117','v229r120'),encoding='utf8')
+              page=root/name
+              html=page.read_text('utf8')
+              assert 'V229R120' in html and 'V229R121' not in html
+              page.write_text(html.replace('V229R120','V229R121')
+                               .replace('v229r120','v229r121'),encoding='utf8')
           runtime=root/'knight/js/sl-assets-v229r115.js'
           js=runtime.read_text('utf8')
-          assert js.count("var version='V229R117';")==1
-          runtime.write_text(js.replace("var version='V229R117';",
-                     "var version='V229R120';"),encoding='utf8')
+          assert js.count("var version='V229R120';")==1
+          runtime.write_text(js.replace("var version='V229R120';",
+                                        "var version='V229R121';"),encoding='utf8')
           before=json.loads(Path('build/before.json').read_text('utf8'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          assert before.keys()==after.keys() and len(before)==5566
-          changed={p for p in before if before[p]!=after[p]}
-          approved={'index.html','knight/index.html',
-                    'knight/gameasync/mapping.js',
-                    'knight/gameasync/Data/Scripts.rxdata',
-                    'knight/js/sl-assets-v229r115.js'}
-          assert changed==approved,('Unexpected game changes',changed^approved)
+          assert len(before)==len(after)==5566 and before.keys()==after.keys()
+          modified={p for p in before if before[p]!=after[p]}
+          expected={'index.html','knight/index.html','knight/gameasync/mapping.js',
+                    'knight/gameasync/Data/Scripts.rxdata','knight/js/sl-assets-v229r115.js'}
+          assert modified==expected,('Unexpected file changes',modified^expected)
           for p in before:
-            if p.startswith('knight/assets/') or p.startswith('knight/gameasync/Graphics/') or \
-               p.startswith('knight/gameasync/Data/') and not p.endswith('/Scripts.rxdata') or \
-               p in ('knight/js/dpad.js','knight/js/drive.js'):
-              assert before[p]==after[p],('Protected content changed',p)
-          actor=Path('build/134-r120.rb').read_text('utf8')
-          floor=Path('build/97-r120.rb').read_text('utf8')
-          assert all(s not in actor for s in ('slti_native66_prepare',
-                      'slti_native66_move','@slti_native66_',
-                      'slti_native66_original_moveto'))
-          assert 'module SLTI_V229R97Corner' in actor
-          assert 'module SLTI_Native66' in actor
-          assert 'alias slti_native66_original_passable passable?' in actor
-          assert 'module SLTI_R111Respawn' in actor
-          assert 'SLTI_V229R49.monster?' in actor
-          assert 'wall_x=cx*1024+(id%4)*256-sx+24' in actor
-          assert 'wall_y=cy*1024+(id/4)*128-sy+12' in actor
-          assert 'sprite.x=x*1024-sx+24' in floor
-          assert 'sprite.y=y*1024-sy+12' in floor
-          assert 'sprite.x=key[0]*1024-sx+24' in floor
-          assert 'sprite.y=key[1]*1024-sy+12' in floor
-          assert 'js/sl-assets-v229r115.js?v=v229r120' in (root/'knight/index.html').read_text('utf8')
-          print('PASS 5566 files; only 5 approved files changed')
-          print('PASS both floors original passages, walls, doors, spawns and action packs unchanged')
-          print('PASS only actor coordinates removed; floor/wall artwork shifted right/down')
-          R120_AUDIT
+              if (p.startswith('knight/assets/') or
+                  p.startswith('knight/gameasync/Graphics/') or
+                  (p.startswith('knight/gameasync/Data/') and not p.endswith('Scripts.rxdata')) or
+                  p in ('knight/js/dpad.js','knight/js/drive.js')):
+                  assert before[p]==after[p],('Protected content modified',p)
+          print('PASS only 5 expected files changed; maps, doors, enemies, PNG and packs untouched')
+          R121_FILES
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
-          node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
+          node --check site/knight/gameasync/mapping.js
 
-      - name: V229R120 Publish R117 preserved gameplay with repaired coordinates
+      - name: V229R121 Publish corrected original dungeon coordinate alignment
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
