@@ -1,13 +1,15 @@
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R114
-# BASE: verified deployed V229R111, run 40523152040 (R112 failed; do not use it).
-# MAP ACTIONS: bundle event graphics and their attack/hit/death/motion variants
-#              for each of the actual 46 maps; include map-specific floor/walls.
-# INVENTORY: stage 395 existing icon bytes at boot without setting decoded flags.
-# LOADING: stage bytes in JS transport cache only; native PNG decoder remains in use.
-# KEEP: exact R111 Scripts.rxdata, Map045/046, S32 movement, doors, NPCs,
-#       monster positions, shifted original art, 4-way pad, other game files.
-name: build-slknight-web.yml | V229R114 | Clean Native Events and 2x Terrain
+# VERSION: V229R115
+# BASE: deployed R111, run 40523152040. R112 was invalid.
+# FIX: download the current map's native terrain BEFORE its map data is passed
+#      to the engine. Stage all shared action/character/UI graphics once.
+# INVENTORY: stage all 395 icons before the engine starts.
+# SAFETY: no fabricated passable tiles, no changed maps, doors, monster spawns,
+#         screen projection, native movement, monster collision, or sprite art.
+# DECODE: use the original FS.createPreloadedFile as needed; special C/W floor
+#         textures are downloaded first but decoded only when actually visible.
+# FAILURE: a visible retry control, never silently enter with missing assets.
+name: build-slknight-web.yml | V229R115 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R114 Restore exact deployed R111
+      - name: V229R115 Restore deployed R111
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -38,14 +40,13 @@ jobs:
           name: github-pages
           github-token: ${{ github.token }}
           path: r111
-
-      - name: V229R114 Verify untouched R111 original game
+      - name: V229R115 Verify original engine and map data
         shell: bash
         run: |
           set -euo pipefail
-          test -s r111/artifact.tar
           rm -rf site
           mkdir -p site build
+          test -s r111/artifact.tar
           tar -xf r111/artifact.tar -C site
           python3 - <<'PY_BASE'
           from pathlib import Path
@@ -53,25 +54,24 @@ jobs:
           root=Path('site')
           files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          assert len(files)==5517,('Wrong R111 baseline count',len(files))
+          assert len(files)==5517,('Wrong R111 baseline',len(files))
           expected={
-            'knight/js/drive.js':'833a13026929d62d24a5ad645a8af764511fe40584ebefcf5d1b3251d9a35573',
-            'knight/js/dpad.js':'2bd401adf130339d154ce6a8efd0127cefd9b1bc58bc60d1de68e8b6d8b7a791',
-            'knight/gameasync/Data/Scripts.rxdata':'e7cc01b36ad7edc18d8026854f4ae37932ebadb74e54d2b43ab47cc6ae112aee',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'}
-          for path,sha in expected.items():assert files[path]==sha,('Wrong R111 file',path)
+           'knight/js/drive.js':'833a13026929d62d24a5ad645a8af764511fe40584ebefcf5d1b3251d9a35573',
+           'knight/js/dpad.js':'2bd401adf130339d154ce6a8efd0127cefd9b1bc58bc60d1de68e8b6d8b7a791',
+           'knight/gameasync/Data/Scripts.rxdata':'e7cc01b36ad7edc18d8026854f4ae37932ebadb74e54d2b43ab47cc6ae112aee',
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'}
+          for path,sha in expected.items():assert files[path]==sha,('Baseline mismatch',path)
           for path in ('index.html','knight/index.html'):
-            assert 'V229R111' in (root/path).read_text('utf8')
+           assert 'V229R111' in (root/path).read_text('utf8')
           Path('build/before.json').write_text(json.dumps(files,sort_keys=True))
-          print('PASS deployed R111: 5517 files, original dpad, map collision and engine')
+          print('PASS R111 baseline, original engine and maps unchanged')
           PY_BASE
-
-      - name: V229R114 Pack map actions and inventory icons; update loader
+      - name: V229R115 Package mapped actions and block entry until downloaded
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/export_maps.rb <<'R114_MAPS'
+          cat > build/export_maps.rb <<'R115_EXPORT'
           require 'json'
           module RPG
             class Map;end; class MapInfo;end; class AudioFile;end; class Tileset;end
@@ -141,300 +141,350 @@ jobs:
            result[mid]={name:text(info[mid].instance_variable_get(:@name)),graphics:graphics.uniq.sort,events:events.uniq.sort,scripts:scripts.uniq.sort,terrain:tileset_files.compact.reject(&:empty?).uniq}
           end
           STDOUT.write(JSON.generate(result))
-          R114_MAPS
-          cat > build/pack_assets.py <<'R114_PACKS'
+          R115_EXPORT
+          cat > build/build_packs.py <<'R115_PACKER'
           from pathlib import Path
-          import collections, json, re, struct, os, hashlib, sys
-          root=Path(sys.argv[1])
+          import collections, hashlib, json, re, struct, sys
+
+          root=Path(sys.argv[1]); output=Path(sys.argv[2]); output.mkdir(exist_ok=True,parents=True)
           base=root/'knight/gameasync'
-          assets=root/'knight/assets'; assets.mkdir(exist_ok=True)
-          lines=(base/'mapping.js').read_text(encoding='utf8').splitlines()
           source={}
-          for l in lines:
-              if l.startswith('["'):
-                  try: k,v=json.loads(l.rstrip(','))
-                  except ValueError:continue
-                  if '?' in v and not v.endswith('h='):source[k]=v.split('?',1)[0]
+          for ln in (base/'mapping.js').read_text(encoding='utf8').splitlines():
+              if not ln.startswith('["'):continue
+              try: key,mapped=json.loads(ln.rstrip(','))
+              except ValueError:continue
+              if '?' in mapped and not mapped.endswith('h='):
+                  source[key]=mapped.split('?',1)[0]
 
-          def norm(x):return re.sub(r'[\s_\-\.]+','',x.casefold())
+          def pack(filename,kind,mid,keys):
+              keys=sorted(set(keys)); parts=[];index=[];offset=0
+              for key in keys:
+                  if key not in source:raise ValueError(('Missing mapping',key))
+                  file=base/source[key]
+                  if not file.is_file():raise ValueError(('Missing file',key,file))
+                  data=file.read_bytes()
+                  if source[key].lower().endswith('.png') and not data.startswith(b'\x89PNG\r\n\x1a\n'):
+                      raise ValueError(('Invalid PNG',key))
+                  index.append([key,offset,len(data)])
+                  parts.append(data);offset+=len(data)
+              if not keys:raise ValueError(('Empty pack',filename))
+              header=json.dumps({'kind':kind,'map_id':mid,'files':index},separators=(',',':'),ensure_ascii=False).encode()
+              (output/filename).write_bytes(struct.pack('<I',len(header))+header+b''.join(parts))
+              return len(keys),sum(map(len,parts))
 
-          def key_name(k):
-              return norm(k.rsplit('/',1)[-1])
-
-          by_cat=collections.defaultdict(dict)
-          for k,v in source.items():
-              prefix=k.split('/',1)[0]+'/'+k.split('/',2)[1] if k.count('/')>=1 else k
-              by_cat[prefix][k]=v
-
-          def kfrom(cat,name):
-              k=(cat+'/'+name).casefold()
-              return k if k in source else None
-
-          # A page's character graphic is the declared identity; collect all action variants
-          # with that full identity, including attack, hit, death and directional images.
-          def shorten(name):
-              x=norm(name)
-              for suffix in ['죽음캐릭터','죽음모션','좌표','죽음','사망','피격','맞음','공격','이동','대기','모션','창']:
-                  if x.endswith(suffix) and len(x)>len(suffix):
-                      x=x[:-len(suffix)]
-                      break
-              return x
-
-          info=json.loads(Path(sys.argv[2]).read_text(encoding='utf8'))
-          indices={}
-          reports=[]
-          for mid,rec in info.items():
-              names=set(rec['graphics'])
-              for e in rec['events']:
-                  if e.startswith('[ID'):
-                      # Some event names include a trailing bracket, some do not.
-                      n=e[3:].split(']')[0].strip()
-                      if n:names.add(n)
-              stems={shorten(name) for name in names if name}
-              stems={s for s in stems if s and not s.isnumeric()}
+          icons=[k for k in source if k.startswith('graphics/icons/')]
+          assert len(icons)==395,('Wrong icon count',len(icons))
+          shared=[k for k in source if (k.startswith('graphics/') and not k.startswith(('graphics/icons/','graphics/tilesets/','graphics/panoramas/'))) or k.startswith('audio/se/')]
+          i=pack('icons-v229r115.pack','icons',None,icons)
+          s=pack('shared-v229r115.pack','shared',None,shared)
+          meta=json.loads(Path(sys.argv[3]).read_text(encoding='utf8'))
+          summary={}
+          for sid,info in meta.items():
+              mid=int(sid)
               keys=set()
-              direct_missing=[]
-              for name in rec['graphics']:
-                  k=kfrom('graphics/characters',name)
-                  if k:keys.add(k)
-                  else:direct_missing.append(name)
-              for cat in ['graphics/characters','graphics/animations','graphics/pictures','audio/se']:
-                  for k in by_cat.get(cat,{}):
-                      n=key_name(k)
-                      if any(n.startswith(s) for s in stems): keys.add(k)
-              # Exact asset names passed by event scripts for Change Graphic, Show Picture etc.
-              for s in rec['scripts']:
-                  for cat in ['graphics/characters','graphics/animations','graphics/pictures']:
-                      k=kfrom(cat,s)
-                      if k:keys.add(k)
-              # The map's actual tileset and fog/autotiles are also map-scoped.
-              for n in rec['terrain']:
-                  for cat in ['graphics/tilesets','graphics/fogs','graphics/panoramas','graphics/autotiles']:
-                      k=kfrom(cat,n)
-                      if k:keys.add(k)
-              if mid in ['45','46']:
-                  keys|={k for k in source if re.match(r'^graphics/panoramas/slti_'+mid+r'_(c\d+_\d+|w_c\d+_\d+)$',k)}
-              keys=sorted(keys)
-              assert keys,mid
-              reports.append((int(mid),rec['name'],len(keys),sum((base/source[k]).stat().st_size for k in keys),len(direct_missing),direct_missing))
-              indices[mid]=keys
-
-          def pack(kind,mid,keys,filename):
-              rows=[];payload=[];offset=0
-              for k in keys:
-                  path=base/source[k]
-                  assert path.is_file(),(k,path)
-                  data=path.read_bytes()
-                  assert len(data)>4,(k,len(data))
-                  if source[k].lower().endswith('.png'):assert data[:8]==b'\x89PNG\r\n\x1a\n',k
-                  rows.append([k,offset,len(data)])
-                  payload.append(data);offset+=len(data)
-              header=json.dumps({'kind':kind,'map_id':mid,'files':rows},ensure_ascii=False,separators=(',',':')).encode('utf8')
-              f=assets/filename
-              f.write_bytes(struct.pack('<I',len(header))+header+b''.join(payload))
-              return f, len(rows), len(header),sum(map(len,payload))
-
-          for mid,keys in indices.items():
-              f,*_ =pack('map',int(mid),keys,f'map-{int(mid):03d}-v229r114.pack')
-
-          icon_keys=sorted(k for k in source if k.startswith('graphics/icons/'))
-          assert len(icon_keys)==395,len(icon_keys)
-          icons=pack('icons',None,icon_keys,'icons-v229r114.pack')
-          Path(sys.argv[3]).write_text(json.dumps({'map_counts':{str(a):[b,c,d,missing] for a,b,c,d,missing,miss in reports},'icons':icons[1],'total_pack_bytes':sum(p.stat().st_size for p in assets.iterdir())},ensure_ascii=False,indent=2))
-          print('ICONS',icons[1],icons[0].stat().st_size)
-          print('PACKS',len(indices),'TOTAL',sum(p.stat().st_size for p in assets.iterdir()))
-          for a,b,c,d,missing,miss in reports:
-           if a in (29,45,46):print(f'MAP {a} {b}: assets={c} size={d/1024/1024:.2f}MiB missing_char={missing} {miss[:9]}')
-          print('missing events total',sum(x[4] for x in reports))
-          R114_PACKS
-          cat > build/sl-assets-v229r114.js <<'R114_RUNTIME'
-          // V229R114: transport cache only. Never write PNGs to Emscripten FS here.
-          // The original drive.js must call createPreloadedFile and complete decode.
+              for name in info['terrain']:
+                  for cat in ('graphics/tilesets/','graphics/panoramas/'):
+                      k=cat+name.lower()
+                      if k in source:keys.add(k)
+              if mid in (45,46):
+                  keys.update(k for k in source if re.fullmatch('graphics/panoramas/slti_'+str(mid)+r'_(?:c\d+_\d+|w_c\d+_\d+)',k))
+              # Preserve the map's own assets but never download graphics from other maps.
+              n,size=pack(f'map-{mid:03d}-v229r115.pack','map',mid,keys)
+              summary[mid]={'files':n,'bytes':size}
+          assert len(summary)==46,(len(summary),list(summary))
+          assert sum(k.startswith('graphics/panoramas/slti_45_') for k in source)==62
+          assert sum(k.startswith('graphics/panoramas/slti_46_') for k in source)==94
+          Path(sys.argv[4]).write_text(json.dumps({'icons':i,'shared':s,'maps':summary},ensure_ascii=False,indent=2))
+          print('PASS packs: icons',i,'shared',s,'maps',len(summary), '29',summary[29], '45',summary[45], '46',summary[46])
+          R115_PACKER
+          cat > build/sl-assets-v229r115.js <<'R115_BROWSER'
+          // V229R115: download every mapped action and current-map terrain BEFORE MapXXX.rxdata
+          // is passed to the game engine. The original drive.js remains the PNG decoder.
           (function(){
             'use strict';
-            var staged=Object.create(null), mapStates=Object.create(null);
-            var originalGet=window.getLazyAsset;
-            if(typeof originalGet!=='function')throw new Error('R114 requires native drive.js');
-            window.getLazyAsset=function(url,filename,callback,noretry){
-              var clean=String(url).replace(/^gameasync\//,'').split('?')[0].toLowerCase();
-              var bytes=staged[clean];
-              if(bytes){callback(bytes);return;}
-              return originalGet.apply(this,arguments);
-            };
-            function label(text){
+            var nativeMapLoad=window.loadFileAsync;
+            var nativeAssetGet=window.getLazyAsset;
+            if(typeof nativeMapLoad!=='function'||typeof nativeAssetGet!=='function')
+              throw new Error('R115 requires existing drive.js functions');
+            var staged=Object.create(null), jobs=Object.create(null);
+            var ready=Object.create(null), currentMap=null, overlay=null;
+            var version='V229R115';
+            function label(message){
               var el=document.getElementById('sl-build-version');
-              if(el)el.textContent='V229R114'+(text?' | '+text:'');
+              if(el)el.textContent=version+(message?' | '+message:'');
             }
-            function retrieve(name,timeout){
-              var c=new AbortController(),clock=setTimeout(function(){c.abort();},timeout);
-              return fetch('assets/'+name,{cache:'force-cache',signal:c.signal})
-                .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.arrayBuffer();})
-                .finally(function(){clearTimeout(clock);});
+            function display(message,action){
+              if(!document.body)return;
+              if(!overlay){
+                overlay=document.createElement('div');overlay.id='sl-r115-download';
+                overlay.style.cssText='position:fixed;inset:0;z-index:9000000;background:rgba(0,0,0,.90);color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:15px;text-align:center;font:16px/1.5 sans-serif;padding:20px;box-sizing:border-box';
+                document.body.appendChild(overlay);
+              }
+              overlay.textContent=message;
+              if(action){
+                var button=document.createElement('button');button.textContent='Retry download';
+                button.style.cssText='background:white;color:black;font:16px sans-serif;padding:12px 20px;border-radius:8px;border:0';
+                button.onclick=action;overlay.appendChild(button);
+              }
+            }
+            function hide(){if(overlay){overlay.remove();overlay=null;}}
+            function fetchPack(filename,report){
+              var controller=new AbortController();
+              var timeout=setTimeout(function(){controller.abort();},90000);
+              return fetch('assets/'+filename,{cache:'force-cache',signal:controller.signal}).then(function(response){
+                if(!response.ok)throw new Error('HTTP '+response.status+': '+filename);
+                if(!response.body||typeof response.body.getReader!=='function')return response.arrayBuffer();
+                var reader=response.body.getReader(),chunks=[],size=0;
+                var total=Number(response.headers.get('content-length'))||0;
+                function read(){
+                  return reader.read().then(function(part){
+                    if(part.done){
+                      var data=new Uint8Array(size),pos=0;
+                      chunks.forEach(function(a){data.set(a,pos);pos+=a.length;});
+                      return data.buffer;
+                    }
+                    chunks.push(part.value);size+=part.value.length;
+                    if(report)report(size,total);
+                    return read();
+                  });
+                }
+                return read();
+              }).finally(function(){clearTimeout(timeout);});
             }
             function stage(buffer,kind,mid){
               var data=new Uint8Array(buffer);
-              if(data.length<16)throw new Error('Invalid asset pack');
-              var size=new DataView(data.buffer,data.byteOffset,4).getUint32(0,true);
-              if(size<10||4+size>data.length)throw new Error('Invalid pack header');
-              var manifest=JSON.parse(new TextDecoder('utf-8').decode(data.subarray(4,4+size)));
-              if(manifest.kind!==kind||(kind==='map'&&manifest.map_id!==mid))throw new Error('Wrong pack');
-              var start=4+size,added=0;
-              for(var i=0;i<manifest.files.length;i++){
-                var file=manifest.files[i],mappingValue=mapping[file[0]];
-                if(!mappingValue)throw new Error('Missing mapping '+file[0]);
-                var offset=file[1],len=file[2];
-                if(!Number.isInteger(offset)||!Number.isInteger(len)||offset<0||len<8||start+offset+len>data.length)throw new Error('Bad pack bounds');
-                var target=mappingValue.split('?')[0].toLowerCase();
-                var bytes=data.slice(start+offset,start+offset+len);
-                if(/\.png$/i.test(target)&&!(bytes[0]===137&&bytes[1]===80&&bytes[2]===78&&bytes[3]===71))throw new Error('Invalid PNG '+target);
-                staged[target]=bytes;
-                added++;
+              if(data.length<16)throw new Error('Invalid '+kind+' asset pack');
+              var headLength=new DataView(data.buffer,data.byteOffset,4).getUint32(0,true);
+              if(headLength<10||headLength>data.length-4)throw new Error('Invalid asset index');
+              var head=JSON.parse(new TextDecoder('utf-8').decode(data.subarray(4,4+headLength)));
+              if(head.kind!==kind||(kind==='map'&&head.map_id!==mid)||!Array.isArray(head.files))
+                throw new Error('Incorrect '+kind+' manifest');
+              var start=4+headLength,items=Object.create(null);
+              for(var i=0;i<head.files.length;i++){
+                var row=head.files[i],key=row[0],offset=row[1],length=row[2];
+                var mapped=mapping[key];
+                if(!mapped||!Number.isInteger(offset)||!Number.isInteger(length)||offset<0||length<8||
+                   start+offset+length>data.length)throw new Error('Bad manifest file '+key);
+                var file=mapped.split('?')[0].toLowerCase(),bytes=data.subarray(start+offset,start+offset+length);
+                if(/\.png$/i.test(file)&&!(bytes[0]===137&&bytes[1]===80&&bytes[2]===78&&bytes[3]===71))
+                  throw new Error('Invalid PNG '+file);
+                items[file]=bytes;
               }
-              return added;
+              // Commit only after every file has passed bounds and signature checks.
+              Object.keys(items).forEach(function(k){staged[k]=items[k];});
+              return head.files.length;
             }
-            window.slR114BootIcons=function(){
-              var dep='r114-icons',released=false;
+            function prepare(id,kind,mid,filename,report){
+              if(ready[id])return Promise.resolve(ready[id]);
+              if(jobs[id])return jobs[id];
+              jobs[id]=fetchPack(filename,report).then(function(bytes){
+                var count=stage(bytes,kind,mid);ready[id]=count;return count;
+              }).catch(function(err){delete jobs[id];throw err;});
+              return jobs[id];
+            }
+            function progress(name,done,total){
+              var s=total?((done/total)*100).toFixed(0)+'%':(done/1048576).toFixed(1)+' MB';
+              label(name+' '+s);display('Preparing '+name+' before entering the map\n'+s);
+            }
+            function prepareMap(mid){
+              return Promise.all([
+                prepare('shared','shared',null,'shared-v229r115.pack',function(a,b){progress('Action assets',a,b);}),
+                prepare('map'+mid,'map',mid,'map-'+String(mid).padStart(3,'0')+'-v229r115.pack',function(a,b){progress('Map '+mid+' terrain',a,b);})
+              ]);
+            }
+            window.getLazyAsset=function(url,filename,callback,noretry){
+              var key=String(url).replace(/^gameasync\//i,'').split('?')[0].toLowerCase();
+              var bytes=staged[key];
+              if(bytes){setTimeout(function(){callback(bytes);},0);return;}
+              if(currentMap!==null&&/^graphics\//i.test(key)){
+                console.error('SLRUNTIMEERR|R115_UNSTAGED_GRAPHIC Map'+currentMap+' '+key);
+              }
+              return nativeAssetGet.apply(this,arguments);
+            };
+            window.loadFileAsync=function(fullPath,bitmap,callback){
+              var found=!bitmap&&/Map(\d{3})\.rxdata$/i.exec(String(fullPath||''));
+              if(!found)return nativeMapLoad.apply(this,arguments);
+              var mid=Number(found[1]),args=arguments,self=this;
+              if(mid<1||mid>46)return nativeMapLoad.apply(self,args);
+              function begin(){
+                label('Map '+mid+' assets downloading');
+                display('Preparing all Map '+mid+' resources before entering');
+                prepareMap(mid).then(function(){
+                  currentMap=mid;
+                  label('Map '+mid+' files ready; opening');
+                  display('Map '+mid+' downloads complete\nOpening map...');
+                  var finished=false;
+                  var guard=setTimeout(function(){
+                    if(!finished)display('Map '+mid+' engine loading exceeded 35 seconds',function(){location.reload();});
+                  },35000);
+                  var originalCallback=callback;
+                  var nativeArgs=[fullPath,bitmap,function(){
+                    if(finished)return;
+                    finished=true;clearTimeout(guard);hide();
+                    if(typeof originalCallback==='function')originalCallback();
+                  }];
+                  try{nativeMapLoad.apply(self,nativeArgs);}catch(err){
+                    clearTimeout(guard);console.error('SLRUNTIMEERR|R115_MAP_NATIVE '+err);
+                    display('Map '+mid+' engine error: '+String(err),function(){location.reload();});
+                  }
+                }).catch(function(err){
+                  console.error('SLRUNTIMEERR|R115_MAP_PREPARE '+mid+' '+String(err));
+                  label('Map '+mid+' download failed');
+                  display('Map '+mid+' download failed: '+String(err),begin);
+                });
+              }
+              begin();
+            };
+            window.slR115BootIcons=function(){
+              var dep='sl-r115-icons',released=false;
               addRunDependency(dep);
-              function release(){if(!released){released=true;removeRunDependency(dep);}}
-              var guard=setTimeout(function(){label('Icons fallback');release();},12000);
-              retrieve('icons-v229r114.pack',11000).then(function(bytes){
-                if(!released){var n=stage(bytes,'icons',null);if(n!==395)throw new Error('Icon count '+n);label('Icons staged');}
-              }).catch(function(e){console.error('R114_ICON_PACK',e);}).finally(function(){clearTimeout(guard);release();});
+              function finish(){if(!released){released=true;removeRunDependency(dep);}}
+              function retry(){
+                label('Inventory icons downloading');
+                prepare('icons','icons',null,'icons-v229r115.pack',function(a,b){progress('Inventory icons',a,b);})
+                  .then(function(n){if(n!==395)throw new Error('Expected 395 icons, received '+n);hide();finish();})
+                  .catch(function(err){
+                    console.error('SLRUNTIMEERR|R115_ICONS '+String(err));
+                    display('Inventory icon download failed: '+String(err),retry);
+                  });
+              }
+              retry();
             };
-            window.slR114BeginMap=function(mid){
-              mid=Number(mid);
-              if(!Number.isInteger(mid)||mid<1||mid>46)return Promise.resolve(false);
-              if(mapStates[mid])return mapStates[mid];
-              label('Map '+mid+' assets downloading');
-              var p=retrieve('map-'+String(mid).padStart(3,'0')+'-v229r114.pack',20000)
-                .then(function(bytes){var n=stage(bytes,'map',mid);label('Map '+mid+' assets staged '+n);return true;})
-                .catch(function(e){console.error('R114_MAP_PACK',mid,e);delete mapStates[mid];return false;});
-              mapStates[mid]=p;
-              return p;
-            };
-            // Diagnostic: staged count is NOT renderer readiness.
-            window.slR114StagedCount=function(){return Object.keys(staged).length;};
+            window.slR115Status=function(){return {map:currentMap,staged:Object.keys(staged).length,ready:Object.keys(ready)};};
           })();
-          R114_RUNTIME
-          cat > build/patch_browser.py <<'R114_PATCH'
+          R115_BROWSER
+          cat > build/patch_browser.py <<'R115_PATCH'
           from pathlib import Path
           import sys
-          root=Path(sys.argv[1]); js_src=Path(sys.argv[2])
+          root=Path(sys.argv[1]); runtime=Path(sys.argv[2])
           drive=root/'knight/js/drive.js'
-          src=drive.read_text('utf8')
-          # Restore ordinary preloadList for ALL maps; R111's special PNG queue
-          # previously marked placeholders as ready, which bypassed image decode.
+          src=drive.read_text(encoding='utf8')
           assert src.count('R111_SANCTUARY_QUEUE')==1
           start=src.index('function preloadList(jsonArray) {')
           end=src.index('\nwindow.fileLoadedAsync = function(file)',start)
-          generic='''function preloadList(jsonArray) {
+          # The preloaded bytes are staged by R115 BEFORE entering the map.
+          # Decoding 45/66 giant floor PNGs together caused frame stalls; native renderer
+          # should decode only the floor chunks that are actually on the screen.
+          replacement='''function preloadList(jsonArray) {
               jsonArray.forEach((file) => {
+                  if (/^Graphics\\/Panoramas\\/SLTI_(45|46)_(?:C|W_C)/i.test(file)) return;
                   const key=getMappingKey(file);
                   const mapped=mapping[key];
-                  if(!mapped || window.fileAsyncCache[key])return;
+                  if(!mapped || window.fileAsyncCache[key]) return;
                   const dir='/game/'+mapped.substring(0,mapped.lastIndexOf('/'));
                   const name=mapped.substring(mapped.lastIndexOf('/')+1).split('?')[0];
-                  getLazyAsset('gameasync/'+mapped,name,function(data){
-                      if(!data)return;
-                      FS.createPreloadedFile(dir,name,new Uint8Array(data),true,true,
+                  getLazyAsset('gameasync/'+mapped,name,function(bytes){
+                      if(!bytes)return;
+                      FS.createPreloadedFile(dir,name,new Uint8Array(bytes),true,true,
                           function(){window.fileAsyncCache[key]=1;},console.error,false,false,
-                          function(){try{FS.unlink(dir+'/'+name);}catch(e){} });
+                          function(){try{FS.unlink(dir+'/'+name);}catch(err){} });
                   },true);
               });
           }
           '''
-          src=src[:start]+generic+src[end:]
+          src=src[:start]+replacement+src[end:]
           src=src.replace('// R111_SANCTUARY_QUEUE: limit only the special 2x panoramas.\n','')
-          # Keep the existing engine callback intact. Merely schedule pack loading.
-          head='''window.fileLoadedAsync = function(file) {
-              document.title = wTitle;
-          '''
-          assert src.count(head)==1
-          src=src.replace(head,head+'''    var found=/Map(\\d{3})\\.rxdata$/i.exec(String(file||''));
-              if(found && window.slR114BeginMap)window.slR114BeginMap(Number(found[1]));
-          ''')
           assert src.count('window.loadFileAsync = function(fullPath, bitmap, callback)')==1
-          assert src.count('FS.createPreloadedFile(')>=3
+          assert src.count('window.fileLoadedAsync = function(file)')==1
+          # This handler is NOT modified: native loading and game events keep R111 order.
+          assert 'if (!(/.*Map.*rxdata/i.test(file))) return;' in src
+          assert 'R111_SANCTUARY_QUEUE' not in src
           drive.write_text(src,encoding='utf8')
-          (root/'knight/js/sl-assets-v229r114.js').write_bytes(js_src.read_bytes())
+          (root/'knight/js/sl-assets-v229r115.js').write_bytes(runtime.read_bytes())
           for name in ('index.html','knight/index.html'):
               file=root/name
-              html=file.read_text('utf8')
-              assert 'V229R111' in html and 'V229R114' not in html
+              html=file.read_text(encoding='utf8')
+              assert 'V229R111' in html and 'V229R115' not in html
               if name=='knight/index.html':
-                  assert html.count('createDummies();window.restoreLocalFilesBeforeRun();')==1
-                  html=html.replace('createDummies();window.restoreLocalFilesBeforeRun();',
-                                    'createDummies();window.slR114BootIcons();window.restoreLocalFilesBeforeRun();')
-                  anchor='<script src="gameasync/mapping.js?v=v229r111"></script>'
+                  anchor='createDummies();window.restoreLocalFilesBeforeRun();'
                   assert html.count(anchor)==1
-                  html=html.replace(anchor,anchor+'\n    <script src="js/sl-assets-v229r114.js?v=v229r114"></script>')
-              html=html.replace('V229R111','V229R114').replace('v229r111','v229r114')
-              file.write_text(html,encoding='utf8')
-          print('PASS R114 unchanged native loader callbacks, original image decode, staging-only packs')
-          R114_PATCH
-          cat > build/test-r114.js <<'R114_TEST'
-          const fs=require('fs'),vm=require('vm'),assert=require('assert'),path=require('path');
-          const root=process.argv[2]||'site';
-          const browser=fs.readFileSync(path.join(root,'knight/js/sl-assets-v229r114.js'),'utf8');
-          const mappingSrc=fs.readFileSync(path.join(root,'knight/gameasync/mapping.js'),'utf8');
-          const mappingContext={};vm.runInNewContext(mappingSrc,mappingContext);
-          const mapping=mappingContext.mapping;
-          let dependencies=0, nativeCalls=0, requests=[];
-          const nativeLoader=function(url,filename,cb){nativeCalls++;cb(Buffer.from('FALLBACK'));};
-          const sandbox={window:{getLazyAsset:nativeLoader,fileAsyncCache:{}},mapping,console,
-            TextDecoder,Uint8Array,DataView,AbortController,setTimeout,clearTimeout,Number,String,Array,Object,
-            document:{getElementById:()=>null},
-            addRunDependency(){dependencies++;},removeRunDependency(){dependencies--;},
-            fetch:async url=>{requests.push(url);return {ok:true,arrayBuffer:async()=>{
-              const bytes=fs.readFileSync(path.join(root,'knight',url));
-              return bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);
-            }}}};
-          vm.runInNewContext(browser,sandbox);
-          (async()=>{
-            sandbox.window.slR114BootIcons();
-            while(dependencies>0)await new Promise(resolve=>setTimeout(resolve,1));
-            let icons=0;
-            for(const k of Object.keys(mapping).filter(k=>k.startsWith('graphics/icons/'))){
-              let val;const url='gameasync/'+mapping[k];
-              sandbox.window.getLazyAsset(url,'file',b=>val=Buffer.from(b));
-              const real=fs.readFileSync(path.join(root,'knight/gameasync',mapping[k].split('?')[0]));
-              assert.deepEqual(val,real);icons++;
-            }
-            assert.equal(icons,395);
-            for(const mid of [29,45,46]){
-              assert.equal(await sandbox.window.slR114BeginMap(mid),true);
-              const pack=fs.readFileSync(path.join(root,'knight/assets','map-'+String(mid).padStart(3,'0')+'-v229r114.pack'));
-              const n=pack.readUInt32LE(0),manifest=JSON.parse(pack.subarray(4,4+n).toString('utf8'));
-              assert.equal(manifest.files.length,{29:74,45:143,46:161}[mid]);
-              for(const [k] of manifest.files){
-                let staged;
-                sandbox.window.getLazyAsset('gameasync/'+mapping[k],'f',v=>staged=Buffer.from(v));
-                assert.deepEqual(staged,fs.readFileSync(path.join(root,'knight/gameasync',mapping[k].split('?')[0])));
-              }
-              const prev=requests.length;
-              assert.equal(await sandbox.window.slR114BeginMap(mid),true);
-              assert.equal(requests.length,prev);
-              console.log('PASS Map'+mid+' '+manifest.files.length+' staged as original bytes; no repeat');
-            }
-            assert.deepEqual(Object.keys(sandbox.window.fileAsyncCache),[],'No premature cache completed flags');
-            assert.equal(nativeCalls,0);
-            console.log('PASS 395 icons staged; NO Emscripten FS writes; original image decode remains authoritative');
-          })().catch(e=>{console.error(e);process.exit(1)});
-          R114_TEST
+                  html=html.replace(anchor,'createDummies();window.slR115BootIcons();window.restoreLocalFilesBeforeRun();')
+                  tag='<script src="gameasync/mapping.js?v=v229r111"></script>'
+                  assert html.count(tag)==1
+                  html=html.replace(tag,tag+'\n    <script src="js/sl-assets-v229r115.js?v=v229r115"></script>')
+              file.write_text(html.replace('V229R111','V229R115').replace('v229r111','v229r115'),encoding='utf8')
+          print('PASS R115 native loading gated before entry, original decoder and existing map events preserved')
+          R115_PATCH
           ruby -c build/export_maps.rb
-          ruby build/export_maps.rb site/knight/gameasync/Data > build/map-meta.json
-          python3 build/pack_assets.py site build/map-meta.json build/asset-report.json
-          python3 build/patch_browser.py site build/sl-assets-v229r114.js
+          ruby build/export_maps.rb site/knight/gameasync/Data > build/maps.json
+          python3 build/build_packs.py site site/knight/assets build/maps.json build/report.json
+          python3 build/patch_browser.py site build/sl-assets-v229r115.js
           node --check site/knight/js/drive.js
-          node --check site/knight/js/sl-assets-v229r114.js
+          node --check site/knight/js/sl-assets-v229r115.js
           node --check site/knight/js/dpad.js
           node --check site/knight/gameasync/mapping.js
-          node build/test-r114.js site
-
-      - name: V229R114 Verify every pack and untouched S32 maps
+      - name: V229R115 Smoke-test preload order and immutable game data
         shell: bash
         run: |
           set -euo pipefail
+          cat > build/test_r115.js <<'R115_SMOKE'
+          const fs=require('fs'),vm=require('vm'),path=require('path'),assert=require('assert');
+          const root=process.argv[2];
+          const base=path.join(root,'knight');
+          const src=fs.readFileSync(path.join(base,'js/sl-assets-v229r115.js'),'utf8');
+          const mappingSrc=fs.readFileSync(path.join(base,'gameasync/mapping.js'),'utf8');
+          let nativeCalls=[],http=[],fallback=0,dependencies=0;
+          const children=[];
+          function domNode(){return {style:{},children:[],textContent:'',onclick:null,
+            appendChild(x){this.children.push(x);children.push(x);},remove(){}};}
+          const document={body:domNode(),getElementById:()=>null,createElement:()=>domNode()};
+          const sandbox={window:{loadFileAsync:(name,bitmap,cb)=>{nativeCalls.push(name);if(cb)cb();},
+          getLazyAsset:(url,filename,cb)=>{fallback++;cb(Buffer.from('NETWORK'));}},
+           document,console,TextDecoder,Uint8Array,DataView,AbortController,setTimeout,clearTimeout,
+           Number,String,Array,Object,location:{reload(){throw Error('unexpected reload');}},
+           addRunDependency(){dependencies++;},removeRunDependency(){dependencies--;},
+           fetch(url){
+            http.push(url);
+            const f=path.join(base,url);
+            return new Promise((resolve,reject)=>setTimeout(()=>{
+              if(!fs.existsSync(f)){reject(new Error('File not found '+f));return;}
+              const b=fs.readFileSync(f);
+              resolve({ok:true,body:null,arrayBuffer:async()=>b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength)});
+            },20));
+           }};
+          vm.createContext(sandbox);vm.runInContext(mappingSrc,sandbox);vm.runInContext(src,sandbox);
+          const mapping=sandbox.mapping;
+          function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+          async function until(fn,limit=30000){let start=Date.now();while(!fn()){await sleep(10);if(Date.now()-start>limit)throw Error('wait timeout');}}
+          async function test(){
+           sandbox.window.slR115BootIcons();
+           assert.equal(dependencies,1,'Boot must wait for icons');
+           await until(()=>dependencies===0);
+           assert.equal(http.length,1,'Icons should be downloaded once');
+           let stat=sandbox.window.slR115Status();assert.equal(stat.staged,395);
+           for(const map of [29,45,46]){
+             const before=nativeCalls.length;
+             let count=0;
+             sandbox.window.loadFileAsync('Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap'+String(map).padStart(3,'0')+'.rxdata',false,()=>{count++;});
+             assert.equal(nativeCalls.length,before,'Native map should NOT load before resource packs');
+             await until(()=>count===1);
+             assert.equal(nativeCalls.length,before+1);
+             assert.equal(sandbox.window.slR115Status().map,map);
+             assert.equal(fallback,0,'No network fallback for mapped files');
+             const packs=['shared-v229r115.pack','map-'+String(map).padStart(3,'0')+'-v229r115.pack'];
+             for(const f of packs){
+               let b=fs.readFileSync(path.join(base,'assets',f));
+               let n=b.readUInt32LE(0),entries=JSON.parse(b.subarray(4,4+n).toString('utf8')).files;
+               for(const [key] of entries.slice(0,Math.min(50,entries.length))){
+                 const name=mapping[key];let got=null;
+                 sandbox.window.getLazyAsset('gameasync/'+name,'test',x=>{got=Buffer.from(x);});
+                 await until(()=>got!==null);
+                 assert.deepEqual(got,fs.readFileSync(path.join(base,'gameasync',name.split('?')[0])),'wrong cached bytes: '+key);
+               }
+             }
+             console.log('PASS before Map'+map+': native callback after all bundles, mapped bytes served without network');
+           }
+           const pre=http.length;
+           let called=0;
+           sandbox.window.loadFileAsync('Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata',false,()=>called++);
+           await until(()=>called===1);
+           assert.equal(http.length,pre,'A revisited map must not redownload');
+           assert.equal(fallback,0);
+           console.log('PASS 395 icons at boot, all relevant scene bundles before entry, no repeated map fetch');
+          }
+          test().catch(e=>{console.error(e);process.exit(1)});
+          R115_SMOKE
+          node build/test_r115.js site
           python3 - <<'PY_AUDIT'
           from pathlib import Path
           import hashlib,json,struct
@@ -442,45 +492,58 @@ jobs:
           before=json.loads(Path('build/before.json').read_text('utf8'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          changed={k for k in before if before[k]!=after.get(k)}
-          expected={'index.html','knight/index.html','knight/js/drive.js'}
-          assert changed==expected,('Unexpected original game changes',changed^expected)
-          added=set(after)-set(before)
-          expected_added={'knight/js/sl-assets-v229r114.js','knight/assets/icons-v229r114.pack'}
-          expected_added|={f'knight/assets/map-{i:03d}-v229r114.pack' for i in range(1,47)}
-          assert added==expected_added,('Unexpected added files',added^expected_added)
-          assert len(after)==5565 and len(before)==5517,(len(before),len(after))
-          assert not any(k.startswith('knight/gameasync/') for k in changed)
+          changed={p for p in before if before[p]!=after.get(p)}
+          assert changed=={'index.html','knight/index.html','knight/js/drive.js'},changed
+          new=set(after)-set(before)
+          expected={'knight/js/sl-assets-v229r115.js',
+                    'knight/assets/icons-v229r115.pack',
+                    'knight/assets/shared-v229r115.pack'}
+          expected|={f'knight/assets/map-{i:03d}-v229r115.pack' for i in range(1,47)}
+          assert new==expected,('Unexpected new files',new^expected)
+          assert len(after)==5566 and len(before)==5517
+          assert not any('/Graphics/' in n for n in changed)
+          assert before['knight/gameasync/Data/Scripts.rxdata']==after['knight/gameasync/Data/Scripts.rxdata']
+          for i in (45,46):
+           name=f'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap{i:03d}.rxdata'
+           assert before[name]==after[name]
           assert before['knight/js/dpad.js']==after['knight/js/dpad.js']
-          # Validate all 46 packs against every original asset, not just 3 samples.
           mapping={}
           for line in (root/'knight/gameasync/mapping.js').read_text('utf8').splitlines():
-              if line.startswith('["'):
-                  k,v=json.loads(line.rstrip(','));mapping[k]=v.split('?')[0]
-          for name in sorted(expected_added):
-              if not name.endswith('.pack'):continue
-              blob=(root/name).read_bytes()
-              index_size=struct.unpack('<I',blob[:4])[0]
-              index=json.loads(blob[4:4+index_size]);offset=4+index_size
-              assert index['files'] and len(index['files'])==len({r[0] for r in index['files']})
-              for k,pos,size in index['files']:
-                  target=root/'knight/gameasync'/mapping[k]
-                  assert blob[offset+pos:offset+pos+size]==target.read_bytes(),('Bad pack bytes',name,k)
-          assert len(after)==len(before)+48
-          assert b'R111_SANCTUARY_QUEUE' not in (root/'knight/js/drive.js').read_bytes()
-          assert b'FS.createPreloadedFile' in (root/'knight/js/drive.js').read_bytes()
-          assert b'FS.writeFile' not in (root/'knight/js/sl-assets-v229r114.js').read_bytes()
-          assert b'window.fileAsyncCache[key]=1' not in (root/'knight/js/sl-assets-v229r114.js').read_bytes()
+           if line.startswith('["'):
+            try:k,v=json.loads(line.rstrip(','))
+            except ValueError:continue
+            mapping[k]=v.split('?')[0]
+          for name in sorted(new):
+           if not name.endswith('.pack'):continue
+           blob=(root/name).read_bytes();n=struct.unpack_from('<I',blob)[0]
+           index=json.loads(blob[4:4+n]); start=4+n
+           for key,pos,size in index['files']:
+            original=(root/'knight/gameasync'/mapping[key]).read_bytes()
+            assert blob[start+pos:start+pos+size]==original,('Corrupt pack entry',name,key)
+          # All R114 action dependencies must be covered by R115 shared/icon/map packs.
+          def pack_keys(file):
+           blob=file.read_bytes();n=struct.unpack_from('<I',blob)[0]
+           return {row[0] for row in json.loads(blob[4:4+n])['files']}
+          shared=pack_keys(root/'knight/assets/shared-v229r115.pack')
+          icons=pack_keys(root/'knight/assets/icons-v229r115.pack')
+          assert len(icons)==395
+          assert len(shared)>2000
+          for mid in (45,46):
+           terrain=pack_keys(root/f'knight/assets/map-{mid:03d}-v229r115.pack')
+           expected=62 if mid==45 else 94
+           assert len([k for k in terrain if k.startswith(f'graphics/panoramas/slti_{mid}_')])==expected
           html=(root/'knight/index.html').read_text('utf8')
-          assert 'window.slR114BootIcons();' in html
-          assert 'sl-assets-v229r114.js?v=v229r114' in html
-          assert 'name: build-slknight-web.yml' not in html
-          print('PASS R111 engine, coordinates, doors, mobs, graphics, dpad byte-identical')
-          print('PASS all 46 map packs and 395 icon entries compared to original files')
-          print('PASS only 3 HTML/loader source changes plus 48 generated asset files')
+          assert 'window.slR115BootIcons();' in html
+          assert 'sl-assets-v229r115.js?v=v229r115' in html
+          runtime=(root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
+          assert 'window.loadFileAsync=function(fullPath,bitmap,callback)' in runtime
+          assert 'prepareMap(mid).then(function()' in runtime
+          assert 'window.fileAsyncCache[key]=1' not in runtime
+          assert 'FS.writeFile' not in runtime
+          print('PASS all 48 pack files byte-identical to source, exactly three original files changed')
+          print('PASS R111 game engine/map 45/46/dpad preserved, map gate before native load')
           PY_AUDIT
-
-      - name: V229R114 Publish exact R111 game with map-action and item packs
+      - name: V229R115 Publish original engine with map-first asset loading
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
