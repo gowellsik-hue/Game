@@ -1,13 +1,13 @@
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R113
+# VERSION: V229R114
 # BASE: verified deployed V229R111, run 40523152040 (R112 failed; do not use it).
 # MAP ACTIONS: bundle event graphics and their attack/hit/death/motion variants
 #              for each of the actual 46 maps; include map-specific floor/walls.
-# INVENTORY: load all 395 existing icons from one verified asset pack at boot.
-# LOADING: preserve native map callbacks; show bounded asset-loading overlay.
+# INVENTORY: stage 395 existing icon bytes at boot without setting decoded flags.
+# LOADING: stage bytes in JS transport cache only; native PNG decoder remains in use.
 # KEEP: exact R111 Scripts.rxdata, Map045/046, S32 movement, doors, NPCs,
 #       monster positions, shifted original art, 4-way pad, other game files.
-name: build-slknight-web.yml | V229R113 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V229R114 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R113 Restore exact deployed R111
+      - name: V229R114 Restore exact deployed R111
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -39,7 +39,7 @@ jobs:
           github-token: ${{ github.token }}
           path: r111
 
-      - name: V229R113 Verify untouched R111 original game
+      - name: V229R114 Verify untouched R111 original game
         shell: bash
         run: |
           set -euo pipefail
@@ -67,11 +67,11 @@ jobs:
           print('PASS deployed R111: 5517 files, original dpad, map collision and engine')
           PY_BASE
 
-      - name: V229R113 Pack map actions and inventory icons; update loader
+      - name: V229R114 Pack map actions and inventory icons; update loader
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/export_maps.rb <<'R113_MAPS'
+          cat > build/export_maps.rb <<'R114_MAPS'
           require 'json'
           module RPG
             class Map;end; class MapInfo;end; class AudioFile;end; class Tileset;end
@@ -141,8 +141,8 @@ jobs:
            result[mid]={name:text(info[mid].instance_variable_get(:@name)),graphics:graphics.uniq.sort,events:events.uniq.sort,scripts:scripts.uniq.sort,terrain:tileset_files.compact.reject(&:empty?).uniq}
           end
           STDOUT.write(JSON.generate(result))
-          R113_MAPS
-          cat > build/pack_assets.py <<'R113_PACKS'
+          R114_MAPS
+          cat > build/pack_assets.py <<'R114_PACKS'
           from pathlib import Path
           import collections, json, re, struct, os, hashlib, sys
           root=Path(sys.argv[1])
@@ -235,280 +235,203 @@ jobs:
               return f, len(rows), len(header),sum(map(len,payload))
 
           for mid,keys in indices.items():
-              f,*_ =pack('map',int(mid),keys,f'map-{int(mid):03d}-v229r113.pack')
+              f,*_ =pack('map',int(mid),keys,f'map-{int(mid):03d}-v229r114.pack')
 
           icon_keys=sorted(k for k in source if k.startswith('graphics/icons/'))
           assert len(icon_keys)==395,len(icon_keys)
-          icons=pack('icons',None,icon_keys,'icons-v229r113.pack')
+          icons=pack('icons',None,icon_keys,'icons-v229r114.pack')
           Path(sys.argv[3]).write_text(json.dumps({'map_counts':{str(a):[b,c,d,missing] for a,b,c,d,missing,miss in reports},'icons':icons[1],'total_pack_bytes':sum(p.stat().st_size for p in assets.iterdir())},ensure_ascii=False,indent=2))
           print('ICONS',icons[1],icons[0].stat().st_size)
           print('PACKS',len(indices),'TOTAL',sum(p.stat().st_size for p in assets.iterdir()))
           for a,b,c,d,missing,miss in reports:
            if a in (29,45,46):print(f'MAP {a} {b}: assets={c} size={d/1024/1024:.2f}MiB missing_char={missing} {miss[:9]}')
           print('missing events total',sum(x[4] for x in reports))
-          R113_PACKS
-          cat > build/sl-assets-v229r113.js <<'R113_RUNTIME'
-          // V229R113: preload all recorded map event-action assets in one mapped binary pack.
-          // This script never replaces a native map-load callback or changes engine movement.
+          R114_PACKS
+          cat > build/sl-assets-v229r114.js <<'R114_RUNTIME'
+          // V229R114: transport cache only. Never write PNGs to Emscripten FS here.
+          // The original drive.js must call createPreloadedFile and complete decode.
           (function(){
             'use strict';
-            var maps={};
-            var active=0;
-            var bootDone=false;
-            var mapLimit=25000;
-            var iconLimit=12000;
-            var overlay=null;
-            function label(message){
+            var staged=Object.create(null), mapStates=Object.create(null);
+            var originalGet=window.getLazyAsset;
+            if(typeof originalGet!=='function')throw new Error('R114 requires native drive.js');
+            window.getLazyAsset=function(url,filename,callback,noretry){
+              var clean=String(url).replace(/^gameasync\//,'').split('?')[0].toLowerCase();
+              var bytes=staged[clean];
+              if(bytes){callback(bytes);return;}
+              return originalGet.apply(this,arguments);
+            };
+            function label(text){
               var el=document.getElementById('sl-build-version');
-              if(el)el.textContent='V229R113'+(message?' | '+message:'');
+              if(el)el.textContent='V229R114'+(text?' | '+text:'');
             }
-            function show(mid){
-              if(!document.body)return;
-              if(!overlay){
-                overlay=document.createElement('div');
-                overlay.id='sl-r113-map-load';
-                overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.86);z-index:900000;display:flex;align-items:center;justify-content:center;color:white;font:16px sans-serif;white-space:pre-line;text-align:center;';
-                document.body.appendChild(overlay);
-              }
-              overlay.textContent='Map '+mid+' resources loading\nPreparing all map actions...';
+            function retrieve(name,timeout){
+              var c=new AbortController(),clock=setTimeout(function(){c.abort();},timeout);
+              return fetch('assets/'+name,{cache:'force-cache',signal:c.signal})
+                .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.arrayBuffer();})
+                .finally(function(){clearTimeout(clock);});
             }
-            function status(mid,finished,total){
-              label('Map '+mid+' '+finished+'/'+total);
-              if(overlay)overlay.textContent='Map '+mid+' resources loading\n'+finished+' / '+total;
-            }
-            function hide(){if(overlay){overlay.remove();overlay=null;}}
-            function requestPack(filename,timeout,onBytes){
-              var ctl=new AbortController();
-              var killed=false;
-              var guard=setTimeout(function(){killed=true;ctl.abort();},timeout);
-              return fetch('assets/'+filename,{cache:'force-cache',signal:ctl.signal}).then(function(res){
-                if(!res.ok)throw new Error('HTTP '+res.status+' '+filename);
-                if(!onBytes || !res.body || typeof res.body.getReader!=='function')return res.arrayBuffer();
-                return (async function(){
-                  var reader=res.body.getReader(),pieces=[],received=0;
-                  var total=res.headers ? Number(res.headers.get('content-length'))||0 : 0;
-                  for(;;){
-                    var part=await reader.read();
-                    if(part.done)break;
-                    pieces.push(part.value);
-                    received+=part.value.length;
-                    onBytes(received,total);
-                  }
-                  var result=new Uint8Array(received),at=0;
-                  pieces.forEach(function(piece){result.set(piece,at);at+=piece.length;});
-                  return result.buffer;
-                })();
-              }).then(function(bytes){
-                if(killed)throw new Error('Asset request timed out: '+filename);
-                return bytes;
-              }).finally(function(){clearTimeout(guard);});
-            }
-            function unpack(buffer,kind,mid,onProgress){
+            function stage(buffer,kind,mid){
               var data=new Uint8Array(buffer);
               if(data.length<16)throw new Error('Invalid asset pack');
               var size=new DataView(data.buffer,data.byteOffset,4).getUint32(0,true);
-              if(size<10 || size>data.length-4)throw new Error('Invalid pack index');
-              var desc=JSON.parse(new TextDecoder('utf-8').decode(data.subarray(4,4+size)));
-              if(desc.kind!==kind || (kind==='map' && desc.map_id!==mid))throw new Error('Wrong asset pack');
-              var files=desc.files;
-              if(!Array.isArray(files) || !files.length)throw new Error('Empty asset pack');
-              var start=4+size;
-              var prepared=0;
-              for(var i=0;i<files.length;i++){
-                var item=files[i],key=item[0],off=item[1],length=item[2];
-                var original=mapping[key];
-                if(!original || !Number.isInteger(off) || !Number.isInteger(length) ||
-                   off<0 || length<8 || start+off+length>data.length){
-                  throw new Error('Invalid item '+key);
-                }
-                var path='/game/'+original.split('?')[0];
-                var bytes=data.subarray(start+off,start+off+length);
-                if(/\.png$/i.test(path) && !(bytes[0]===137&&bytes[1]===80&&bytes[2]===78&&bytes[3]===71)){
-                  throw new Error('Bad PNG '+key);
-                }
-                // createDummies() wrote a one-byte placeholder. Never mark that as loaded.
-                if(!Object.prototype.hasOwnProperty.call(window.fileAsyncCache,key) ||
-                   !FS.analyzePath(path).exists || FS.stat(path).size<=1){
-                  FS.writeFile(path,bytes,{flags:'w'});
-                  if(FS.stat(path).size!==length)throw new Error('FS size mismatch '+key);
-                  window.fileAsyncCache[key]=1;
-                }
-                prepared++;
-                if(onProgress && (prepared%12===0 || prepared===files.length))onProgress(prepared,files.length);
+              if(size<10||4+size>data.length)throw new Error('Invalid pack header');
+              var manifest=JSON.parse(new TextDecoder('utf-8').decode(data.subarray(4,4+size)));
+              if(manifest.kind!==kind||(kind==='map'&&manifest.map_id!==mid))throw new Error('Wrong pack');
+              var start=4+size,added=0;
+              for(var i=0;i<manifest.files.length;i++){
+                var file=manifest.files[i],mappingValue=mapping[file[0]];
+                if(!mappingValue)throw new Error('Missing mapping '+file[0]);
+                var offset=file[1],len=file[2];
+                if(!Number.isInteger(offset)||!Number.isInteger(len)||offset<0||len<8||start+offset+len>data.length)throw new Error('Bad pack bounds');
+                var target=mappingValue.split('?')[0].toLowerCase();
+                var bytes=data.slice(start+offset,start+offset+len);
+                if(/\.png$/i.test(target)&&!(bytes[0]===137&&bytes[1]===80&&bytes[2]===78&&bytes[3]===71))throw new Error('Invalid PNG '+target);
+                staged[target]=bytes;
+                added++;
               }
-              return prepared;
+              return added;
             }
-            window.slR113BootIcons=function(){
-              if(bootDone)return;
-              bootDone=true;
-              var dependency='sl-r113-inventory-icons';
-              addRunDependency(dependency);
-              var released=false;
-              var guard=setTimeout(function(){release();},iconLimit+1000);
-              function release(){
-                if(released)return;
-                released=true;clearTimeout(guard);removeRunDependency(dependency);
-              }
-              label('Inventory icons loading');
-              requestPack('icons-v229r113.pack',iconLimit).then(function(data){
-                if(!released){
-                  var count=unpack(data,'icons',null,null);
-                  if(count!==395)throw new Error('Icon count '+count);
-                }
-                label('Inventory ready');
-              }).catch(function(err){
-                console.error('SLRUNTIMEERR|R113_ICON_PRELOAD '+String(err));
-                label('Inventory fallback');
-              }).finally(release);
+            window.slR114BootIcons=function(){
+              var dep='r114-icons',released=false;
+              addRunDependency(dep);
+              function release(){if(!released){released=true;removeRunDependency(dep);}}
+              var guard=setTimeout(function(){label('Icons fallback');release();},12000);
+              retrieve('icons-v229r114.pack',11000).then(function(bytes){
+                if(!released){var n=stage(bytes,'icons',null);if(n!==395)throw new Error('Icon count '+n);label('Icons staged');}
+              }).catch(function(e){console.error('R114_ICON_PACK',e);}).finally(function(){clearTimeout(guard);release();});
             };
-            window.slR113BeginMap=function(mid){
+            window.slR114BeginMap=function(mid){
               mid=Number(mid);
-              if(!Number.isInteger(mid) || mid<1 || mid>46)return Promise.resolve(false);
-              if(maps[mid] && maps[mid].ready){label('Map '+mid+' ready');return Promise.resolve(true);}
-              if(maps[mid] && maps[mid].promise)return maps[mid].promise;
-              var token=++active;
-              show(mid);
-              label('Map '+mid+' downloading');
-              var state={ready:false,promise:null};
-              maps[mid]=state;
-              state.promise=requestPack('map-'+String(mid).padStart(3,'0')+'-v229r113.pack',mapLimit,function(bytes,total){
-                if(token!==active)return;
-                var amount=(bytes/1048576).toFixed(1);
-                var full=total?' / '+(total/1048576).toFixed(1)+' MB':' MB';
-                label('Map '+mid+' '+amount+full);
-                if(overlay)overlay.textContent='Map '+mid+' asset download\n'+amount+full;
-              })
-                .then(function(data){
-                  return unpack(data,'map',mid,function(done,total){if(token===active)status(mid,done,total);});
-                }).then(function(n){
-                  state.ready=true;
-                  if(token===active)label('Map '+mid+' ready '+n+'/'+n);
-                  return true;
-                }).catch(function(err){
-                  delete maps[mid];
-                  console.error('SLRUNTIMEERR|R113_MAP_PRELOAD '+mid+' '+String(err));
-                  if(token===active)label('Map '+mid+' asset fallback');
-                  return false;
-                }).finally(function(){
-                  if(token===active)hide();
-                  state.promise=null;
-                });
-              return state.promise;
+              if(!Number.isInteger(mid)||mid<1||mid>46)return Promise.resolve(false);
+              if(mapStates[mid])return mapStates[mid];
+              label('Map '+mid+' assets downloading');
+              var p=retrieve('map-'+String(mid).padStart(3,'0')+'-v229r114.pack',20000)
+                .then(function(bytes){var n=stage(bytes,'map',mid);label('Map '+mid+' assets staged '+n);return true;})
+                .catch(function(e){console.error('R114_MAP_PACK',mid,e);delete mapStates[mid];return false;});
+              mapStates[mid]=p;
+              return p;
             };
+            // Diagnostic: staged count is NOT renderer readiness.
+            window.slR114StagedCount=function(){return Object.keys(staged).length;};
           })();
-          R113_RUNTIME
-          cat > build/patch_browser.py <<'R113_PATCH'
+          R114_RUNTIME
+          cat > build/patch_browser.py <<'R114_PATCH'
           from pathlib import Path
           import sys
           root=Path(sys.argv[1]); js_src=Path(sys.argv[2])
           drive=root/'knight/js/drive.js'
           src=drive.read_text('utf8')
+          # Restore ordinary preloadList for ALL maps; R111's special PNG queue
+          # previously marked placeholders as ready, which bypassed image decode.
           assert src.count('R111_SANCTUARY_QUEUE')==1
           start=src.index('function preloadList(jsonArray) {')
-          loop=src.index('    jsonArray.forEach((file) => {',start)
-          end=src.index('\n}\n\nwindow.fileLoadedAsync = function(file)',loop)
-          generic='function preloadList(jsonArray) {\n'+src[loop:end]+'\n}'
-          src=src[:start]+generic+src[end+2:]
+          end=src.index('\nwindow.fileLoadedAsync = function(file)',start)
+          generic='''function preloadList(jsonArray) {
+              jsonArray.forEach((file) => {
+                  const key=getMappingKey(file);
+                  const mapped=mapping[key];
+                  if(!mapped || window.fileAsyncCache[key])return;
+                  const dir='/game/'+mapped.substring(0,mapped.lastIndexOf('/'));
+                  const name=mapped.substring(mapped.lastIndexOf('/')+1).split('?')[0];
+                  getLazyAsset('gameasync/'+mapped,name,function(data){
+                      if(!data)return;
+                      FS.createPreloadedFile(dir,name,new Uint8Array(data),true,true,
+                          function(){window.fileAsyncCache[key]=1;},console.error,false,false,
+                          function(){try{FS.unlink(dir+'/'+name);}catch(e){} });
+                  },true);
+              });
+          }
+          '''
+          src=src[:start]+generic+src[end:]
           src=src.replace('// R111_SANCTUARY_QUEUE: limit only the special 2x panoramas.\n','')
-          start=src.index('window.fileLoadedAsync = function(file) {')
-          end=src.index('\nvar activeStreams = [];',start)
-          new_handler='''window.fileLoadedAsync = function(file) {
+          # Keep the existing engine callback intact. Merely schedule pack loading.
+          head='''window.fileLoadedAsync = function(file) {
               document.title = wTitle;
-              var found=/Map(\\d{3})\\.rxdata$/i.exec(String(file||''));
-              if(found && window.slR113BeginMap)window.slR113BeginMap(Number(found[1]));
-          };
           '''
-          src=src[:start]+new_handler+src[end:]
-          anchor='    // Get mapping key\n    const mappingKey = getMappingKey(fullPath);'
-          assert src.count(anchor)==1
-          hook='''    // Start the mapped pack before the native map request completes.
-              // Never delay the engine callback; loader releases input via a visible
-              // progress overlay and always has a network timeout.
-              var mapMatch=/Map(\\d{3})\\.rxdata$/i.exec(String(fullPath||''));
-              if(!bitmap && mapMatch && window.slR113BeginMap)
-                  window.slR113BeginMap(Number(mapMatch[1]));
-          '''
-          src=src.replace(anchor,hook+anchor)
-          assert 'R111_SANCTUARY_QUEUE' not in src
-          assert 'window.loadFileAsync = function(fullPath, bitmap, callback)' in src
-          assert 'function getLazyAsset(' in src
-          assert 'function preloadList(jsonArray)' in src
-          assert src.count('window.fileLoadedAsync = function(file)')==1
+          assert src.count(head)==1
+          src=src.replace(head,head+'''    var found=/Map(\\d{3})\\.rxdata$/i.exec(String(file||''));
+              if(found && window.slR114BeginMap)window.slR114BeginMap(Number(found[1]));
+          ''')
+          assert src.count('window.loadFileAsync = function(fullPath, bitmap, callback)')==1
+          assert src.count('FS.createPreloadedFile(')>=3
           drive.write_text(src,encoding='utf8')
-          js_out=root/'knight/js/sl-assets-v229r113.js'
-          js_out.write_bytes(js_src.read_bytes())
+          (root/'knight/js/sl-assets-v229r114.js').write_bytes(js_src.read_bytes())
           for name in ('index.html','knight/index.html'):
-              htmlfile=root/name
-              html=htmlfile.read_text('utf8')
-              assert 'V229R111' in html and 'V229R113' not in html
+              file=root/name
+              html=file.read_text('utf8')
+              assert 'V229R111' in html and 'V229R114' not in html
               if name=='knight/index.html':
                   assert html.count('createDummies();window.restoreLocalFilesBeforeRun();')==1
                   html=html.replace('createDummies();window.restoreLocalFilesBeforeRun();',
-                                    'createDummies();window.slR113BootIcons();window.restoreLocalFilesBeforeRun();')
+                                    'createDummies();window.slR114BootIcons();window.restoreLocalFilesBeforeRun();')
                   anchor='<script src="gameasync/mapping.js?v=v229r111"></script>'
                   assert html.count(anchor)==1
-                  html=html.replace(anchor,anchor+'\n    <script src="js/sl-assets-v229r113.js?v=v229r113"></script>')
-              html=html.replace('V229R111','V229R113').replace('v229r111','v229r113')
-              htmlfile.write_text(html,encoding='utf8')
-          print('PASS R111 map-load callback retained; map packs start at request, 395 icons boot, title/version updated')
-          R113_PATCH
-          cat > build/test-r113.js <<'R113_TEST'
-          // Verify the actual browser code against mapped assets, placeholder FS and HTTP responses.
+                  html=html.replace(anchor,anchor+'\n    <script src="js/sl-assets-v229r114.js?v=v229r114"></script>')
+              html=html.replace('V229R111','V229R114').replace('v229r111','v229r114')
+              file.write_text(html,encoding='utf8')
+          print('PASS R114 unchanged native loader callbacks, original image decode, staging-only packs')
+          R114_PATCH
+          cat > build/test-r114.js <<'R114_TEST'
           const fs=require('fs'),vm=require('vm'),assert=require('assert'),path=require('path');
           const root=process.argv[2]||'site';
-          const browser=fs.readFileSync(path.join(root,'knight/js/sl-assets-v229r113.js'),'utf8');
+          const browser=fs.readFileSync(path.join(root,'knight/js/sl-assets-v229r114.js'),'utf8');
           const mappingSrc=fs.readFileSync(path.join(root,'knight/gameasync/mapping.js'),'utf8');
           const mappingContext={};vm.runInNewContext(mappingSrc,mappingContext);
           const mapping=mappingContext.mapping;
-          const cache=new Map(),cachedKeys={},calls=[];
-          const document={body:{appendChild:()=>{}},getElementById:()=>null,createElement:()=>({style:{},remove(){}})};
-          let dependencies=0;
-          const sandbox={window:{fileAsyncCache:cachedKeys},mapping,document,console,
+          let dependencies=0, nativeCalls=0, requests=[];
+          const nativeLoader=function(url,filename,cb){nativeCalls++;cb(Buffer.from('FALLBACK'));};
+          const sandbox={window:{getLazyAsset:nativeLoader,fileAsyncCache:{}},mapping,console,
             TextDecoder,Uint8Array,DataView,AbortController,setTimeout,clearTimeout,Number,String,Array,Object,
+            document:{getElementById:()=>null},
             addRunDependency(){dependencies++;},removeRunDependency(){dependencies--;},
-            FS:{analyzePath:p=>({exists:cache.has(p)}),stat:p=>({size:(cache.get(p)||Buffer.alloc(0)).length}),
-                writeFile:(p,b)=>cache.set(p,Buffer.from(b))},
-            fetch:async url=>{const resource=String(url);calls.push(resource);return {
-              ok:true,arrayBuffer:async()=>{const bytes=fs.readFileSync(path.join(root,'knight',resource));return bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);}
-            };}
-          };
+            fetch:async url=>{requests.push(url);return {ok:true,arrayBuffer:async()=>{
+              const bytes=fs.readFileSync(path.join(root,'knight',url));
+              return bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);
+            }}}};
           vm.runInNewContext(browser,sandbox);
           (async()=>{
-            sandbox.window.slR113BootIcons();
-            while(dependencies>0) await new Promise(resolve=>setTimeout(resolve,1));
-            assert.equal(Object.keys(cachedKeys).filter(k=>k.startsWith('graphics/icons/')).length,395,'Icons missing');
-            for(const k of Object.keys(cachedKeys).filter(k=>k.startsWith('graphics/icons/')).slice(0,8)){
-              const rel=mapping[k].split('?')[0]; assert.deepEqual(cache.get('/game/'+rel),fs.readFileSync(path.join(root,'knight/gameasync',rel)));
+            sandbox.window.slR114BootIcons();
+            while(dependencies>0)await new Promise(resolve=>setTimeout(resolve,1));
+            let icons=0;
+            for(const k of Object.keys(mapping).filter(k=>k.startsWith('graphics/icons/'))){
+              let val;const url='gameasync/'+mapping[k];
+              sandbox.window.getLazyAsset(url,'file',b=>val=Buffer.from(b));
+              const real=fs.readFileSync(path.join(root,'knight/gameasync',mapping[k].split('?')[0]));
+              assert.deepEqual(val,real);icons++;
             }
+            assert.equal(icons,395);
             for(const mid of [29,45,46]){
-              assert.equal(await sandbox.window.slR113BeginMap(mid),true,'Map pack failed '+mid);
-              const packed=fs.readFileSync(path.join(root,'knight/assets','map-'+String(mid).padStart(3,'0')+'-v229r113.pack'));
-              const n=packed.readUInt32LE(0),header=JSON.parse(packed.subarray(4,4+n).toString('utf8'));
-              const expected={29:74,45:143,46:161}[mid];assert.equal(header.files.length,expected);
-              for(const [k,off,len] of header.files){
-                assert.equal(cachedKeys[k],1,'Cache key missing '+k);
-                const name=mapping[k].split('?')[0];assert.deepEqual(cache.get('/game/'+name),fs.readFileSync(path.join(root,'knight/gameasync',name)));
+              assert.equal(await sandbox.window.slR114BeginMap(mid),true);
+              const pack=fs.readFileSync(path.join(root,'knight/assets','map-'+String(mid).padStart(3,'0')+'-v229r114.pack'));
+              const n=pack.readUInt32LE(0),manifest=JSON.parse(pack.subarray(4,4+n).toString('utf8'));
+              assert.equal(manifest.files.length,{29:74,45:143,46:161}[mid]);
+              for(const [k] of manifest.files){
+                let staged;
+                sandbox.window.getLazyAsset('gameasync/'+mapping[k],'f',v=>staged=Buffer.from(v));
+                assert.deepEqual(staged,fs.readFileSync(path.join(root,'knight/gameasync',mapping[k].split('?')[0])));
               }
-              const prior=calls.length;
-              assert.equal(await sandbox.window.slR113BeginMap(mid),true);
-              assert.equal(calls.length,prior,'A ready map should not be downloaded again');
-              console.log('PASS MAP '+mid+' '+header.files.length+' assets exact, no repeat');
+              const prev=requests.length;
+              assert.equal(await sandbox.window.slR114BeginMap(mid),true);
+              assert.equal(requests.length,prev);
+              console.log('PASS Map'+mid+' '+manifest.files.length+' staged as original bytes; no repeat');
             }
-            assert.equal(calls.filter(x=>x.includes('icons-')).length,1);
-            console.log('PASS 395 icons, 3 mapped packs, exact bytes and cache flags');
-          })().catch(err=>{console.error(err);process.exit(1)});
-          R113_TEST
+            assert.deepEqual(Object.keys(sandbox.window.fileAsyncCache),[],'No premature cache completed flags');
+            assert.equal(nativeCalls,0);
+            console.log('PASS 395 icons staged; NO Emscripten FS writes; original image decode remains authoritative');
+          })().catch(e=>{console.error(e);process.exit(1)});
+          R114_TEST
           ruby -c build/export_maps.rb
           ruby build/export_maps.rb site/knight/gameasync/Data > build/map-meta.json
           python3 build/pack_assets.py site build/map-meta.json build/asset-report.json
-          python3 build/patch_browser.py site build/sl-assets-v229r113.js
+          python3 build/patch_browser.py site build/sl-assets-v229r114.js
           node --check site/knight/js/drive.js
-          node --check site/knight/js/sl-assets-v229r113.js
+          node --check site/knight/js/sl-assets-v229r114.js
           node --check site/knight/js/dpad.js
           node --check site/knight/gameasync/mapping.js
-          node build/test-r113.js site
+          node build/test-r114.js site
 
-      - name: V229R113 Verify every pack and untouched S32 maps
+      - name: V229R114 Verify every pack and untouched S32 maps
         shell: bash
         run: |
           set -euo pipefail
@@ -523,8 +446,8 @@ jobs:
           expected={'index.html','knight/index.html','knight/js/drive.js'}
           assert changed==expected,('Unexpected original game changes',changed^expected)
           added=set(after)-set(before)
-          expected_added={'knight/js/sl-assets-v229r113.js','knight/assets/icons-v229r113.pack'}
-          expected_added|={f'knight/assets/map-{i:03d}-v229r113.pack' for i in range(1,47)}
+          expected_added={'knight/js/sl-assets-v229r114.js','knight/assets/icons-v229r114.pack'}
+          expected_added|={f'knight/assets/map-{i:03d}-v229r114.pack' for i in range(1,47)}
           assert added==expected_added,('Unexpected added files',added^expected_added)
           assert len(after)==5565 and len(before)==5517,(len(before),len(after))
           assert not any(k.startswith('knight/gameasync/') for k in changed)
@@ -545,16 +468,19 @@ jobs:
                   assert blob[offset+pos:offset+pos+size]==target.read_bytes(),('Bad pack bytes',name,k)
           assert len(after)==len(before)+48
           assert b'R111_SANCTUARY_QUEUE' not in (root/'knight/js/drive.js').read_bytes()
+          assert b'FS.createPreloadedFile' in (root/'knight/js/drive.js').read_bytes()
+          assert b'FS.writeFile' not in (root/'knight/js/sl-assets-v229r114.js').read_bytes()
+          assert b'window.fileAsyncCache[key]=1' not in (root/'knight/js/sl-assets-v229r114.js').read_bytes()
           html=(root/'knight/index.html').read_text('utf8')
-          assert 'window.slR113BootIcons();' in html
-          assert 'sl-assets-v229r113.js?v=v229r113' in html
+          assert 'window.slR114BootIcons();' in html
+          assert 'sl-assets-v229r114.js?v=v229r114' in html
           assert 'name: build-slknight-web.yml' not in html
           print('PASS R111 engine, coordinates, doors, mobs, graphics, dpad byte-identical')
           print('PASS all 46 map packs and 395 icon entries compared to original files')
           print('PASS only 3 HTML/loader source changes plus 48 generated asset files')
           PY_AUDIT
 
-      - name: V229R113 Publish exact R111 game with map-action and item packs
+      - name: V229R114 Publish exact R111 game with map-action and item packs
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
