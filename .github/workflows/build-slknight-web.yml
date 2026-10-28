@@ -1,15 +1,14 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R129
-# BASE: exact deployed R121 clean artwork and R127 default RPG movement.
-# ONLY NEW RULE: on dungeon maps 45/46 never ENTER an ORIGINAL tile ID 385.
-# KEEP: original RPG movement, original 384 and 385 map cells / tile passage flags.
-# KEEP: R127 removal of three legacy collision interceptors and the two
-# approved R125 S32 direction-mask bytes. No R128 map-tile conversion.
-# PROTECT: all maps/tilesets, original stair/door events, no image or wall edits,
-# all smoke-free 2F artwork, monsters, respawns, sprites, controls and saves.
-# NO new runtime classes, per-frame search, graphical shifts, or wall carving.
-name: build-slknight-web.yml | V229R129 | Clean Native Events and 2x Terrain
+# VERSION: V229R130
+# BASE: verified V229R121 with clean original 1F/2F terrain and wall artwork.
+# DELETE: unused R42/R44 grid masks, R49 monster sight/path/attack guards,
+# native movement overrides, and obsolete per-movement S32 passability search.
+# KEEP: RPG's standard Game_Map, Game_Character and Game_Player movement.
+# KEEP: original RPG 384/385 map tiles, all monster/map events and R111 respawn.
+# KEEP: original 1F/2F graphics, 2F smoke cleanup, wall rendering and 4-way pad.
+# NO: invented movement, new collision guard, new map tiles or new runtime hooks.
+name: build-slknight-web.yml | V229R130 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -32,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R129 Restore exact current graphics and original maps
+      - name: V229R130 Restore verified smoke-free original game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -41,7 +40,7 @@ jobs:
           github-token: ${{ github.token }}
           path: original
 
-      - name: V229R129 Protect 2F artwork and immutable map data
+      - name: V229R130 Check original game and protect all graphics
         shell: bash
         run: |
           set -euo pipefail
@@ -49,303 +48,139 @@ jobs:
           mkdir -p site build
           tar -xf original/artifact.tar -C site
           python3 - <<'BASE'
+          import hashlib,json
           from pathlib import Path
-          import json,hashlib
           root=Path('site')
-          before={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
-                  for f in root.rglob('*') if f.is_file()}
-          assert len(before)==5566,('Wrong game baseline',len(before))
-          expected={
-            'knight/gameasync/Data/Scripts.rxdata':
-              '51bbd2b04e5a8e51a7ab95838ba3f7669009ffc1f66c1695c74ed35c6344e7ee',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':
-              'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':
-              'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c',
-            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata':
-              'fcbdad7b1d9da2511991632022b8364de0a3c0ea4a2fe62111b155b8eaf73aa5'
-          }
-          for file,sha in expected.items():
-            assert before.get(file)==sha,('Incorrect source; abort',file)
+          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.rglob('*') if p.is_file()}
+          assert len(before)==5566,('Unexpected file count',len(before))
+          assert before['knight/gameasync/Data/Scripts.rxdata']==\
+            '51bbd2b04e5a8e51a7ab95838ba3f7669009ffc1f66c1695c74ed35c6344e7ee'
+          assert before['knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata']==\
+            'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6'
+          assert before['knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata']==\
+            'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'
           assert 'V229R121' in (root/'knight/index.html').read_text('utf8')
-          Path('build/original-digests.json').write_text(json.dumps(before,sort_keys=True))
-          print('PASS source inventory including unchanged clean second-floor images')
+          Path('build/before.json').write_text(json.dumps(before,sort_keys=True))
           BASE
-          cp site/knight/gameasync/Data/Scripts.rxdata build/original-scripts.rxdata
+          cp site/knight/gameasync/Data/Scripts.rxdata build/source-scripts.rxdata
 
-      - name: V229R129 Keep normal movement and prevent original 385 entry
+      - name: V229R130 Delete remaining dungeon movement and sight code
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/delete.rb <<'DELETE'
+          cat > build/cleanup.rb <<'RUBY'
+          # encoding: UTF-8
           require 'zlib'
           source=ARGV.fetch(0)
           destination=ARGV.fetch(1)
           archive=Marshal.load(File.binread(source))
-          before=Marshal.load(File.binread(source))
-          raise 'Unexpected RPG script count' unless archive.length==136
+          original=Marshal.load(File.binread(source))
+          raise 'Wrong 136 scripts' unless archive.size==136
 
-          # Remove legacy dungeon collision overrides; leave the original RPG
-          # Game_Map and Game_Character methods in place for EVERY game map.
-          delete=lambda do |text,first,last,label|
+          def strip(text,first,last,label,replace='')
             first=first.b;last=last.b
             a=text.index(first)
-            raise "#{label}: start not found or duplicated" if a.nil? || text.index(first,a+first.length)
-            b=text.index(last,a+first.length)
-            raise "#{label}: end not found" if b.nil?
-            [text[0...a]+text[b..-1],text[a...b]]
+            raise "#{label}: missing start" if a.nil?
+            raise "#{label}: duplicate start" if label!='native actor and monster path methods' && text.index(first,a+first.bytesize)
+            b=text.index(last,a+first.bytesize)
+            raise "#{label}: missing finish" if b.nil?
+            [text[0...a]+replace.b+text[b..-1],text[a...b]]
           end
 
           s21=Zlib::Inflate.inflate(archive[21][2])
-          s21,cut21=delete.call(s21,
+          s21,discard=strip(s21,
             '    # V229R42: replace ONLY the static ground-tile passage rule on original',
             '    # 주어진 좌표가 맵외의 경우',
-            'script21 map collision')
-          raise 'Script21 unexpected change' unless cut21.include?('SLTI_V229R44.allowed?') && cut21.include?('if (@map_id == 45 or @map_id == 46)')
-          raise 'Script21 original tile passage missing' unless s21.include?('tile_id = data[x, y, i]') && s21.include?('@passages[tile_id] & bit')
+            'obsolete collision interceptor')
+          raise 'wrong deleted collision override' unless discard.include?('SLTI_V229R44.allowed?')
+          s21,discard=strip(s21,'module SLTI_V229R42\n'.gsub('\\n',"\n"),'class Game_Map', 'obsolete 2 large RGSS direction masks')
+          raise 'wrong RGSS graph' unless discard.include?('module SLTI_V229R44')
+          raise 'original Game_Map lost' unless s21.include?('tile_id = data[x, y, i]')
           archive[21][2]=Zlib::Deflate.deflate(s21)
 
           s23=Zlib::Inflate.inflate(archive[23][2])
-          s23,cut23=delete.call(s23,
+          s23,discard=strip(s23,
             '    # R49: apply the exact native directional graph to regular dungeon monsters',
             '    # 새로운 좌표를 요구한다',
-            'script23 character collision')
-          raise 'Script23 unexpected change' unless cut23.include?('SLTI_V229R44.allowed?') && cut23.include?('self == $game_player')
-          raise 'Script23 original movement missing' unless s23.include?('$game_map.passable?(x, y, d, self)') && s23.include?('if @through')
-
-          # ONLY NEW MOVEMENT CONDITION: preserve all 384 tiles and prevent
-          # stepping INTO original 385, even if a through flag was enabled.
-          # No replacement tiles, direction graphs, or new movement handler.
-          anchor="    if @through\r\n"
-          raise 'Unexpected original through branch' unless s23.scan(anchor).size==1
-          guard=[
-            '    # V229R129: do not enter an original dungeon tile ID 385.',
-            '    if ($game_map.map_id == 45 || $game_map.map_id == 46) &&',
-            '       $game_map.data[new_x, new_y, 0] == 385',
-            '      return false',
-            '    end',
-            ''
-          ].join("\r\n")
-          baseline_s23=s23.dup
-          s23=s23.sub(anchor,guard+anchor)
-          raise 'Modification exceeds exact 385 condition' unless
-            s23.sub(guard,'')==baseline_s23
+            'obsolete monster collision interceptor')
+          raise 'wrong monster interceptor' unless discard.include?('SLTI_V229R44.allowed?')
+          raise 'original actor passability lost' unless s23.include?('$game_map.passable?(x, y, d, self)')
           archive[23][2]=Zlib::Deflate.deflate(s23)
 
           s134=Zlib::Inflate.inflate(archive[134][2])
-          s134,cut134=delete.call(s134,
+          s134,discard=strip(s134,
             '# Any remaining movement query must consult the same native wall-base edges.',
             '# V229R97: 419 corners, 32 bridges, one manual edge; no boot scan.',
-            'script134 per-move 81-cell S32 scan')
-          raise 'Script134 unexpected change' unless cut134.include?('class Game_Map') && cut134.include?('SLTI_Native66.nearest(@map_id,x,y,16)')
-          raise 'Script134 projection lost' unless s134.include?('def self.project(mid,x,y)') && s134.include?('# V229R84:')
+            'per-move 81-cell native nearest')
+          raise 'wrong per-frame search' unless discard.include?('SLTI_Native66.nearest') && discard.include?('class Game_Map')
 
-          # Keep the TWO explicitly approved R125 original S32 direction masks.
-          # The 450 other original records are untouched. No runtime additions.
-          pattern=/data='([^']+)'\.unpack\('m'\)\[0\]\.unpack\('C\*'\)/
-          found=s134.scan(pattern)
-          raise 'Original S32 masks missing' unless found.length==1
-          encoded=found.first.first
-          bytes=encoded.unpack('m')[0].unpack('C*')
-          raise 'Wrong original mask count' unless bytes.length==452*3
-          changes={[32657,32805]=>11,[32657,32807]=>7}
-          seen=[]
-          (0...bytes.length).step(3) do |i|
-            xy=[32576+bytes[i],32704+bytes[i+1]]
-            next unless changes.key?(xy)
-            raise "Wrong old S32 mask #{xy}" unless bytes[i+2]==3
-            bytes[i+2]=changes.fetch(xy)
-            seen<<xy
-          end
-          raise 'Missing approved S32 masks' unless seen.sort==changes.keys.sort
-          replaced="data='#{[bytes.pack('C*')].pack('m0')}'.unpack('m')[0].unpack('C*')"
-          s134=s134.sub(pattern,replaced)
-          raise 'R126 custom player code must be absent' if s134.include?('SLTI_R126Gates') || s134.include?('slti_r126_prepare')
-          raise 'Native actor mover must be absent' if s134.include?('slti_native66_move') || s134.include?('slti_native66_prepare')
+          # Preserve original monster identification for R111 respawn, keep wall art.
+          s134,discard=strip(s134,'  def self.grid(mid)', "\nclass Game_Character\n  alias slti_r49_original_range", 'R49 unused sight graph', "end\n")
+          raise 'wrong LOS graph' unless discard.include?('def self.route?') && discard.include?('SLTI_V229R44')
+          s134,discard=strip(s134,"\nclass Game_Character\n  alias slti_r49_original_range", "\n# Guard ACTUAL actor HP damage originating in native monster events.", 'R49 special monster-sight override')
+          raise 'wrong monster range' unless discard.include?('first_sight?') && discard.include?('slti_r49_original_range')
+          s134,discard=strip(s134,"\n# Guard ACTUAL actor HP damage originating in native monster events.","\n# Floor and wall are separate ORIGINAL textures",'R49 script damage ray guard')
+          raise 'wrong script damage guard' unless discard.include?('attack_open?')
+
+          # Delete uncalled native movement graph methods; preserve source nearest ONLY
+          # for existing, previously approved random respawn at monster death.
+          s134,discard=strip(s134,'  def self.edge?(mid,x,y,dx,dy)','  def self.project(mid,x,y)', 'native movement geometry')
+          raise 'wrong path methods' unless discard.include?('def self.move_path?')
+          s134,discard=strip(s134,'  def self.native_target(mid,x,y,dir)',"\nend\n\n# Replace the old R42/R44 graph used by monster first-sight/attack ray tests.", 'native actor and monster path methods')
+          raise 'wrong native target' unless discard.include?('native_line?')
+          s134,discard=strip(s134,"\n# Replace the old R42/R44 graph used by monster first-sight/attack ray tests.","\n# V229R111: select a different traversable position",'unused rays/corner direction overrides')
+          raise 'wrong old path append' unless discard.include?('module SLTI_V229R97Corner') && discard.include?('def self.native_target')
+          raise 'approved respawn lost' unless s134.include?('module SLTI_R111Respawn') && s134.include?('SLTI_Native66.nearest(mid,x,y,16)')
+          raise 'wall graphics lost' unless s134.include?('slti_r49_update_walls') && s134.include?('::PARTS')
+          raise 'unused movement code remains' if s134.include?('SLTI_V229R44') || s134.include?('SLTI_V229R97Corner') || s134.include?('native_target') || s134.include?('direct_line?')
           archive[134][2]=Zlib::Deflate.deflate(s134)
 
-          archive.each_with_index do |entry,i|
-            next if [21,23,134].include?(i)
-            raise "Unapproved game script modification: #{i}" unless entry==before[i]
+          archive.each_with_index do |v,i|
+           next if [21,23,134].include?(i)
+           raise "Unexpected edited game script #{i}" unless v==original[i]
           end
           File.binwrite(destination,Marshal.dump(archive))
-          puts "PASS removed 3 legacy interceptors, one 385-only guard, 2 approved mask bytes kept"
-          puts "PASS original RPG movement with unchanged other maps and original tile IDs"
-          puts "PASS 133 untouched game scripts"
-          DELETE
-          ruby -c build/delete.rb
-          ruby build/delete.rb build/original-scripts.rxdata site/knight/gameasync/Data/Scripts.rxdata
-          ruby -rzlib -e 's=Marshal.load(File.binread(ARGV[0]));[21,23,134].each{|i|File.binwrite("build/script#{i}.rb",Zlib::Inflate.inflate(s[i][2]))}' \
-            site/knight/gameasync/Data/Scripts.rxdata
+          puts "PASS exact source, original RPG movement all maps, removed obsolete dungeon mover / sight / path"
+          puts "PASS original reward, respawn, map rendering and other scripts preserved"
+          puts "BYTES script21=#{s21.bytesize} script23=#{s23.bytesize} script134=#{s134.bytesize}"
+          RUBY
+          ruby -c build/cleanup.rb
+          ruby build/cleanup.rb build/source-scripts.rxdata site/knight/gameasync/Data/Scripts.rxdata
+          ruby -rzlib -e 'a=Marshal.load(File.binread(ARGV[0]));[21,23,134].each{|i|File.binwrite("build/script#{i}.rb",Zlib::Inflate.inflate(a[i][2]))}' site/knight/gameasync/Data/Scripts.rxdata
           ruby -c build/script21.rb
           ruby -c build/script23.rb
           ruby -c build/script134.rb
 
-      - name: V229R129 Test unchanged maps and 385 entry refusal
+      - name: V229R130 Verify vanilla four-direction movement and no side effects
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/test.rb <<'TEST'
+          cat > build/check.rb <<'CHECK'
           require 'zlib'
-          require 'json'
-          path=ARGV.fetch(0)
-          a=Marshal.load(File.binread(path))
-          s=lambda{|i|Zlib::Inflate.inflate(a[i][2])}
-          # Verify only allowed 3 scripts differ from the current R121 source.
-          original=Marshal.load(File.binread(ARGV.fetch(1)))
-          changed=[]
-          a.each_with_index{|row,i| changed<<i if row!=original[i]}
-          raise "Unexpected script edits #{changed.inspect}" unless changed==[21,23,134]
-          [21,23,134].each do |i|
-            txt=s.call(i)
-            temp="build/r129-check-#{i}.rb"
-            File.binwrite(temp,txt)
-            raise "Syntax error #{i}" unless system('ruby','-c',temp,out:File::NULL)
-          end
-          raise 'Game_Map 81 scan still installed' if s.call(134).include?('cell=SLTI_Native66.nearest(@map_id,x,y,16)')
-          raise 'R126 overrides still installed' if s.call(134).include?('slti_r126_prepare')
-          raise 'Game_Map movement override remains' if s.call(21).include?('return false unless SLTI_V229R44.allowed?(@map_id, x, y, d)')
-          raise 'Game_Character movement override remains' if s.call(23).include?('regular || self == $game_player')
-          raise '385-only guard missing' unless s.call(23).include?('$game_map.data[new_x, new_y, 0] == 385')
+          a=Marshal.load(File.binread(ARGV.fetch(0)))
+          b=Marshal.load(File.binread(ARGV.fetch(1)))
+          changed=(0...a.size).select{|i| a[i]!=b[i]}
+          raise 'Unexpected scripts changed' unless changed==[21,23,134]
+          scripts={}
+          [21,23,134].each{|i|scripts[i]=Zlib::Inflate.inflate(a[i][2])}
+          raise 'RPG default map collision missing' unless scripts[21].include?('tile_id = data[x, y, i]')
+          raise 'RPG default character movement missing' unless scripts[23].include?('$game_map.passable?(x, y, d, self)')
+          raise 'Obsolete R42/R44 movement data remains' if scripts[21].include?('SLTI_V229R44') || scripts[21].include?('SLTI_V229R42')
+          raise 'Extra character collision remains' if scripts[23].include?('SLTI_') || scripts[23].include?('== 385')
+          raise 'Per-frame native movement override remains' if scripts[134].include?('SLTI_V229R44') || scripts[134].include?('native_target') || scripts[134].include?('slti_native66_prepare') || scripts[134].include?('slti_r49_original_range')
+          raise 'Per-frame S32 path detection remains' if scripts[134].include?('first_sight?') || scripts[134].include?('direct_line?')
+          raise 'Extra movement passes remain' if scripts[134].include?('alias slti_native66_original_passable')
+          raise 'Native nearest may be called outside respawn' unless scripts[134].scan('SLTI_Native66.nearest').length==1
+          raise 'Original walls lost' unless scripts[134].include?('slti_r49_update_walls') && scripts[134].include?('SLTI_V229R49::PARTS')
+          raise 'Original monster respawn lost' unless scripts[134].include?('module SLTI_R111Respawn')
+          raise 'Original rewards lost' unless scripts[134].include?('module SLV541')
+          puts 'PASS all standard RPG move directions; removed obsolete dungeon path overrides'
+          puts 'PASS original wall rendering, 2F assets and monster respawn code retained'
+          CHECK
+          ruby build/check.rb site/knight/gameasync/Data/Scripts.rxdata build/source-scripts.rxdata
 
-          module RPG
-           class Map
-             attr_reader :width,:height,:data,:events
-           end
-           class AudioFile;end
-           class Event
-             class Page
-               class Condition;end
-               class Graphic;end
-             end
-           end
-           class EventCommand;end
-           class MoveRoute;end
-           class MoveCommand;end
-           class Tileset
-             attr_reader :passages,:priorities
-           end
-          end
-          class Table
-           def self._load(s)
-             d,x,y,z,total=s.byteslice(0,20).unpack('V5')
-             t=allocate;t.instance_variable_set(:@size,[x,y,z]);t.instance_variable_set(:@cells,s.byteslice(20..-1).unpack('v*'));t
-           end
-           def [](x,y=nil,z=0)
-            return @cells[x] if y.nil?
-            sizes=@size;return nil if x<0||y<0||x>=sizes[0]||y>=sizes[1]||z>=sizes[2]
-            @cells[(z*sizes[1]+y)*sizes[0]+x]
-           end
-           def size;@size;end
-          end
-          Object.class_eval(s.call(21))
-          [23,24,25,27].each{|i|Object.class_eval(s.call(i))}
-          class Game_Event < Game_Character;end
-          class Game_Character
-           def check_event_trigger_touch(*args);end
-          end
-          class RealMap < Game_Map
-           def initialize(mid,original)
-            @map_id=mid
-            @map=original
-            @events={}
-            @passages=$tileset.passages
-            @priorities=$tileset.priorities
-           end
-          end
-          $tilesets=Marshal.load(File.binread('site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata'))
-          D={2=>[0,1],4=>[-1,0],6=>[1,0],8=>[0,-1]}
-          def bfs(mid,start,goals)
-           f='site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap%03d.rxdata'%mid
-           m=Marshal.load(File.binread(f))
-           $tileset=$tilesets[m.instance_variable_get(:@tileset_id)]
-           $game_map=RealMap.new(mid,m)
-           $game_player=Game_Character.new
-           $game_player.instance_variable_set(:@character_name,'Knight')
-           $game_player.moveto(*start)
-           seen={start=>true};queue=[start];head=0
-           while head<queue.length
-            x,y=queue[head];head+=1
-            D.each do |d,(dx,dy)|
-             goal=[x+dx,y+dy]
-             next if seen[goal]
-             next unless $game_player.passable?(x,y,d)
-             seen[goal]=true;queue<<goal
-            end
-           end
-           puts "MAP #{mid} #{queue.length} reachable, goals #{goals.map{|p|[p,seen[p]||false]}.inspect}"
-           raise "Map#{mid} stairs/targets disconnected" unless goals.all?{|xy|seen[xy]}
-           raise 'unexpected graph change' unless queue.length==(mid==45 ? 3712 : 7056)
-          end
-          bfs(45,[92,74],[[153,72],[201,76],[165,75],[187,64],[113,59]])
-          bfs(46,[74,94],[[76,94],[156,100]])
-
-          # Exact 385 regression across both original map tables.
-          # No 385 cell has been rewritten as 384 or as R128's synthetic tiles.
-          prefix='site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          directions={2=>[0,1],4=>[-1,0],6=>[1,0],8=>[0,-1]}
-          [[45,37748,3724],[46,49348,7100]].each do |mid,blocked,open|
-            m=Marshal.load(File.binread('%sMap%03d.rxdata'%[prefix,mid]))
-            ts=$tilesets[m.instance_variable_get(:@tileset_id)]
-            table=m.instance_variable_get(:@data)
-            assert_count={384=>0,385=>0}
-            m.width.times do |x|
-              m.height.times do |y|
-                tile=table[x,y,0]
-                raise "Unexpected map tile #{mid}/#{tile}" unless assert_count.key?(tile)
-                assert_count[tile]+=1
-                raise 'Layer 1 modified' unless table[x,y,1]==0
-                raise 'Layer 2 modified' unless table[x,y,2]==0
-              end
-            end
-            raise "385 changed on #{mid}" unless assert_count[385]==blocked
-            raise "384 changed on #{mid}" unless assert_count[384]==open
-            raise "385 no longer fully blocked" unless ts.passages[385]==15
-            raise "384 no longer open" unless ts.passages[384]==0
-
-            $tileset=ts
-            $game_map=RealMap.new(mid,m)
-            $game_player=Game_Character.new
-            tested=0
-            control=0
-            (0...m.width).each do |x|
-              (0...m.height).each do |y|
-                next unless table[x,y,0]==384
-                directions.each do |dir,(dx,dy)|
-                  nx=x+dx;ny=y+dy
-                  next unless nx>=0 && ny>=0 && nx<m.width && ny<m.height
-                  target=table[nx,ny,0]
-                  next unless target==385 || target==384
-                  # Original movement and character instance, no alternative engine.
-                  actor=Game_Character.new
-                  actor.moveto(x,y)
-                  actor.instance_variable_set(:@through,true)
-                  observed=actor.passable?(x,y,dir)
-                  if target==385
-                    raise "ENTERED tile 385 #{mid}/#{x},#{y},#{dir}" if observed
-                    tested+=1
-                  elsif target==384 && control<5
-                    raise "384 was wrongly blocked #{mid}" unless observed
-                    control+=1
-                  end
-                end
-              end
-            end
-            raise "No tile 385 boundaries tested #{mid}" if tested<50
-            raise "No tile 384 controls tested #{mid}" if control<5
-            # Other maps keep the exact original passable?/through semantics.
-            $game_map=RealMap.new(1,m)
-            actor=Game_Character.new
-            actor.instance_variable_set(:@through,true)
-            raise 'Other-map movement changed' unless actor.passable?(0,0,6)
-            puts "PASS map #{mid}: #{tested} blocked 385 entrances with through ON, #{control} open 384 controls"
-          end
-          puts 'PASS original 1F/2F map tiles and 385 collision; all other maps unchanged'
-          TEST
-          ruby -c build/test.rb
-          ruby build/test.rb site/knight/gameasync/Data/Scripts.rxdata build/original-scripts.rxdata
-
-      - name: V229R129 Update only script cache and verify untouched artwork
+      - name: V229R130 Update cache and verify all map and image bytes unchanged
         shell: bash
         run: |
           set -euo pipefail
@@ -355,51 +190,44 @@ jobs:
           root=Path('site')
           scripts=root/'knight/gameasync/Data/Scripts.rxdata'
           mapping=root/'knight/gameasync/mapping.js'
-          code=mapping.read_text('utf8')
-          code,n=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
-              lambda m:m.group(1)+hashlib.md5(scripts.read_bytes()).hexdigest(),code)
-          assert n==1,('Script hash not unique',n)
-          mapping.write_text(code,encoding='utf8')
-          for name in ('index.html','knight/index.html'):
-            path=root/name
-            html=path.read_text('utf8')
-            assert 'V229R121' in html and 'V229R129' not in html
-            path.write_text(html.replace('V229R121','V229R129')
-                .replace('v229r121','v229r129'),encoding='utf8')
+          text,count=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
+              lambda m:m.group(1)+hashlib.md5(scripts.read_bytes()).hexdigest(),mapping.read_text('utf8'))
+          assert count==1,('Missing Scripts cache entry',count)
+          mapping.write_text(text,encoding='utf8')
+          for filename in ('index.html','knight/index.html'):
+            p=root/filename
+            s=p.read_text('utf8')
+            assert 'V229R121' in s
+            p.write_text(s.replace('V229R121','V229R130').replace('v229r121','v229r130'),encoding='utf8')
           runtime=root/'knight/js/sl-assets-v229r115.js'
-          code=runtime.read_text('utf8')
-          assert code.count("var version='V229R121';")==1
-          runtime.write_text(code.replace("var version='V229R121';",
-                             "var version='V229R129';"),encoding='utf8')
-          before=json.loads(Path('build/original-digests.json').read_text('utf8'))
-          after={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
-                 for f in root.rglob('*') if f.is_file()}
-          assert len(before)==len(after)==5566
-          assert before.keys()==after.keys(),('Original content inventory changed')
-          changed={f for f in before if before[f]!=after[f]}
-          expected={'index.html','knight/index.html',
-            'knight/gameasync/mapping.js',
-            'knight/gameasync/Data/Scripts.rxdata',
-            'knight/js/sl-assets-v229r115.js'}
-          assert changed==expected,('Unexpected edits',sorted(changed^expected))
-          for file in before:
-            protected=(file.startswith('knight/assets/') or
-              file.startswith('knight/gameasync/Graphics/') or
-              (file.startswith('knight/gameasync/Data/') and
-               not file.endswith('/Scripts.rxdata')) or
-              file in ('knight/js/dpad.js','knight/js/drive.js'))
-            if protected:
-              assert before[file]==after[file],('PROTECTED ASSET MODIFIED',file)
-          assert 'js/sl-assets-v229r115.js?v=v229r129' in (root/'knight/index.html').read_text('utf8')
-          print('PASS 5,566 original files preserved; only 5 version/script/cache files differ')
-          print('PASS zero modified 1F/2F images, graphics, wall textures, maps and events')
+          data=runtime.read_text('utf8')
+          assert data.count("var version='V229R121';")==1
+          runtime.write_text(data.replace("var version='V229R121';","var version='V229R130';"),encoding='utf8')
+          before=json.loads(Path('build/before.json').read_text('utf8'))
+          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.rglob('*') if p.is_file()}
+          assert before.keys()==after.keys() and len(after)==5566
+          changed={k for k in before if before[k]!=after[k]}
+          expected={'index.html','knight/index.html','knight/gameasync/mapping.js',
+            'knight/gameasync/Data/Scripts.rxdata','knight/js/sl-assets-v229r115.js'}
+          assert changed==expected,('Unexpected changed assets',changed^expected)
+          for name in before:
+            if (name.startswith('knight/assets/') or
+                name.startswith('knight/gameasync/Graphics/') or
+                (name.startswith('knight/gameasync/Data/') and
+                 name!='knight/gameasync/Data/Scripts.rxdata') or
+                name in ('knight/js/dpad.js','knight/js/drive.js')):
+              assert before[name]==after[name],('Protected game content modified',name)
+          assert 'js/sl-assets-v229r115.js?v=v229r130' in (root/'knight/index.html').read_text('utf8')
+          print('PASS original map045/046, tilesets, sprites, walls, cleaned 2F artwork byte-identical')
+          print('PASS only 5 script/cache/version files changed')
           AUDIT
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
           node --check site/knight/js/dpad.js
           node --check site/knight/js/drive.js
-          node --check site/knight/js/sl-assets-v229r115.js
-          node --check site/knight/gameasync/mapping.js
 
-      - name: V229R129 Publish original movement with no new runtime overrides
+      - name: V229R130 Publish no added runtime movement code
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
