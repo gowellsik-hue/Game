@@ -1,219 +1,275 @@
-
-# FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V6.11
-# PURPOSE: Bypass further WinLicense layer-by-layer updates. Recover the distinct
-#          authentic TW13032701 native client from the original Sanctuary archive;
-#          trace real native socket receive call sites toward monster packet handlers.
-# SOURCE: user-supplied original Sanctuary release, not SLKnight or L1J SQL.
-# IMPORTANT: native socket call sites are NOT original initial monster spawn XY.
-# KEEP: workflow file/title unchanged except version; no changes to game or Pages.
-name: audit-sanctuary-maps.yml | V6.11 | Original Knight Scale Audit
+# FILE: .github/workflows/build-slknight-web.yml
+# VERSION: V229R118
+# BASE: successful deployed R117, run 40624859427.
+# REMOVE: entire custom Native66 player/monster movement, coordinate conversion,
+#         native passability, native ray tests and native coordinate spawn checks.
+# KEEP: RGSS/R44 existing four-way passability, original enemy event logic,
+#       approved randomized respawn, R115 asset bundles, map files and 4-way pad.
+# VISUAL: offset BOTH Map045/046 floor AND wall artwork (+12,+6) screen pixels.
+#         This is renderer placement only, never Game_Character coordinates.
+name: build-slknight-web.yml | V229R118 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/audit-sanctuary-maps.yml]
+    paths: [.github/workflows/build-slknight-web.yml]
 
 permissions:
   contents: read
   actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: slknight-github-pages
+  cancel-in-progress: false
 
 jobs:
-  alternate-original-client-receiver:
-    name: V6.11 | Locate native packet receive and its code path
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    env:
-      GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 60
     steps:
-      - name: V6.11 Download distinct original client volume directly
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p source reports
-          gh release download v1.0.0 -R gowellsik-hue/Game \
-            -p 'Sanctuary.of.Aden.-.Copy.z35' \
-            -D source --clobber
-          test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.z35)" -eq 100000000
-
-      - name: V6.11 Extract original game client and trace packet receiver references
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/v611-native-receiver.py <<'PY_V611'
-          from pathlib import Path
-          from collections import Counter
-          from math import log2
-          import csv, hashlib, json, re, struct, subprocess, sys, zlib
-
-          ZIP_VOLUME = 'Sanctuary.of.Aden.-.Copy.z35'
-          EXPECTED = 'Sanctuary of Aden - Copy/TW13032701.bin'
-          EXPECTED_SHA = '049e0579c193a666665eec0c10c4e28e8aa2184f1c0d26c1767e77212e6beda4'
-
-          def unzip_original(volume, out):
-              data = Path(volume).read_bytes()
-              start = 73614956
-              hdr = struct.unpack_from('<IHHHHHIIIHH', data, start)
-              signature, _, flags, method, _, _, _, _, _, name_len, extra_len = hdr
-              assert signature == 0x04034B50, 'Archive local ZIP header mismatch'
-              name = data[start+30:start+30+name_len].decode('utf-8' if flags & 0x800 else 'cp949')
-              assert name.replace('\\', '/') == EXPECTED, name
-              assert method == 8 and not(flags & 1), 'Expected unencrypted deflate'
-              raw_offset = start + 30 + name_len + extra_len
-              packed_size, unpacked_size, crc = 2332239, 2582376, 2104511809
-              assert raw_offset + packed_size <= len(data), 'Unexpected volume boundary'
-              extracted = zlib.decompress(data[raw_offset:raw_offset+packed_size], -15)
-              assert len(extracted) == unpacked_size and zlib.crc32(extracted) & 0xffffffff == crc
-              assert hashlib.sha256(extracted).hexdigest() == EXPECTED_SHA
-              Path(out).write_bytes(extracted)
-              return extracted
-
-          def u16(b,o): return struct.unpack_from('<H',b,o)[0]
-          def u32(b,o): return struct.unpack_from('<I',b,o)[0]
-
-          def inspect_exe(data, out):
-              assert data[:2] == b'MZ'
-              peoff = u32(data,0x3c);assert data[peoff:peoff+4] == b'PE\0\0'
-              number = u16(data,peoff+6)
-              opt_size = u16(data,peoff+20)
-              opt = peoff+24
-              magic=u16(data,opt);assert magic == 0x10b, 'Expected native 32-bit PE'
-              base=u32(data,opt+28)
-              entry=base+u32(data,opt+16)
-              import_rva=u32(data,opt+104)
-              sections=[]
-              for i in range(number):
-                  off=opt+opt_size+i*40
-                  name=data[off:off+8].rstrip(b'\0').decode('ascii','replace')
-                  size, rva, packed, raw, _, _, _, _, flags=struct.unpack_from('<IIIIIIHHI',data,off+8)
-                  blob=data[raw:raw+packed]; cnt=Counter(blob)
-                  entropy=round(-sum((n/len(blob))*log2(n/len(blob)) for n in cnt.values()),3) if blob else 0
-                  sections.append(dict(name=name,rva=rva,virtual_size=size,file_offset=raw,raw_size=packed,
-                                       flags=flags,executable=bool(flags & 0x20000000),entropy=entropy))
-              def from_rva(rva):
-                  if rva < u32(data,opt+60): return rva
-                  for sec in sections:
-                      if sec['rva'] <= rva < sec['rva']+max(sec['virtual_size'],sec['raw_size']):
-                          offset = rva-sec['rva']
-                          if offset < sec['raw_size']:
-                              return sec['file_offset']+offset
-                  raise ValueError('Unmapped or BSS RVA '+hex(rva))
-              def string(rva):
-                  pos=from_rva(rva)
-                  end=data.find(b'\0',pos,min(len(data),pos+1024))
-                  assert end>pos
-                  return data[pos:end].decode('latin1','replace')
-              imports=[]
-              if import_rva:
-                  try: desc=from_rva(import_rva)
-                  except ValueError: desc=None
-                  if desc is not None:
-                      for di in range(300):
-                          o=desc+di*20
-                          if o+20>len(data):break
-                          orig, _, _, name_rva, first = struct.unpack_from('<IIIII',data,o)
-                          if not(orig or name_rva or first):break
-                          try:
-                              dll=string(name_rva)
-                              thunk=orig or first
-                              for ti in range(6000):
-                                  to=from_rva(thunk+ti*4)
-                                  val=u32(data,to)
-                                  if not val:break
-                                  if val & 0x80000000:
-                                      imp='#'+str(val & 0xffff)
-                                  else:
-                                      imp=string(val+2)
-                                  imports.append((dll,imp,base+first+ti*4))
-                          except (ValueError,AssertionError,struct.error):
-                              continue
-              pattern=re.compile(r'^(?:recv|recvfrom|wsa(recv|recvfrom|send|sendto|socket[a-z]?)|send|sendto|socket|connect|wsaconnect|select|ioctlsocket|closesocket|gethostbyname|getaddrinfo|ntohl|htons)$',re.I)
-              target=[(dll,api,va) for dll,api,va in imports if re.search(r'ws2_32|wsock32',dll,re.I) and pattern.fullmatch(api)]
-              calls=[]
-              for dll,api,iat_va in target:
-                  if not pattern.fullmatch(api): continue
-                  for sec in sections:
-                      if not sec['executable']:continue
-                      blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
-                      for op in (b'\xff\x15', b'\xff\x25'):
-                          needle=op+struct.pack('<I',iat_va)
-                          pos=0
-                          while True:
-                              hit=blob.find(needle,pos)
-                              if hit<0:break
-                              va=base+sec['rva']+hit
-                              local=data[sec['file_offset']+max(0,hit-40):sec['file_offset']+min(len(blob),hit+50)]
-                              calls.append((dll,api,hex(iat_va),hex(va),'call' if op==b'\xff\x15' else 'jmp',local.hex()))
-                              pos=hit+1
-              # Also resolve near-call instructions which target an import jump thunk.
-              thunks={}
-              for dll,api,iat_va in target:
-                  jmp=b'\xff\x25'+struct.pack('<I',iat_va)
-                  for sec in sections:
-                      if not sec['executable']:continue
-                      blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
-                      pos=0
-                      while True:
-                          hit=blob.find(jmp,pos)
-                          if hit<0:break
-                          thunks[base+sec['rva']+hit]=(dll,api,iat_va)
-                          pos=hit+1
-              for sec in sections:
-                  if not sec['executable']:continue
-                  blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
-                  pos=0
-                  while True:
-                      hit=blob.find(b'\xe8',pos)
-                      if hit<0 or hit+5>len(blob):break
-                      source_va=base+sec['rva']+hit
-                      dest=(source_va+5+struct.unpack_from('<i',blob,hit+1)[0])&0xffffffff
-                      if dest in thunks:
-                          dll,api,iat_va=thunks[dest]
-                          lo=max(0,hit-32);hi=min(len(blob),hit+48)
-                          calls.append((dll,api,hex(iat_va),hex(source_va),'call-via-import-thunk',blob[lo:hi].hex()))
-                      pos=hit+1
-              out=Path(out);out.mkdir(exist_ok=True)
-              with (out/'native-packet-call-sites.csv').open('w',newline='') as f:
-                  writer=csv.writer(f);writer.writerow(['DLL','API','importVA','callSiteVA','operation','originalByteContext']);writer.writerows(calls)
-              (out/'native-imports.json').write_text(json.dumps({'imageBase':hex(base),'entryVA':hex(entry),'nativePESections':sections,
-                               'imports':[{'dll':d,'api':a,'iatVA':hex(x)} for d,a,x in imports],
-                               'nativePacketCallSites':len(calls)},indent=2))
-              notes=[f'Original EXE SHA256: {hashlib.sha256(data).hexdigest()}',
-                  f'Native entry: 0x{entry:08X}', f'Native import entries: {len(imports)}',
-                  f'Socket and relevant API imports: {len(target)}',
-                  f'Static native socket call sites: {len(calls)}',
-                  f'Executable sections: {sum(s["executable"] for s in sections)}',
-                  'Spawn IDs, counts and XY: not claimed from API call sites alone.',
-                  'Zero static socket call sites means no native receiver is identifiable from this PE without runtime evidence.']
-              (out/'native-packet-trace-results.txt').write_text('\n'.join(notes)+'\n',encoding='utf-8')
-              print('\n'.join(notes))
-              subprocess.run(['objdump','-d','-M','intel',str(out/'native-game-client.bin')],
-                  stdout=(out/'native-game-client.asm').open('w'),stderr=subprocess.DEVNULL,check=False)
-
-          if __name__ == '__main__':
-              if len(sys.argv)==3 and sys.argv[1]=='--test':
-                  path=Path(sys.argv[2]);dest=Path('reports');dest.mkdir(exist_ok=True)
-                  (dest/'native-game-client.bin').write_bytes(path.read_bytes())
-                  inspect_exe(path.read_bytes(),dest)
-              else:
-                  volume=Path(sys.argv[1]);dest=Path(sys.argv[2]);dest.mkdir(exist_ok=True)
-                  raw=unzip_original(volume,dest/'native-game-client.bin')
-                  inspect_exe(raw,dest)
-          PY_V611
-          python3 -m py_compile /tmp/v611-native-receiver.py
-          python3 /tmp/v611-native-receiver.py \
-            source/Sanctuary.of.Aden.-.Copy.z35 reports
-          test -s reports/native-game-client.bin
-          test -s reports/native-imports.json
-          test -s reports/native-packet-trace-results.txt
-          cat reports/native-packet-trace-results.txt
-
-      - name: V6.11 Upload genuine client and packet call-site candidates
-        uses: actions/upload-artifact@v4
+      - name: V229R118 Restore exact deployed R117
+        uses: actions/download-artifact@v4
         with:
-          name: Sanctuary-Map-V6.11-Original-Alternate-Client-Receive-Tracing
-          path: reports/
-          retention-days: 60
-          compression-level: 1
-          if-no-files-found: error
+          repository: gowellsik-hue/Game
+          run-id: 40624859427
+          name: github-pages
+          github-token: ${{ github.token }}
+          path: r117
+
+      - name: V229R118 Remove all native character coordinate/movement overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s r117/artifact.tar
+          mkdir -p site build
+          tar -xf r117/artifact.tar -C site
+          python3 - <<'PY_BASE'
+          from pathlib import Path
+          import hashlib, json
+          root=Path('site')
+          initial={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in root.rglob('*') if p.is_file()}
+          assert len(initial)==5566,('Wrong R117 baseline',len(initial))
+          checks={
+            'knight/gameasync/Data/Scripts.rxdata':'26e9eab43df5ea98406db49881ba45b3eb27af72ada6781ec317f3f4aa6db599',
+            'knight/js/dpad.js':'2bd401adf130339d154ce6a8efd0127cefd9b1bc58bc60d1de68e8b6d8b7a791',
+            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
+            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'}
+          for k,sha in checks.items():assert initial[k]==sha,('Wrong R117 file',k)
+          assert 'V229R117' in (root/'knight/index.html').read_text('utf8')
+          Path('build/before.json').write_text(json.dumps(initial,sort_keys=True))
+          print('PASS original R117 engine, Map045/046 and controls checked')
+          PY_BASE
+
+          cat > build/r118.rb <<'R118_RUBY'
+          require 'zlib'
+          file='site/knight/gameasync/Data/Scripts.rxdata'
+          scripts=Marshal.load(File.binread(file))
+          raise 'Unexpected scripts count' unless scripts.size==136
+          s=Zlib::Inflate.inflate(scripts[134][2])
+          terrain=Zlib::Inflate.inflate(scripts[97][2])
+
+          # Drop the WHOLE R66/R84/R97 native-coordinate layer. It included
+          # Game_Character#moveto/moving?/update_move, eight move_* overrides,
+          # Game_Map/Game_Character#passable?, and the per-move 81-cell nearest
+          # search. Earlier RGSS/R44 movement and collision remain authoritative.
+          start_tag='# V229R66: preserve original Sanctuary four-way native tile coordinates.'
+          end_tag='# V229R111: select a different traversable position near each monster'
+          a=s.index(start_tag)
+          b=s.index(end_tag,a || 0)
+          raise 'Unexpected Native66 block' unless a && b && a<b
+          removed=s[a...b]
+          required=['module SLTI_Native66','alias slti_native66_original_moveto',
+                    'alias slti_native66_original_passable','module SLTI_V229R97Corner',
+                    'def slti_native66_prepare','def self.nearest','def self.project',
+                    'def self.direct_line?']
+          required.each{|word| raise "Native layer missing #{word}" unless removed.include?(word)}
+          s=s[0...a]+s[b..-1]
+
+          # Keep only the approved randomized respawn on the original RGSS grid.
+          # Do not invoke deleted native coordinate or actor-movement methods.
+          a=s.index("module SLTI_R111Respawn\n")
+          b=s.index("\nclass Interpreter\n",a || 0)
+          raise 'Missing respawn boundaries' unless a && b
+          respawn=<<'R118_RESPAWN'
+          module SLTI_R111Respawn
+            ENTRY={45=>[92,74],46=>[74,94]}.freeze
+            def self.pick(event)
+              map=$game_map
+              return nil if map==nil
+              mid=map.map_id
+              entrance=ENTRY[mid]
+              return nil if entrance==nil
+              original=event.instance_variable_get(:@event)
+              return nil if original==nil
+              x0=original.x;y0=original.y
+              last=event.instance_variable_get(:@slti_r111_last_spawn)
+              player=$game_player
+              96.times do
+                x=x0+rand(25)-12
+                y=y0+rand(25)-12
+                next if x<0 || y<0 || x>=map.width || y>=map.height
+                next unless map.data[x,y,0]==384
+                next unless SLTI_V229R49.walkable?(mid,x,y)
+                next if (x-entrance[0]).abs+(y-entrance[1]).abs<9
+                next if player!=nil && (x-player.x).abs+(y-player.y).abs<9
+                next if last!=nil && last[0]==x && last[1]==y
+                occupied=false
+                map.events.each_value do |other|
+                  next if other==event || other.through || other.character_name==''
+                  if other.x==x && other.y==y
+                    occupied=true
+                    break
+                  end
+                end
+                next if occupied
+                event.instance_variable_set(:@slti_r111_last_spawn,[x,y])
+                return [x,y]
+              end
+              nil
+            end
+          end
+          R118_RESPAWN
+          s=s[0...a]+respawn+s[b..-1]
+
+          # Keep the map offset in GRAPHICS only, not player or monster positions.
+          # Both floors use the same approved (+12,+6) source-isometric cell.
+          def exactly_one(code, old, newer)
+            count=code.scan(Regexp.new(Regexp.escape(old))).size
+            raise "Expected one instance of #{old.inspect}; found #{count}" unless count==1
+            code.sub(old,newer)
+          end
+          terrain=exactly_one(terrain,'left=[sx/1024,0].max',
+                                     'left=[(sx-12)/1024,0].max')
+          terrain=exactly_one(terrain,'top=[sy/1024,0].max',
+                                     'top=[(sy-6)/1024,0].max')
+          terrain=exactly_one(terrain,'right=[(sx+vw-1)/1024,@slti_cols-1].min',
+                                     'right=[(sx+vw-1-12)/1024,@slti_cols-1].min')
+          terrain=exactly_one(terrain,'bottom=[(sy+vh-1)/1024,@slti_rows-1].min',
+                                     'bottom=[(sy+vh-1-6)/1024,@slti_rows-1].min')
+          terrain=exactly_one(terrain,'sprite.x=key[0]*1024-sx',
+                                     'sprite.x=key[0]*1024-sx+12')
+          terrain=exactly_one(terrain,'sprite.y=key[1]*1024-sy',
+                                     'sprite.y=key[1]*1024-sy+6')
+          terrain=exactly_one(terrain,'sprite.x=x*1024-sx',
+                                     'sprite.x=x*1024-sx+12')
+          terrain=exactly_one(terrain,'sprite.y=y*1024-sy',
+                                     'sprite.y=y*1024-sy+6')
+          s=exactly_one(s,'wall_x=cx*1024+(id%4)*256-sx',
+                           'wall_x=cx*1024+(id%4)*256-sx+12')
+          s=exactly_one(s,'wall_y=cy*1024+(id/4)*128-sy',
+                           'wall_y=cy*1024+(id/4)*128-sy+6')
+
+          raise 'Native movement still referenced' if s.include?('SLTI_Native66') ||
+            s.include?('slti_native66') || s.include?('SLTI_V229R97Corner')
+          raise 'Respawn removed' unless s.include?('module SLTI_R111Respawn')
+          raise 'Original R49 wall-aware monster sight removed' unless
+            s.include?('module SLTI_V229R49') && s.include?('SLTI_V229R44.allowed?')
+          raise 'Unapproved sprite position edits' unless
+            terrain.include?('sprite.x=x*1024-sx+12') &&
+            terrain.include?('sprite.y=y*1024-sy+6') &&
+            s.include?('wall_x=cx*1024+(id%4)*256-sx+12') &&
+            s.include?('wall_y=cy*1024+(id/4)*128-sy+6')
+          scripts[97][2]=Zlib::Deflate.deflate(terrain)
+          scripts[134][2]=Zlib::Deflate.deflate(s)
+          File.binwrite(file,Marshal.dump(scripts))
+          File.binwrite('build/97-r118.rb',terrain)
+          File.binwrite('build/134-r118.rb',s)
+          puts 'PASS all native S32 actor coordinate/movement/passability overrides removed'
+          puts 'PASS RGSS/R44 baseline movement and wall-aware AI retained'
+          puts 'PASS both floor and wall artwork shifted right 12px / down 6px'
+          R118_RUBY
+          ruby build/r118.rb
+          ruby -c build/97-r118.rb
+          ruby -c build/134-r118.rb
+
+          python3 - <<'PY_CACHE'
+          from pathlib import Path
+          import hashlib,re
+          root=Path('site')
+          data=root/'knight/gameasync/Data/Scripts.rxdata'
+          mapping=root/'knight/gameasync/mapping.js'
+          txt=mapping.read_text('utf8')
+          txt,count=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
+            lambda m:m.group(1)+hashlib.md5(data.read_bytes()).hexdigest(),txt)
+          assert count==1,('Mapping Scripts cache update',count)
+          mapping.write_text(txt,encoding='utf8')
+          for filename in ('index.html','knight/index.html'):
+            path=root/filename
+            text=path.read_text('utf8')
+            assert 'V229R117' in text and 'V229R118' not in text
+            text=text.replace('V229R117','V229R118').replace('v229r117','v229r118')
+            path.write_text(text,encoding='utf8')
+          runtime=root/'knight/js/sl-assets-v229r115.js'
+          code=runtime.read_text('utf8')
+          assert code.count("var version='V229R117';")==1
+          runtime.write_text(code.replace("var version='V229R117';",
+            "var version='V229R118';"),encoding='utf8')
+          print('PASS updated script mapping hash and R118 labels; R115 packs intact')
+          PY_CACHE
+
+      - name: V229R118 Verify complete removal and unchanged assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -c build/97-r118.rb
+          ruby -c build/134-r118.rb
+          node --check site/knight/js/drive.js
+          node --check site/knight/js/sl-assets-v229r115.js
+          node --check site/knight/gameasync/mapping.js
+          python3 - <<'PY_AUDIT'
+          from pathlib import Path
+          import hashlib,json,subprocess
+          root=Path('site')
+          before=json.loads(Path('build/before.json').read_text('utf8'))
+          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.rglob('*') if p.is_file()}
+          assert len(before)==len(after)==5566 and before.keys()==after.keys()
+          changed={p for p in before if before[p]!=after[p]}
+          approved={'index.html','knight/index.html',
+                    'knight/gameasync/mapping.js',
+                    'knight/gameasync/Data/Scripts.rxdata',
+                    'knight/js/sl-assets-v229r115.js'}
+          assert changed==approved,('Unexpected changed files',changed^approved)
+          for p in before:
+            if p.startswith('knight/assets/') or p.startswith('knight/gameasync/Graphics/') or \
+               p.startswith('knight/gameasync/Data/') and not p.endswith('Scripts.rxdata') or \
+               p in ('knight/js/dpad.js','knight/js/drive.js'):
+              assert before[p]==after[p],('Protected file modified',p)
+          s=Path('build/134-r118.rb').read_text('utf8')
+          t=Path('build/97-r118.rb').read_text('utf8')
+          assert not any(k in s for k in ('SLTI_Native66','slti_native66',
+              'SLTI_V229R97Corner','slti_r111_original_move_toward_player'))
+          assert all(k in t for k in (
+            'sprite.x=key[0]*1024-sx+12','sprite.y=key[1]*1024-sy+6',
+            'sprite.x=x*1024-sx+12','sprite.y=y*1024-sy+6'))
+          assert 'wall_x=cx*1024+(id%4)*256-sx+12' in s
+          assert 'wall_y=cy*1024+(id/4)*128-sy+6' in s
+          assert 'SLTI_R111Respawn' in s
+          assert 'SLTI_V229R49.walkable?(mid,x,y)' in s
+          assert 'js/sl-assets-v229r115.js?v=v229r118' in (root/'knight/index.html').read_text('utf8')
+          assert all(before[x]==after[x] for x in ('knight/js/dpad.js','knight/js/drive.js'))
+          print('PASS no native S32 actor movement/collision/coordinate code remains')
+          print('PASS both dungeon floors artwork +12/+6, no actor offsets')
+          print('PASS no changes to map data, doors, mobs, game assets or downloader')
+          PY_AUDIT
+
+      - name: V229R118 Publish original movement with visual offsets preserved
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+          retention-days: 30
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v6
+      - id: deployment
+        uses: actions/deploy-pages@v5
