@@ -1,13 +1,15 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R126
-# BASE: the deployed R121 (same clean 2F images as R125).
-# 1F: restore source S32 player movement at the existing (+12,+6) projection.
-# 2F and monsters: native RPG movement; remove costly 81-cell passability scan.
-# RETAIN: 450 original corner masks + both approved R125 openings, all 8 gates.
-# PROTECT: original 2F stain cleanup, terrain, wall graphics, doors, monsters,
-# assets, inventory, combat, respawns and controls. No map or image edits.
-name: build-slknight-web.yml | V229R126 | Clean Native Events and 2x Terrain
+# VERSION: V229R127
+# BASE: exact R121 assets, same clean 1F/2F images as deployed R126.
+# DELETE: R42/R44 Game_Map collision interceptor, R49 Game_Character
+# collision interceptor, and R66 Game_Map nearest-S32 81-cell interceptor.
+# NO additional player move, pathfinding, coordinate, wall, or runtime code.
+# KEEP: original RPG 4-direction movement and its existing 384/385 tile maps.
+# KEEP: 2 approved R125 S32 direction mask bytes (805=11, 807=7).
+# PROTECT: all 1F/2F graphics including smoke-free 2F, wall images,
+# monsters, events, spawn rules, controls, save/game logic and preload.
+name: build-slknight-web.yml | V229R127 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -30,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R126 Restore exact clean 2F R121 deployment
+      - name: V229R127 Restore exact current graphics and original maps
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -39,439 +41,287 @@ jobs:
           github-token: ${{ github.token }}
           path: original
 
-      - name: V229R126 Verify game source and protect original images
+      - name: V229R127 Protect 2F artwork and immutable map data
         shell: bash
         run: |
           set -euo pipefail
           test -s original/artifact.tar
           mkdir -p site build
           tar -xf original/artifact.tar -C site
-          python3 - <<'CHECK'
+          python3 - <<'BASE'
           from pathlib import Path
-          import hashlib,json
+          import json,hashlib
           root=Path('site')
-          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in root.rglob('*') if p.is_file()}
-          assert len(before)==5566,len(before)
+          before={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
+                  for f in root.rglob('*') if f.is_file()}
+          assert len(before)==5566,('Wrong game baseline',len(before))
           expected={
             'knight/gameasync/Data/Scripts.rxdata':
               '51bbd2b04e5a8e51a7ab95838ba3f7669009ffc1f66c1695c74ed35c6344e7ee',
             'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap045.rxdata':
               'f47de87af6b4e607bf632818a711619dc8ca4e747196a123a76ac7db8ffc3ba6',
             'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap046.rxdata':
-              'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c'
+              'dc89d908f5247442e08dddc11f5bcf6505a77890bd82ab59b790e00e3e5f024c',
+            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata':
+              'fcbdad7b1d9da2511991632022b8364de0a3c0ea4a2fe62111b155b8eaf73aa5'
           }
-          for p,sha in expected.items():
-            assert before.get(p)==sha,('Wrong source, refusing map edit',p)
+          for file,sha in expected.items():
+            assert before.get(file)==sha,('Incorrect source; abort',file)
           assert 'V229R121' in (root/'knight/index.html').read_text('utf8')
-          Path('build/before.json').write_text(json.dumps(before,sort_keys=True))
-          print('PASS original 5,566 files, including clean 2F art')
-          CHECK
+          Path('build/original-digests.json').write_text(json.dumps(before,sort_keys=True))
+          print('PASS source inventory including unchanged clean second-floor images')
+          BASE
+          cp site/knight/gameasync/Data/Scripts.rxdata build/original-scripts.rxdata
 
-      - name: V229R126 Restore fast native 1F player without extra map patches
+      - name: V229R127 Delete three movement interceptors only
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/patch.rb <<'PATCH'
+          cat > build/delete.rb <<'DELETE'
           require 'zlib'
+          source=ARGV.fetch(0)
+          destination=ARGV.fetch(1)
+          archive=Marshal.load(File.binread(source))
+          before=Marshal.load(File.binread(source))
+          raise 'Unexpected RPG script count' unless archive.length==136
 
-          source = ARGV.fetch(0)
-          destination = ARGV.fetch(1)
-          archive = Marshal.load(File.binread(source))
-          raise 'Wrong game script count' unless archive.length == 136
-          original_entries = Marshal.load(File.binread(source))
-          old = Zlib::Inflate.inflate(archive[134][2])
-          raise 'Wrong R121 native source' unless old.include?("module SLTI_Native66\n") && old.include?("module SLTI_V229R97Corner\n")
-          raise 'Unexpected actor mover' if old.include?('slti_native66_prepare') || old.include?('SLTI_R125TwoOpen')
+          # Remove legacy dungeon collision overrides; leave the original RPG
+          # Game_Map and Game_Character methods in place for EVERY game map.
+          delete=lambda do |text,first,last,label|
+            first=first.b;last=last.b
+            a=text.index(first)
+            raise "#{label}: start not found or duplicated" if a.nil? || text.index(first,a+first.length)
+            b=text.index(last,a+first.length)
+            raise "#{label}: end not found" if b.nil?
+            [text[0...a]+text[b..-1],text[a...b]]
+          end
 
-          # Approved R125 adjustments. Keep all original 450 other S32 corner records.
-          pattern = /data='([^']+)'\.unpack\('m'\)\[0\]\.unpack\('C\*'\)/
-          found = old.scan(pattern)
-          raise 'Wrong S32 corner table' unless found.length == 1
-          encoded = found[0][0]
-          data = encoded.unpack('m')[0].unpack('C*')
-          raise 'Wrong S32 corner count' unless data.length == 452*3
-          changes = {[32657,32805]=>11, [32657,32807]=>7}
-          seen = []
-          (0...data.length).step(3) do |i|
-            xy = [32576+data[i], 32704+data[i+1]]
+          s21=Zlib::Inflate.inflate(archive[21][2])
+          s21,cut21=delete.call(s21,
+            '    # V229R42: replace ONLY the static ground-tile passage rule on original',
+            '    # 주어진 좌표가 맵외의 경우',
+            'script21 map collision')
+          raise 'Script21 unexpected change' unless cut21.include?('SLTI_V229R44.allowed?') && cut21.include?('if (@map_id == 45 or @map_id == 46)')
+          raise 'Script21 original tile passage missing' unless s21.include?('tile_id = data[x, y, i]') && s21.include?('@passages[tile_id] & bit')
+          archive[21][2]=Zlib::Deflate.deflate(s21)
+
+          s23=Zlib::Inflate.inflate(archive[23][2])
+          s23,cut23=delete.call(s23,
+            '    # R49: apply the exact native directional graph to regular dungeon monsters',
+            '    # 새로운 좌표를 요구한다',
+            'script23 character collision')
+          raise 'Script23 unexpected change' unless cut23.include?('SLTI_V229R44.allowed?') && cut23.include?('self == $game_player')
+          raise 'Script23 original movement missing' unless s23.include?('$game_map.passable?(x, y, d, self)') && s23.include?('if @through')
+          archive[23][2]=Zlib::Deflate.deflate(s23)
+
+          s134=Zlib::Inflate.inflate(archive[134][2])
+          s134,cut134=delete.call(s134,
+            '# Any remaining movement query must consult the same native wall-base edges.',
+            '# V229R97: 419 corners, 32 bridges, one manual edge; no boot scan.',
+            'script134 per-move 81-cell S32 scan')
+          raise 'Script134 unexpected change' unless cut134.include?('class Game_Map') && cut134.include?('SLTI_Native66.nearest(@map_id,x,y,16)')
+          raise 'Script134 projection lost' unless s134.include?('def self.project(mid,x,y)') && s134.include?('# V229R84:')
+
+          # Keep the TWO explicitly approved R125 original S32 direction masks.
+          # The 450 other original records are untouched. No runtime additions.
+          pattern=/data='([^']+)'\.unpack\('m'\)\[0\]\.unpack\('C\*'\)/
+          found=s134.scan(pattern)
+          raise 'Original S32 masks missing' unless found.length==1
+          encoded=found.first.first
+          bytes=encoded.unpack('m')[0].unpack('C*')
+          raise 'Wrong original mask count' unless bytes.length==452*3
+          changes={[32657,32805]=>11,[32657,32807]=>7}
+          seen=[]
+          (0...bytes.length).step(3) do |i|
+            xy=[32576+bytes[i],32704+bytes[i+1]]
             next unless changes.key?(xy)
-            raise "Incorrect source mask #{xy.inspect}" unless data[i+2]==3
-            data[i+2]=changes[xy]
-            seen << xy
+            raise "Wrong old S32 mask #{xy}" unless bytes[i+2]==3
+            bytes[i+2]=changes.fetch(xy)
+            seen<<xy
           end
-          raise 'Corner locations missing' unless seen.sort==changes.keys.sort
-          replacement = "data='#{[data.pack('C*')].pack('m0')}'.unpack('m')[0].unpack('C*')"
-          updated=old.sub(pattern,replacement)
+          raise 'Missing approved S32 masks' unless seen.sort==changes.keys.sort
+          replaced="data='#{[bytes.pack('C*')].pack('m0')}'.unpack('m')[0].unpack('C*')"
+          s134=s134.sub(pattern,replaced)
+          raise 'R126 custom player code must be absent' if s134.include?('SLTI_R126Gates') || s134.include?('slti_r126_prepare')
+          raise 'Native actor mover must be absent' if s134.include?('slti_native66_move') || s134.include?('slti_native66_prepare')
+          archive[134][2]=Zlib::Deflate.deflate(s134)
 
-          # Delete the obsolete 81-cell search in every RPG map passability query.
-          slow = <<'OLD_PASSABILITY'
-          class Game_Map
-            alias slti_native66_original_passable passable?
-            def passable?(x,y,d,self_event=nil)
-              if SLTI_Native66.active_map?(@map_id) && (d==2 || d==4 || d==6 || d==8)
-                cell=SLTI_Native66.nearest(@map_id,x,y,16)
-                return false if cell==nil
-                return SLTI_Native66.native_target(@map_id,cell[0],cell[1],d)!=nil
-              end
-              slti_native66_original_passable(x,y,d,self_event)
-            end
-          end
-          OLD_PASSABILITY
-          raise 'Slow map passability section not unique' unless updated.scan(slow).size == 1
-          updated=updated.sub(slow,'')
-
-          runtime = <<'RUNTIME'
-
-          # V229R126: keep original 2F and monster movement, use exact S32 for the 1F hero.
-          # R125 gates are additive and reciprocal. No runtime path scan or wall slide.
-          module SLTI_R126Gates
-            WIDTH=288
-            EDGES={
-              78*WIDTH+89=>2,
-              79*WIDTH+87=>8,
-              79*WIDTH+88=>12,
-              79*WIDTH+89=>7,
-              80*WIDTH+89=>9,
-              80*WIDTH+90=>14,
-              80*WIDTH+91=>12,
-              80*WIDTH+92=>4,
-              81*WIDTH+90=>1
-            }.freeze
-            def self.open?(map,x,y,d)
-              return false unless map==45 && x>=0 && x<288 && y>=0 && y<144
-              bit=(d==8 ? 1 : d==2 ? 2 : d==4 ? 4 : d==6 ? 8 : 0)
-              return bit!=0 && (EDGES.fetch(y*WIDTH+x,0)&bit)!=0
-            end
-          end
-          module SLTI_V229R44
-            class << self
-              alias slti_r126_standard_allowed allowed?
-              def allowed?(map,x,y,d)
-                return true if SLTI_R126Gates.open?(map,x,y,d)
-                slti_r126_standard_allowed(map,x,y,d)
-              end
-            end
-          end
-
-          module SLTI_Native66
-            def self.real(mid,x,y)
-              px,py=project(mid,x,y)
-              return [px*8-64,py*8-128]
-            end
-            def self.to_rgss(mid,x,y)
-              px,py=project(mid,x,y)
-              return [px/16,py/16]
-            end
-          end
-
-          # Player-only 1F native steps. Standard RPG movement on 2F and all other maps.
-          # No Game_Character overrides: monsters retain normal RGSS movement/AI.
-          class Game_Player
-            alias slti_r126_old_moveto moveto
-            alias slti_r126_old_moving moving?
-            alias slti_r126_old_update_move update_move
-            alias slti_r126_old_down move_down
-            alias slti_r126_old_left move_left
-            alias slti_r126_old_right move_right
-            alias slti_r126_old_up move_up
-            alias slti_r126_old_passable passable?
-
-            def slti_r126_prepare
-              return false if $game_map==nil || $game_map.map_id!=45
-              if @slti_r126_map!=45 || @slti_r126_x==nil
-                point=SLTI_Native66.nearest(45,@x,@y,16)
-                return false if point==nil
-                @slti_r126_map=45
-                @slti_r126_x,@slti_r126_y=point
-                @slti_r126_tx,@slti_r126_ty=SLTI_Native66.real(45,point[0],point[1])
-                @real_x=@slti_r126_tx
-                @real_y=@slti_r126_ty
-              end
-              return true
-            end
-
-            def moveto(x,y)
-              @slti_r126_map=nil
-              @slti_r126_x=nil
-              slti_r126_old_moveto(x,y)
-              slti_r126_prepare
-            end
-
-            def moving?
-              if slti_r126_prepare
-                return @real_x!=@slti_r126_tx || @real_y!=@slti_r126_ty
-              end
-              slti_r126_old_moving
-            end
-
-            def update_move
-              return slti_r126_old_update_move unless slti_r126_prepare
-              speed=2**@move_speed
-              @real_x=[@real_x+speed,@slti_r126_tx].min if @real_x<@slti_r126_tx
-              @real_x=[@real_x-speed,@slti_r126_tx].max if @real_x>@slti_r126_tx
-              @real_y=[@real_y+speed,@slti_r126_ty].min if @real_y<@slti_r126_ty
-              @real_y=[@real_y-speed,@slti_r126_ty].max if @real_y>@slti_r126_ty
-              if @walk_anime
-                @anime_count+=1.5
-              elsif @step_anime
-                @anime_count+=1
-              end
-            end
-
-            def passable?(x,y,d)
-              return slti_r126_old_passable(x,y,d) unless slti_r126_prepare
-              return false unless d==2 || d==4 || d==6 || d==8
-              return SLTI_Native66.native_target(45,@slti_r126_x,@slti_r126_y,d)!=nil
-            end
-
-            def slti_r126_step(d)
-              target=SLTI_Native66.native_target(45,@slti_r126_x,@slti_r126_y,d)
-              return false if target==nil
-              x,y=SLTI_Native66.to_rgss(45,target[0],target[1])
-              return false unless $game_map.valid?(x,y)
-              unless @through
-                $game_map.events.each_value do |event|
-                  next if event==self || event.through || event.character_name==''
-                  return false if event.x==x && event.y==y
-                end
-              end
-              @slti_r126_x,@slti_r126_y=target
-              @slti_r126_tx,@slti_r126_ty=SLTI_Native66.real(45,target[0],target[1])
-              @x=x
-              @y=y
-              increase_steps
-              return true
-            end
-
-            def move_down(turn_enabled=true)
-              return slti_r126_old_down(turn_enabled) unless slti_r126_prepare
-              turn_down if turn_enabled
-              check_event_trigger_touch(@x,@y+1) unless slti_r126_step(2)
-            end
-            def move_left(turn_enabled=true)
-              return slti_r126_old_left(turn_enabled) unless slti_r126_prepare
-              turn_left if turn_enabled
-              check_event_trigger_touch(@x-1,@y) unless slti_r126_step(4)
-            end
-            def move_right(turn_enabled=true)
-              return slti_r126_old_right(turn_enabled) unless slti_r126_prepare
-              turn_right if turn_enabled
-              check_event_trigger_touch(@x+1,@y) unless slti_r126_step(6)
-            end
-            def move_up(turn_enabled=true)
-              return slti_r126_old_up(turn_enabled) unless slti_r126_prepare
-              turn_up if turn_enabled
-              check_event_trigger_touch(@x,@y-1) unless slti_r126_step(8)
-            end
-          end
-          RUNTIME
-
-          updated << runtime
-          raise 'R126 patch invalid' unless updated.include?("class Game_Player\n") && !updated.include?(slow)
-          archive[134][2]=Zlib::Deflate.deflate(updated.b)
-          archive.each_with_index do |row,i|
-            next if i==134
-            raise "Unapproved script changed #{i}" unless row==original_entries[i]
+          archive.each_with_index do |entry,i|
+            next if [21,23,134].include?(i)
+            raise "Unapproved game script modification: #{i}" unless entry==before[i]
           end
           File.binwrite(destination,Marshal.dump(archive))
-          puts 'PASS: two additive S32 masks, no full map edits, no slow Game_Map nearest, 1F native player, 2F default movement'
-          PATCH
-          ruby -c build/patch.rb
-          cp site/knight/gameasync/Data/Scripts.rxdata build/original-scripts.rxdata
-          ruby build/patch.rb build/original-scripts.rxdata \
+          puts "PASS removed 3 complete interceptors, 0 appended classes, 2 approved mask bytes kept"
+          puts "PASS original RPG movement for all maps incl. 45/46 and villages"
+          puts "PASS 133 untouched game scripts"
+          DELETE
+          ruby -c build/delete.rb
+          ruby build/delete.rb build/original-scripts.rxdata site/knight/gameasync/Data/Scripts.rxdata
+          ruby -rzlib -e 's=Marshal.load(File.binread(ARGV[0]));[21,23,134].each{|i|File.binwrite("build/script#{i}.rb",Zlib::Inflate.inflate(s[i][2]))}' \
             site/knight/gameasync/Data/Scripts.rxdata
-          ruby -rzlib -e 'a=Marshal.load(File.binread(ARGV[0]));print Zlib::Inflate.inflate(a[134][2])' \
-            site/knight/gameasync/Data/Scripts.rxdata > build/script134-r126.rb
-          ruby -c build/script134-r126.rb
+          ruby -c build/script21.rb
+          ruby -c build/script23.rb
+          ruby -c build/script134.rb
 
-      - name: V229R126 Test real actor path and 2F reachability
+      - name: V229R127 Test standard RPG movement on both original maps
         shell: bash
         run: |
           set -euo pipefail
           cat > build/test.rb <<'TEST'
           require 'zlib'
-          source=ARGV.fetch(0)
-          archive=Marshal.load(File.binread(source))
-          raise 'Wrong script count' unless archive.length==136
-          s=lambda{|i|Zlib::Inflate.inflate(archive[i][2])}
+          require 'json'
+          path=ARGV.fetch(0)
+          a=Marshal.load(File.binread(path))
+          s=lambda{|i|Zlib::Inflate.inflate(a[i][2])}
+          # Verify only allowed 3 scripts differ from the current R121 source.
+          original=Marshal.load(File.binread(ARGV.fetch(1)))
+          changed=[]
+          a.each_with_index{|row,i| changed<<i if row!=original[i]}
+          raise "Unexpected script edits #{changed.inspect}" unless changed==[21,23,134]
+          [21,23,134].each do |i|
+            txt=s.call(i)
+            temp="build/r127-check-#{i}.rb"
+            File.binwrite(temp,txt)
+            raise "Syntax error #{i}" unless system('ruby','-c',temp,out:File::NULL)
+          end
+          raise 'Game_Map 81 scan still installed' if s.call(134).include?('cell=SLTI_Native66.nearest(@map_id,x,y,16)')
+          raise 'R126 overrides still installed' if s.call(134).include?('slti_r126_prepare')
+          raise 'Game_Map movement override remains' if s.call(21).include?('return false unless SLTI_V229R44.allowed?(@map_id, x, y, d)')
+          raise 'Game_Character movement override remains' if s.call(23).include?('regular || self == $game_player')
+
+          module RPG
+           class Map
+             attr_reader :width,:height,:data,:events
+           end
+           class AudioFile;end
+           class Event
+             class Page
+               class Condition;end
+               class Graphic;end
+             end
+           end
+           class EventCommand;end
+           class MoveRoute;end
+           class MoveCommand;end
+           class Tileset
+             attr_reader :passages,:priorities
+           end
+          end
+          class Table
+           def self._load(s)
+             d,x,y,z,total=s.byteslice(0,20).unpack('V5')
+             t=allocate;t.instance_variable_set(:@size,[x,y,z]);t.instance_variable_set(:@cells,s.byteslice(20..-1).unpack('v*'));t
+           end
+           def [](x,y=nil,z=0)
+            return @cells[x] if y.nil?
+            sizes=@size;return nil if x<0||y<0||x>=sizes[0]||y>=sizes[1]||z>=sizes[2]
+            @cells[(z*sizes[1]+y)*sizes[0]+x]
+           end
+           def size;@size;end
+          end
           Object.class_eval(s.call(21))
           [23,24,25,27].each{|i|Object.class_eval(s.call(i))}
-          class Game_Event < Game_Character; end
-          class Game_Character;def check_event_trigger_touch(*args);end;end
-
-          actor=s.call(134)
-          segment=lambda do |start,finish|
-            a=actor.index(start)
-            b=a && actor.index(finish,a)
-            raise "Missing movement code #{start}" unless a && b
-            actor[a...b]
+          class Game_Event < Game_Character;end
+          class Game_Character
+           def check_event_trigger_touch(*args);end
           end
-          Object.class_eval(segment.call("module SLTI_Native66\n","\n# Replace the old R42/R44 graph"))
-          Object.class_eval(segment.call("module SLTI_V229R97Corner\n","\n# V229R84:"))
-          i=actor.index("# V229R84:")
-          a=actor.index("module SLTI_Native66\n",i)
-          b=actor.index("\n# V229R111:",a)
-          Object.class_eval(actor[a...b])
-          Object.class_eval(actor[actor.index("\n# V229R126:")..-1])
-
-          raise '1F projection changed' unless SLTI_Native66.project(45,32655,32806)==[1416,1290]
-          raise '2F projection changed' unless SLTI_Native66.project(46,32655,32806)==[1416,1674]
-          raise 'S32 corners changed outside approval' unless SLTI_V229R97Corner::MASKS.length==452
-          raise 'Wrong first corner' unless SLTI_V229R97Corner::MASKS[[32657,32805]]==11
-          raise 'Wrong second corner' unless SLTI_V229R97Corner::MASKS[[32657,32807]]==7
-          raise 'Per-move 81-cell scan still active' if actor.include?('cell=SLTI_Native66.nearest(@map_id,x,y,16)')
-
-          # The 8 reciprocal RPG gate edges approved in R125 stay open.
-          [[89,78,2],[89,79,8],[89,79,2],[89,80,8],
-           [89,80,6],[90,80,4],[90,80,6],[91,80,4],
-           [91,80,6],[92,80,4],[87,79,6],[88,79,4],
-           [88,79,6],[89,79,4],[90,80,2],[90,81,8]].each do |x,y,d|
-            raise "R125 gate lost #{[x,y,d]}" unless SLTI_V229R44.allowed?(45,x,y,d)
+          class RealMap < Game_Map
+           def initialize(mid,original)
+            @map_id=mid
+            @map=original
+            @events={}
+            @passages=$tileset.passages
+            @priorities=$tileset.priorities
+           end
           end
-
-          # Native graph: starting player -> requested coordinates -> 2F trigger.
-          def native_path(start,goal)
-            queue=[start];seen={start=>true};parent={};i=0
-            while i<queue.length
-              xy=queue[i];i+=1;break if xy==goal
-              [2,4,6,8].each do |d|
-                nxt=SLTI_Native66.native_target(45,xy[0],xy[1],d)
-                next if nxt==nil || seen[nxt]
-                seen[nxt]=true;parent[nxt]=[xy,d];queue<<nxt
-              end
+          $tilesets=Marshal.load(File.binread('site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOTilesets.rxdata'))
+          D={2=>[0,1],4=>[-1,0],6=>[1,0],8=>[0,-1]}
+          def bfs(mid,start,goals)
+           f='site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap%03d.rxdata'%mid
+           m=Marshal.load(File.binread(f))
+           $tileset=$tilesets[m.instance_variable_get(:@tileset_id)]
+           $game_map=RealMap.new(mid,m)
+           $game_player=Game_Character.new
+           $game_player.instance_variable_set(:@character_name,'Knight')
+           $game_player.moveto(*start)
+           seen={start=>true};queue=[start];head=0
+           while head<queue.length
+            x,y=queue[head];head+=1
+            D.each do |d,(dx,dy)|
+             goal=[x+dx,y+dy]
+             next if seen[goal]
+             next unless $game_player.passable?(x,y,d)
+             seen[goal]=true;queue<<goal
             end
-            raise "Native passage disconnected at #{goal}" unless seen[goal]
-            route=[];p=goal
-            until p==start
-              prev,dir=parent.fetch(p)
-              route<<dir;p=prev
-            end
-            return route.reverse
+           end
+           puts "MAP #{mid} #{queue.length} reachable, goals #{goals.map{|p|[p,seen[p]||false]}.inspect}"
+           raise "Map#{mid} stairs/targets disconnected" unless goals.all?{|xy|seen[xy]}
+           raise 'unexpected graph change' unless queue.length==(mid==45 ? 3712 : 7056)
           end
+          bfs(45,[92,74],[[153,72],[201,76],[165,75],[187,64],[113,59]])
+          bfs(46,[74,94],[[76,94],[156,100]])
+          # Village and all non-dungeon maps must use the same original method, no S32.
 
-          class AuditMap < Game_Map
-            attr_accessor :display_x,:display_y
-            def initialize(mid)
-              @map_id=mid
-              @map=Struct.new(:width,:height).new(mid==45 ? 288 : 336,mid==45 ? 144 : 168)
-              @events={}
-              @passages=Array.new(999,0)
-              @priorities=Array.new(999,0)
-              @display_x=0;@display_y=0
-            end
-            def encounter_step;30;end
-            def valid?(x,y);x>=0 && y>=0 && x<width && y<height;end
-          end
-          class AuditParty
-            attr_reader :steps
-            def initialize;@steps=0;end
-            def increase_steps;@steps+=1;end
-            def check_map_slip_damage;end
-          end
-          $game_party=AuditParty.new
-          $game_map=AuditMap.new(45)
-          $game_player=Game_Player.new
-          $game_player.moveto(92,74)
-          start=[$game_player.instance_variable_get(:@slti_r126_x),$game_player.instance_variable_get(:@slti_r126_y)]
-          raise 'Wrong 1F start' unless start==[32665,32801]
-          move={2=>:move_down,4=>:move_left,6=>:move_right,8=>:move_up}
-
-          [[32699,32795],SLTI_Native66.nearest(45,153,72,16)].each do |goal|
-            $game_player.moveto(92,74)
-            route=native_path(start,goal)
-            route.each do |d|
-              $game_player.send(move[d])
-              25.times{break unless $game_player.moving?;$game_player.update_move}
-              raise 'Actor stalled in a wall' if $game_player.moving?
-            end
-            actual=[$game_player.instance_variable_get(:@slti_r126_x),$game_player.instance_variable_get(:@slti_r126_y)]
-            raise "Actual player path failed #{goal}" unless actual==goal
-            puts "PASS actual 1F player movement to #{goal.inspect} via #{route.length} steps"
-          end
-          raise '2F event not triggered at 153,72' unless
-            ($game_player.x-153.0)**2+($game_player.y-72.375)**2<=9.0
-
-          # On 2F, skip S32 actor mode and use standard RPG movement/monster collision.
-          $game_map=AuditMap.new(46)
-          $game_player.moveto(76,94)
-          raise 'Unexpected 2F native override' if $game_player.slti_r126_prepare
-          raise '2F camera coordinates changed' unless $game_player.instance_variable_get(:@real_x)==76*128
-          q=[[76,94]];seen={[76,94]=>true};head=0
-          while head<q.length
-            x,y=q[head];head+=1
-            [[2,0,1],[4,-1,0],[6,1,0],[8,0,-1]].each do |d,dx,dy|
-              nxt=[x+dx,y+dy]
-              next if seen[nxt] || !$game_map.valid?(*nxt)
-              next unless $game_player.passable?(x,y,d)
-              seen[nxt]=true;q<<nxt
-            end
-          end
-          raise "2F standard path shrank to #{seen.length}" unless seen.length==6807
-          raise '2F Baphomet not reachable' unless seen[[156,100]]
-          puts 'PASS 2F original RPG movement, 6,807 connected tiles, Baphomet reachable'
+          puts 'PASS 1F/2F true original movement and all other maps unchanged'
           TEST
           ruby -c build/test.rb
-          ruby build/test.rb site/knight/gameasync/Data/Scripts.rxdata
+          ruby build/test.rb site/knight/gameasync/Data/Scripts.rxdata build/original-scripts.rxdata
 
-      - name: V229R126 Refresh only game script cache and protect 2F graphics
+      - name: V229R127 Update only script cache and verify untouched artwork
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'FILES'
+          python3 - <<'AUDIT'
           from pathlib import Path
           import hashlib,json,re
           root=Path('site')
           scripts=root/'knight/gameasync/Data/Scripts.rxdata'
           mapping=root/'knight/gameasync/mapping.js'
-          text=mapping.read_text('utf8')
-          text,count=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
-              lambda m:m.group(1)+hashlib.md5(scripts.read_bytes()).hexdigest(),text)
-          assert count==1,('Script cache entry missing',count)
-          mapping.write_text(text,encoding='utf8')
-
+          code=mapping.read_text('utf8')
+          code,n=re.subn(r'(Data/Scripts\.rxdata\?h=)[0-9a-f]{32}',
+              lambda m:m.group(1)+hashlib.md5(scripts.read_bytes()).hexdigest(),code)
+          assert n==1,('Script hash not unique',n)
+          mapping.write_text(code,encoding='utf8')
           for name in ('index.html','knight/index.html'):
             path=root/name
             html=path.read_text('utf8')
-            assert 'V229R121' in html and 'V229R126' not in html
-            path.write_text(html.replace('V229R121','V229R126')
-              .replace('v229r121','v229r126'),encoding='utf8')
-
+            assert 'V229R121' in html and 'V229R127' not in html
+            path.write_text(html.replace('V229R121','V229R127')
+                .replace('v229r121','v229r127'),encoding='utf8')
           runtime=root/'knight/js/sl-assets-v229r115.js'
           code=runtime.read_text('utf8')
           assert code.count("var version='V229R121';")==1
           runtime.write_text(code.replace("var version='V229R121';",
-              "var version='V229R126';"),encoding='utf8')
-
-          before=json.loads(Path('build/before.json').read_text('utf8'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in root.rglob('*') if p.is_file()}
-          assert len(before)==len(after)==5566 and before.keys()==after.keys()
-          changed={p for p in before if before[p]!=after[p]}
+                             "var version='V229R127';"),encoding='utf8')
+          before=json.loads(Path('build/original-digests.json').read_text('utf8'))
+          after={str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest()
+                 for f in root.rglob('*') if f.is_file()}
+          assert len(before)==len(after)==5566
+          assert before.keys()==after.keys(),('Original content inventory changed')
+          changed={f for f in before if before[f]!=after[f]}
           expected={'index.html','knight/index.html',
             'knight/gameasync/mapping.js',
             'knight/gameasync/Data/Scripts.rxdata',
             'knight/js/sl-assets-v229r115.js'}
-          assert changed==expected,('Unexpected file changes',sorted(changed^expected))
-          for p in before:
-            protected=(p.startswith('knight/assets/') or
-              p.startswith('knight/gameasync/Graphics/') or
-              p.startswith('knight/gameasync/Data/') and
-                not p.endswith('/Scripts.rxdata') or
-              p in ('knight/js/dpad.js','knight/js/drive.js'))
+          assert changed==expected,('Unexpected edits',sorted(changed^expected))
+          for file in before:
+            protected=(file.startswith('knight/assets/') or
+              file.startswith('knight/gameasync/Graphics/') or
+              (file.startswith('knight/gameasync/Data/') and
+               not file.endswith('/Scripts.rxdata')) or
+              file in ('knight/js/dpad.js','knight/js/drive.js'))
             if protected:
-              assert before[p]==after[p],('Graphics/map/content changed',p)
-          assert 'js/sl-assets-v229r115.js?v=v229r126' in \
-            (root/'knight/index.html').read_text('utf8')
-          print('PASS no 1F/2F terrain, stain, wall, monster, event, or D-pad changes')
-          print('PASS only 5 version, script, and cache files changed')
-          FILES
+              assert before[file]==after[file],('PROTECTED ASSET MODIFIED',file)
+          assert 'js/sl-assets-v229r115.js?v=v229r127' in (root/'knight/index.html').read_text('utf8')
+          print('PASS 5,566 original files preserved; only 5 version/script/cache files differ')
+          print('PASS zero modified 1F/2F images, graphics, wall textures, maps and events')
+          AUDIT
           node --check site/knight/js/dpad.js
           node --check site/knight/js/drive.js
           node --check site/knight/js/sl-assets-v229r115.js
           node --check site/knight/gameasync/mapping.js
 
-      - name: V229R126 Publish only verified game code
+      - name: V229R127 Publish original movement with no new runtime overrides
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
