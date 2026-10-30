@@ -1,14 +1,16 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V229R150
-# PURPOSE: Remove the Sanctuary Talking Island Dungeon 1F (Map045) and 2F (Map046).
-# BASE: Last successful V229R149 GitHub Pages artifact, run 41083013038.
-# REMOVE: Dungeon maps, their exclusive graphics, teleport menu option, and dungeon-only Ruby scripts.
-# KEEP: Map047 (Talking Island field), Map001-044, original graphics, monsters,
-#   V230 balance and reward code, battle, saves, mobile controls, and unrelated files.
-# DO NOT: Regenerate maps, change passage, or add any replacement dungeon.
+# VERSION: V229R151
+# BASE: Successful V229R150 deployment (run 41090135570).
+# PURPOSE: Download the complete Talking Island (Map047) terrain before map entry.
+# PRESERVE: Talking Island dungeon Map045/Map046 removal from V229R150.
+# PRESERVE: Map047 tiles/collision/graphics, original NPC data, all other maps,
+#           monsters, V230 reward logic, mobile controls, and saves.
+# CHANGES: Build one Map047 pack from the 96 verified 512x512 PNG chunks and the
+#          transparent collision tileset. Stage every byte before Map047 opens.
+# HOUSE INTERIORS/NPC: NO unverified location, event, or interior is added here.
 
-name: build-slknight-web.yml | V229R150 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V229R151 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -32,16 +34,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: V229R150 Download last successful complete game
+      - name: V229R151 Download preserved V229R150 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 41083013038
+          run-id: 41090135570
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V229R150 Extract baseline and record exact file hashes
+      - name: V229R151 Extract original and hash-protect files
         shell: bash
         run: |
           set -euo pipefail
@@ -50,314 +52,143 @@ jobs:
           tar -xf baseline/artifact.tar -C site
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib, json
+          import hashlib,json
           root=Path('site')
           before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in root.rglob('*') if p.is_file()}
           prefix='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          assert len(before)==5663, ('Wrong V229R149 baseline file count',len(before))
-          assert 'V229R149' in (root/'index.html').read_text('utf8')
-          assert 'V229R149' in (root/'knight/index.html').read_text('utf8')
-          for mid in (29,45,46,47):
-              assert prefix+f'Map{mid:03d}.rxdata' in before
-          assert 'knight/gameasync/Data/Scripts.rxdata' in before
-          (Path('build')/'before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
-          print('PASS V229R149 full original baseline verified')
+          if 'V229R150' not in (root/'knight/index.html').read_text('utf-8'):
+              raise ValueError('Wrong game base: expected successful V229R150')
+          if prefix+'Map047.rxdata' not in before or any(prefix+f'Map{mid:03d}.rxdata' in before for mid in (45,46)):
+              raise ValueError('Dungeon removal or Map047 original was not preserved')
+          if 'knight/assets/map-047-v229r115.pack' in before:
+              raise ValueError('Unexpected pre-existing Map047 pack')
+          Path('build/before.json').write_text(json.dumps(before,sort_keys=True),'utf-8')
+          print('PASS R150 preserved base: Map047 remains, dungeon 45/46 absent')
           PY
 
-      - name: V229R150 Remove dungeon maps, entrance and dungeon-only Ruby engine
+      - name: V229R151 Build complete Map047 map-entry download pack
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/remove_dungeon.rb <<'RUBY'
-          require 'zlib'
-          require 'digest'
-
-          module RPG
-            class Map; end
-            class MapInfo; end
-            class Event; end
-            class Event::Page; end
-            class Event::Page::Condition; end
-            class Event::Page::Graphic; end
-            class EventCommand; end
-            class MoveCommand; end
-            class MoveRoute; end
-            class AudioFile; end
-            class Tileset; end
-          end
-          class Table
-            def self._load(raw); o=allocate; o.instance_variable_set(:@raw,raw); o; end
-            def _dump(_depth); @raw; end
-          end
-          class Tone
-            def self._load(raw); o=allocate; o.instance_variable_set(:@raw,raw); o; end
-            def _dump(_depth); @raw; end
-          end
-          class Color
-            def self._load(raw); o=allocate; o.instance_variable_set(:@raw,raw); o; end
-            def _dump(_depth); @raw; end
-          end
-
-          root=ENV.fetch('SL_SITE', 'site')
-          data=File.join(root,'knight/gameasync/Data')
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          path_for=->(id) { File.join(data,prefix+id+'.rxdata') }
-
-          def open_exact(path)
-            raw=File.binread(path)
-            obj=Marshal.load(raw)
-            raise "Unexpected binary encoding: #{path}" unless Marshal.dump(obj)==raw
-            obj
-          end
-
-          def dump_exact(path,obj)
-            File.binwrite(path,Marshal.dump(obj))
-            raise "Failed to reload #{path}" unless Marshal.dump(Marshal.load(File.binread(path)))==File.binread(path)
-          end
-
-          # Remove only the dungeon destinations from the actual teleport menu.
-          map_path=path_for.call('Map029')
-          map=open_exact(map_path)
-          ev=map.instance_variable_get(:@events).fetch(11)
-          raise 'Wrong teleport NPC' unless ev.instance_variable_get(:@name).to_s.force_encoding('UTF-8')=='[ID공간 이동사]'
-          pages=ev.instance_variable_get(:@pages)
-          raise 'Unexpected teleport NPC pages' unless pages.length>=1
-          list=pages[0].instance_variable_get(:@list)
-          code=->(c){c.instance_variable_get(:@code)}
-          params=->(c){c.instance_variable_get(:@parameters)}
-          indent=->(c){c.instance_variable_get(:@indent)}
-          choices=list.select do |c|
-            code.call(c)==102 && params.call(c)[0].is_a?(Array) &&
-              params.call(c)[0].any?{|s|s.to_s.force_encoding('UTF-8')=='말섬던전'}
-          end
-          raise "Dungeon choice menu not unique: #{choices.length}" unless choices.length==1
-          choice=choices.first
-          options=params.call(choice)[0]
-          raise 'Unexpected teleport option labels or count' unless
-            options.length==4 && options.map{|s|s.to_s.force_encoding('UTF-8')}==
-            ['지저 호수 2500 아데나','말섬던전','말하는 섬','취소']
-          raise 'Unexpected cancel option' unless params.call(choice)[1]==4
-          branch_i=list.index do |c|
-            code.call(c)==402 && indent.call(c)==indent.call(choice) &&
-              params.call(c)[0]==1 && params.call(c)[1].to_s.force_encoding('UTF-8')=='말섬던전'
-          end
-          raise 'Dungeon selection branch missing' unless branch_i
-          branch=list[branch_i,3]
-          raise 'Unexpected dungeon branch commands' unless branch.map{|c|code.call(c)}==[402,201,0] &&
-            params.call(branch[1])[0,2]==[0,45] &&
-            branch.map{|c|indent.call(c)}==[4,5,5]
-          list.slice!(branch_i,3)
-          options.delete_at(1)
-          params.call(choice)[1]=3
-          adjusted=[]
-          list.each do |c|
-            next unless code.call(c)==402 && indent.call(c)==4
-            label=params.call(c)[1].to_s.force_encoding('UTF-8')
-            if label=='말하는 섬' && params.call(c)[0]==2
-              params.call(c)[0]=1
-              adjusted<<label
-            elsif label=='취소' && params.call(c)[0]==3
-              params.call(c)[0]=2
-              adjusted<<label
-            end
-          end
-          raise 'Unexpected remaining teleport choices' unless adjusted.sort==['말하는 섬','취소'].sort
-          raise 'Other teleport targets were affected' unless
-            list.count{|c|code.call(c)==201}==8 &&
-            list.any?{|c|code.call(c)==201 && params.call(c)[0,2]==[0,47]} &&
-            list.none?{|c|code.call(c)==201 && [45,46].include?(params.call(c)[1])}
-          dump_exact(map_path,map)
-          puts 'PASS Map029 teleport: only dungeon option and its branch removed; Map047 field retained'
-
-          # Remove the two dungeon entries without touching Map047.
-          info_path=path_for.call('MapInfos')
-          infos=open_exact(info_path)
-          raise 'MapInfo list not expected' unless infos.length==47 &&
-            infos[45].instance_variable_get(:@name).include?('말섬던전') &&
-            infos[46].instance_variable_get(:@name).include?('말섬던전') &&
-            infos[47].instance_variable_get(:@name).include?('말하는 섬')
-          infos.delete(45)
-          infos.delete(46)
-          raise 'Wrong MapInfos after removal' unless infos.length==45 && infos.key?(47)
-          dump_exact(info_path,infos)
-          puts 'PASS MapInfos: 45 and 46 removed; field 47 and all other entries retained'
-
-          # Strip the isolated dungeon-only engine from script 134, but retain
-          # the unrelated boss respawn and V230 monster reward modules.
-          scripts_path=File.join(data,'Scripts.rxdata')
-          scripts=open_exact(scripts_path)
-          raise 'Unexpected script count' unless scripts.length==136
-          raw134=Zlib::Inflate.inflate(scripts[134][2])
-          marker49="\n# V229R49:"
-          marker56="\n# V229R56:"
-          marker66="\n# V229R66:"
-          pos=[marker49,marker56,marker66].map{|s|raw134.index(s)}
-          raise 'Cannot safely separate dungeon engine' unless pos.all? && pos==pos.sort &&
-            [marker49,marker56,marker66].all?{|x|raw134.scan(x).length==1}
-          boss=raw134.byteslice(0,pos[0])
-          rewards=raw134.byteslice(pos[1],pos[2]-pos[1])
-          raise 'Original boss code missing' unless boss.include?('module SLV230BossRespawn')
-          raise 'V230 reward module missing' unless rewards.include?('module SLV541')
-          raise 'Unexpected later non-dungeon modules' if raw134.byteslice(pos[2]..-1).match?(/^module SLV/m)
-          new134=boss+rewards+"\n"
-          raise 'Dungeon code survived in script 134' if new134.include?('SLTI')
-          scripts[134][2]=Zlib::Deflate.deflate(new134, Zlib::BEST_COMPRESSION)
-
-          # Keep the separate Map047 field renderer while disabling dungeon floor rendering.
-          raw97=Zlib::Inflate.inflate(scripts[97][2])
-          old='@slti_floor = [45,46,47].include?($game_map.map_id) ? $game_map.map_id : nil'
-          new='@slti_floor = ($game_map.map_id == 47) ? 47 : nil'
-          raise 'Field renderer cannot be located uniquely' unless raw97.scan(old).length==1
-          scripts[97][2]=Zlib::Deflate.deflate(raw97.sub(old,new), Zlib::BEST_COMPRESSION)
-
-          # Delete an initialization branch for the removed dungeon monsters alone.
-          raw26=Zlib::Inflate.inflate(scripts[26][2])
-          old_gate=<<'OLD_GATE'
-              # R56: original R49 gate setup moved here, before the native super() call.
-              # Do not call an alias of Game_Event#initialize: mruby rejects aliased super.
-              if (map_id==45 || map_id==46) && event.id>=16 && event.name.to_s[0,3]=='[ID'
-                gate=event.pages[1].condition
-                $game_switches[gate.switch1_id]=false if gate.switch1_valid
-              end
-          OLD_GATE
-          old_gate=old_gate.gsub("\n","\r\n")
-          raise 'Dungeon gate cannot be located uniquely' unless raw26.scan(old_gate).length==1
-          new26=raw26.sub(old_gate,'')
-          raise 'V230 rewards accidentally modified' unless new26.include?('SLV541.observe(self)')
-          scripts[26][2]=Zlib::Deflate.deflate(new26, Zlib::BEST_COMPRESSION)
-          dump_exact(scripts_path,scripts)
-          puts 'PASS Scripts: removed only Map045/046 movement, wall, spawn modules and gate'
-          puts 'PASS Scripts: retained V230 boss respawn, V5.41 rewards, Map047 renderer'
-
-          # Remove only the two original dungeon map resources.
-          [45,46].each do |id|
-            path=path_for.call(format('Map%03d',id))
-            raise "Missing dungeon map #{id}" unless File.file?(path)
-            File.delete(path)
-          end
-          puts 'PASS Map045/046 binary resources deleted'
-          RUBY
-          ruby -c build/remove_dungeon.rb
-          ruby build/remove_dungeon.rb
-
-      - name: V229R150 Delete dungeon graphics and update game resource catalog
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/finish_reset.py <<'PY'
+          cat > build/create_map047_pack.py <<'PY'
           from pathlib import Path
-          import hashlib,re
-          root=Path('site')
-          base=root/'knight/gameasync'
-          data=base/'Data'
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          import hashlib, json, re, struct
 
-          # Physically remove the 1F/2F-only graphics. Keep Map047 and shared assets.
-          removed=[]
-          for p in (base/'Graphics').rglob('*'):
-              if p.is_file() and p.name.startswith(('SLTI_45_','SLTI_46_')):
-                  removed.append(p)
-          if len(removed)!=158:
-              raise ValueError(f'Wrong exact number of dungeon-only graphics: {len(removed)}')
-          for p in removed:
-              p.unlink()
-          refs=[str(p.relative_to(base)) for p in removed]
-          refs.extend(['Data/'+prefix+'Map045.rxdata','Data/'+prefix+'Map046.rxdata'])
+          root=Path('site/knight')
+          base=root/'gameasync'
+          mapping=(base/'mapping.js').read_text('utf-8')
+          out=root/'assets/map-047-v229r151.pack'
+          entries=[]
+          payload=bytearray()
+          files=[]
+          for cx in range(12):
+              for cy in range(8):
+                  files.append(('graphics/panoramas/slti_47_c%d_%d'%(cx,cy),
+                                'Graphics/Panoramas/SLTI_47_C%d_%d.png'%(cx,cy)))
+          files.append(('graphics/tilesets/slti_collision_transparent',
+                        'Graphics/Tilesets/SLTI_Collision_Transparent.png'))
+          if len(files)!=97:raise ValueError('Incorrect Map047 file list')
 
-          # Remove entries for every deleted resource from the game's actual loader map.
-          mapping=base/'mapping.js'
-          s=mapping.read_text('utf8')
-          lines=s.splitlines(keepends=True)
-          for path in refs:
-              n=sum(('"'+path+'?h=') in line for line in lines)
-              if n!=1:
-                  raise ValueError(f'Dungeon file loader entry missing or duplicated: {path}: {n}')
-          lines=[line for line in lines if not any(('"'+p+'?h=') in line for p in refs)]
-          s=''.join(lines)
-
-          # Update only the resource hashes of files actually changed by the reset.
-          for name in ('Scripts','Map029','MapInfos'):
-              filename='Scripts.rxdata' if name=='Scripts' else prefix+name+'.rxdata'
-              digest=hashlib.md5((data/filename).read_bytes()).hexdigest()
-              pattern=r'(Data/'+re.escape(filename)+r'\?h=)[0-9a-f]{32}'
-              s,count=re.subn(pattern,lambda m:m.group(1)+digest,s)
-              if count!=1:raise ValueError(f'Reset file cache link not unique: {filename} ({count})')
-          mapping.write_text(s,encoding='utf8')
-
-          for page in (root/'index.html',root/'knight/index.html'):
-              s=page.read_text('utf8')
-              if 'V229R149' not in s:raise ValueError(f'Unexpected root baseline version: {page}')
-              page.write_text(s.replace('V229R149','V229R150').replace('v229r149','v229r150'),encoding='utf8')
-          assets=root/'knight/js/sl-assets-v229r115.js'
-          s=assets.read_text('utf8')
-          old="var version='V229R149';"
-          if s.count(old)!=1:raise ValueError('Wrong assets version token')
-          assets.write_text(s.replace(old,"var version='V229R150';"),encoding='utf8')
-          if 'js/sl-assets-v229r115.js?v=v229r150' not in (root/'knight/index.html').read_text('utf8'):
-              raise ValueError('Wrong browser cache version')
-
-          # Verify no path referring to deleted maps/graphics survives.
-          now=mapping.read_text('utf8')
-          if any(path+'?h=' in now for path in refs):
-              raise ValueError('Deleted resources still mapped')
-          assert (data/(prefix+'Map047.rxdata')).is_file()
-          assert (base/'Graphics/Tilesets/SLTI_Collision_Transparent.png').is_file()
-          assert not (data/(prefix+'Map045.rxdata')).exists()
-          assert not (data/(prefix+'Map046.rxdata')).exists()
-          print(f'PASS: deleted 2 dungeon map files and {len(removed)} dungeon-only graphics')
-          print('PASS: removed all 160 loader paths; updated 3 binary resource hashes')
-          print('PASS: preserved Map047 field and shared collision tileset')
-          print('PASS: updated V229R150 HTML and assets version/cache')
+          for key,name in files:
+              path=base/name
+              if not path.is_file():raise FileNotFoundError('Missing Map047 original asset '+name)
+              raw=path.read_bytes()
+              if raw[:8]!=b'\x89PNG\r\n\x1a\n':
+                  raise ValueError('Not an original PNG: '+name)
+              match=re.findall(r'\["'+re.escape(key)+r'",\s*"'+re.escape(name)+r'\?h=([0-9a-f]{32})"\]',mapping)
+              if len(match)!=1 or hashlib.md5(raw).hexdigest()!=match[0]:
+                  raise ValueError('Map047 resource mapping or exact original MD5 mismatch: '+name)
+              entries.append([key,len(payload),len(raw)])
+              payload.extend(raw)
+          index=json.dumps({'kind':'map','map_id':47,'files':entries},
+                           separators=(',',':'),ensure_ascii=False).encode('utf-8')
+          out.write_bytes(struct.pack('<I',len(index))+index+payload)
+          if len(entries)!=97:raise ValueError('Map047 pack incomplete')
+          print('PASS Map047 all 96 terrain PNGs and 1 collision tileset, pre-bundled: ',len(payload),'bytes')
+          print('PASS only exact pre-existing map graphics are bundled; no map or NPC modifications')
           PY
-          python3 build/finish_reset.py
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
-          node --check site/knight/js/dpad.js
-          node --check site/knight/js/drive.js
+          python3 -m py_compile build/create_map047_pack.py
+          python3 build/create_map047_pack.py
 
-      - name: V229R150 Audit every original game file and protected map
+      - name: V229R151 Stage complete Map047 before game movement
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,json
           root=Path('site')
-          before=json.loads(Path('build/before.json').read_text('utf8'))
+          path=root/'knight/js/sl-assets-v229r115.js'
+          original=path.read_text('utf-8')
+          edits={
+              "var version='V229R150';":"var version='V229R151';",
+              "if(mid<1||mid>46)return nativeMapLoad.apply(self,args);":
+                  "if(mid<1||mid>47)return nativeMapLoad.apply(self,args);",
+              "'map-'+String(mid).padStart(3,'0')+'-v229r115.pack'":
+                  "(mid===47?'map-047-v229r151.pack':'map-'+String(mid).padStart(3,'0')+'-v229r115.pack')",
+          }
+          for old,new in edits.items():
+              if original.count(old)!=1:
+                  raise ValueError('Loader original pattern missing or ambiguous: '+old)
+              original=original.replace(old,new)
+          path.write_text(original,'utf-8')
+          for file in ('index.html','knight/index.html'):
+              page=root/file
+              text=page.read_text('utf-8')
+              if 'V229R150' not in text:raise ValueError('Unexpected page version '+file)
+              text=text.replace('V229R150','V229R151').replace('v229r150','v229r151')
+              page.write_text(text,'utf-8')
+          game=(root/'knight/index.html').read_text('utf-8')
+          if 'js/sl-assets-v229r115.js?v=v229r151' not in game:
+              raise ValueError('Map loader has stale browser cache version')
+          print('PASS Map047 loads the complete 97-file pack before its map data enters the engine')
+          print('PASS other maps retain existing map pack behavior')
+          PY
+          node --check site/knight/js/sl-assets-v229r115.js
+          node --check site/knight/js/dpad.js
+          node --check site/knight/js/drive.js
+
+      - name: V229R151 Audit map coverage and unchanged gameplay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,struct,re
+          root=Path('site')
+          before=json.loads(Path('build/before.json').read_text('utf-8'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
-          prefix='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          removed=set(before)-set(after)
-          created=set(after)-set(before)
-          changed={n for n in before.keys()&after.keys() if before[n]!=after[n]}
-          allowed_deleted={prefix+'Map045.rxdata',prefix+'Map046.rxdata'}
-          allowed_deleted|={n for n in before if '/Graphics/' in n and
-              Path(n).name.startswith(('SLTI_45_','SLTI_46_'))}
-          allowed_changed={prefix+'Map029.rxdata',prefix+'MapInfos.rxdata',
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/mapping.js','index.html','knight/index.html',
-              'knight/js/sl-assets-v229r115.js'}
-          if created:raise ValueError('New unapproved files: '+repr(sorted(created)))
-          if removed!=allowed_deleted or len(removed)!=160:
-              raise ValueError('Incorrect dungeon deletion: '+repr(sorted(removed^allowed_deleted)))
-          if changed!=allowed_changed:
-              raise ValueError('Modified unrelated files: '+repr(sorted(changed^allowed_changed)))
-          if len(after)!=5503:raise ValueError('Unapproved changes to the game file set')
-          for id in [i for i in range(1,45) if i!=29]+[47]:
-              key=prefix+f'Map{id:03d}.rxdata'
-              if key in before and before[key]!=after.get(key):
-                  raise ValueError(f'Other map changed: Map{id:03d}')
-          if before[prefix+'Map047.rxdata']!=after[prefix+'Map047.rxdata']:
-              raise ValueError('Map047 field unexpectedly changed')
-          for file in ('knight/js/dpad.js','knight/js/drive.js'):
-              if before[file]!=after[file]:raise ValueError('Controls changed: '+file)
-          print('PASS deleted only Map045/046 and their 158 exclusive image files')
-          print('PASS 5,503 remaining game files, exactly 7 authorized file changes')
-          print('PASS all other maps, Map047 field, graphics, controls, combat unchanged')
+          new=set(after)-set(before)
+          gone=set(before)-set(after)
+          changed={p for p in before.keys()&after.keys() if before[p]!=after[p]}
+          expected_new={'knight/assets/map-047-v229r151.pack'}
+          expected_changed={'index.html','knight/index.html','knight/js/sl-assets-v229r115.js'}
+          if new!=expected_new or gone or changed!=expected_changed:
+              raise ValueError('Unapproved game file changes: new='+repr(sorted(new))+
+                               ' removed='+repr(sorted(gone))+' changed='+repr(sorted(changed)))
+          source=(root/'knight/assets/map-047-v229r151.pack').read_bytes()
+          size=struct.unpack_from('<I',source,0)[0]
+          index=json.loads(source[4:4+size])
+          rows=index['files']
+          if index['kind']!='map' or index['map_id']!=47 or len(rows)!=97:
+              raise ValueError('Map047 pack header incomplete')
+          if len([r for r in rows if re.fullmatch(r'graphics/panoramas/slti_47_c(?:[0-9]|10|11)_[0-7]',r[0])])!=96:
+              raise ValueError('Map047 missing terrain chunks')
+          for key,off,n in rows:
+              if n<8 or source[4+size+off:4+size+off+8]!=b'\x89PNG\r\n\x1a\n':
+                  raise ValueError('Packed Map047 original image not valid: '+key)
+          if 4+size+sum(r[2] for r in rows)!=len(source):
+              raise ValueError('Packed asset byte length incorrect')
+          loader=(root/'knight/js/sl-assets-v229r115.js').read_text('utf-8')
+          if 'mid>47' not in loader or 'map-047-v229r151.pack' not in loader:
+              raise ValueError('Map047 not included in pre-enter hook')
+          print('PASS all 96 Map047 chunks downloaded as 1 request before map activation')
+          print('PASS Map045/046 remain removed; original Map047 and other maps remain byte-identical')
+          print('PASS only one new pack and 3 version/loader files changed')
           PY
 
-      - name: V229R150 Publish game without Talking Island Dungeon
+      - name: V229R151 Publish preloaded Talking Island
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
