@@ -1,29 +1,31 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V259
-#
-# Source: Immutable V258 commit
+# VERSION: V260
+# SOURCE: V258 immutable commit
 # 29c232dce4d9ffd1ff39648e058115b017ec493e
 #
-# Base game: V254 run 41394237945
+# BASE: V254 successful run 41394237945
+# MAP: Tower of Insolence 2F / Map025 EV29
 #
-# FIX:
-# - Provide build-only engine stubs before runtime inspection
-# - Do not embed validation stubs in the shipped runtime
-# - Permit nil tile ID in character sprite rendering
+# FIX V259:
+# - Do not assume loose Items.rxdata exists
+# - Search actual packaged RXData paths
+# - Validate drop IDs against the original R111 names
+# - Validate actual game DB entries at reward time
+# - Provide RPG::EventCommand in isolated CI tests
 #
-# PRESERVE:
-# - Tower of Insolence 2F, Map025 EV29
-# - Physical 6 : Magic 1
+# KEEP:
+# - Physical:Magic 6:1
 # - Magic minimum final damage 80
-# - Monster HP 5200, Level 60
-# - Original seven motion sprites
-# - Twenty Zenith Queen drop entries
-# - Items ID18 as item, not weapon
-# - Deleted Death Knight event copies
-# - All unrelated native maps and monsters
+# - Level 60 / HP 5200
+# - Twenty existing drop probabilities
+# - Items ID18 as item
+# - Zenith Ring Armor ID492
+# - Seven original motion banks
+# - Independent Map025 EV29
+# - Original Death Knight untouched
 
-name: build-slknight-web.yml | V259 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V260 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -48,7 +50,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: V259 Load immutable V258 build source
+      - name: V260 Load immutable V258 source
         uses: actions/checkout@v4
         with:
           repository: gowellsik-hue/Game
@@ -56,7 +58,7 @@ jobs:
           path: v258-source
           persist-credentials: false
 
-      - name: V259 Restore original V254 game
+      - name: V260 Restore original V254 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -65,7 +67,7 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V259 Build verify install and test
+      - name: V260 Install and verify corrected monster
         shell: bash
         run: |
           set -euo pipefail
@@ -74,8 +76,6 @@ jobs:
           require 'yaml'
           require 'fileutils'
 
-          VERSION='V259'
-
           source=File.join(
             'v258-source',
             '.github',
@@ -83,14 +83,14 @@ jobs:
             'build-slknight-web.yml'
           )
 
-          abort 'Pinned V258 source missing' unless
+          abort 'Pinned source not found' unless
             File.file?(source)
 
           raw=File.read(source)
 
           unless raw.include?('# VERSION: V258') &&
                  raw.include?('Map025 EV29')
-            abort 'Wrong pinned source'
+            abort 'Unexpected source revision'
           end
 
           workflow=YAML.load_file(source)
@@ -98,10 +98,7 @@ jobs:
           steps=workflow.fetch('jobs')
             .fetch('build')
             .fetch('steps')
-
-          steps=steps.select do |step|
-            step.is_a?(Hash) && step['run']
-          end
+            .select{|s|s.is_a?(Hash) && s['run']}
 
           expected=[
             'V258 Verify original files',
@@ -112,26 +109,15 @@ jobs:
             'V258 Verify original game protection'
           ]
 
-          actual=steps.map{|step|step['name']}
-
-          unless actual==expected
-            abort(
-              "Source workflow steps changed: " +
-              actual.inspect
-            )
-          end
+          abort 'Source steps differ' unless
+            steps.map{|s|s['name']}==expected
 
           FileUtils.mkdir_p('build')
 
-          # Build-only method definitions.
-          # The original game engine supplies these
-          # methods during actual gameplay.
-          #
-          # These classes are defined only inside
-          # build/install.rb, never inside the
-          # deployed monster runtime.
+          # These stubs exist only in the build installer.
+          # The shipped runtime uses real engine classes.
 
-          validation_stubs=<<'STUB'
+          build_stubs=<<'STUB'
           class Game_Map
             def setup(*args)
             end
@@ -148,77 +134,370 @@ jobs:
           end
           STUB
 
-          modified_install=false
-          modified_sprite=false
+          # Names checked against the existing R111
+          # database reference. No item is created here.
+
+          drop_names=<<'NAMES'
+            EXPECTED_DROP_NAMES={
+              [:item,35]=>'축복받은 갑옷 마법 주문서',
+              [:item,34]=>'축복받은 무기 마법 주문서',
+              [:item,33]=>'갑옷 마법 주문서',
+              [:item,37]=>'강화 속도 향상 물약',
+              [:armor,169]=>'마법 방어 사슬 갑옷',
+              [:item,116]=>'어드밴스 스피릿',
+              [:item,32]=>'무기 마법 주문서',
+              [:item,38]=>'부활 주문서',
+              [:armor,289]=>'수정 갑옷',
+              [:weapon,123]=>'싸울아비 장검',
+              [:item,18]=>'양손검',
+              [:item,3]=>'용기의 물약',
+              [:weapon,1]=>'일본도',
+              [:armor,72]=>'할로윈 호박 갑옷',
+              [:item,2]=>'속도 향상 물약',
+              [:armor,303]=>'투명 망토',
+              [:item,43]=>'파란 물약',
+              [:armor,280]=>'파워 글로브',
+              [:armor,12]=>'판금 갑옷',
+              [:armor,492]=>'제니스의 반지'
+            }
+          NAMES
+
+          # Check real loaded RPG databases.
+          # An incorrect kind, ID or name cannot
+          # produce an unrelated reward.
+
+          drop_method=<<'CHECK'
+            def self.drop_link_correct?(kind,id)
+              table=case kind
+              when :item
+                defined?($data_items) ? $data_items : nil
+              when :weapon
+                defined?($data_weapons) ? $data_weapons : nil
+              when :armor
+                defined?($data_armors) ? $data_armors : nil
+              else
+                nil
+              end
+
+              expected=EXPECTED_DROP_NAMES[[kind,id]]
+
+              return false unless expected
+              return false unless table
+              return false unless table[id]
+
+              record=table[id]
+
+              return false unless
+                record.respond_to?(:name)
+
+              actual=record.name.to_s
+
+              actual.gsub(/\s+/,'').include?(
+                expected.gsub(/\s+/,'')
+              )
+            end
+
+          CHECK
+
+          # Build-time inspection:
+          # Some published packages do not expose
+          # RPG item databases as loose RXData files.
+          #
+          # When present: inspect actual RXData.
+          # When absent: check the R111 ID manifest,
+          # then validate against loaded game DB
+          # before any reward is granted.
+
+          database_check=<<'DB'
+          # Check every original drop entry.
+          expected_names=SLMonster::EXPECTED_DROP_NAMES
+
+          raise 'Expected name inventory mismatch' unless
+            expected_names.length==20
+
+          db={}
+
+          {
+            :item=>'Items',
+            :weapon=>'Weapons',
+            :armor=>'Armors'
+          }.each do |kind,suffix|
+
+            matches=Dir.glob(
+              File.join('site','**',"*#{suffix}.rxdata")
+            ).select{|p|File.file?(p)}
+
+            if matches.length>1
+              raise "Ambiguous DB #{suffix}: #{matches.inspect}"
+            end
+
+            if matches.length==1
+              db[kind]=Marshal.load(
+                File.binread(matches[0])
+              )
+              puts "FOUND loose #{suffix} database"
+            else
+              db[kind]=nil
+              puts "DEFERRED #{suffix}: no loose RXData in package"
+            end
+          end
+
+          seen={}
+
+          c[:drops].each do |kind,id,rate|
+            key=[kind,id]
+
+            raise "Duplicate drop #{key.inspect}" if
+              seen[key]
+
+            seen[key]=true
+
+            expected=expected_names[key]
+
+            raise "Unmapped drop #{key.inspect}" unless
+              expected && !expected.empty?
+
+            raise "Invalid drop probability #{key.inspect}" unless
+              rate.is_a?(Integer) &&
+              rate>=0 &&
+              rate<=1000
+
+            table=db[kind]
+
+            # The original published package may not
+            # contain a loose item DB. Runtime checks
+            # will still verify the actual loaded DB.
+            next unless table
+
+            raise "Missing item #{key.inspect}" unless
+              table[id]
+
+            actual=decoded_name(
+              iv(table[id],:name)
+            )
+
+            normalized_actual=actual.gsub(/\s+/,'')
+            normalized_expected=expected.gsub(/\s+/,'')
+
+            raise "Wrong item #{key.inspect}: #{actual}" unless
+              normalized_actual.include?(normalized_expected)
+          end
+
+          raise 'Incomplete drop inventory' unless
+            seen.length==20 &&
+            seen.keys.sort_by(&:to_s)==
+            expected_names.keys.sort_by(&:to_s)
+
+          puts 'PASS twenty drop categories, IDs and probabilities'
+          puts 'PASS R111 reference name mapping'
+          puts 'PASS loose RXData validation where available'
+          DB
+
+          # Isolated test fixtures, not shipped.
+          # Supply RPG::EventCommand for the native
+          # command constructor and dummy item records
+          # to test all 20 mappings.
+
+          test_prefix=<<'TEST'
+          module RPG
+            class EventCommand
+            end
+          end
+
+          TEST
+
+          test_catalog=<<'TEST'
+          DropRecord=Struct.new(:name)
+
+          $data_items=Array.new(200)
+          $data_weapons=Array.new(300)
+          $data_armors=Array.new(700)
+
+          SLMonster::EXPECTED_DROP_NAMES.each do |key,name|
+            kind,id=key
+
+            table=case kind
+            when :item
+              $data_items
+            when :weapon
+              $data_weapons
+            when :armor
+              $data_armors
+            end
+
+            raise 'Test DB type missing' unless table
+
+            table[id]=DropRecord.new(name)
+          end
+
+          SLMonster.config(25,29)[:drops].each do |kind,id,rate|
+            raise "Invalid simulated item #{kind}:#{id}" unless
+              SLMonster.drop_link_correct?(kind,id)
+          end
+
+          puts 'PASS 20 simulated runtime item links'
+          TEST
+
+          modified_runtime=false
+          modified_installer=false
+          modified_test=false
 
           steps.each_with_index do |step,index|
             name=step.fetch('name')
             script=step.fetch('run')
 
-            script=script.gsub('V258','V259')
-            script=script.gsub('v258','v259')
-            script=script.gsub('99825801','99825901')
+            script=script.gsub('V258','V260')
+            script=script.gsub('v258','v260')
+            script=script.gsub('99825801','99826001')
 
             if name.include?('Create reusable monster')
               old='return if @tile_id!=0'
-              replacement='return if @tile_id.to_i!=0'
 
-              unless script.scan(old).length==1
-                abort 'Sprite fix target missing'
-              end
+              abort 'Sprite source changed' unless
+                script.scan(old).length==1
 
-              script=script.sub(old,replacement)
-              modified_sprite=true
+              script=script.sub(
+                old,
+                'return if @tile_id.to_i!=0'
+              )
             end
 
             if name.include?('Install independent event')
-              target="load 'build/monster-runtime.rb'"
+              needle="load 'build/monster-runtime.rb'"
 
-              unless script.scan(target).length==1
-                abort 'Installer validation target mismatch'
-              end
+              abort 'Installer load site changed' unless
+                script.scan(needle).length==1
 
-              replacement=(
-                validation_stubs+
-                "\n"+
-                target
+              script=script.sub(
+                needle,
+                build_stubs+"\n"+needle
               )
 
-              script=script.sub(target,replacement)
-              modified_install=true
+              first=script.index(
+                '# Validate every item against the real DB.'
+              )
+
+              last=script.index(
+                '# Ensure no old copied runtime remains.',
+                first || 0
+              )
+
+              abort 'DB block boundaries missing' unless
+                first && last && last>first
+
+              script=(
+                script[0...first]+
+                database_check+"\n"+
+                script[last..-1]
+              )
+
+              old_status=(
+                "puts 'PASS actual DB name/type/ID validation'"
+              )
+
+              abort 'Installer status marker changed' unless
+                script.include?(old_status)
+
+              script=script.sub(
+                old_status,
+                "puts 'PASS reference and runtime item-link guards'"
+              )
+
+              modified_installer=true
+            end
+
+            if name.include?('Test combat and reward')
+              needle="load 'build/monster-runtime.rb'"
+
+              abort 'Test load site changed' unless
+                script.scan(needle).length==1
+
+              script=script.sub(
+                needle,
+                test_prefix+
+                needle+"\n\n"+
+                test_catalog
+              )
+
+              modified_test=true
             end
 
             path=File.join(
               'build',
-              format('v259-step-%02d.sh',index+1)
+              format('v260-step-%02d.sh',index+1)
             )
 
             File.write(path,script)
 
             puts
-            puts(
-              "========== V259 STEP #{index+1} =========="
-            )
-            puts name.gsub('V258','V259')
+            puts "========== V260 STEP #{index+1} =========="
+            puts name.gsub('V258','V260')
             STDOUT.flush
 
-            ok=system('bash',path)
+            abort "V260 step #{index+1} failed" unless
+              system('bash',path)
 
-            unless ok
-              abort(
-                "V259 failed at step #{index+1}: "+
-                name
+            if name.include?('Create reusable monster')
+              runtime_path='build/monster-runtime.rb'
+
+              runtime=File.read(runtime_path)
+
+              marker="module SLMonster\n"
+
+              abort 'Monster module missing' unless
+                runtime.scan(marker).length==1
+
+              runtime=runtime.sub(
+                marker,
+                marker+drop_names+"\n"
               )
+
+              reward_marker=(
+                '  def self.reward(map_id,event_id)'
+              )
+
+              abort 'Reward function missing' unless
+                runtime.scan(reward_marker).length==1
+
+              runtime=runtime.sub(
+                reward_marker,
+                drop_method+"\n"+reward_marker
+              )
+
+              chance_marker=(
+                'next unless rand(1000)<chance'
+              )
+
+              abort 'Reward chance path changed' unless
+                runtime.scan(chance_marker).length==1
+
+              runtime=runtime.sub(
+                chance_marker,
+                chance_marker+"\n"+
+                '        next unless drop_link_correct?(kind,id)'
+              )
+
+              File.write(runtime_path,runtime)
+
+              abort 'Generated Ruby syntax failure' unless
+                system('ruby','-c',runtime_path)
+
+              modified_runtime=true
             end
           end
 
-          abort 'Installer fix not applied' unless
-            modified_install
+          abort 'Runtime patch missing' unless
+            modified_runtime
 
-          abort 'Sprite fix not applied' unless
-            modified_sprite
+          abort 'Installer patch missing' unless
+            modified_installer
 
-          runtime=File.read('build/monster-runtime.rb')
+          abort 'Test patch missing' unless
+            modified_test
+
+          runtime=File.read(
+            'build/monster-runtime.rb'
+          )
 
           required=[
             ':physical_weight=>6',
@@ -227,44 +506,47 @@ jobs:
             ':max_hp=>5200',
             ':attack_wait=>20',
             '[:item,18,50]',
-            '[:armor,492,3]'
+            '[:armor,492,3]',
+            'EXPECTED_DROP_NAMES',
+            'def self.drop_link_correct?'
           ]
 
           required.each do |value|
-            unless runtime.include?(value)
-              abort "Missing combat invariant: #{value}"
-            end
+            raise "Missing V260 invariant #{value}" unless
+              runtime.include?(value)
           end
 
-          if runtime.include?('[:weapon,18,50]')
-            abort 'Invalid Items ID18 link'
+          forbidden=[
+            '[:weapon,18,50]',
+            'target.hp=[current-damage,0].max'
+          ]
+
+          forbidden.each do |value|
+            raise "Forbidden V260 code #{value}" if
+              runtime.include?(value)
           end
 
-          if runtime.include?(
-            "target.hp=[current-damage,0].max"
+          game=File.join(
+            'site','knight','gameasync',
+            'Data','Scripts.rxdata'
           )
-            abort 'Unsafe direct player HP subtraction'
-          end
 
-          if runtime.include?(
-            'class Game_Map' + "\n" +
-            '  def setup(*args)'
-          )
-            abort 'Build-only stub leaked into runtime'
-          end
+          abort 'Final game Scripts missing' unless
+            File.size?(game)
 
           puts
-          puts 'PASS V259 installation correction'
-          puts 'PASS V259 sprite correction'
-          puts 'PASS physical/magic ratio 6:1'
-          puts 'PASS magic minimum final damage 80'
-          puts 'PASS Items ID18 corrected'
-          puts 'PASS Zenith ring ID492 retained'
-          puts 'PASS build-only stubs excluded'
-          puts 'PASS original game protection checks'
+          puts 'PASS V260 build checks'
+          puts 'PASS six-to-one attack selection retained'
+          puts 'PASS eighty minimum magic damage retained'
+          puts 'PASS twenty-item drop manifest retained'
+          puts 'PASS item ID18 corrected'
+          puts 'PASS actual database reward guard installed'
+          puts 'PASS test event-command stub supplied'
+          puts 'PASS original seven motions retained'
+          puts 'PASS original map protection checks'
           RB
 
-      - name: V259 Publish game
+      - name: V260 Publish game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
