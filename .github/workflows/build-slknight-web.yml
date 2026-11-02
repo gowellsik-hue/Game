@@ -1,15 +1,15 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V253
-# BASE: V252 successful run 41386395573
-# FIX: Restore 17 native monster attack registrations.
-# FIX: Refresh native attack common-event switch.
-# FIX: Recognize Zenith Queen as a monster event.
-# DISPLAY: Remove both visible version labels.
-# KEEP: All existing maps, NPCs, loot, graphics and FX.
-# STATUS: Build and mobile combat verification pending.
+# VERSION: V254
+# BASE: V253 successful build run 41388878119
+# FIX: Remove 17 duplicate boss attack registrations.
+# FIX: Limit native attack activation to one cycle.
+# FIX: Preserve boss HP and targeting commands.
+# KEEP: All maps, NPCs, drops, graphics and FX.
+# DISPLAY: Keep both version labels removed.
+# STATUS: Build and mobile verification pending.
 
-name: build-slknight-web.yml | V253 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V254 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -34,16 +34,16 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: V253 Restore V252 successful game
+      - name: V254 Restore V253 published game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 41386395573
+          run-id: 41388878119
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V253 Verify baseline
+      - name: V254 Verify original inventory
         shell: bash
         run: |
           set -euo pipefail
@@ -53,7 +53,8 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-          import json,hashlib
+          import hashlib
+          import json
 
           root=Path('site')
           before={
@@ -63,7 +64,7 @@ jobs:
           }
 
           assert len(before)==5610,(
-              'Wrong V252 inventory',len(before)
+              'Unexpected inventory',len(before)
           )
 
           pre=(
@@ -78,21 +79,106 @@ jobs:
               assert pre+f'Map{mid:03d}.rxdata' not in before
 
           assert 'knight/assets/map-047-v241.pack' in before
+          assert 'knight/gameasync/Data/Scripts.rxdata' in before
 
           Path('build/before.json').write_text(
               json.dumps(before,sort_keys=True)
           )
-          print('PASS V252 original inventory')
+
+          print('PASS V253 original 5610 files')
           PY
 
-      - name: V253 Restore native boss combat
+      - name: V254 Repair native boss combat
         shell: bash
         run: |
           set -euo pipefail
 
+          cat > build/combat-runtime.rb <<'RUNTIME'
+          # V254 bounded Zenith combat.
+          # Only Map025 Event29 is affected.
+
+          module SLZenith
+            def self.v254_combat_tick(ev)
+              return unless ev
+              return unless $game_map && $game_player
+              return unless $game_map.map_id==MAP_ID
+              return unless $game_switches && $game_variables
+              return if @paid
+              return if ev.instance_variable_get(:@erased)
+              return if $game_variables[HP_VAR].to_i>=MAX_HP
+
+              return unless ev.respond_to?(:x) &&
+                ev.respond_to?(:y) &&
+                $game_player.respond_to?(:x) &&
+                $game_player.respond_to?(:y)
+
+              dx=($game_player.x-ev.x).abs
+              dy=($game_player.y-ev.y).abs
+
+              if dx>3 || dy>3
+                ev.instance_variable_set(:@slz_v254_tick,0)
+                return
+              end
+
+              # CE1062 controls the native attack switch.
+              # An active cycle must never be re-entered.
+              return if $game_switches[ATTACK_SWITCH]
+
+              ticks=ev.instance_variable_get(
+                :@slz_v254_tick
+              ).to_i+1
+
+              ev.instance_variable_set(
+                :@slz_v254_tick,ticks
+              )
+
+              return if ticks<ATTACK_WAIT
+
+              ev.instance_variable_set(
+                :@slz_v254_tick,0
+              )
+
+              # Register one context per attack pulse.
+              # Do not register on every update.
+              if defined?(SLMonsterAttackContext) &&
+                 SLMonsterAttackContext.respond_to?(:register)
+
+                SLMonsterAttackContext.register(
+                  ATTACK_SWITCH,MAP_ID,EVENT_ID
+                )
+              end
+
+              engage
+              $game_switches[ATTACK_SWITCH]=true
+
+              if $game_map.respond_to?(:need_refresh=)
+                $game_map.need_refresh=true
+              end
+            end
+          end
+
+          class Game_Event
+            alias slz_v254_native_update update
+
+            def update
+              if @map_id==SLZenith::MAP_ID &&
+                 @id==SLZenith::EVENT_ID
+                @monster=true
+              end
+
+              slz_v254_native_update
+
+              return unless
+                @map_id==SLZenith::MAP_ID &&
+                @id==SLZenith::EVENT_ID
+
+              SLZenith.v254_combat_tick(self)
+            end
+          end
+          RUNTIME
+
           cat > build/fix.rb <<'RUBY'
           require 'zlib'
-          require 'digest'
 
           module RPG
             class Map;end
@@ -116,7 +202,10 @@ jobs:
               o.instance_variable_set(:@raw,raw)
               o
             end
-            def _dump(level=0);@raw;end
+
+            def _dump(level=0)
+              @raw
+            end
           end
 
           class Tone
@@ -125,7 +214,10 @@ jobs:
               o.instance_variable_set(:@raw,raw)
               o
             end
-            def _dump(level=0);@raw;end
+
+            def _dump(level=0)
+              @raw
+            end
           end
 
           class Color<Tone;end
@@ -141,154 +233,122 @@ jobs:
           root='site/knight/gameasync/Data/'
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          source_path=root+pre+'Map016.rxdata'
-          target_path=root+pre+'Map025.rxdata'
+          map_path=root+pre+'Map025.rxdata'
           common_path=root+pre+'CommonEvents.rxdata'
           scripts_path=root+'Scripts.rxdata'
 
-          source=Marshal.load(File.binread(source_path))
-          target=Marshal.load(File.binread(target_path))
+          map=Marshal.load(File.binread(map_path))
           common=Marshal.load(File.binread(common_path))
           scripts=Marshal.load(File.binread(scripts_path))
 
-          source_event=iv(source,:events).fetch(8)
-          events=iv(target,:events)
+          events=iv(map,:events)
           boss=events.fetch(29)
 
+          name=iv(boss,:name).to_s.dup
+            .force_encoding('UTF-8').scrub
+
           raise 'Wrong Zenith Queen event' unless
-            iv(boss,:name).to_s.dup
-              .force_encoding('UTF-8').scrub
-              .include?('제니스 퀸')
+            name.include?('제니스 퀸')
 
-          source_pages=iv(source_event,:pages)
-          boss_pages=iv(boss,:pages)
+          pages=iv(boss,:pages)
+          raise 'Wrong boss pages' unless
+            pages.length==2
 
-          raise 'Unexpected boss page structure' unless
-            source_pages.length==5 &&
-            boss_pages.length==2
+          originals=events.each_with_object({}) do |(id,ev),h|
+            h[id]=Marshal.dump(ev) unless id==29
+          end
 
-          original_events=events.transform_values{
-            |e| Marshal.dump(e)
-          }
+          active=iv(pages[0],:list)
 
-          source_list=iv(source_pages[1],:list)
-          boss_list=iv(boss_pages[0],:list)
+          # V253 contains 17 redundant context registrations.
+          # CE1062 still provides native physical/magic damage.
+          # Preserve all native HP, hit and movement commands.
+          suppressed=0
 
-          raise 'Event command count differs' unless
-            source_list.length==boss_list.length
-
-          restored=0
-
-          source_list.each_with_index do |command,i|
+          active.each do |command|
             code=iv(command,:code)
             next unless code==355 || code==655
 
-            parameters=iv(command,:parameters)
-            next unless parameters.is_a?(Array)
-            text=parameters[0]
-            next unless text.is_a?(String)
-            next unless text.include?(
+            p=iv(command,:parameters)
+
+            next unless p.is_a?(Array)
+            next unless p[0].is_a?(String)
+            next unless p[0].include?(
               'SLMonsterAttackContext.register'
             )
 
-            patched=text.gsub(
-              /SLMonsterAttackContext\.register\(\s*133\s*,\s*\$game_map\.map_id\s*,\s*8\s*\)/,
-              'SLMonsterAttackContext.register(7002,$game_map.map_id,29)'
-            )
-
-            raise 'Attack context was not redirected' if
-              patched==text
-
-            patched=patched.gsub(
-              '$game_map.events[8]',
-              '$game_map.events[29]'
-            )
-
-            patched=patched.gsub(
-              '$game_variables[1980]',
-              '$game_variables[7001]'
-            )
-
-            patched=patched.gsub(
-              '$game_switches[133]',
-              '$game_switches[7002]'
-            )
-
-            destination=boss_list[i]
-            raise 'Unexpected command mismatch' unless
-              iv(destination,:code)==code
-
-            put(
-              destination,:parameters,[patched]
-            )
-            restored+=1
+            put(command,:parameters,['nil'])
+            suppressed+=1
           end
 
           raise(
-            "Original attack contexts incomplete: "+
-            restored.to_s
-          ) unless restored==17
+            "Unexpected registration count: "+
+            suppressed.to_s
+          ) unless suppressed==17
 
-          attack_switches=boss_list.count do |c|
+          attack_switches=active.count do |c|
             iv(c,:code)==121 &&
-            iv(c,:parameters)==[7002,7002,0]
+              iv(c,:parameters)==[7002,7002,0]
           end
 
-          hp_writes=boss_list.count do |c|
+          hp_writes=active.count do |c|
             p=iv(c,:parameters)
             iv(c,:code)==122 &&
               p.is_a?(Array) &&
               p[0]==7001
           end
 
-          raise 'Boss attack switches missing' unless
+          raise 'Native attack graph changed' unless
             attack_switches==17
 
-          raise 'Boss HP receivers missing' unless
+          raise 'Native HP graph changed' unless
             hp_writes==20
 
-          death_condition=iv(
-            boss_pages[1],:condition
-          )
+          condition=iv(pages[1],:condition)
 
-          raise 'Incorrect boss death HP variable' unless
-            iv(death_condition,:variable_id)==7001 &&
-            iv(death_condition,:variable_value)==5200
+          raise 'Boss death condition changed' unless
+            iv(condition,:variable_id)==7001 &&
+            iv(condition,:variable_value)==5200
+
+          originals.each do |id,raw|
+            raise "Unrelated event modified: #{id}" unless
+              Marshal.dump(events[id])==raw
+          end
 
           cycle=common.fetch(1062)
           damage=common.fetch(1061)
 
-          raise 'Native attack cycle not enabled' unless
+          raise 'Native attack cycle missing' unless
             iv(cycle,:trigger)==2 &&
             iv(cycle,:switch_id)==7002
 
-          raise 'Native damage event missing' unless
+          raise 'Native damage missing' unless
             iv(damage,:list).count{
               |c| iv(c,:code)==311
             }>=2
 
-          original_events.each do |id,raw|
-            next if id==29
-            raise "Original event changed #{id}" unless
-              Marshal.dump(events[id])==raw
-          end
+          File.binwrite(map_path,Marshal.dump(map))
 
-          File.binwrite(
-            target_path,Marshal.dump(target)
-          )
-
-          entries=scripts.each_index.select do |i|
-            row=scripts[i]
-            row.is_a?(Array) &&
-              row[1]=='SLZenithV252'
+          indices=scripts.each_index.select do |i|
+            scripts[i].is_a?(Array) &&
+              scripts[i][1]=='SLZenithV253'
           end
 
           raise 'Original runtime not unique' unless
-            entries.length==1
+            indices.length==1
 
-          index=entries.first
+          index=indices.first
           entry=scripts[index]
-          runtime=Zlib::Inflate.inflate(entry[2])
+
+          old=Zlib::Inflate.inflate(entry[2]).b
+          marker="\n# V253 native Zenith combat activation.".b
+
+          raise 'V253 extension missing' unless
+            old.scan(marker).length==1
+
+          # Remove the V253 extra update wrapper.
+          # Keep the original V252/V247 runtime.
+          base=old.split(marker,2).first
 
           required=[
             'MAX_HP=5200',
@@ -300,125 +360,41 @@ jobs:
           ]
 
           required.each do |value|
-            raise "Missing approved value #{value}" unless
-              runtime.include?(value)
+            raise "Approved stat missing: #{value}" unless
+              base.include?(value)
           end
 
-          patch=File.read(
-            'build/combat-runtime.rb'
-          ).b
+          patch=File.binread('build/combat-runtime.rb')
+          runtime=base.b+"\n"+patch.b
 
-          runtime=runtime.b+"\n"+patch
-          entry[0]=99825301
-          entry[1]='SLZenithV253'
+          entry[0]=99825401
+          entry[1]='SLZenithV254'
           entry[2]=Zlib::Deflate.deflate(runtime,9)
 
-          File.binwrite(
-            scripts_path,Marshal.dump(scripts)
-          )
+          File.binwrite(scripts_path,Marshal.dump(scripts))
 
-          check=Marshal.load(
-            File.binread(scripts_path)
-          )
+          check=Marshal.load(File.binread(scripts_path))
 
-          assert_runtime=Zlib::Inflate.inflate(
+          verified=Zlib::Inflate.inflate(
             check[index][2]
           )
 
           raise 'Runtime serialization failed' unless
-            check[index][1]=='SLZenithV253' &&
-            assert_runtime.b==runtime.b
+            check[index][1]=='SLZenithV254' &&
+            verified.b==runtime.b
 
-          puts 'PASS 17 original attack contexts restored'
-          puts 'PASS 17 attack switches and 20 HP writes'
-          puts 'PASS native CE1062 / CE1061 preserved'
+          puts 'PASS duplicate attack registrations disabled'
+          puts 'PASS native 17 switches and 20 HP writes'
+          puts 'PASS original CE1061/CE1062 preserved'
+          puts 'PASS original combat stats retained'
           puts 'PASS Map025 EV29 only modified'
-          puts 'PASS original boss combat stats retained'
           RUBY
-
-          cat > build/combat-runtime.rb <<'RUNTIME'
-          # V253 native Zenith combat activation.
-          # Only Map025 EV29 is affected.
-
-          module SLZenith
-            def self.v253_combat_tick(ev)
-              return unless ev
-              return unless $game_map &&
-                $game_map.map_id==MAP_ID
-
-              return unless $game_player &&
-                $game_switches &&
-                $game_variables
-
-              return if ev.instance_variable_get(:@erased)
-              return if @paid
-
-              return if
-                $game_variables[HP_VAR].to_i>=MAX_HP
-
-              return unless
-                ev.respond_to?(:x) &&
-                ev.respond_to?(:y) &&
-                $game_player.respond_to?(:x) &&
-                $game_player.respond_to?(:y)
-
-              dx=($game_player.x-ev.x).abs
-              dy=($game_player.y-ev.y).abs
-
-              # Native event tiles; no remote attack.
-              return if dx>3 || dy>3
-
-              return if
-                $game_switches[ATTACK_SWITCH]
-
-              if defined?(SLMonsterAttackContext) &&
-                 SLMonsterAttackContext.respond_to?(:register)
-                SLMonsterAttackContext.register(
-                  ATTACK_SWITCH,MAP_ID,EVENT_ID
-                )
-              end
-
-              # CE1062 executes CE1061, which retains
-              # the original physical/magic HP damage.
-              $game_switches[ATTACK_SWITCH]=true
-
-              # Native Game_Switches does not always
-              # refresh parallel event activation.
-              if $game_map.respond_to?(:need_refresh=)
-                $game_map.need_refresh=true
-              end
-
-              engage
-            end
-          end
-
-          class Game_Event
-            alias slz_v253_native_update update
-
-            def update
-              if @map_id==SLZenith::MAP_ID &&
-                 @id==SLZenith::EVENT_ID
-                # Preserve monster classification
-                # for original targeting routines.
-                @monster=true
-              end
-
-              slz_v253_native_update
-
-              return unless
-                @map_id==SLZenith::MAP_ID &&
-                @id==SLZenith::EVENT_ID
-
-              SLZenith.v253_combat_tick(self)
-            end
-          end
-          RUNTIME
 
           ruby -c build/combat-runtime.rb
           ruby -c build/fix.rb
           ruby build/fix.rb
 
-      - name: V253 Test attack activation and native hit graph
+      - name: V254 Test bounded attack activation
         shell: bash
         run: |
           set -euo pipefail
@@ -426,12 +402,11 @@ jobs:
           cat > build/test.rb <<'RUBY'
           class Game_Event
             attr_accessor :x,:y
-
             def update;end
           end
 
           class Game_Map
-            attr_accessor :map_id,:events,:need_refresh
+            attr_accessor :map_id,:need_refresh
           end
 
           class Game_Player
@@ -441,10 +416,15 @@ jobs:
           module SLMonsterAttackContext
             def self.register(*args)
               @last=args
+              @count=(@count||0)+1
             end
 
             def self.last
               @last
+            end
+
+            def self.count
+              @count||0
             end
           end
 
@@ -454,6 +434,7 @@ jobs:
             HP_VAR=7001
             ATTACK_SWITCH=7002
             MAX_HP=5200
+            ATTACK_WAIT=20
 
             def self.engage
               @engaged=true
@@ -465,6 +446,7 @@ jobs:
           $game_map=Game_Map.new
           $game_map.map_id=25
           $game_map.need_refresh=false
+
           $game_player=Game_Player.new
           $game_variables=Hash.new(0)
           $game_switches=Hash.new(false)
@@ -478,68 +460,100 @@ jobs:
           $game_player.x=120
           $game_player.y=120
 
-          boss.update
+          80.times{boss.update}
 
-          raise 'Distant boss activated' if
+          raise 'Distant attack activated' if
             $game_switches[7002]
 
           $game_player.x=101
           $game_player.y=100
 
-          boss.update
+          19.times{boss.update}
 
-          raise 'Native attack switch not activated' unless
+          raise 'Attack fired too early' if
             $game_switches[7002]
 
-          raise 'Native common events not refreshed' unless
+          boss.update
+
+          raise 'Attack switch missing' unless
+            $game_switches[7002]
+
+          raise 'Native refresh missing' unless
             $game_map.need_refresh
 
-          raise 'Wrong original attack context' unless
+          raise 'Incorrect context registration' unless
             SLMonsterAttackContext.last==[7002,25,29]
 
-          raise 'Monster classification missing' unless
+          raise 'Duplicate context' unless
+            SLMonsterAttackContext.count==1
+
+          raise 'Monster recognition missing' unless
             boss.instance_variable_get(:@monster)==true
+
+          120.times{boss.update}
+
+          raise 'Active attack re-entered' unless
+            SLMonsterAttackContext.count==1
+
+          $game_switches[7002]=false
+
+          19.times{boss.update}
+
+          raise 'Second attack fired too early' if
+            $game_switches[7002]
+
+          boss.update
+
+          raise 'Second attack missing' unless
+            $game_switches[7002] &&
+            SLMonsterAttackContext.count==2
 
           $game_switches[7002]=false
           $game_variables[7001]=5200
-          boss.update
+
+          80.times{boss.update}
 
           raise 'Dead boss attacked' if
-            $game_switches[7002]
+            $game_switches[7002] ||
+            SLMonsterAttackContext.count!=2
 
-          puts 'PASS no distant attack'
-          puts 'PASS nearby native attack activation'
-          puts 'PASS parallel common-event refresh'
-          puts 'PASS original attack context registration'
-          puts 'PASS monster recognition'
-          puts 'PASS dead boss does not attack'
+          puts 'PASS no remote attacks'
+          puts 'PASS one context per attack pulse'
+          puts 'PASS 20-frame attack cooldown'
+          puts 'PASS no concurrent attack re-entry'
+          puts 'PASS monster classification'
+          puts 'PASS defeated boss remains passive'
           RUBY
 
           ruby -c build/test.rb
           ruby build/test.rb
 
-      - name: V253 Remove both visible version displays
+      - name: V254 Refresh resource hashes
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,re
+          import hashlib
+          import re
 
           root=Path('site')
           data=root/'knight/gameasync/Data'
-          mapfile=data/(
-              'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-              'Map025.rxdata'
-          )
-          scripts=data/'Scripts.rxdata'
-          mapping=root/'knight/gameasync/mapping.js'
 
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          files=[
+              data/(pre+'Map025.rxdata'),
+              data/'Scripts.rxdata'
+          ]
+
+          mapping=root/'knight/gameasync/mapping.js'
           text=mapping.read_text('utf-8')
 
-          for path in (mapfile,scripts):
+          for path in files:
               key='Data/'+path.name
+
               digest=hashlib.md5(
                   path.read_bytes()
               ).hexdigest()
@@ -554,6 +568,7 @@ jobs:
                   lambda m:m.group(1)+digest,
                   text
               )
+
               assert count==1,(
                   'Mapping hash mismatch',key,count
               )
@@ -563,68 +578,28 @@ jobs:
           loader=root/'knight/js/sl-assets-v229r115.js'
           js=loader.read_text('utf-8')
 
-          old="var version='V252';"
+          old="var version='V253';"
           assert js.count(old)==1
 
-          js=js.replace(
-              old,"var version='V253';"
+          loader.write_text(
+              js.replace(
+                  old,"var version='V254';"
+              ),
+              'utf-8'
           )
-          loader.write_text(js,'utf-8')
-
-          # Remove the original debug status and the
-          # extra version badge. Keep map-loading logic.
-          status_id='sl-build-version'
-          badge_id='slknight-v252-version'
-
-          element=re.compile(
-              r'<(?P<tag>[a-zA-Z][\w-]*)\b'
-              r'(?=[^>]*\bid\s*=\s*["\']'
-              r'(?:sl-build-version|slknight-v252-version)'
-              r'["\'])[^>]*>.*?</(?P=tag)>',
-              re.I|re.S
-          )
-
-          status_count=0
-          badge_count=0
 
           for rel in ('index.html','knight/index.html'):
               path=root/rel
               html=path.read_text('utf-8')
 
-              assert 'V252' in html
+              assert 'V253' in html
 
-              status_count+=len(re.findall(
-                  r'\bid\s*=\s*["\']'+status_id+r'["\']',
-                  html,re.I
-              ))
-              badge_count+=len(re.findall(
-                  r'\bid\s*=\s*["\']'+badge_id+r'["\']',
-                  html,re.I
-              ))
-
-              html=element.sub('',html)
-
-              html=html.replace('V252','V253')
+              html=html.replace('V253','V254')
               html=html.replace(
-                  '?v=v252','?v=v253'
+                  '?v=v253','?v=v254'
               )
 
-              # Fallback if a loader recreates a
-              # status element after page startup.
-              hidden=(
-                  '<style>'
-                  '#sl-build-version,'
-                  '#slknight-v252-version'
-                  '{display:none!important}'
-                  '</style>'
-              )
-              assert '</head>' in html
-              html=html.replace(
-                  '</head>',hidden+'</head>',1
-              )
-
-              path.write_text(html,'utf-8')
-
+              # Preserve V253 removal of both labels.
               assert not re.search(
                   r'\bid\s*=\s*["\']'
                   r'(?:sl-build-version|slknight-v252-version)'
@@ -632,17 +607,11 @@ jobs:
                   html,re.I
               )
 
-          assert status_count>=1,(
-              'Original status element missing'
-          )
-          assert badge_count>=1,(
-              'Extra version badge missing'
-          )
+              path.write_text(html,'utf-8')
 
-          print('PASS original top-left status removed')
-          print('PASS additional black version badge removed')
-          print('PASS map resource loading remains installed')
-          print('PASS V253 internal cache version')
+          print('PASS Map025 and Scripts hashes updated')
+          print('PASS cache version V254')
+          print('PASS visible version labels remain removed')
           PY
 
           node --check site/knight/gameasync/mapping.js
@@ -650,16 +619,18 @@ jobs:
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
 
-      - name: V253 Verify unrelated data unchanged
+      - name: V254 Verify unrelated game data
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import json,hashlib
+          import hashlib
+          import json
 
           root=Path('site')
+
           before=json.loads(
               Path('build/before.json').read_text()
           )
@@ -715,7 +686,8 @@ jobs:
                   'knight/gameasync/Graphics/'
                   'Characters/SLZenith'+action+'.png'
               )
-              assert before[name]==after[name]
+
+              assert before[name]==after[name],name
 
           for name in (
               '이펙트마법',
@@ -727,17 +699,19 @@ jobs:
                   'knight/gameasync/Graphics/'
                   'Animations/'+name+'.png'
               )
-              assert before[name]==after[name]
 
-          print('PASS Map016 and Map047 unchanged')
-          print('PASS all original NPCs preserved')
-          print('PASS CE1061 and CE1062 unchanged')
-          print('PASS seven original motion sheets unchanged')
-          print('PASS four original magic effects unchanged')
-          print('PASS total inventory 5610 preserved')
+              assert before[name]==after[name],name
+
+          print('PASS all 5610 original files retained')
+          print('PASS all unrelated maps unchanged')
+          print('PASS all original NPCs unchanged')
+          print('PASS native common events unchanged')
+          print('PASS original motion sheets unchanged')
+          print('PASS original magic effects unchanged')
+          print('PASS six intended files modified')
           PY
 
-      - name: V253 Publish game
+      - name: V254 Publish game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
