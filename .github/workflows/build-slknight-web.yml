@@ -1,15 +1,16 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V254
-# BASE: V253 successful build run 41388878119
-# FIX: Remove 17 duplicate boss attack registrations.
-# FIX: Limit native attack activation to one cycle.
-# FIX: Preserve boss HP and targeting commands.
-# KEEP: All maps, NPCs, drops, graphics and FX.
-# DISPLAY: Keep both version labels removed.
-# STATUS: Build and mobile verification pending.
+# VERSION: V255
+# BASE: V254 successful run 41394237945
+# ARCHITECTURE: Monster Registry / Core / Engine Adapter
+# FIX: Replace repeated sprite loads with one motion atlas.
+# FIX: Run native monster attack through one interpreter.
+# FIX: Centralize hit, death, reward and animation states.
+# KEEP: Original maps, NPCs, drops, stats and magic FX.
+# SCOPE: Map025 EV29 only.
+# STATUS: Automated tests included; mobile verification pending.
 
-name: build-slknight-web.yml | V254 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V255 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -34,16 +35,16 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: V254 Restore V253 published game
+      - name: V255 Restore complete V254 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 41388878119
+          run-id: 41394237945
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V254 Verify original inventory
+      - name: V255 Verify baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -53,131 +54,638 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib,json
 
           root=Path('site')
           before={
-              str(p.relative_to(root)):
-              hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
+            str(p.relative_to(root)):
+            hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in root.rglob('*') if p.is_file()
           }
 
-          assert len(before)==5610,(
-              'Unexpected inventory',len(before)
-          )
+          assert len(before)==5610,len(before)
 
           pre=(
-              'knight/gameasync/Data/'
-              'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+            'knight/gameasync/Data/'
+            'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           )
 
           for mid in (16,25,47):
-              assert pre+f'Map{mid:03d}.rxdata' in before
+            assert pre+f'Map{mid:03d}.rxdata' in before
 
           for mid in (45,46):
-              assert pre+f'Map{mid:03d}.rxdata' not in before
-
-          assert 'knight/assets/map-047-v241.pack' in before
-          assert 'knight/gameasync/Data/Scripts.rxdata' in before
+            assert pre+f'Map{mid:03d}.rxdata' not in before
 
           Path('build/before.json').write_text(
-              json.dumps(before,sort_keys=True)
+            json.dumps(before,sort_keys=True)
           )
 
-          print('PASS V253 original 5610 files')
+          print('PASS V254 inventory: 5610 files')
           PY
 
-      - name: V254 Repair native boss combat
+      - name: V255 Generate reusable motion atlas
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > build/combat-runtime.rb <<'RUNTIME'
-          # V254 bounded Zenith combat.
-          # Only Map025 Event29 is affected.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pil
 
-          module SLZenith
-            def self.v254_combat_tick(ev)
-              return unless ev
-              return unless $game_map && $game_player
-              return unless $game_map.map_id==MAP_ID
-              return unless $game_switches && $game_variables
-              return if @paid
-              return if ev.instance_variable_get(:@erased)
-              return if $game_variables[HP_VAR].to_i>=MAX_HP
+          cat > build/atlas.py <<'PY'
+          from pathlib import Path
+          from PIL import Image
 
-              return unless ev.respond_to?(:x) &&
-                ev.respond_to?(:y) &&
-                $game_player.respond_to?(:x) &&
-                $game_player.respond_to?(:y)
+          root=Path(
+            'site/knight/gameasync/Graphics/Characters'
+          )
+
+          motions=[
+            ('Walk',12),
+            ('Idle',11),
+            ('Attack',13),
+            ('AltAttack',14),
+            ('Spell',14),
+            ('Hit',2),
+            ('Death',17)
+          ]
+
+          images=[]
+          cell_w=0
+          cell_h=0
+
+          for name,count in motions:
+            path=root/f'SLZenith{name}.png'
+            assert path.is_file(),path
+
+            image=Image.open(path).convert('RGBA')
+
+            assert image.width%count==0
+            assert image.height%4==0
+
+            w=image.width//count
+            h=image.height//4
+
+            cell_w=max(cell_w,w)
+            cell_h=max(cell_h,h)
+            images.append((image,count,w,h))
+
+          atlas=Image.new(
+            'RGBA',
+            (cell_w*17,cell_h*28),
+            (0,0,0,0)
+          )
+
+          for action,(image,count,w,h) in enumerate(images):
+            for direction in range(4):
+              for frame in range(count):
+                tile=image.crop((
+                  frame*w,direction*h,
+                  (frame+1)*w,(direction+1)*h
+                ))
+
+                x=frame*cell_w+(cell_w-w)//2
+                y=(action*4+direction)*cell_h+cell_h-h
+
+                atlas.alpha_composite(tile,(x,y))
+
+          path=root/'SLMonsterAtlas.png'
+          atlas.save(path,optimize=True)
+
+          assert path.stat().st_size>1000
+          assert atlas.width==cell_w*17
+          assert atlas.height==cell_h*28
+
+          print('PASS 7 motions / 4 directions')
+          print('PASS one reusable atlas')
+          print('PASS original 7 sheets untouched')
+          PY
+
+          python3 build/atlas.py
+
+      - name: V255 Create monster registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > build/monster-registry.rb <<'RUBY'
+          module SLMonsters
+            ATLAS='SLMonsterAtlas'
+
+            MOTION_ORDER=[
+              'Walk','Idle','Attack','AltAttack',
+              'Spell','Hit','Death'
+            ]
+
+            # Add future monsters here.
+            # Core and engine adapter remain unchanged.
+            REGISTRY={
+              [25,29]=>{
+                :name=>'제니스 퀸',
+                :level=>60,
+                :hp=>5200,
+                :hp_variable=>7001,
+                :attack_switch=>7002,
+                :physical=>[50,100],
+                :magic=>[150,300],
+                :accuracy=>9999,
+                :hit_random=>[15,35],
+                :attack_wait=>20,
+                :attack_range=>3,
+                :attack_common_event=>1061,
+                :exp=>43212,
+                :adena=>[64800,151200],
+                :magic_fx=>[25,14,15,16],
+                :motions=>{
+                  'Walk'=>12,
+                  'Idle'=>11,
+                  'Attack'=>13,
+                  'AltAttack'=>14,
+                  'Spell'=>14,
+                  'Hit'=>2,
+                  'Death'=>17
+                },
+                :drops=>__APPROVED_DROPS__
+              }
+            }
+          end
+          RUBY
+
+      - name: V255 Create reusable monster core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > build/monster-core.rb <<'RUBY'
+          module SLMonsters
+            @states={}
+
+            def self.config(map_id,event_id)
+              REGISTRY[[map_id,event_id]]
+            end
+
+            def self.state(map_id,event_id)
+              key=[map_id,event_id]
+
+              @states[key]||={
+                :tick=>0,
+                :motion=>nil,
+                :motion_tick=>0,
+                :motion_duration=>0,
+                :last_damage=>0,
+                :cooldown=>0,
+                :engaged=>false,
+                :paid=>false,
+                :magic_index=>0,
+                :death_tick=>0,
+                :interpreter=>nil,
+                :interpreter_tick=>0
+              }
+            end
+
+            def self.event(map_id,event_id)
+              return nil unless $game_map
+              return nil unless $game_map.map_id==map_id
+              return nil unless $game_map.events
+
+              $game_map.events[event_id]
+            end
+
+            def self.reset(map_id)
+              @states.clear
+              return unless $game_variables
+
+              REGISTRY.each do |key,c|
+                next unless key[0]==map_id
+
+                $game_variables[c[:hp_variable]]=0
+
+                if $game_switches
+                  $game_switches[c[:attack_switch]]=false
+                end
+              end
+            end
+
+            def self.motion(map_id,event_id,name,duration)
+              c=config(map_id,event_id)
+              return unless c
+              return unless c[:motions].key?(name)
+
+              s=state(map_id,event_id)
+              return if s[:paid] && name!='Death'
+
+              s[:motion]=name
+              s[:motion_tick]=0
+              s[:motion_duration]=duration
+            end
+
+            def self.engage(map_id,event_id)
+              c=config(map_id,event_id)
+              return unless c
+
+              s=state(map_id,event_id)
+              s[:engaged]=true
+
+              show_hp(map_id,event_id)
+            end
+
+            def self.show_hp(map_id,event_id)
+              c=config(map_id,event_id)
+              return unless c
+              return unless $game_variables
+              return unless $m && $m.respond_to?(:drawMHP)
+
+              damage=$game_variables[c[:hp_variable]].to_i
+
+              $m.drawMHP(
+                c[:name],damage,c[:hp],2
+              )
+            end
+
+            def self.magic_effect(map_id,event_id)
+              c=config(map_id,event_id)
+              return unless c
+              return unless $game_player
+              return unless $data_animations
+              return unless $game_player.respond_to?(:animation_id=)
+
+              s=state(map_id,event_id)
+              ids=c[:magic_fx]
+
+              index=s[:magic_index]%ids.length
+              id=ids[index]
+
+              return unless $data_animations[id]
+
+              $game_player.animation_id=id
+              s[:magic_index]=(index+1)%ids.length
+            end
+
+            def self.roll(pair)
+              pair[0]+rand(pair[1]-pair[0]+1)
+            end
+
+            def self.reward(map_id,event_id)
+              c=config(map_id,event_id)
+              return unless c
+              return unless $game_variables && $game_party
+
+              s=state(map_id,event_id)
+              return if s[:paid]
+
+              damage=$game_variables[c[:hp_variable]].to_i
+              return if damage<c[:hp]
+
+              s[:paid]=true
+              gold=roll(c[:adena])
+
+              $game_party.gain_gold(gold)
+
+              actor=$game_actors[1] if $game_actors
+
+              if actor
+                actor.exp=actor.exp+c[:exp]
+              end
+
+              $game_variables[333]=gold
+              $game_variables[1926]=c[:exp]
+
+              c[:drops].each do |kind,id,chance|
+                next unless rand(1000)<chance
+
+                case kind
+                when :item
+                  $game_party.gain_item(id,1)
+                when :weapon
+                  $game_party.gain_weapon(id,1)
+                when :armor
+                  $game_party.gain_armor(id,1)
+                end
+              end
+            end
+
+            def self.near_player?(ev,c)
+              return false unless $game_player
+              return false unless ev.respond_to?(:x)
+              return false unless ev.respond_to?(:y)
 
               dx=($game_player.x-ev.x).abs
               dy=($game_player.y-ev.y).abs
+              range=c[:attack_range]
 
-              if dx>3 || dy>3
-                ev.instance_variable_set(:@slz_v254_tick,0)
+              dx<=range && dy<=range
+            end
+
+            def self.start_attack(ev,key,c,s)
+              return unless $data_common_events
+              return unless defined?(Game_Interpreter)
+
+              common=$data_common_events[
+                c[:attack_common_event]
+              ]
+
+              return unless common
+              return unless common.respond_to?(:list)
+
+              engage(key[0],key[1])
+
+              motion(
+                key[0],key[1],
+                'Attack',c[:attack_wait]
+              )
+
+              interpreter=Game_Interpreter.new(0)
+
+              interpreter.setup(
+                common.list,key[1]
+              )
+
+              s[:interpreter]=interpreter
+              s[:interpreter_tick]=0
+              s[:cooldown]=c[:attack_wait]
+            end
+
+            def self.update_interpreter(s)
+              interpreter=s[:interpreter]
+              return unless interpreter
+
+              s[:interpreter_tick]+=1
+
+              # Stop a runaway interpreter.
+              if s[:interpreter_tick]>90
+                s[:interpreter]=nil
                 return
               end
 
-              # CE1062 controls the native attack switch.
-              # An active cycle must never be re-entered.
-              return if $game_switches[ATTACK_SWITCH]
+              interpreter.update
 
-              ticks=ev.instance_variable_get(
-                :@slz_v254_tick
-              ).to_i+1
+              if interpreter.respond_to?(:running?) &&
+                 !interpreter.running?
+                s[:interpreter]=nil
+              end
+            end
 
-              ev.instance_variable_set(
-                :@slz_v254_tick,ticks
-              )
+            def self.update(ev)
+              map_id=ev.instance_variable_get(:@map_id)
+              event_id=ev.instance_variable_get(:@id)
 
-              return if ticks<ATTACK_WAIT
+              c=config(map_id,event_id)
+              return unless c
+              return unless $game_map && $game_variables
+              return unless $game_map.map_id==map_id
+              return if ev.instance_variable_get(:@erased)
 
-              ev.instance_variable_set(
-                :@slz_v254_tick,0
-              )
+              s=state(map_id,event_id)
+              key=[map_id,event_id]
 
-              # Register one context per attack pulse.
-              # Do not register on every update.
-              if defined?(SLMonsterAttackContext) &&
-                 SLMonsterAttackContext.respond_to?(:register)
+              s[:tick]+=1
 
-                SLMonsterAttackContext.register(
-                  ATTACK_SWITCH,MAP_ID,EVENT_ID
+              # One stable bitmap for every action.
+              if ev.instance_variable_get(:@character_name)!=ATLAS
+                ev.instance_variable_set(
+                  :@character_name,ATLAS
                 )
               end
 
-              engage
-              $game_switches[ATTACK_SWITCH]=true
+              damage=$game_variables[c[:hp_variable]].to_i
 
-              if $game_map.respond_to?(:need_refresh=)
-                $game_map.need_refresh=true
+              # Native hit commands update the damage variable.
+              if damage>s[:last_damage] && damage<c[:hp]
+                motion(map_id,event_id,'Hit',14)
+                engage(map_id,event_id)
               end
+
+              if damage!=s[:last_damage]
+                s[:last_damage]=damage
+                show_hp(map_id,event_id)
+              end
+
+              if damage>=c[:hp]
+                if s[:death_tick]==0
+                  motion(map_id,event_id,'Death',42)
+                  reward(map_id,event_id)
+                end
+
+                s[:death_tick]+=1
+
+                if s[:death_tick]>=42 &&
+                   ev.respond_to?(:erase)
+                  ev.erase
+                end
+
+                return
+              end
+
+              if s[:motion]
+                s[:motion_tick]+=1
+
+                if s[:motion_tick]>=s[:motion_duration]
+                  s[:motion]=nil
+                  s[:motion_tick]=0
+                end
+              end
+
+              update_interpreter(s)
+
+              if s[:cooldown]>0
+                s[:cooldown]-=1
+              end
+
+              return if s[:interpreter]
+              return if s[:cooldown]>0
+              return if s[:motion]=='Hit'
+              return unless near_player?(ev,c)
+
+              start_attack(ev,key,c,s)
+            end
+
+            def self.frame_info(ev)
+              map_id=ev.instance_variable_get(:@map_id)
+              event_id=ev.instance_variable_get(:@id)
+
+              c=config(map_id,event_id)
+              return nil unless c
+
+              s=state(map_id,event_id)
+
+              action=s[:motion]
+
+              if !action
+                moving=ev.respond_to?(:moving?) &&
+                  ev.moving?
+
+                action=moving ? 'Walk' : 'Idle'
+              end
+
+              total=c[:motions][action]
+              return nil unless total
+
+              if s[:motion]
+                duration=[s[:motion_duration],1].max
+                frame=[
+                  s[:motion_tick]*total/duration,
+                  total-1
+                ].min
+              else
+                speed=(action=='Walk' ? 2 : 4)
+                frame=(s[:tick]/speed)%total
+              end
+
+              direction=ev.direction.to_i
+              row_index=[2,4,6,8].index(direction)
+              return nil unless row_index
+
+              bank=MOTION_ORDER.index(action)
+              return nil unless bank
+
+              [frame,bank*4+row_index]
+            end
+          end
+          RUBY
+
+      - name: V255 Create isolated engine adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > build/monster-adapter.rb <<'RUBY'
+          # Compatibility with the existing native CE1061.
+          # These calls all route into the reusable core.
+
+          module SLZenith
+            MAP_ID=25
+            EVENT_ID=29
+
+            def self.engage
+              SLMonsters.engage(MAP_ID,EVENT_ID)
+            end
+
+            def self.attack_start
+              SLMonsters.motion(
+                MAP_ID,EVENT_ID,'Attack',20
+              )
+            end
+
+            def self.magic_start
+              SLMonsters.motion(
+                MAP_ID,EVENT_ID,'Spell',20
+              )
+
+              SLMonsters.magic_effect(MAP_ID,EVENT_ID)
+            end
+
+            def self.hit
+              SLMonsters.motion(
+                MAP_ID,EVENT_ID,'Hit',14
+              )
+
+              SLMonsters.engage(MAP_ID,EVENT_ID)
+            end
+
+            def self.reward
+              SLMonsters.reward(MAP_ID,EVENT_ID)
+            end
+
+            def self.reset(map_id)
+              SLMonsters.reset(map_id)
+            end
+          end
+
+          class Game_Map
+            alias slm_v255_native_setup setup
+
+            def setup(map_id)
+              slm_v255_native_setup(map_id)
+              SLMonsters.reset(map_id)
             end
           end
 
           class Game_Event
-            alias slz_v254_native_update update
+            alias slm_v255_native_update update
 
             def update
-              if @map_id==SLZenith::MAP_ID &&
-                 @id==SLZenith::EVENT_ID
-                @monster=true
-              end
+              c=SLMonsters.config(@map_id,@id)
 
-              slz_v254_native_update
+              # Only registered monsters get the new system.
+              @monster=true if c
 
-              return unless
-                @map_id==SLZenith::MAP_ID &&
-                @id==SLZenith::EVENT_ID
+              slm_v255_native_update
 
-              SLZenith.v254_combat_tick(self)
+              SLMonsters.update(self) if c
             end
           end
-          RUNTIME
 
-          cat > build/fix.rb <<'RUBY'
+          class Sprite_Character
+            alias slm_v255_native_update update
+
+            def update
+              slm_v255_native_update
+
+              return unless @character
+              return unless @character.is_a?(Game_Event)
+
+              map_id=@character.instance_variable_get(:@map_id)
+              event_id=@character.instance_variable_get(:@id)
+
+              c=SLMonsters.config(map_id,event_id)
+              return unless c
+
+              return unless @character.character_name==
+                SLMonsters::ATLAS
+
+              bmp=respond_to?(:bitmap) ? bitmap : @bitmap
+
+              return unless bmp
+              return unless bmp.width.to_i>0
+              return unless bmp.height.to_i>0
+
+              return unless bmp.width%17==0
+              return unless bmp.height%28==0
+
+              info=SLMonsters.frame_info(@character)
+              return unless info
+
+              frame,row=info
+
+              cw=bmp.width/17
+              ch=bmp.height/28
+
+              rect=respond_to?(:src_rect) ?
+                src_rect : @src_rect
+
+              return unless rect &&
+                rect.respond_to?(:set)
+
+              rect.set(frame*cw,row*ch,cw,ch)
+
+              @cw=cw
+              @ch=ch
+
+              if respond_to?(:ox=)
+                self.ox=cw/2
+              else
+                @ox=cw/2
+              end
+
+              if respond_to?(:oy=)
+                self.oy=ch
+              else
+                @oy=ch
+              end
+
+              if respond_to?(:z=) &&
+                 @character.respond_to?(:screen_z)
+                self.z=@character.screen_z(ch)
+              end
+            end
+          end
+          RUBY
+
+      - name: V255 Install registry and replace boss runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > build/install.rb <<'RUBY'
           require 'zlib'
 
           module RPG
@@ -202,10 +710,7 @@ jobs:
               o.instance_variable_set(:@raw,raw)
               o
             end
-
-            def _dump(level=0)
-              @raw
-            end
+            def _dump(level=0);@raw;end
           end
 
           class Tone
@@ -214,10 +719,7 @@ jobs:
               o.instance_variable_set(:@raw,raw)
               o
             end
-
-            def _dump(level=0)
-              @raw
-            end
+            def _dump(level=0);@raw;end
           end
 
           class Color<Tone;end
@@ -234,12 +736,12 @@ jobs:
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           map_path=root+pre+'Map025.rxdata'
-          common_path=root+pre+'CommonEvents.rxdata'
           scripts_path=root+'Scripts.rxdata'
+          common_path=root+pre+'CommonEvents.rxdata'
 
           map=Marshal.load(File.binread(map_path))
-          common=Marshal.load(File.binread(common_path))
           scripts=Marshal.load(File.binread(scripts_path))
+          common=Marshal.load(File.binread(common_path))
 
           events=iv(map,:events)
           boss=events.fetch(29)
@@ -247,371 +749,468 @@ jobs:
           name=iv(boss,:name).to_s.dup
             .force_encoding('UTF-8').scrub
 
-          raise 'Wrong Zenith Queen event' unless
+          raise 'Wrong boss event' unless
             name.include?('제니스 퀸')
 
-          pages=iv(boss,:pages)
-          raise 'Wrong boss pages' unless
-            pages.length==2
-
-          originals=events.each_with_object({}) do |(id,ev),h|
-            h[id]=Marshal.dump(ev) unless id==29
+          original_others=events.each_with_object({}) do |(id,e),h|
+            h[id]=Marshal.dump(e) unless id==29
           end
-
-          active=iv(pages[0],:list)
-
-          # V253 contains 17 redundant context registrations.
-          # CE1062 still provides native physical/magic damage.
-          # Preserve all native HP, hit and movement commands.
-          suppressed=0
-
-          active.each do |command|
-            code=iv(command,:code)
-            next unless code==355 || code==655
-
-            p=iv(command,:parameters)
-
-            next unless p.is_a?(Array)
-            next unless p[0].is_a?(String)
-            next unless p[0].include?(
-              'SLMonsterAttackContext.register'
-            )
-
-            put(command,:parameters,['nil'])
-            suppressed+=1
-          end
-
-          raise(
-            "Unexpected registration count: "+
-            suppressed.to_s
-          ) unless suppressed==17
-
-          attack_switches=active.count do |c|
-            iv(c,:code)==121 &&
-              iv(c,:parameters)==[7002,7002,0]
-          end
-
-          hp_writes=active.count do |c|
-            p=iv(c,:parameters)
-            iv(c,:code)==122 &&
-              p.is_a?(Array) &&
-              p[0]==7001
-          end
-
-          raise 'Native attack graph changed' unless
-            attack_switches==17
-
-          raise 'Native HP graph changed' unless
-            hp_writes==20
-
-          condition=iv(pages[1],:condition)
-
-          raise 'Boss death condition changed' unless
-            iv(condition,:variable_id)==7001 &&
-            iv(condition,:variable_value)==5200
-
-          originals.each do |id,raw|
-            raise "Unrelated event modified: #{id}" unless
-              Marshal.dump(events[id])==raw
-          end
-
-          cycle=common.fetch(1062)
-          damage=common.fetch(1061)
-
-          raise 'Native attack cycle missing' unless
-            iv(cycle,:trigger)==2 &&
-            iv(cycle,:switch_id)==7002
-
-          raise 'Native damage missing' unless
-            iv(damage,:list).count{
-              |c| iv(c,:code)==311
-            }>=2
-
-          File.binwrite(map_path,Marshal.dump(map))
 
           indices=scripts.each_index.select do |i|
             scripts[i].is_a?(Array) &&
-              scripts[i][1]=='SLZenithV253'
+              scripts[i][1]=='SLZenithV254'
           end
 
-          raise 'Original runtime not unique' unless
+          raise 'Unexpected runtime count' unless
             indices.length==1
 
           index=indices.first
           entry=scripts[index]
 
-          old=Zlib::Inflate.inflate(entry[2]).b
-          marker="\n# V253 native Zenith combat activation.".b
+          source=Zlib::Inflate.inflate(entry[2])
 
-          raise 'V253 extension missing' unless
-            old.scan(marker).length==1
-
-          # Remove the V253 extra update wrapper.
-          # Keep the original V252/V247 runtime.
-          base=old.split(marker,2).first
-
-          required=[
+          approved=[
             'MAX_HP=5200',
             'PHYSICAL=[50,100]',
             'MAGIC=[150,300]',
+            'ACCURACY=9999',
+            'HIT_RANDOM=[15,35]',
             'ATTACK_WAIT=20',
             'EXP=43212',
             'ADENA=[64800,151200]'
           ]
 
-          required.each do |value|
+          approved.each do |value|
             raise "Approved stat missing: #{value}" unless
-              base.include?(value)
+              source.include?(value)
           end
 
-          patch=File.binread('build/combat-runtime.rb')
-          runtime=base.b+"\n"+patch.b
+          # Preserve the actual 20-entry approved drop list.
+          match=source.match(/DROPS=(\[\n.*?\n  \])/m)
+          raise 'Approved drop table missing' unless match
 
-          entry[0]=99825401
-          entry[1]='SLZenithV254'
+          drops=match[1]
+
+          raise 'Drop entries changed' unless
+            drops.scan(/\[:(?:item|weapon|armor),/).length==20
+
+          registry=File.read('build/monster-registry.rb')
+
+          assert_placeholder='__APPROVED_DROPS__'
+          raise 'Registry placeholder missing' unless
+            registry.count(assert_placeholder)==1
+
+          registry=registry.sub(assert_placeholder,drops)
+
+          runtime=[
+            registry,
+            File.read('build/monster-core.rb'),
+            File.read('build/monster-adapter.rb')
+          ].join("\n\n")
+
+          File.write('build/monster-runtime.rb',runtime)
+
+          entry[0]=99825501
+          entry[1]='SLMonstersV255'
           entry[2]=Zlib::Deflate.deflate(runtime,9)
 
+          pages=iv(boss,:pages)
+          raise 'Unexpected boss pages' unless pages.length==2
+
+          active,death=pages
+          active_list=iv(active,:list)
+
+          # Remove old parallel attack-switch activation.
+          # Keep the native incoming-hit command graph.
+          suppressed=0
+
+          active_list.each do |command|
+            next unless iv(command,:code)==121
+            next unless iv(command,:parameters)==[7002,7002,0]
+
+            put(command,:code,355)
+            put(command,:parameters,['nil'])
+            suppressed+=1
+          end
+
+          raise 'Old attack paths changed' unless
+            suppressed==17
+
+          hp_writes=active_list.count do |command|
+            p=iv(command,:parameters)
+            iv(command,:code)==122 &&
+              p.is_a?(Array) && p[0]==7001
+          end
+
+          raise 'Incoming hit graph missing' unless
+            hp_writes==20
+
+          # Native movement, not copied Death Knight AI.
+          put(active,:move_type,2)
+          put(active,:move_speed,3)
+          put(active,:move_frequency,6)
+
+          put(
+            iv(active,:graphic),
+            :character_name,'SLMonsterAtlas'
+          )
+
+          # Core owns death and reward.
+          put(
+            iv(death,:graphic),
+            :character_name,'SLMonsterAtlas'
+          )
+
+          put(death,:trigger,0)
+
+          stop=RPG::EventCommand.allocate
+          put(stop,:code,0)
+          put(stop,:indent,0)
+          put(stop,:parameters,[])
+          put(death,:list,[stop])
+
+          condition=iv(death,:condition)
+
+          raise 'Death HP condition changed' unless
+            iv(condition,:variable_id)==7001 &&
+            iv(condition,:variable_value)==5200
+
+          # Keep CE1061 as a temporary native damage adapter.
+          # CE1062 is retained but never activated by the new core.
+          attack=common.fetch(1061)
+          cycle=common.fetch(1062)
+
+          raise 'Native combat missing' unless
+            iv(attack,:list).count{
+              |c| iv(c,:code)==311
+            }>=2
+
+          raise 'Original cycle changed' unless
+            iv(cycle,:switch_id)==7002
+
+          original_others.each do |id,raw|
+            raise "Other monster changed: #{id}" unless
+              Marshal.dump(events[id])==raw
+          end
+
+          File.binwrite(map_path,Marshal.dump(map))
           File.binwrite(scripts_path,Marshal.dump(scripts))
 
-          check=Marshal.load(File.binread(scripts_path))
-
-          verified=Zlib::Inflate.inflate(
-            check[index][2]
+          verify=Marshal.load(File.binread(scripts_path))
+          restored=Zlib::Inflate.inflate(
+            verify[index][2]
           )
 
           raise 'Runtime serialization failed' unless
-            check[index][1]=='SLZenithV254' &&
-            verified.b==runtime.b
+            verify[index][1]=='SLMonstersV255' &&
+            restored.b==runtime.b
 
-          puts 'PASS duplicate attack registrations disabled'
-          puts 'PASS native 17 switches and 20 HP writes'
-          puts 'PASS original CE1061/CE1062 preserved'
-          puts 'PASS original combat stats retained'
-          puts 'PASS Map025 EV29 only modified'
+          puts 'PASS reusable registry/core/adapter'
+          puts 'PASS original approved drops and stats'
+          puts 'PASS original 20 incoming hit commands'
+          puts 'PASS original other monster events'
+          puts 'PASS original native damage adapter'
           RUBY
 
-          ruby -c build/combat-runtime.rb
-          ruby -c build/fix.rb
-          ruby build/fix.rb
+          ruby -c build/install.rb
+          ruby build/install.rb
+          ruby -c build/monster-runtime.rb
 
-      - name: V254 Test bounded attack activation
+      - name: V255 Test independent monster runtime
         shell: bash
         run: |
           set -euo pipefail
 
           cat > build/test.rb <<'RUBY'
           class Game_Event
-            attr_accessor :x,:y
+            attr_accessor :x,:y,:direction,:character_name
             def update;end
+            def moving?;false;end
+            def erase;@erased=true;end
+            def screen_z(_);500;end
           end
 
           class Game_Map
-            attr_accessor :map_id,:need_refresh
+            attr_accessor :map_id,:events
+            def setup(id);@map_id=id;end
           end
 
           class Game_Player
-            attr_accessor :x,:y
+            attr_accessor :x,:y,:animation_id
           end
 
-          module SLMonsterAttackContext
-            def self.register(*args)
-              @last=args
-              @count=(@count||0)+1
+          class Sprite_Character
+            attr_accessor :ox,:oy,:z
+            def initialize(ev,bmp)
+              @character=ev
+              @bitmap=bmp
+              @rect=Struct.new(:x,:y,:width,:height) do
+                def set(x,y,w,h)
+                  self.x=x
+                  self.y=y
+                  self.width=w
+                  self.height=h
+                end
+              end.new
             end
+            def update;end
+            def bitmap;@bitmap;end
+            def src_rect;@rect;end
+          end
 
-            def self.last
-              @last
+          class Game_Interpreter
+            def initialize(*);end
+            def setup(list,id)
+              @running=true
             end
-
-            def self.count
-              @count||0
+            def running?
+              !!@running
+            end
+            def update
+              $game_actors[1].hp-=15
+              @running=false
             end
           end
 
-          module SLZenith
-            MAP_ID=25
-            EVENT_ID=29
-            HP_VAR=7001
-            ATTACK_SWITCH=7002
-            MAX_HP=5200
-            ATTACK_WAIT=20
-
-            def self.engage
-              @engaged=true
+          class DummyActor
+            attr_accessor :hp,:exp
+            def initialize
+              @hp=1000
+              @exp=0
             end
           end
 
-          load 'build/combat-runtime.rb'
+          class DummyParty
+            attr_reader :gold
+            def initialize
+              @gold=0
+            end
+            def gain_gold(n);@gold+=n;end
+            def gain_item(*);end
+            def gain_weapon(*);end
+            def gain_armor(*);end
+          end
 
-          $game_map=Game_Map.new
-          $game_map.map_id=25
-          $game_map.need_refresh=false
-
-          $game_player=Game_Player.new
           $game_variables=Hash.new(0)
           $game_switches=Hash.new(false)
+          $game_map=Game_Map.new
+          $game_map.map_id=25
+
+          $game_player=Game_Player.new
+          $game_player.x=101
+          $game_player.y=100
+
+          $game_actors={1=>DummyActor.new}
+          $game_party=DummyParty.new
+
+          $data_animations=Array.new(26)
+          [25,14,15,16].each do |id|
+            $data_animations[id]=Object.new
+          end
+
+          $data_common_events=Array.new(1063)
+          $data_common_events[1061]=
+            Struct.new(:list).new([])
+
+          $m=nil
+
+          load 'build/monster-runtime.rb'
 
           boss=Game_Event.new
           boss.instance_variable_set(:@map_id,25)
           boss.instance_variable_set(:@id,29)
+
           boss.x=100
           boss.y=100
+          boss.direction=2
+          boss.character_name='SLMonsterAtlas'
 
-          $game_player.x=120
-          $game_player.y=120
+          $game_map.events={29=>boss}
 
-          80.times{boss.update}
+          c=SLMonsters.config(25,29)
 
-          raise 'Distant attack activated' if
-            $game_switches[7002]
+          raise 'Registration missing' unless c
+          raise 'Wrong HP' unless c[:hp]==5200
+          raise 'Wrong monster level' unless c[:level]==60
+          raise 'Wrong motion inventory' unless
+            c[:motions].length==7
+          raise 'Wrong drops' unless c[:drops].length==20
 
-          $game_player.x=101
-          $game_player.y=100
+          # Actual native attack interpreter must run.
+          hp_before=$game_actors[1].hp
 
-          19.times{boss.update}
+          25.times{boss.update}
 
-          raise 'Attack fired too early' if
-            $game_switches[7002]
+          raise 'Attack did not damage actor' unless
+            $game_actors[1].hp<hp_before
 
-          boss.update
-
-          raise 'Attack switch missing' unless
-            $game_switches[7002]
-
-          raise 'Native refresh missing' unless
-            $game_map.need_refresh
-
-          raise 'Incorrect context registration' unless
-            SLMonsterAttackContext.last==[7002,25,29]
-
-          raise 'Duplicate context' unless
-            SLMonsterAttackContext.count==1
-
-          raise 'Monster recognition missing' unless
+          raise 'Monster classification missing' unless
             boss.instance_variable_get(:@monster)==true
 
-          120.times{boss.update}
-
-          raise 'Active attack re-entered' unless
-            SLMonsterAttackContext.count==1
-
-          $game_switches[7002]=false
-
-          19.times{boss.update}
-
-          raise 'Second attack fired too early' if
-            $game_switches[7002]
-
+          # Damage variable drives incoming hit motion.
+          $game_variables[7001]=200
           boss.update
 
-          raise 'Second attack missing' unless
-            $game_switches[7002] &&
-            SLMonsterAttackContext.count==2
+          state=SLMonsters.state(25,29)
 
-          $game_switches[7002]=false
+          raise 'Hit animation missing' unless
+            state[:motion]=='Hit'
+
+          # One atlas renders different actions.
+          bmp=Struct.new(:width,:height).new(
+            17*144,28*120
+          )
+
+          sprite=Sprite_Character.new(boss,bmp)
+
+          [2,4,6,8].each do |direction|
+            boss.direction=direction
+            sprite.update
+
+            row=SLMonsters.frame_info(boss)[1]
+            expected=row*120
+
+            raise 'Wrong cardinal sprite row' unless
+              sprite.src_rect.y==expected
+          end
+
+          # Death pays exactly once.
           $game_variables[7001]=5200
+          boss.update
 
-          80.times{boss.update}
+          first_gold=$game_party.gold
 
-          raise 'Dead boss attacked' if
-            $game_switches[7002] ||
-            SLMonsterAttackContext.count!=2
+          raise 'Death reward missing' unless
+            first_gold.between?(64800,151200)
 
-          puts 'PASS no remote attacks'
-          puts 'PASS one context per attack pulse'
-          puts 'PASS 20-frame attack cooldown'
-          puts 'PASS no concurrent attack re-entry'
-          puts 'PASS monster classification'
-          puts 'PASS defeated boss remains passive'
+          raise 'EXP missing' unless
+            $game_actors[1].exp==43212
+
+          50.times{boss.update}
+
+          raise 'Reward duplicated' unless
+            $game_party.gold==first_gold
+
+          raise 'Death event not erased' unless
+            boss.instance_variable_get(:@erased)
+
+          # Non-registered monster is untouched.
+          other=Game_Event.new
+          other.instance_variable_set(:@map_id,16)
+          other.instance_variable_set(:@id,8)
+
+          other.update
+
+          raise 'Other monster was modified' if
+            other.instance_variable_get(:@monster)==true
+
+          puts 'PASS original approved monster registration'
+          puts 'PASS native outgoing actor HP damage'
+          puts 'PASS incoming hit animation state'
+          puts 'PASS four direction atlas rendering'
+          puts 'PASS death and single reward'
+          puts 'PASS unrelated monster bypass'
           RUBY
 
           ruby -c build/test.rb
           ruby build/test.rb
 
-      - name: V254 Refresh resource hashes
+      - name: V255 Refresh native asset mapping
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
-          import re
+          import hashlib,re
 
           root=Path('site')
           data=root/'knight/gameasync/Data'
+          mapping=root/'knight/gameasync/mapping.js'
+
+          text=mapping.read_text('utf-8')
+
+          atlas=(
+            root/'knight/gameasync/Graphics/Characters/'
+            'SLMonsterAtlas.png'
+          )
+
+          digest=hashlib.md5(atlas.read_bytes()).hexdigest()
+
+          anchor='];\n\nvar mapping = {}'
+
+          assert text.count(anchor)==1
+          assert 'graphics/characters/slmonsteratlas' not in text
+
+          entry=(
+            '["graphics/characters/slmonsteratlas", '
+            '"Graphics/Characters/SLMonsterAtlas.png'
+            '?h='+digest+'"],'
+          )
+
+          text=text.replace(anchor,entry+'\n'+anchor)
 
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           files=[
-              data/(pre+'Map025.rxdata'),
-              data/'Scripts.rxdata'
+            data/(pre+'Map025.rxdata'),
+            data/'Scripts.rxdata'
           ]
 
-          mapping=root/'knight/gameasync/mapping.js'
-          text=mapping.read_text('utf-8')
-
           for path in files:
-              key='Data/'+path.name
+            key='Data/'+path.name
+            md5=hashlib.md5(path.read_bytes()).hexdigest()
 
-              digest=hashlib.md5(
-                  path.read_bytes()
-              ).hexdigest()
+            pattern=(
+              '('+re.escape(key)+
+              r'\?h=)[0-9a-f]{32}'
+            )
 
-              pattern=(
-                  '('+re.escape(key)+
-                  r'\?h=)[0-9a-f]{32}'
-              )
+            text,count=re.subn(
+              pattern,
+              lambda m:m.group(1)+md5,
+              text
+            )
 
-              text,count=re.subn(
-                  pattern,
-                  lambda m:m.group(1)+digest,
-                  text
-              )
-
-              assert count==1,(
-                  'Mapping hash mismatch',key,count
-              )
+            assert count==1,(key,count)
 
           mapping.write_text(text,'utf-8')
 
           loader=root/'knight/js/sl-assets-v229r115.js'
           js=loader.read_text('utf-8')
 
-          old="var version='V253';"
-          assert js.count(old)==1
+          assert js.count("var version='V254';")==1
 
           loader.write_text(
-              js.replace(
-                  old,"var version='V254';"
-              ),
-              'utf-8'
+            js.replace(
+              "var version='V254';",
+              "var version='V255';"
+            ),
+            'utf-8'
           )
 
-          for rel in ('index.html','knight/index.html'):
-              path=root/rel
-              html=path.read_text('utf-8')
+          for relative in ('index.html','knight/index.html'):
+            path=root/relative
+            html=path.read_text('utf-8')
 
-              assert 'V253' in html
+            assert 'V254' in html
 
-              html=html.replace('V253','V254')
-              html=html.replace(
-                  '?v=v253','?v=v254'
-              )
+            html=html.replace('V254','V255')
+            html=html.replace('?v=v254','?v=v255')
 
-              # Preserve V253 removal of both labels.
-              assert not re.search(
-                  r'\bid\s*=\s*["\']'
-                  r'(?:sl-build-version|slknight-v252-version)'
-                  r'["\']',
-                  html,re.I
-              )
+            assert not re.search(
+              r'\bid\s*=\s*["\']'
+              r'(?:sl-build-version|slknight-v252-version)'
+              r'["\']',
+              html,re.I
+            )
 
-              path.write_text(html,'utf-8')
+            path.write_text(html,'utf-8')
 
-          print('PASS Map025 and Scripts hashes updated')
-          print('PASS cache version V254')
-          print('PASS visible version labels remain removed')
+          print('PASS atlas mapping installed')
+          print('PASS Map025 and Scripts hashes refreshed')
+          print('PASS V255 cache version')
+          print('PASS version labels remain removed')
           PY
 
           node --check site/knight/gameasync/mapping.js
@@ -619,99 +1218,102 @@ jobs:
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
 
-      - name: V254 Verify unrelated game data
+      - name: V255 Verify other game data unchanged
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib,json
 
           root=Path('site')
-
           before=json.loads(
-              Path('build/before.json').read_text()
+            Path('build/before.json').read_text()
           )
 
           after={
-              str(p.relative_to(root)):
-              hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
+            str(p.relative_to(root)):
+            hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in root.rglob('*') if p.is_file()
           }
 
           pre=(
-              'knight/gameasync/Data/'
-              'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+            'knight/gameasync/Data/'
+            'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           )
 
-          allowed={
-              pre+'Map025.rxdata',
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/mapping.js',
-              'knight/js/sl-assets-v229r115.js',
-              'index.html',
-              'knight/index.html'
-          }
+          atlas=(
+            'knight/gameasync/Graphics/Characters/'
+            'SLMonsterAtlas.png'
+          )
 
           changed={
-              key for key in before
-              if before[key]!=after.get(key)
+            key for key in before
+            if before[key]!=after.get(key)
+          }
+
+          allowed={
+            pre+'Map025.rxdata',
+            'knight/gameasync/Data/Scripts.rxdata',
+            'knight/gameasync/mapping.js',
+            'knight/js/sl-assets-v229r115.js',
+            'index.html',
+            'knight/index.html'
           }
 
           assert changed==allowed,(
-              'Unexpected modifications',
-              sorted(changed^allowed)
+            'Unexpected changes',
+            sorted(changed^allowed)
           )
 
-          assert set(before)==set(after)
-          assert len(after)==5610
+          assert set(after)==set(before)|{atlas}
+          assert len(after)==5611
 
           protected=[
-              pre+'Map016.rxdata',
-              pre+'Map047.rxdata',
-              pre+'CommonEvents.rxdata',
-              'knight/assets/map-047-v241.pack'
+            pre+'Map016.rxdata',
+            pre+'Map047.rxdata',
+            pre+'CommonEvents.rxdata',
+            'knight/assets/map-047-v241.pack'
           ]
 
-          for name in protected:
-              assert before[name]==after[name],name
+          for path in protected:
+            assert before[path]==after[path],path
 
           for action in (
-              'Walk','Idle','Attack','AltAttack',
-              'Spell','Hit','Death'
+            'Walk','Idle','Attack','AltAttack',
+            'Spell','Hit','Death'
           ):
-              name=(
-                  'knight/gameasync/Graphics/'
-                  'Characters/SLZenith'+action+'.png'
-              )
+            path=(
+              'knight/gameasync/Graphics/'
+              'Characters/SLZenith'+action+'.png'
+            )
 
-              assert before[name]==after[name],name
+            assert before[path]==after[path],path
 
           for name in (
-              '이펙트마법',
-              '물의 대정령 마법',
-              '불의 대정령 마법',
-              '땅의 대정령 마법'
+            '이펙트마법',
+            '물의 대정령 마법',
+            '불의 대정령 마법',
+            '땅의 대정령 마법'
           ):
-              name=(
-                  'knight/gameasync/Graphics/'
-                  'Animations/'+name+'.png'
-              )
+            path=(
+              'knight/gameasync/Graphics/'
+              'Animations/'+name+'.png'
+            )
 
-              assert before[name]==after[name],name
+            assert before[path]==after[path],path
 
-          print('PASS all 5610 original files retained')
-          print('PASS all unrelated maps unchanged')
-          print('PASS all original NPCs unchanged')
-          print('PASS native common events unchanged')
-          print('PASS original motion sheets unchanged')
+          print('PASS 5610 original files retained')
+          print('PASS one new reusable motion atlas')
+          print('PASS Map016 Death Knight untouched')
+          print('PASS all unrelated maps and NPCs untouched')
+          print('PASS original 7 motion assets unchanged')
           print('PASS original magic effects unchanged')
-          print('PASS six intended files modified')
+          print('PASS native CommonEvents unchanged')
           PY
 
-      - name: V254 Publish game
+      - name: V255 Publish game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
