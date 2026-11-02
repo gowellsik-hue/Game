@@ -1,15 +1,14 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V268
-# BASE: V267 successful run 41441629897
-# SCOPE: Loading pipeline only; no game rules, maps or sprites changed.
-# FIX: One network request and one FS install for a concurrent asset.
-# FIX: Bounded retries, failed-decode release and duplicate preload throttling.
-# FIX: Pre-install the seven existing Zenith motions before Map025 callback.
-# KEEP: Native movement and combat, all event data, rewards and 5610 files.
-# QA: Node loader simulation; actual mobile frame pacing not yet verified.
+# VERSION: V269
+# PURPOSE: Emergency rollback of the broken V268 browser loader.
+# BASE: Exact V267 successful GitHub Pages artifact, run 41441629897.
+# IMPORTANT: NO source patching, NO browser loader replacements, NO asset changes.
+# The published game is intentionally byte-for-byte V267.
+# The workflow version is V269; in-game version labels remain V267 because
+# changing them would invalidate the no-change rollback guarantee.
 
-name: build-slknight-web.yml | V268 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V269 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -31,10 +30,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-
+    timeout-minutes: 30
     steps:
-      - name: V268 Restore deployed V267 game
+      - name: V269 Download last launchable V267 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -43,462 +41,69 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V268 Verify original inventory
+      - name: V269 Restore and verify without modifying any game files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p site build
           test -s baseline/artifact.tar
+          mkdir -p site
           tar -xf baseline/artifact.tar -C site
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,json
+          import hashlib
+
           root=Path('site')
-          original={
-              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-          assert len(original)==5610,len(original)
-          for name in ('drive.js','sl-assets-v229r115.js'):
-              assert (root/'knight/js'/name).is_file(),name
-          for action in ('Idle','Walk','Attack','AltAttack','Spell','Hit','Death'):
-              name='SLZenith'+action+'.png'
-              assert (root/'knight/gameasync/Graphics/Characters'/name).is_file(),name
-          Path('build/before.json').write_text(json.dumps(original,sort_keys=True))
-          print('PASS 5610 original files; seven motion images unchanged')
-          PY
+          files={str(p.relative_to(root)):p for p in root.rglob('*') if p.is_file()}
+          assert len(files)==5610,('Unexpected V267 inventory',len(files))
 
-      - name: V268 Install single-flight browser loader
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/new-lazy.js <<'V268_LAZY'
-          // V268: one in-flight HTTP request per mapped URL; no unbounded retries.
-          var slV268NetPending = Object.create(null);
-          var slV268NetBlocked = Object.create(null);
-          var slV268NetCounters = {requests:0,joined:0,retries:0,failures:0};
-          function getLazyAsset(url, filename, callback, noretry) {
-              var key=String(url);
-              if (slV268NetBlocked[key]) {if(typeof callback==='function') callback(null);return;}
-              var job=slV268NetPending[key];
-              if (job) {
-                  job.callbacks.push(callback);
-                  if (!noretry) job.limit=3;
-                  slV268NetCounters.joined++;
-                  return;
-              }
-              job={callbacks:[callback],tries:0,limit:noretry?1:3,done:false,xhr:null};
-              slV268NetPending[key]=job;
-              function progress(message) {
-                  var element=document.getElementById('progress');
-                  if (element) {
-                      element.textContent=String(filename)+' - '+message;
-                      element.style.opacity='0.5';
-                  }
-              }
-              function complete(data) {
-                  if (job.done) return;
-                  job.done=true;
-                  delete slV268NetPending[key];
-                  var pos=activeStreams.indexOf(key);
-                  if (pos!==-1) activeStreams.splice(pos,1);
-                  var el=document.getElementById('progress');
-                  if (el && activeStreams.length===0) el.style.opacity='0';
-                  if (!data) slV268NetCounters.failures++;
-                  var callers=job.callbacks;
-                  job.callbacks=[];
-                  callers.forEach(function(cb){
-                      try { if(typeof cb==='function') cb(data); }
-                      catch(e) { console.error('V268 asset callback',key,e); }
-                  });
-              }
-              function attempt() {
-                  if (job.done) return;
-                  job.tries++;
-                  slV268NetCounters.requests++;
-                  var xhr=new XMLHttpRequest();
-                  job.xhr=xhr;
-                  var settled=false;
-                  var guard=0;
-                  function retry() {
-                      if (settled || job.done) return;
-                      settled=true;
-                      clearTimeout(guard);
-                      try { xhr.onreadystatechange=null; xhr.onerror=null; xhr.onprogress=null; xhr.abort(); }
-                      catch(e) {}
-                      if (job.tries < job.limit) {
-                          slV268NetCounters.retries++;
-                          attempt();
-                      } else {
-                          console.error('V268_ASSET_FAILED',key,'attempts',job.tries);
-                          slV268NetBlocked[key]=true;
-                          complete(null);
-                      }
-                  }
-                  xhr.responseType='arraybuffer';
-                  xhr.onreadystatechange=function(){
-                      if (settled || xhr.readyState!==4) return;
-                      if (xhr.status>=200 && xhr.status<400 && xhr.response && xhr.response.byteLength>0) {
-                          settled=true;
-                          clearTimeout(guard);
-                          complete(xhr.response);
-                      } else retry();
-                  };
-                  xhr.onerror=retry;
-                  xhr.onprogress=function(event){
-                      if (settled) return;
-                      progress('loading '+Math.round(event.loaded/1024)+' KB');
-                      clearTimeout(guard);
-                      guard=setTimeout(retry,12000);
-                  };
-                  try {
-                      xhr.open('GET',key,true);
-                      xhr.send();
-                      progress('start '+job.tries+'/'+job.limit);
-                      guard=setTimeout(retry,12000);
-                  } catch(e) { retry(); }
-              }
-              activeStreams.push(key);
-              attempt();
-          }
-          V268_LAZY
-          cat > build/new-preload.js <<'V268_PRELOAD'
-          // V268: preloads and foreground requests use the SAME installer.
-          // Never fire an unbounded batch of createPreloadedFile calls on map entry.
-          var slV268Queue=[];
-          var slV268Queued=Object.create(null);
-          var slV268Active=0;
-          function slV268Drain(){
-              while (slV268Active<2 && slV268Queue.length) {
-                  var next=slV268Queue.shift();
-                  (function(file,key){
-                      slV268Active++;
-                      window.loadFileAsync(file,null,function(){
-                          slV268Active--;
-                          delete slV268Queued[key];
-                          slV268Drain();
-                      });
-                  })(next[0],next[1]);
-              }
-          }
-          function preloadList(jsonArray) {
-              if (!Array.isArray(jsonArray)) return;
-              jsonArray.forEach(function(file){
-                  var key=getMappingKey(file);
-                  if (!mapping[key] || window.fileAsyncCache[key] || slV268Queued[key]) return;
-                  slV268Queued[key]=true;
-                  slV268Queue.push([file,key]);
-              });
-              slV268Drain();
-          }
-          V268_PRELOAD
-          cat > build/new-flight.js <<'V268_FLIGHT'
-          // V268: coalesce the native FS installer, not just the HTTP transfer.
-          (function(){
-              var nativeLoad=window.loadFileAsync;
-              if(typeof nativeLoad!=='function') throw new Error('V268 native loader missing');
-              var inflight=Object.create(null),joined=0,installed=0;
-              window.slV268DecodeFailed=Object.create(null);
-              window.loadFileAsync=function(fullPath,bitmap,callback){
-                  var key=getMappingKey(fullPath);
-                  var mapped=mapping[key];
-                  var cb=typeof callback==='function'?callback:function(){};
-                  if (!mapped || mapped.endsWith('h=')) return nativeLoad.call(this,fullPath,bitmap,cb);
-                  if (window.fileAsyncCache[key] || window.slV268DecodeFailed[key]) {cb();return;}
-                  if (inflight[key]) {inflight[key].push(cb);joined++;return;}
-                  // Bitmap requests may return early on an intentional dummy image.
-                  // Keep that native behavior, but network calls are still coalesced.
-                  if (bitmap) return nativeLoad.call(this,fullPath,bitmap,cb);
-                  inflight[key]=[cb];
-                  try {
-                      return nativeLoad.call(this,fullPath,null,function(){
-                          var callbacks=inflight[key]||[];
-                          delete inflight[key];
-                          if (window.fileAsyncCache[key]) installed++;
-                          callbacks.forEach(function(fn){try{fn();}catch(e){console.error('V268_FS_CB',e);}});
-                      });
-                  } catch(e) {
-                      var callbacks=inflight[key]||[];
-                      delete inflight[key];
-                      console.error('V268_FS_INSTALL',fullPath,e);
-                      callbacks.forEach(function(fn){try{fn();}catch(err){console.error(err);}});
-                  }
-              };
-              window.slV268Stats=function(){
-                  return {http:slV268NetCounters.requests,httpJoined:slV268NetCounters.joined,
-                      retries:slV268NetCounters.retries,failures:slV268NetCounters.failures,
-                      fsJoined:joined,fsInstalled:installed,fsPending:Object.keys(inflight).length,
-                      preloadQueued:slV268Queue.length,preloadActive:slV268Active};
-              };
-          })();
-          V268_FLIGHT
-          cat > build/new-prime.js <<'V268_PRIME'
-          // V268: prepare all seven Zenith motion bitmaps before Map025 is handed
-          // to the engine. This runs ONCE per game session; no per-frame loading.
-          (function(){
-              var original=window.loadFileAsync;
-              if(typeof original!=='function') throw new Error('V268 requires R115 loader');
-              var ready=false, pending=null;
-              var actions=['Idle','Walk','Attack','AltAttack','Spell','Hit','Death'];
-              function prepare(done){
-                  if(ready) {done();return;}
-                  if(pending) {pending.push(done);return;}
-                  pending=[done];
-                  var index=0,active=0,left=actions.length,failed=[];
-                  function finish(){
-                      ready=true;
-                      var listeners=pending;
-                      pending=null;
-                      if(failed.length) console.error('V268_ZENITH_PRIME_FAILED',failed.join(','));
-                      listeners.forEach(function(cb){cb();});
-                  }
-                  function launch(){
-                      while(active<2 && index<actions.length){
-                          (function(action){
-                              active++;
-                              var filename='Graphics/Characters/SLZenith'+action+'.png';
-                              var key=getMappingKey(filename);
-                              if (!mapping[key]) {
-                                  failed.push(action+':missing-mapping');
-                                  active--;left--;if(!left)finish();else launch();
-                                  return;
-                              }
-                              original(filename,null,function(){
-                                  if(!window.fileAsyncCache[key]) failed.push(action+':load-failed');
-                                  active--;left--;
-                                  if(!left)finish();else launch();
-                              });
-                          })(actions[index++]);
-                      }
-                  }
-                  launch();
-              }
-              window.loadFileAsync=function(fullPath,bitmap,callback){
-                  var cb=typeof callback==='function'?callback:function(){};
-                  if(!/Map025\.rxdata$/i.test(String(fullPath)))
-                      return original.call(this,fullPath,bitmap,cb);
-                  // Preserve R115's map-pack staging and the native map decode order.
-                  return original.call(this,fullPath,bitmap,function(){prepare(cb);});
-              };
-              window.slV268ZenithReady=function(){return ready;};
-          })();
-          V268_PRIME
-          cat > build/patch_browser.py <<'V268_PATCH'
-          from pathlib import Path
-          import re
-          import sys
-          root=Path(sys.argv[1])
-          files=Path(sys.argv[2])
-          drive=root/'knight/js/drive.js'
-          source=drive.read_text('utf-8')
-          assert source.count('function preloadList(jsonArray) {')==1
-          assert source.count('function getLazyAsset(url, filename, callback, noretry) {')==1
-          assert source.count('window.loadFileAsync = function(fullPath, bitmap, callback) {')==1
-          # Native returns null on exhausted network attempts. Make its completion
-          # robust rather than calling Uint8Array(null), which would leave the spinner.
-          anchor='getLazyAsset(iurl, filename, (data) => {'
-          assert source.count(anchor)==1
-          source=source.replace(anchor,anchor+"\n            if (!data) {\n                console.error('V268_NATIVE_ASSET_FAILED',mappingKey);\n                if (window.slV268DecodeFailed) window.slV268DecodeFailed[mappingKey]=true;\n                if (!bitmap && window.setNotBusy) window.setNotBusy();\n                callback();\n                if (cb1) cb1();\n                return;\n            }")
-          # Do not leave the game blocked if Emscripten fails to decode an asset.
-          old='}, console.error, false, false, () => {'
-          assert source.count(old)>=2
-          source=source.replace(old,"""}, function(err) {
-                          console.error('V268_DECODE_FAILED',mappingKey,err);
-                          if (window.slV268DecodeFailed) window.slV268DecodeFailed[mappingKey]=true;
-                          if (!bitmap && window.setNotBusy) window.setNotBusy();
-                          callback();
-                      }, false, false, () => {""",1)
-          a=source.index('function preloadList(jsonArray) {')
-          b=source.index('\nwindow.fileLoadedAsync = function(file)',a)
-          source=source[:a]+(files/'new-preload.js').read_text('utf-8')+'\n'+source[b:]
-          a=source.index('function getLazyAsset(url, filename, callback, noretry) {')
-          # Function is at file tail in original. In later versions additional hooks can
-          # follow: replace only its balanced top-level body, not unrelated source.
-          mt=re.search(r'(?m)^function getLazyAsset\(url, filename, callback, noretry\) \{[\s\S]*?^\}',source[a:])
-          assert mt is not None,'Native getLazyAsset ending missing'
-          source=source[:a]+(files/'new-lazy.js').read_text('utf-8')+'\n'+source[a+mt.end():]
-          source+='\n'+(files/'new-flight.js').read_text('utf-8')
-          assert 'slV268NetPending' in source and 'slV268Drain' in source
-          assert source.count('window.loadFileAsync')>=2
-          assert source.count('window.fileLoadedAsync = function(file)')==1
-          drive.write_text(source,encoding='utf-8')
-          # Loader is loaded after drive.js and installed the R115 asset-pack hook.
-          # Only then wrap its entry path for pre-entry Zenith bitmap preparation.
-          loader=root/'knight/js/sl-assets-v229r115.js'
-          js=loader.read_text('utf-8')
-          assert js.count("var version='V267';")==1
-          assert 'window.loadFileAsync' in js
-          js=js.replace("var version='V267';","var version='V268';")
-          js+='\n'+(files/'new-prime.js').read_text('utf-8')
-          loader.write_text(js,encoding='utf-8')
-          for rel in ['index.html','knight/index.html']:
-              path=root/rel
-              s=path.read_text('utf-8')
-              assert 'V267' in s,rel
-              s=s.replace('V267','V268').replace('v267','v268')
-              if rel=='knight/index.html':
-                  s,n=re.subn(r'(js/drive\.js\?v=)[^"\'\s<>]+',r'\g<1>v268',s)
-                  assert n==1,n
-              path.write_text(s,encoding='utf-8')
-          print('PASS V268 coalesced HTTP + FS, bounded retries and pre-entry 7 motions')
-          V268_PATCH
-          python3 build/patch_browser.py site build
-          node --check site/knight/js/drive.js
-          node --check site/knight/js/sl-assets-v229r115.js
-
-      - name: V268 Test deduplication retries and pre-entry cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/test-loader.js <<'V268_TEST'
-          const fs=require('fs'),vm=require('vm'),assert=require('assert');
-          const path=process.argv[2];
-          const primePath=process.argv[3]||'/mnt/data/v268-audit/new-prime.js';
-          function context(options={}){
-            let http=0,installed=0;
-            const files=new Set();
-            const map={
-              'graphics/characters/slzenithwalk':'Graphics/Characters/SLZenithWalk.png?h=abcd',
-              'graphics/characters/slzenithidle':'Graphics/Characters/SLZenithIdle.png?h=abcd',
-              'graphics/characters/unknown':'Graphics/Characters/Unknown.png?h=abcd',
-              'data/map025':'Data/Map025.rxdata?h=abcd'
-            };
-            const progress={style:{},innerHTML:'',textContent:''};
-            const ctx={
-              console,setTimeout,clearTimeout,Uint8Array,ArrayBuffer,Promise,
-              namespace:'sl-test',wTitle:'SLKnight',Module:{cwrap:()=>()=>{}},
-              document:{createElement:()=>({getContext:()=>({drawImage(){}}),toDataURL:()=>''}),getElementById:()=>progress},
-              FS:{createPreloadedFile(dir,name,bytes,a,b,success){installed++;setTimeout(()=>{files.add(dir+'/'+name);success();},4);},unlink(){},analyzePath:()=>({exists:false})},
-              mapping:map, bitmapSizeMapping:{},
-              getMappingKey(x){return x.toLowerCase().replace(/\.[^/.]+$/,'')},
-              get installed(){return installed},get http(){return http}
-            };
-            ctx.XMLHttpRequest=class{
-              open(method,url){this.url=url;}
-              send(){http++;setTimeout(()=>{
-                this.readyState=4;
-                this.status=this.url.includes('Unknown.png')?404:200;
-                this.response=this.status===200?new Uint8Array([137,80,78,71]).buffer:null;
-                this.onreadystatechange();
-              },4);}
-              abort(){}
-            };
-            ctx.window=ctx;
-            vm.createContext(ctx);
-            vm.runInContext(fs.readFileSync(path,'utf8'),ctx,{filename:path});
-            return ctx;
-          }
-          const delay=n=>new Promise(res=>setTimeout(res,n));
-          (async()=>{
-           const c=context();
-           let callbacks=0;
-           for(let i=0;i<11;i++)c.loadFileAsync('Graphics/Characters/SLZenithWalk.png',null,()=>callbacks++);
-           c.preloadList(['Graphics/Characters/SLZenithWalk.png','Graphics/Characters/SLZenithWalk.png']);
-           await delay(100);
-           assert.equal(callbacks,11,'All concurrent foreground callbacks must complete');
-           assert.equal(c.http,1,'Only one network GET');
-           assert.equal(c.installed,1,'Only one preloaded FS file');
-           const stats=c.slV268Stats();
-           assert.equal(stats.http,1);assert.equal(stats.retries,0);
-           assert.equal(stats.fsPending,0);
-           c.loadFileAsync('Graphics/Characters/SLZenithWalk.png',null,()=>callbacks++);
-           assert.equal(c.http,1,'Cached file must not refetch');
-           assert.equal(callbacks,12);
-           let failed=0;
-           c.loadFileAsync('Graphics/Characters/Unknown.png',null,()=>failed++);
-           await delay(130);
-           assert.equal(c.http,4,'one success, three bounded bad requests');
-           assert.equal(failed,1,'one failed completion');
-           assert.equal(c.slV268Stats().failures,1);
-           c.loadFileAsync('Graphics/Characters/Unknown.png',null,()=>failed++);
-           await delay(10);
-           assert.equal(c.http,4,'permanently failed file must not retry every frame');
-           assert.equal(failed,2);
-           console.log('PASS V268 network single-flight, single FS decode, bounded errors, repeated failure suppression');
-
-           // Map entry: wait for seven motions before the original map callback.
-           const context2={window:{fileAsyncCache:{}},mapping:{},console};
-           context2.getMappingKey=x=>x.toLowerCase().replace(/\.[^/.]+$/,'');
-           let prime=0,mapCB=0;
-           for(const action of ['Idle','Walk','Attack','AltAttack','Spell','Hit','Death'])
-             context2.mapping['graphics/characters/slzenith'+action.toLowerCase()]='Graphics/Characters/SLZenith'+action+'.png?h=hash';
-           context2.window.loadFileAsync=(filename,bitmap,callback)=>{
-             if(filename.includes('SLZenith')){
-               prime++;
-               setTimeout(()=>{context2.window.fileAsyncCache[context2.getMappingKey(filename)]=1;callback();},5);
-             }else setTimeout(callback,1);
-           };
-           vm.createContext(context2);
-           vm.runInContext(fs.readFileSync(primePath,'utf8'),context2);
-           context2.window.loadFileAsync('Data/Map025.rxdata',null,()=>{
-             assert.equal(prime,7,'all 7 primed before map callback');mapCB++;
-           });
-           await delay(150);
-           assert.equal(prime,7);assert.equal(mapCB,1);assert(context2.window.slV268ZenithReady());
-           context2.window.loadFileAsync('Data/Map025.rxdata',null,()=>mapCB++);
-           await delay(25);
-           assert.equal(prime,7,'second map entry never reloads 7 sprites');assert.equal(mapCB,2);
-           console.log('PASS V268 map enters after seven original motion assets ready; no repeated entry preloading');
-          })().catch(e=>{console.error(e);process.exit(1)});
-          V268_TEST
-          node build/test-loader.js site/knight/js/drive.js build/new-prime.js
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/dpad.js
-          python3 - <<'PY'
-          from pathlib import Path
-          js=Path('site/knight/gameasync/mapping.js').read_text('utf-8').lower()
-          for action in ('idle','walk','attack','altattack','spell','hit','death'):
-              key='graphics/characters/slzenith'+action
-              assert key in js,('Unmapped motion; cannot prime',key)
-          loader=Path('site/knight/js/sl-assets-v229r115.js').read_text('utf-8')
-          assert loader.count('window.slV268ZenithReady=')==1
-          assert loader.count("var version='V268';")==1
-          print('PASS original mapping contains all seven motion identities')
-          PY
-
-      - name: V268 Verify untouched game scripts and maps
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib,json
-          root=Path('site')
-          before=json.loads(Path('build/before.json').read_text())
-          after={
-              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-          allowed={
+          required=[
+              'index.html',
+              'knight/index.html',
               'knight/js/drive.js',
               'knight/js/sl-assets-v229r115.js',
-              'index.html',
-              'knight/index.html'
-          }
-          changed={name for name in before if before[name]!=after.get(name)}
-          assert set(before)==set(after)
-          assert len(after)==5610
-          assert changed==allowed,('Unexpected modified files',sorted(changed^allowed))
-          protected=[
               'knight/js/dpad.js',
               'knight/gameasync/mapping.js',
               'knight/gameasync/Data/Scripts.rxdata',
               'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap025.rxdata',
               'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap016.rxdata',
-              'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata',
-              'knight/assets/map-047-v241.pack'
+              'knight/assets/map-047-v241.pack',
           ]
-          for name in protected:
-              assert before[name]==after[name],name
-          for name in before:
-              if name.startswith('knight/gameasync/Graphics/'):
-                  assert before[name]==after[name],name
-          assert 'js/drive.js?v=v268' in (root/'knight/index.html').read_text('utf-8')
-          print('PASS game, all monsters, movement, event data and resources byte-identical')
-          print('PASS only four browser/HTML files changed')
-          PY
+          for name in required:
+              assert name in files and files[name].stat().st_size>0,('Missing original file',name)
 
-      - name: V268 Publish full unchanged game with loader fix
+          for action in ('Idle','Walk','Attack','AltAttack','Spell','Hit','Death'):
+              name='knight/gameasync/Graphics/Characters/SLZenith'+action+'.png'
+              assert name in files and files[name].stat().st_size>0,name
+
+          drive=files['knight/js/drive.js'].read_text('utf-8')
+          loader=files['knight/js/sl-assets-v229r115.js'].read_text('utf-8')
+          html=files['knight/index.html'].read_text('utf-8')
+          for forbidden in ('slV268NetPending','slV268NetBlocked','slV268Drain',
+                            'slV268DecodeFailed','slV268Stats','slV268ZenithReady'):
+              assert forbidden not in drive+loader,('V268 broken patch retained',forbidden)
+          assert 'function getLazyAsset(' in drive
+          assert 'function preloadList(' in drive
+          assert 'window.loadFileAsync' in drive
+          assert "var version='V267';" in loader
+          assert 'V267' in html
+          assert 'v268' not in html.lower(), 'Broken V268 browser cache reference remains'
+
+          inventory=hashlib.sha256()
+          for name in sorted(files):
+              inventory.update(name.encode('utf-8'))
+              inventory.update(b'\0')
+              inventory.update(hashlib.sha256(files[name].read_bytes()).digest())
+          print('PASS byte-preserved V267 rollback, 5610 original game files')
+          print('PASS V268 request/decode/prime patches absent')
+          print('PASS original V267 browser loader, map and game scripts restored')
+          print('V267_FILE_INVENTORY_SHA256='+inventory.hexdigest())
+          PY
+          node --check site/knight/js/drive.js
+          node --check site/knight/js/sl-assets-v229r115.js
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/dpad.js
+
+      - name: V269 Publish exact V267 game (no modifications)
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
