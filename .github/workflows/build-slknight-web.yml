@@ -1,17 +1,17 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V266
-# BASE: V265 successful run 41436712682
+# VERSION: V267
+# BASE: V266 successful run 41438665489
 # SCOPE: Map025 EV29 only
-# FIX 1: Remove repeated event-touch starts and event interpreter locking.
-# FIX 2: Poll actual player attack input during the existing monster update.
-# FIX 3: Stop approach movement at cardinal melee adjacency.
-# FIX 4: Keep walking graphics stable across short movement gaps.
+# FIX 1: Restore native movement ownership; remove V266 per-frame type rewrite.
+# FIX 2: Use same engine command 10 pursuit pattern as Kurtz/Death Knight.
+# FIX 3: Longer Walk/Idle hold to avoid bitmap swapping at tile boundaries.
+# FIX 4: Preserve input-only attacks, native damage and every reward.
 # KEEP: Original title, monster stats, 6:1 attack selection, native
 #       damage commands, HP, EXP, drops, animations and all other files.
 # STATUS: Build-time simulation only; real mobile gameplay unverified.
 
-name: build-slknight-web.yml | V266 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V267 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -36,16 +36,16 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: V266 Restore exact deployed V265 game
+      - name: V267 Restore exact deployed V266 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 41436712682
+          run-id: 41438665489
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V266 Verify and extract V265 inventory
+      - name: V267 Verify and extract V266 inventory
         shell: bash
         run: |
           set -euo pipefail
@@ -78,11 +78,11 @@ jobs:
           Path('build/before.json').write_text(
               json.dumps(before,sort_keys=True),encoding='utf-8'
           )
-          print('PASS V265 inventory: 5610 files')
+          print('PASS V266 inventory: 5610 files')
           print('PASS original boss motion sheets')
           PY
 
-      - name: V266 Correct only Zenith event and existing runtime
+      - name: V267 Correct only Zenith event and existing runtime
         shell: bash
         run: |
           set -euo pipefail
@@ -155,23 +155,51 @@ jobs:
           page=pages.first
           old_list=iv(page,:list)
 
-          raise 'Wrong old trigger' unless iv(page,:trigger)==2
-          raise 'Wrong original chase type' unless iv(page,:move_type)==2
-          raise 'Wrong old command list' unless
-            old_list.length==2 &&
-            iv(old_list[0],:code)==355 &&
-            iv(old_list[0],:parameters)==['SLMonster.player_strike(25,29)'] &&
-            iv(old_list[1],:code)==0
+          raise 'Wrong event trigger' unless iv(page,:trigger)==0
+          raise 'Wrong V266 movement type' unless iv(page,:move_type)==2
+          raise 'Unexpected V266 event commands' unless
+            old_list.length==1 && iv(old_list[0],:code)==0
+          route=iv(page,:move_route)
+          raise 'Original Zenith route missing' unless route
+          original_route=iv(route,:list)
+          raise 'Unexpected prior Zenith route' unless
+            original_route.length==1 && iv(original_route[0],:code)==0
+          raise 'Unexpected Zenith movement speed' unless
+            iv(page,:move_speed)==3 && iv(page,:move_frequency)==6
+
+          # Inspect the real Kurtz and Death Knight event data.
+          # Read only; no original monster is cloned or modified.
+          [[21,27,'Kurtz'],[16,8,'Death Knight']].each do |mid,eid,label|
+            other=Marshal.load(File.binread(root+pre+format('Map%03d.rxdata',mid)))
+            ref=iv(other,:events).fetch(eid)
+            match=iv(ref,:pages).any? do |p|
+              r=iv(p,:move_route)
+              next false unless iv(p,:move_type)==3 && r
+              iv(r,:repeat)==true && iv(r,:skippable)==true &&
+                iv(r,:list).map{|cmd| iv(cmd,:code)}==[10,0]
+            end
+            raise "Native #{label} route changed" unless match
+            puts "PASS reference #{label}: custom pursuit 3, commands 10/0"
+          end
 
           untouched_events={}
           events.each do |id,event|
             untouched_events[id]=Marshal.dump(event) unless id==29
           end
 
-          # Contact no longer starts a blocking map event.
-          # The same event and its original chase configuration remain.
-          put(page,:trigger,0)
-          put(page,:list,[old_list.last])
+          # Reuse ONLY this boss's original event and original move route.
+          # Engine command 10 moves toward player; command 0 loops the route.
+          # Unlike move type 2, it has no extra randomized movement choice.
+          approach=RPG::MoveCommand.allocate
+          put(approach,:code,10)
+          put(approach,:parameters,[])
+          put(route,:list,[approach,original_route[0]])
+          put(route,:repeat,true)
+          put(route,:skippable,true)
+          put(page,:move_type,3)
+
+          # Touch events are still disabled; player hits stay input-driven.
+          raise 'Touch trigger reenabled' unless iv(page,:trigger)==0
 
           untouched_events.each do |id,raw|
             raise "Other event changed #{id}" unless
@@ -179,9 +207,9 @@ jobs:
           end
 
           indices=scripts.each_index.select do |i|
-            scripts[i].is_a?(Array) && scripts[i][1]=='SLMonsterV265'
+            scripts[i].is_a?(Array) && scripts[i][1]=='SLMonsterV266'
           end
-          raise 'V265 runtime missing or duplicated' unless indices.length==1
+          raise 'V266 runtime missing or duplicated' unless indices.length==1
           index=indices.first
           original_other_scripts={}
           scripts.each_with_index do |entry,i|
@@ -205,58 +233,30 @@ jobs:
           raise 'Two-handed sword link changed' unless
             runtime.include?('[:weapon,41,50]')
 
-          # V265 called player_strike from an Event Touch page.
-          # Call it only from the normal per-frame monster update instead.
+          # V266 forcibly rewrote @move_type to 0 or 2 on every frame.
+          # That fights the stock event's movement controller. Remove it.
+          old_override=/^[ \t]*if c\n[ \t]*@monster=true\n[ \t]*d=SLMonster\.distance\(self\)\n[ \t]*@move_type=\(d && d\[0\]\+d\[1\]<=1\) \? 0 : 2\n[ \t]*end$/
           runtime=replace_once(
-            runtime,
-            /^[ \t]*# Player hit requires input\.$/,
-            '              player_strike(map_id,event_id)',
-            'player input hook'
+            runtime,old_override,'              @monster=true if c',
+            'per-frame movement override'
           )
 
-          # Native Approach (2) keeps trying to occupy the player's cell.
-          # Disable self movement at one cardinal tile, then resume pursuit.
-          movement_hook=<<'MOVE'
-                  if c
-                    @monster=true
-                    d=SLMonster.distance(self)
-                    @move_type=(d && d[0]+d[1]<=1) ? 0 : 2
-                  end
-          MOVE
+          # Keep a walking image through normal 16-frame movement transitions.
+          # No code changes actual x/y or movement speed or native collision.
           runtime=replace_once(
             runtime,
-            /^[ \t]*@monster=true if c$/,
-            movement_hook.rstrip,
-            'chase hook'
+            'moving || (s[:tick]-s[:last_move_tick]<=4)',
+            'moving || (s[:tick]-s[:last_move_tick]<=24)',
+            'walking image hold'
           )
+          raise 'Per-frame movement rewrite remains' if
+            runtime.include?('@move_type=(d &&')
+          raise 'Player input attack hook removed' unless
+            runtime.include?('player_strike(map_id,event_id)')
 
-          # Prevent rapid Walk/Idle bitmap swapping between native steps.
-          runtime=replace_once(
-            runtime,
-            ':last_player_action_tick=>-100,',
-            ":last_player_action_tick=>-100,\n"+
-            '                :last_move_tick=>-100,',
-            'last movement state'
-          )
-
-          moving_pattern=/moving=ev\.respond_to\?\(:moving\?\)\s*&&\s*ev\.moving\?/
-          raise 'Walking hooks changed' unless runtime.scan(moving_pattern).length==2
-          runtime=runtime.gsub(moving_pattern,'moving=walking?(ev,s)')
-
-          runtime += <<'WALK'
-
-          module SLMonster
-            def self.walking?(ev,s)
-              moving=ev.respond_to?(:moving?) && ev.moving?
-              s[:last_move_tick]=s[:tick] if moving
-              moving || (s[:tick]-s[:last_move_tick]<=4)
-            end
-          end
-          WALK
-
-          alias_count=runtime.scan('slm_v265').length
-          raise 'V265 aliases missing' unless alias_count>=3
-          runtime=runtime.gsub('slm_v265','slm_v266')
+          alias_count=runtime.scan('slm_v266').length
+          raise 'V266 aliases missing' unless alias_count>=3
+          runtime=runtime.gsub('slm_v266','slm_v267')
 
           raise 'Old passive proximity damage' if
             runtime.include?('def self.player_attack(')
@@ -271,8 +271,8 @@ jobs:
           raise 'Invalid Ruby runtime' unless
             system('ruby','-c','build/monster-runtime.rb')
 
-          scripts[index][0]=99826601
-          scripts[index][1]='SLMonsterV266'
+          scripts[index][0]=99826701
+          scripts[index][1]='SLMonsterV267'
           scripts[index][2]=Zlib::Deflate.deflate(runtime,9)
 
           original_other_scripts.each do |i,raw|
@@ -289,17 +289,25 @@ jobs:
           raise 'Event command remains' unless
             iv(reloaded_page,:list).length==1 &&
             iv(iv(reloaded_page,:list).first,:code)==0
-          raise 'Chase disabled in DB' unless iv(reloaded_page,:move_type)==2
+          raise 'Wrong native approach type' unless iv(reloaded_page,:move_type)==3
+          reloaded_route=iv(reloaded_page,:move_route)
+          raise 'Native pursuit commands incorrect' unless
+            iv(reloaded_route,:repeat)==true &&
+            iv(reloaded_route,:skippable)==true &&
+            iv(reloaded_route,:list).map{|cmd|iv(cmd,:code)}==[10,0]
+          raise 'Native movement speed changed' unless
+            iv(reloaded_page,:move_speed)==3 &&
+            iv(reloaded_page,:move_frequency)==6
 
           restored=Marshal.load(File.binread(scripts_path))
           raise 'Runtime serialization mismatch' unless
-            restored[index][1]=='SLMonsterV266' &&
+            restored[index][1]=='SLMonsterV267' &&
             Zlib::Inflate.inflate(restored[index][2]).b==runtime.b
 
           puts 'PASS event touch removed without cloning'
           puts 'PASS per-frame input-only player attacks'
-          puts 'PASS no adjacent chase jitter'
-          puts 'PASS stable walking image selection'
+          puts 'PASS native pursuit without per-frame move type rewrite'
+          puts 'PASS 24-frame hold reduces bitmap switching'
           puts 'PASS existing native monster attacks unchanged'
           puts 'PASS all twenty original drops unchanged'
           puts 'PASS all other events and scripts unchanged'
@@ -308,7 +316,7 @@ jobs:
           ruby -c build/patch.rb
           ruby build/patch.rb
 
-      - name: V266 Test nonblocking input and movement
+      - name: V267 Test nonblocking input and movement
         shell: bash
         run: |
           set -euo pipefail
@@ -387,7 +395,7 @@ jobs:
           boss=Game_Event.new
           boss.instance_variable_set(:@map_id,25)
           boss.instance_variable_set(:@id,29)
-          boss.instance_variable_set(:@move_type,2)
+          boss.instance_variable_set(:@move_type,3)
           boss.x=100;boss.y=100;boss.direction=2
           boss.character_name='SLZenithIdle'
           $game_map.events={29=>boss}
@@ -396,8 +404,8 @@ jobs:
           Input.pressed=false
           25.times{boss.update}
           raise 'Passive boss HP loss' unless $game_variables[7001]==0
-          raise 'Adjacent chase not paused' unless
-            boss.instance_variable_get(:@move_type)==0
+          raise 'Native chase type changed on an idle update' unless
+            boss.instance_variable_get(:@move_type)==3
 
           Input.pressed=true
           boss.update
@@ -411,15 +419,15 @@ jobs:
           $game_player.x=107
           boss.moving=true
           boss.update
-          raise 'Pursuit not resumed' unless
-            boss.instance_variable_get(:@move_type)==2
+          raise 'Native chase type overwritten' unless
+            boss.instance_variable_get(:@move_type)==3
           raise 'Walking graphics not selected' unless
             SLMonster.walking?(boss,SLMonster.state(25,29))
           boss.moving=false
           boss.update
           raise 'Walk/Idle switched immediately' unless
             SLMonster.walking?(boss,SLMonster.state(25,29))
-          5.times{boss.update}
+          25.times{boss.update}
           raise 'Idle failed to resume' if
             SLMonster.walking?(boss,SLMonster.state(25,29))
 
@@ -454,7 +462,7 @@ jobs:
 
           puts 'PASS no passive proximity player damage'
           puts 'PASS direct input hits boss through update'
-          puts 'PASS native chase pauses only at melee adjacency'
+          puts 'PASS native pursuit remains controlled by the event route'
           puts 'PASS walking-to-idle image hysteresis'
           puts 'PASS approved native command list preserved'
           puts 'PASS one death and reward'
@@ -464,7 +472,7 @@ jobs:
           ruby -c build/test.rb
           ruby build/test.rb
 
-      - name: V266 Refresh resource hashes and cache versions
+      - name: V267 Refresh resource hashes and cache versions
         shell: bash
         run: |
           set -euo pipefail
@@ -488,17 +496,17 @@ jobs:
 
           loader=root/'knight/js/sl-assets-v229r115.js'
           js=loader.read_text('utf-8')
-          assert js.count("var version='V265';")==1
-          loader.write_text(js.replace("var version='V265';","var version='V266';"),encoding='utf-8')
+          assert js.count("var version='V266';")==1
+          loader.write_text(js.replace("var version='V266';","var version='V267';"),encoding='utf-8')
 
           for relative in ('index.html','knight/index.html'):
               path=root/relative
               html=path.read_text('utf-8')
-              assert 'V265' in html,relative
-              html=html.replace('V265','V266').replace('?v=v265','?v=v266')
+              assert 'V266' in html,relative
+              html=html.replace('V266','V267').replace('?v=v266','?v=v267')
               path.write_text(html,encoding='utf-8')
 
-          print('PASS V266 resource hashes and cache version')
+          print('PASS V267 resource hashes and cache version')
           PY
 
           node --check site/knight/gameasync/mapping.js
@@ -506,7 +514,7 @@ jobs:
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
 
-      - name: V266 Verify unchanged game and original assets
+      - name: V267 Verify unchanged game and original assets
         shell: bash
         run: |
           set -euo pipefail
@@ -545,11 +553,11 @@ jobs:
           for action in ('Walk','Idle','Attack','AltAttack','Spell','Hit','Death'):
               name='knight/gameasync/Graphics/Characters/SLZenith'+action+'.png'
               assert before[name]==after[name],name
-          print('PASS all other 5604 files byte-identical to V265')
+          print('PASS all other 5604 files byte-identical to V266')
           print('PASS map, bosses, items, drops, graphics and engine preserved')
           PY
 
-      - name: V266 Publish game
+      - name: V267 Publish game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
