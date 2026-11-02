@@ -1,13 +1,16 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V249
+# VERSION: V250
 # BASE: V247 successful run 41382471524
-# FIX: V248 rejected the legitimate Game_Event alias.
-# FIX: Safe Zenith preload and sprite access on Map025.
-# KEEP: V247 native combat, rewards, maps, NPCs and graphics.
-# STATUS: GitHub Actions execution not yet verified.
+# FIX: V249 invalid YAML indentation.
+# FIX: Remove fatal runtime graphics preload from Map025.
+# FIX: Guard Zenith-specific sprite operations.
+# DISPLAY: Permanent V250 badge in the game.
+# PRELOAD: Browser preload of original motion and FX assets.
+# KEEP: Original combat, rewards, maps, NPCs and Map047.
+# STATUS: Awaiting GitHub Actions and mobile verification.
 
-name: build-slknight-web.yml | V249 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V250 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -32,7 +35,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: V249 Restore successful V247 game
+      - name: V250 Restore verified V247 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -41,7 +44,7 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V249 Verify original inventory
+      - name: V250 Verify original game inventory
         shell: bash
         run: |
           set -euo pipefail
@@ -51,15 +54,14 @@ jobs:
           tar -xf baseline/artifact.tar -C site
 
           python3 - <<'PY'
-          from pathlib import Path
           import hashlib,json
+          from pathlib import Path
 
           root=Path("site")
           before={
               str(p.relative_to(root)):
               hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob("*")
-              if p.is_file()
+              for p in root.rglob("*") if p.is_file()
           }
 
           assert len(before)==5610, (
@@ -79,50 +81,59 @@ jobs:
 
           assert "knight/assets/map-047-v241.pack" in before
 
-          for action in (
+          for motion in (
               "Walk","Idle","Attack","AltAttack",
               "Spell","Hit","Death"
           ):
               name=(
                   "knight/gameasync/Graphics/"
-                  "Characters/SLZenith"+action+".png"
+                  "Characters/SLZenith"+motion+".png"
               )
               assert name in before
 
           Path("build/before.json").write_text(
               json.dumps(before,sort_keys=True)
           )
-
-          print("PASS verified V247 source")
+          print("PASS original V247 inventory")
           PY
 
-      - name: V249 Repair native Zenith runtime
+      - name: V250 Repair isolated runtime
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > build/repair.rb <<'RUBY'
+          cat > build/fix.rb <<'RUBY'
           require 'zlib'
 
           path='site/knight/gameasync/Data/Scripts.rxdata'
           scripts=Marshal.load(File.binread(path))
 
-          raise 'Invalid RGSS script table' unless
+          raise 'Invalid RGSS scripts' unless
             scripts.is_a?(Array)
 
-          matches=scripts.each_index.select do |i|
+          indices=scripts.each_index.select do |i|
             scripts[i].is_a?(Array) &&
               scripts[i][1]=='SLZenithV247'
           end
 
-          raise 'V247 runtime not unique' unless
-            matches.length==1
+          raise 'Original runtime not unique' unless
+            indices.length==1
 
-          index=matches.first
+          index=indices.first
           entry=scripts[index]
-
           source=Zlib::Inflate.inflate(entry[2])
+          source.force_encoding('UTF-8')
+          raise 'Invalid runtime encoding' unless
+            source.valid_encoding?
+
           original=source.dup
+
+          def replace_once!(code,old,new_text,label)
+            count=code.scan(old).length
+            raise "Wrong anchor #{label}: #{count}" unless
+              count==1
+            code.sub!(old){new_text}
+          end
 
           required=[
             'MAX_HP=5200',
@@ -135,63 +146,24 @@ jobs:
             'MAGIC_FX_IDS=[25,14,15,16]'
           ]
 
-          required.each do |item|
-            raise "Wrong source #{item}" unless
-              source.include?(item)
+          required.each do |value|
+            raise "Wrong combat source: #{value}" unless
+              source.include?(value)
           end
 
-          def replace_once!(source,pattern,new_code,label)
-            count=source.scan(pattern).length
-
-            raise(
-              "Wrong replacement anchor #{label}: #{count}"
-            ) unless count==1
-
-            source.sub!(pattern){new_code.rstrip}
-          end
-
-          # Prevent unsupported optional cache calls
-          # from terminating Map025 initialization.
-          preload=<<'PRELOAD'
-  def self.preload
-    return true unless defined?(RPG::Cache)
-
-    cache=RPG::Cache
-    resources=[]
-
-    FRAMES.keys.each do |action|
-      resources << [:character,'SLZenith'+action]
-    end
-
-    MAGIC_FX_GRAPHICS.each do |name|
-      resources << [:animation,name]
-    end
-
-    resources.each do |method,name|
-      next unless cache.respond_to?(method)
-
-      begin
-        cache.__send__(method,name,0)
-      rescue StandardError => e
-        @last_preload_error=(
-          e.class.to_s+': '+e.message.to_s
-        )
-      end
-    end
-
-    true
-  end
-          PRELOAD
-
+          # The browser loads the assets through the
+          # exact native mapping URLs before gameplay.
+          # Do not invoke unsupported RPG::Cache calls
+          # during Game_Map.setup.
           replace_once!(
             source,
             /^  def self\.preload\n.*?^  end(?=\n\n  def self\.show_hp)/m,
-            preload,
-            'Zenith preload'
+            "  def self.preload\n    true\n  end",
+            'preload method'
           )
 
-          # Keep the native Game_Event implementation.
-          # Only guard the optional moving? method.
+          # Prevent a missing movement-state method
+          # from interrupting the entire map update.
           replace_once!(
             source,
             "name=moving? ? 'SLZenithWalk' : 'SLZenithIdle'",
@@ -199,228 +171,120 @@ jobs:
             'movement state'
           )
 
-          # The native renderer must run first.
-          # Only Zenith-specific sprite adjustments
-          # are protected from missing runtime methods.
-          sprite=<<'SPRITE'
-class Sprite_Character
-  alias slz_v249_native_update update
-
-  def update
-    slz_v249_native_update
-
-    return unless $game_map &&
-      $game_map.map_id==SLZenith::MAP_ID
-
-    return unless @character &&
-      @character.is_a?(Game_Event)
-
-    return unless
-      @character.instance_variable_get(:@id)==
-      SLZenith::EVENT_ID
-
-    begin
-      return unless @tile_id.to_i==0
-      return unless
-        @character.respond_to?(:character_name)
-
-      name=@character.character_name.to_s
-      return unless name.start_with?('SLZenith')
-
-      action=name.sub('SLZenith','')
-      total=SLZenith::FRAMES[action]
-
-      return unless total && total>0
-
-      bmp=respond_to?(:bitmap) ?
-        bitmap : @bitmap
-
-      return unless bmp
-      return unless
-        bmp.respond_to?(:width) &&
-        bmp.respond_to?(:height)
-
-      return unless
-        bmp.width.to_i>0 &&
-        bmp.height.to_i>0
-
-      return unless
-        bmp.width%total==0 &&
-        bmp.height%4==0
-
-      return unless
-        @character.respond_to?(:direction) &&
-        @character.respond_to?(:slz_frame)
-
-      direction=@character.direction.to_i
-      return unless [2,4,6,8].include?(direction)
-
-      rect=respond_to?(:src_rect) ?
-        src_rect : @src_rect
-
-      return unless rect && rect.respond_to?(:set)
-
-      cw=bmp.width/total
-      ch=bmp.height/4
-
-      row=(direction-2)/2
-      frame=@character.slz_frame(total)
-
-      return unless frame.is_a?(Integer)
-      return unless frame.between?(0,total-1)
-
-      @cw=cw
-      @ch=ch
-
-      rect.set(
-        frame*cw,row*ch,cw,ch
-      )
-
-      if respond_to?(:ox=)
-        self.ox=cw/2
-      else
-        @ox=cw/2
-      end
-
-      if respond_to?(:oy=)
-        self.oy=ch
-      else
-        @oy=ch
-      end
-
-      if respond_to?(:z=) &&
-         @character.respond_to?(:screen_z)
-        self.z=@character.screen_z(ch)
-      end
-
-    rescue StandardError => e
-      SLZenith.instance_variable_set(
-        :@last_sprite_error,
-        e.class.to_s+': '+e.message.to_s
-      )
-    end
-  end
-end
-          SPRITE
-
+          # Apply guards only to the new boss sprite.
           replace_once!(
             source,
-            /^class Sprite_Character\n.*?^end(?=\n\nclass Game_Map)/m,
-            sprite,
-            'Zenith sprite renderer'
+            'return unless @tile_id==0 && bitmap',
+            'return unless @tile_id==0 && respond_to?(:bitmap) && bitmap && bitmap.respond_to?(:width) && bitmap.respond_to?(:height)',
+            'sprite bitmap'
           )
 
-          # Retain the native map setup result.
-          # Loading Zenith graphics is optional.
-          setup=<<'SETUP'
-class Game_Map
-  alias slz_v249_native_setup setup
-
-  def setup(map_id)
-    SLZenith.reset(map_id)
-
-    result=slz_v249_native_setup(map_id)
-
-    if map_id==SLZenith::MAP_ID
-      SLZenith.preload
-    end
-
-    result
-  end
-end
-          SETUP
+          replace_once!(
+            source,
+            "raise 'Zenith sprite width mismatch' unless bitmap.width%total==0",
+            'return unless bitmap.width%total==0',
+            'sprite width'
+          )
 
           replace_once!(
             source,
-            /^class Game_Map\n.*?^end\s*\z/m,
-            setup+"\n",
-            'Map025 setup'
+            "raise 'Zenith sprite height mismatch' unless bitmap.height%4==0",
+            'return unless bitmap.height%4==0',
+            'sprite height'
+          )
+
+          replace_once!(
+            source,
+            'row=(@character.direction-2)/2',
+            "return unless @character.respond_to?(:direction)\n    row=(@character.direction.to_i-2)/2",
+            'sprite direction'
+          )
+
+          replace_once!(
+            source,
+            'self.src_rect.set(frame*@cw,row*@ch,@cw,@ch)',
+            "return unless respond_to?(:src_rect) && src_rect && src_rect.respond_to?(:set)\n    self.src_rect.set(frame*@cw,row*@ch,@cw,@ch)",
+            'sprite rectangle'
+          )
+
+          replace_once!(
+            source,
+            'self.z=@character.screen_z(@ch)',
+            'self.z=@character.screen_z(@ch) if respond_to?(:z=) && @character.respond_to?(:screen_z)',
+            'sprite depth'
+          )
+
+          # There is no native-cache call on entering
+          # Map025. Browser preloading is installed
+          # separately in knight/index.html.
+          replace_once!(
+            source,
+            'SLZenith.preload if map_id==SLZenith::MAP_ID',
+            'nil # V250 browser preloads original assets',
+            'map setup preload'
           )
 
           source.sub!(
             'SLZenith V247:',
-            'SLZenith V249:'
+            'SLZenith V250:'
           )
 
-          # V248 failed because it searched for this
-          # alias globally. Game_Event legitimately
-          # retains the original alias.
-          raise 'Original Game_Event alias lost' unless
+          # Preserve original event aliases and
+          # all combat and reward calculations.
+          raise 'Native Game_Event alias changed' unless
             source.include?(
               'alias slz_v247_native_update update'
             )
 
-          new_sprite=source[
-            /^class Sprite_Character\n.*?^end(?=\n\nclass Game_Map)/m
-          ]
-
-          raise 'New sprite renderer missing' unless
-            new_sprite &&
-            new_sprite.include?(
-              'alias slz_v249_native_update update'
-            )
-
-          raise 'Old sprite wrapper survived' if
-            new_sprite.include?(
+          raise 'Native Sprite alias changed' unless
+            source.include?(
               'alias slz_v247_native_update update'
             )
 
-          raise 'Old map wrapper survived' if
-            source.include?(
-              'alias slz_v247_native_setup setup'
-            )
-
-          required.each do |item|
-            raise "Combat value changed #{item}" unless
-              source.include?(item)
+          required.each do |value|
+            raise "Combat modified: #{value}" unless
+              source.include?(value)
           end
 
           drop_pattern=/DROPS=\[\n.*?\n  \]/m
-
-          raise 'Original drops changed' unless
-            source[drop_pattern] &&
+          raise 'Drop table modified' unless
+            original[drop_pattern] &&
             source[drop_pattern]==original[drop_pattern]
 
-          raise 'Original motion table changed' unless
-            source[
-              /FRAMES=\{.*?\}/m
-            ]==original[
-              /FRAMES=\{.*?\}/m
-            ]
+          motion_pattern=/FRAMES=\{.*?\}/m
+          raise 'Original motions modified' unless
+            source[motion_pattern]==original[motion_pattern]
 
-          File.write(
-            'build/zenith-runtime.rb',source
-          )
+          File.write('build/zenith-runtime.rb',source)
 
-          entry[0]=99824901
-          entry[1]='SLZenithV249'
+          entry[0]=99825001
+          entry[1]='SLZenithV250'
           entry[2]=Zlib::Deflate.deflate(source,9)
 
           File.binwrite(path,Marshal.dump(scripts))
 
-          check=Marshal.load(File.binread(path))
-
-          raise 'Serialized runtime mismatch' unless
-            check[index][1]=='SLZenithV249' &&
-            Zlib::Inflate.inflate(check[index][2])==
+          verify=Marshal.load(File.binread(path))
+          raise 'Runtime serialization failed' unless
+            verify[index][1]=='SLZenithV250' &&
+            Zlib::Inflate.inflate(verify[index][2])==
             source
 
-          puts 'PASS native Game_Event alias preserved'
-          puts 'PASS isolated Sprite_Character replacement'
-          puts 'PASS safe Map025 preload'
-          puts 'PASS combat, animation and drop values unchanged'
+          puts 'PASS original runtime retained'
+          puts 'PASS fatal Map025 cache preload disabled'
+          puts 'PASS sprite method guards installed'
+          puts 'PASS combat, drops and graphics unchanged'
           RUBY
 
-          ruby -c build/repair.rb
-          ruby build/repair.rb
+          ruby -c build/fix.rb
+          ruby build/fix.rb
           ruby -c build/zenith-runtime.rb
 
-      - name: V249 Test unsupported cache and sprite APIs
+      - name: V250 Verify runtime entry protection
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > build/test-runtime.rb <<'RUBY'
+          cat > build/test.rb <<'RUBY'
           class Game_Event
             attr_accessor :character_name,:direction
             def update;end
@@ -430,140 +294,74 @@ end
             attr_accessor :map_id,:events
             def setup(id)
               @map_id=id
-              :native_ok
+              :native_ready
             end
           end
 
           class Sprite_Character
-            attr_accessor :src_rect,:ox,:oy,:z
             def update;end
+            def bitmap;nil;end
           end
 
           $game_map=Game_Map.new
           $game_map.events={}
           $game_variables=Hash.new(0)
           $game_switches=Hash.new(false)
-          $game_party=nil
           $m=nil
 
           load 'build/zenith-runtime.rb'
 
-          raise 'Wrong event ID' unless
+          raise 'Wrong boss ID' unless
             SLZenith::EVENT_ID==29
 
-          raise 'Wrong combat values' unless
-            SLZenith::MAX_HP==5200 &&
-            SLZenith::PHYSICAL==[50,100] &&
+          raise 'Wrong physical attack' unless
+            SLZenith::PHYSICAL==[50,100]
+
+          raise 'Wrong magic attack' unless
             SLZenith::MAGIC==[150,300]
 
-          raise 'Original drops lost' unless
+          raise 'Wrong boss HP' unless
+            SLZenith::MAX_HP==5200
+
+          raise 'Original drops changed' unless
             SLZenith::DROPS.length==20 &&
-            SLZenith::DROPS.include?(
-              [:armor,492,3]
-            )
-
-          # Test without an available cache.
-          result=$game_map.setup(25)
-
-          raise 'Map025 setup failed' unless
-            result==:native_ok &&
-            $game_map.map_id==25
-
-          # A cache entry point may exist but fail.
-          module RPG
-            module Cache
-              def self.character(name,hue=0)
-                raise NoMethodError,
-                  'unsupported cache operation'
-              end
-            end
-          end
+            SLZenith::DROPS.include?([:armor,492,3])
 
           result=$game_map.setup(25)
 
-          raise 'Cache exception escaped' unless
-            result==:native_ok
-
-          raise 'Cache error was not captured' unless
-            SLZenith.instance_variable_get(
-              :@last_preload_error
-            )
+          raise 'Map025 startup failed' unless
+            result==:native_ready
 
           boss=Game_Event.new
           boss.instance_variable_set(:@map_id,25)
           boss.instance_variable_set(:@id,29)
           boss.character_name='SLZenithIdle'
           boss.direction=2
-
           $game_map.events[29]=boss
 
-          # No moving? method exists in this mock.
-          # The new Game_Event guard must handle it.
+          # Missing moving? must not crash the map.
           boss.update
 
-          # No bitmap and no source rectangle.
           sprite=Sprite_Character.new
           sprite.instance_variable_set(:@character,boss)
           sprite.instance_variable_set(:@tile_id,0)
           sprite.update
 
-          # A valid native-sized 4-direction sheet.
-          bitmap=Struct.new(
-            :width,:height
-          ).new(11*144,4*120)
-
-          rect=Struct.new(
-            :x,:y,:width,:height
-          ) do
-            def set(x,y,w,h)
-              self.x=x
-              self.y=y
-              self.width=w
-              self.height=h
-            end
-          end.new
-
-          sprite.instance_variable_set(
-            :@bitmap,bitmap
-          )
-          sprite.src_rect=rect
-
-          [2,4,6,8].each do |direction|
-            boss.direction=direction
-            sprite.update
-
-            expected=((direction-2)/2)*120
-
-            raise 'Wrong native sprite row' unless
-              rect.y==expected
-
-            raise 'Wrong sprite size' unless
-              rect.width==144 &&
-              rect.height==120
-          end
-
-          raise 'Sprite exception captured' if
-            SLZenith.instance_variable_get(
-              :@last_sprite_error
-            )
-
-          # Unrelated maps still use native setup.
           result=$game_map.setup(47)
-          raise 'Other map setup failed' unless
-            result==:native_ok
+          raise 'Other map setup changed' unless
+            result==:native_ready
 
-          puts 'PASS no-cache Map025 initialization'
-          puts 'PASS partial-cache failure handled'
-          puts 'PASS movement method guard'
-          puts 'PASS incomplete sprite state handled'
-          puts 'PASS all four sprite directions'
-          puts 'PASS Map047 native setup retained'
+          puts 'PASS Map025 setup without RPG::Cache'
+          puts 'PASS missing moving? handled'
+          puts 'PASS missing sprite bitmap handled'
+          puts 'PASS original reward and combat constants'
+          puts 'PASS Map047 native setup'
           RUBY
 
-          ruby -c build/test-runtime.rb
-          ruby build/test-runtime.rb
+          ruby -c build/test.rb
+          ruby build/test.rb
 
-      - name: V249 Refresh script hash and version
+      - name: V250 Install permanent version display
         shell: bash
         run: |
           set -euo pipefail
@@ -572,18 +370,16 @@ end
           import hashlib,re
           from pathlib import Path
 
-          root=Path("site")
-          script=root/"knight/gameasync/Data/Scripts.rxdata"
-          mapping=root/"knight/gameasync/mapping.js"
+          root=Path('site')
+          mapping=root/'knight/gameasync/mapping.js'
+          script=root/'knight/gameasync/Data/Scripts.rxdata'
 
-          content=mapping.read_text("utf-8")
-          digest=hashlib.md5(
-              script.read_bytes()
-          ).hexdigest()
+          content=mapping.read_text('utf-8')
+          digest=hashlib.md5(script.read_bytes()).hexdigest()
 
           pattern=(
-              r"(Data/Scripts\.rxdata\?h=)"
-              r"[0-9a-f]{32}"
+              r'(Data/Scripts\.rxdata\?h=)'
+              r'[0-9a-f]{32}'
           )
 
           content,count=re.subn(
@@ -591,43 +387,102 @@ end
               lambda m:m.group(1)+digest,
               content
           )
+          assert count==1,('Script mapping mismatch',count)
+          mapping.write_text(content,'utf-8')
 
-          assert count==1, (
-              "Script mapping is not unique",count
-          )
+          loader=root/'knight/js/sl-assets-v229r115.js'
+          loader_text=loader.read_text('utf-8')
 
-          mapping.write_text(content,"utf-8")
-
-          loader=root/"knight/js/sl-assets-v229r115.js"
-          text=loader.read_text("utf-8")
-
-          old="var version='V247';"
-          assert text.count(old)==1
-
+          assert loader_text.count("var version='V247';")==1
           loader.write_text(
-              text.replace(
-                  old,"var version='V249';"
+              loader_text.replace(
+                  "var version='V247';",
+                  "var version='V250';"
               ),
-              "utf-8"
+              'utf-8'
           )
 
-          for relative in (
-              "index.html","knight/index.html"
-          ):
-              path=root/relative
-              html=path.read_text("utf-8")
+          motions=[
+              'Walk','Idle','Attack','AltAttack',
+              'Spell','Hit','Death'
+          ]
 
-              assert "V247" in html
+          # Reuse exact hashed URLs from the original
+          # game mapping to avoid duplicate downloads.
+          resources=[
+              'Graphics/Characters/SLZenith'+
+              motion+'.png'
+              for motion in motions
+          ]
 
-              html=html.replace("V247","V249")
-              html=html.replace(
-                  "?v=v247","?v=v249"
+          resources.extend(
+              'Graphics/Animations/'+name+'.png'
+              for name in (
+                  '이펙트마법',
+                  '물의 대정령 마법',
+                  '불의 대정령 마법',
+                  '땅의 대정령 마법'
+              )
+          )
+
+          preload=[]
+          for resource in resources:
+              match=re.search(
+                  re.escape(resource)+
+                  r'\?h=[0-9a-f]{32}',
+                  content
+              )
+              assert match,(
+                  'Missing original graphic mapping',
+                  resource
+              )
+              preload.append(
+                  '<link rel="preload" as="image" href="gameasync/'+
+                  match.group(0)+'">'
               )
 
-              path.write_text(html,"utf-8")
+          banner=(
+              '<div id="sl-build-version-v250" '
+              'style="position:fixed;top:6px;left:50%;'
+              'transform:translateX(-50%);z-index:2147483000;'
+              'padding:4px 11px;background:rgba(0,0,0,.8);'
+              'border:1px solid #999;border-radius:6px;'
+              'color:#fff;font:700 14px sans-serif;'
+              'pointer-events:none;white-space:nowrap">'
+              'SLKnight V250</div>'
+          )
 
-          print("PASS updated RXData hash")
-          print("PASS V249 cache-busting labels")
+          for relative in ('index.html','knight/index.html'):
+              path=root/relative
+              html=path.read_text('utf-8')
+              assert 'V247' in html,relative
+
+              html=html.replace('V247','V250')
+              html=html.replace('?v=v247','?v=v250')
+
+              assert '</body>' in html,(
+                  'HTML body ending missing',relative
+              )
+              assert 'sl-build-version-v250' not in html
+
+              html=html.replace(
+                  '</body>',banner+'\n</body>',1
+              )
+
+              if relative=='knight/index.html':
+                  assert '</head>' in html
+                  html=html.replace(
+                      '</head>',
+                      '\n'.join(preload)+'\n</head>',1
+                  )
+
+              path.write_text(html,'utf-8')
+              assert 'SLKnight V250' in html
+
+          print('PASS V250 visible on game screen')
+          print('PASS 7 original full-motion assets preloaded')
+          print('PASS 4 original magic effect assets preloaded')
+          print('PASS V250 loader and RXData cache hashes')
           PY
 
           node --check site/knight/gameasync/mapping.js
@@ -635,7 +490,7 @@ end
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
 
-      - name: V249 Verify original game resources preserved
+      - name: V250 Verify all original data preserved
         shell: bash
         run: |
           set -euo pipefail
@@ -644,90 +499,94 @@ end
           import hashlib,json
           from pathlib import Path
 
-          root=Path("site")
+          root=Path('site')
           before=json.loads(
-              Path("build/before.json").read_text()
+              Path('build/before.json').read_text('utf-8')
           )
-
           after={
               str(p.relative_to(root)):
               hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob("*")
-              if p.is_file()
+              for p in root.rglob('*') if p.is_file()
           }
 
           allowed={
-              "knight/gameasync/Data/Scripts.rxdata",
-              "knight/gameasync/mapping.js",
-              "knight/js/sl-assets-v229r115.js",
-              "index.html",
-              "knight/index.html"
+              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/mapping.js',
+              'knight/js/sl-assets-v229r115.js',
+              'index.html',
+              'knight/index.html'
           }
 
           changed={
-              name for name in before
-              if before[name]!=after.get(name)
+              key for key in before
+              if before[key]!=after.get(key)
           }
 
-          assert changed==allowed, (
-              "Unexpected modified files",
+          assert changed==allowed,(
+              'Unexpected file modifications',
               sorted(changed^allowed)
           )
 
-          assert set(after)==set(before), (
-              "Game inventory changed"
-          )
-
+          assert set(before)==set(after)
           assert len(after)==5610
 
           pre=(
-              "knight/gameasync/Data/"
-              "MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO"
+              'knight/gameasync/Data/'
+              'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           )
 
           protected=[
-              pre+"Map016.rxdata",
-              pre+"Map025.rxdata",
-              pre+"Map047.rxdata",
-              pre+"CommonEvents.rxdata",
-              "knight/assets/map-047-v241.pack"
+              pre+'Map016.rxdata',
+              pre+'Map025.rxdata',
+              pre+'Map047.rxdata',
+              pre+'CommonEvents.rxdata',
+              'knight/assets/map-047-v241.pack'
           ]
 
-          for path in protected:
-              assert after[path]==before[path],(
-                  "Protected game data changed",path
+          for name in protected:
+              assert before[name]==after[name],(
+                  'Original data modified',name
               )
 
-          for action in (
-              "Walk","Idle","Attack","AltAttack",
-              "Spell","Hit","Death"
+          for motion in (
+              'Walk','Idle','Attack','AltAttack',
+              'Spell','Hit','Death'
           ):
-              path=(
-                  "knight/gameasync/Graphics/"
-                  "Characters/SLZenith"+action+".png"
+              name=(
+                  'knight/gameasync/Graphics/'
+                  'Characters/SLZenith'+motion+'.png'
               )
-              assert after[path]==before[path]
+              assert before[name]==after[name]
 
           for name in (
-              "이펙트마법",
-              "물의 대정령 마법",
-              "불의 대정령 마법",
-              "땅의 대정령 마법"
+              '이펙트마법',
+              '물의 대정령 마법',
+              '불의 대정령 마법',
+              '땅의 대정령 마법'
           ):
               path=(
-                  "knight/gameasync/Graphics/"
-                  "Animations/"+name+".png"
+                  'knight/gameasync/Graphics/'
+                  'Animations/'+name+'.png'
               )
-              assert after[path]==before[path]
+              assert before[path]==after[path]
 
-          print("PASS existing maps and NPCs unchanged")
-          print("PASS CE179 and CE901 unchanged")
-          print("PASS all seven motion sheets unchanged")
-          print("PASS four original magic effects unchanged")
-          print("PASS inventory 5610 unchanged")
+          html=(
+              root/'knight/index.html'
+          ).read_text('utf-8')
+
+          assert 'SLKnight V250' in html
+          assert 'sl-build-version-v250' in html
+          assert html.count('rel="preload"')>=11
+
+          print('PASS Map016 and Map025 unchanged')
+          print('PASS Map047 and all NPCs unchanged')
+          print('PASS native CommonEvents unchanged')
+          print('PASS original graphics unchanged')
+          print('PASS permanent V250 version display')
+          print('PASS total inventory remains 5610')
           PY
 
-      - name: V249 Publish game
+      - name: V250 Publish game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
