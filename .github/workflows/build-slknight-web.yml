@@ -1,16 +1,15 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V272
-# BASE: V267 successful run 41441629897
-# FIX: Remove duplicate Zenith sprite update wrapper.
-# FIX: Modify native source rectangle directly, without replacing sx/sy formulas.
-# FIX: Cache the original attack command list, retaining native Interpreter behavior.
-# FIX: Avoid processing the same monster state twice in one Graphics frame.
-# FIX: Activate pursuit only within recognition distance.
-# KEEP: Original browser loader, all other monsters, original damage and drops.
-# STATUS: Build and actual game execution not yet verified.
+# VERSION: V273
+# BASE: V272 successful run 41470759353; DO NOT inherit V268 loader
+# FIX 1: Remove the separate per-frame Game_Event update and attack Interpreter.
+# FIX 2: Native three-page Zenith-only event: idle / battle / death.
+# FIX 3: Embed V272 approved 50-command damage sequence in native battle page ONCE.
+# FIX 4: Use valid, previously unused variable 4987 and switch 5987.
+# KEEP: Original Kurtz/Death Knight, Map025 other events, all 20 drops, graphics.
+# TEST: Exact V272 artifact patched locally; device performance requires real play.
 
-name: build-slknight-web.yml | V272 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V273 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -33,567 +32,842 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-
     steps:
-      - name: V272 Restore V267 game without broken V268 loader
+      - name: V273 Restore exact V272 deployed game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 41441629897
+          run-id: 41470759353
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: V272 Verify original inventory
+      - name: V273 Verify baseline and record byte inventory
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p site build
           test -s baseline/artifact.tar
           tar -xf baseline/artifact.tar -C site
-
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,json
-
-          root=Path('site')
-          before={
-              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-          assert len(before)==5610,('Unexpected inventory',len(before))
-
-          data=root/'knight/gameasync/Data'
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          for name in (
-              'Scripts.rxdata',
-              prefix+'Map025.rxdata',
-              prefix+'Map016.rxdata',
-              prefix+'Map021.rxdata',
-              prefix+'CommonEvents.rxdata'
-          ):
-              assert (data/name).is_file(),name
-
-          for action in ('Idle','Walk','Attack','AltAttack','Spell','Hit','Death'):
-              name='SLZenith'+action+'.png'
-              assert (root/'knight/gameasync/Graphics/Characters'/name).is_file(),name
-
-          drive=(root/'knight/js/drive.js').read_text('utf-8')
-          loader=(root/'knight/js/sl-assets-v229r115.js').read_text('utf-8')
-          assert 'slV268NetPending' not in drive
-          assert 'slV268ZenithReady' not in loader
-          assert "var version='V267';" in loader
-
-          Path('build/before.json').write_text(
-              json.dumps(before,sort_keys=True),encoding='utf-8'
-          )
-          print('PASS original V267 game and browser loader')
+          import json,hashlib
+          root=Path("site")
+          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*") if p.is_file()}
+          assert len(before)==5610,("Unexpected V272 inventory",len(before))
+          pre="MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO"
+          for name in ("Scripts.rxdata",pre+"Map025.rxdata",pre+"Map016.rxdata",pre+"Map021.rxdata",pre+"CommonEvents.rxdata"):
+              assert (root/"knight/gameasync/Data"/name).is_file(),name
+          for action in ("Walk","Idle","Attack","AltAttack","Spell","Hit","Death"):
+              assert (root/"knight/gameasync/Graphics/Characters"/("SLZenith"+action+".png")).is_file(),action
+          assert "slV268NetPending" not in (root/"knight/js/drive.js").read_text("utf-8")
+          assert "var version='V272';" in (root/"knight/js/sl-assets-v229r115.js").read_text("utf-8")
+          Path("build/before.json").write_text(json.dumps(before,sort_keys=True),"utf-8")
+          print("PASS V272 baseline, all 5610 source files, original browser loader")
           PY
 
-      - name: V272 Remove duplicated Zenith processing
+      - name: V273 Replace Zenith-specific update with native event pages
         shell: bash
         run: |
           set -euo pipefail
+          cat > build/native_runtime_body.rb <<'V273_NATIVE_RUNTIME'
+            # One native map-parallel interpreter executes this boss's own event pages.
+            # There is deliberately NO Game_Event#update or Sprite_Character#update alias,
+            # and NO Interpreter.new in this runtime.
+            SWITCH_ID=5987
+            @states={}
 
-          cat > build/patch.rb <<'RUBY'
-          # encoding: UTF-8
-          require 'zlib'
+            def self.config(map_id,event_id)
+              REGISTRY[[map_id,event_id]]
+            end
 
-          module RPG
-            class Map;end
-            class MapInfo;end
-            class CommonEvent;end
-            class AudioFile;end
-            class Item;end
-            class Weapon;end
-            class Armor;end
-            class Event
-              class Page
-                class Condition;end
-                class Graphic;end
+            def self.state(map_id,event_id)
+              @states[[map_id,event_id]]||={
+                :motion=>nil,:motion_start=>0,:motion_duration=>0,
+                :last_move_frame=>-100,:last_attack_frame=>0,
+                :last_player_frame=>-100,:attack_count=>0,
+                :magic_index=>0,:last_damage=>0,
+                :death_frame=>nil,:paid=>false,:last_tick_frame=>-1
+              }
+            end
+
+            def self.reset(map_id)
+              return unless map_id==25
+              @states={}
+              $game_variables[4987]=0 if $game_variables
+              $game_switches[SWITCH_ID]=false if $game_switches
+            end
+
+            def self.actor
+              if $game_party && $game_party.respond_to?(:actors)
+                arr=$game_party.actors
+                return arr[0] if arr && !arr.empty?
+              end
+              return $game_actors[1] if $game_actors
+              nil
+            end
+
+            def self.event(map_id,event_id)
+              return nil unless $game_map && $game_map.map_id==map_id
+              $game_map.events[event_id]
+            end
+
+            def self.frame
+              return Graphics.frame_count if defined?(Graphics) && Graphics.respond_to?(:frame_count)
+              0
+            end
+
+            def self.roll(pair)
+              low=pair[0].to_i
+              high=pair[1].to_i
+              return low if high<=low
+              low+rand(high-low+1)
+            end
+
+            def self.distance(ev)
+              return nil unless ev && $game_player
+              return nil unless ev.respond_to?(:x) && ev.respond_to?(:y)
+              return nil unless $game_player.respond_to?(:x) && $game_player.respond_to?(:y)
+              [($game_player.x-ev.x).abs,($game_player.y-ev.y).abs]
+            end
+
+            def self.motion(map_id,event_id,name,duration)
+              cfg=config(map_id,event_id)
+              return unless cfg && cfg[:frames][name]
+              s=state(map_id,event_id)
+              return if s[:paid] && name!='Death'
+              s[:motion]=name
+              s[:motion_start]=frame
+              s[:motion_duration]=duration.to_i
+              ev=event(map_id,event_id)
+              return unless ev
+              graphic=cfg[:sprite]+name
+              ev.instance_variable_set(:@character_name,graphic) if
+                ev.instance_variable_get(:@character_name)!=graphic
+            end
+
+            def self.show_hp(map_id,event_id)
+              cfg=config(map_id,event_id)
+              return unless cfg && $game_variables && $m && $m.respond_to?(:drawMHP)
+              $m.drawMHP(cfg[:name],$game_variables[cfg[:damage_var]].to_i,cfg[:max_hp],2)
+            end
+
+            def self.hit(map_id,event_id,amount)
+              cfg=config(map_id,event_id)
+              return false unless cfg && $game_variables
+              return false unless amount.to_i>0
+              s=state(map_id,event_id)
+              return false if s[:paid]
+              old=$game_variables[cfg[:damage_var]].to_i
+              return false if old>=cfg[:max_hp]
+              damage=[old+amount.to_i,cfg[:max_hp]].min
+              $game_variables[cfg[:damage_var]]=damage
+              s[:last_damage]=damage
+              if damage<cfg[:max_hp]
+                motion(map_id,event_id,'Hit',14)
+              else
+                $game_map.need_refresh=true if $game_map && $game_map.respond_to?(:need_refresh=)
+              end
+              show_hp(map_id,event_id)
+              true
+            end
+
+            def self.player_input?(event_id)
+              if defined?($mobile_auto_attack_active) && $mobile_auto_attack_active &&
+                 defined?($mobile_auto_attack_event_id) &&
+                 $mobile_auto_attack_event_id.to_i==event_id
+                return true
+              end
+              return false unless defined?(Input) && Input.const_defined?(:C)
+              (Input.respond_to?(:trigger?) && Input.trigger?(Input::C)) ||
+                (Input.respond_to?(:press?) && Input.press?(Input::C))
+            end
+
+            def self.player_strike(map_id,event_id,ev)
+              cfg=config(map_id,event_id)
+              return false unless cfg && $game_player && player_input?(event_id)
+              s=state(map_id,event_id)
+              now=frame
+              return false if now-s[:last_player_frame]<cfg[:attack_wait]
+              d=distance(ev)
+              return false unless d && d[0]+d[1]==1
+              return false unless $game_player.respond_to?(:direction)
+              dx=ev.x-$game_player.x
+              dy=ev.y-$game_player.y
+              direction=case [dx,dy]
+                when [0,1] then 2
+                when [-1,0] then 4
+                when [1,0] then 6
+                when [0,-1] then 8
+                else nil
+              end
+              return false unless direction && $game_player.direction==direction
+              s[:last_player_frame]=now
+              attacker=actor
+              return false unless attacker && attacker.respond_to?(:atk) && attacker.respond_to?(:agi)
+              roll_hit=roll(cfg[:hit_random])
+              $game_variables[335]=roll_hit if $game_variables
+              return false if attacker.agi.to_i<roll_hit
+              hit(map_id,event_id,attacker.atk.to_i)
+            end
+
+            def self.set_phase(value)
+              return unless $game_switches
+              return if $game_switches[SWITCH_ID]==value
+              state(25,29)[:last_attack_frame]=frame if value
+              $game_switches[SWITCH_ID]=value
+              $game_map.need_refresh=true if $game_map && $game_map.respond_to?(:need_refresh=)
+            end
+
+            def self.visual_tick(map_id,event_id,ev)
+              cfg=config(map_id,event_id)
+              s=state(map_id,event_id)
+              now=frame
+              if s[:motion] && now-s[:motion_start]>=s[:motion_duration]
+                s[:motion]=nil
+              end
+              moving=ev.respond_to?(:moving?) && ev.moving?
+              s[:last_move_frame]=now if moving
+              unless s[:motion]
+                action=moving || (now-s[:last_move_frame]<=24) ? 'Walk' : 'Idle'
+                graphic=cfg[:sprite]+action
+                ev.instance_variable_set(:@character_name,graphic) if
+                  ev.instance_variable_get(:@character_name)!=graphic
               end
             end
-            class EventCommand;end
-            class MoveRoute;end
-            class MoveCommand;end
+
+            # Called from ordinary event page interpreter (parallel, native).
+            def self.tick(map_id,event_id)
+              cfg=config(map_id,event_id)
+              ev=event(map_id,event_id)
+              return true unless cfg && ev && $game_variables
+              s=state(map_id,event_id)
+              now=frame
+              return true if s[:last_tick_frame]==now
+              s[:last_tick_frame]=now
+              return true if $game_variables[cfg[:damage_var]].to_i>=cfg[:max_hp]
+              visual_tick(map_id,event_id,ev)
+              player_strike(map_id,event_id,ev)
+              d=distance(ev)
+              if d
+                range=d[0]+d[1]
+                if $game_switches && $game_switches[SWITCH_ID]
+                  set_phase(false) if range>=14
+                else
+                  set_phase(true) if range<=10
+                end
+              end
+              true
+            end
+
+            # Evaluated by the original event's Interpreter#command_111.
+            # The approved 50-command physical/magic graph follows in the SAME event.
+            def self.attack_due?(map_id,event_id)
+              cfg=config(map_id,event_id)
+              ev=event(map_id,event_id)
+              return false unless cfg && ev && $game_variables
+              return false if $game_variables[cfg[:damage_var]].to_i>=cfg[:max_hp]
+              d=distance(ev)
+              return false unless d && d[0]<=cfg[:attack_range] && d[1]<=cfg[:attack_range]
+              s=state(map_id,event_id)
+              now=frame
+              return false if now-s[:last_attack_frame]<cfg[:attack_wait]
+              s[:last_attack_frame]=now
+              s[:attack_count]+=1
+              motion(map_id,event_id,s[:attack_count].even? ? 'AltAttack' : 'Attack',cfg[:attack_wait])
+              true
+            end
+
+            def self.magic_start(map_id,event_id)
+              cfg=config(map_id,event_id)
+              return true unless cfg
+              motion(map_id,event_id,'Spell',cfg[:attack_wait])
+              s=state(map_id,event_id)
+              return true unless $game_player && $data_animations
+              return true unless $game_player.respond_to?(:animation_id=)
+              ids=cfg[:magic_fx]
+              return true if ids.empty?
+              idx=s[:magic_index]%ids.length
+              id=ids[idx]
+              if $data_animations[id]
+                $game_player.animation_id=id
+                s[:magic_index]=(idx+1)%ids.length
+              end
+              true
+            end
+
+            def self.reward(map_id,event_id)
+              cfg=config(map_id,event_id)
+              return unless cfg && $game_party && $game_variables
+              s=state(map_id,event_id)
+              return if s[:paid]
+              return unless $game_variables[cfg[:damage_var]].to_i>=cfg[:max_hp]
+              s[:paid]=true
+              gold=roll(cfg[:adena])
+              $game_party.gain_gold(gold)
+              a=actor
+              a.exp=a.exp+cfg[:exp] if a && a.respond_to?(:exp) && a.respond_to?(:exp=)
+              $game_variables[333]=gold
+              $game_variables[1926]=cfg[:exp]
+              cfg[:drops].each do |kind,id,chance|
+                next unless rand(1000)<chance
+                case kind
+                when :item then $game_party.gain_item(id,1)
+                when :weapon then $game_party.gain_weapon(id,1)
+                when :armor then $game_party.gain_armor(id,1)
+                end
+              end
+            end
+
+            def self.death_tick(map_id,event_id)
+              cfg=config(map_id,event_id)
+              ev=event(map_id,event_id)
+              return true unless cfg && ev
+              s=state(map_id,event_id)
+              if !s[:death_frame]
+                s[:death_frame]=frame
+                motion(map_id,event_id,'Death',42)
+                reward(map_id,event_id)
+              elsif frame-s[:death_frame]>=42
+                ev.erase if ev.respond_to?(:erase) && !ev.instance_variable_get(:@erased)
+              end
+              true
+            end
+
+            def self.frame_info(ev)
+              mid=ev.instance_variable_get(:@map_id)
+              eid=ev.instance_variable_get(:@id)
+              cfg=config(mid,eid)
+              return nil unless cfg
+              name=ev.character_name.to_s
+              return nil unless name.index(cfg[:sprite])==0
+              action=name[cfg[:sprite].length..-1]
+              count=cfg[:frames][action]
+              return nil unless count && count>0
+              st=state(mid,eid)
+              now=frame
+              if st[:motion]==action
+                duration=[st[:motion_duration].to_i,1].max
+                i=[(now-st[:motion_start])*count/duration,count-1].min
+              else
+                i=(now/(action=='Walk' ? 2 : 4))%count
+              end
+              i=0 if i<0
+              direction=ev.direction.to_i
+              row=[2,4,6,8].index(direction)
+              return nil unless row
+              [action,i,row,count]
+            end
           end
 
-          class Table
-            def self._load(raw)
-              obj=allocate
-              obj.instance_variable_set(:@raw,raw)
-              obj
+          # Only one native map-setup hook. No additional per-frame engine hooks.
+          class Game_Map
+            alias slzenith_v273_original_setup setup
+            def setup(map_id)
+              SLZenithV273.reset(map_id)
+              slzenith_v273_original_setup(map_id)
             end
+          end
+          V273_NATIVE_RUNTIME
+
+          cat > build/patch.rb <<'V273_PATCH'
+          # encoding: UTF-8
+          require 'zlib'
+          module RPG
+            class Map;end; class MapInfo;end; class AudioFile;end; class CommonEvent;end
+            class Item;end;class Weapon;end;class Armor;end
+            class Event
+              class Page
+                class Condition;end;class Graphic;end
+              end
+            end
+            class EventCommand;end; class MoveRoute;end;class MoveCommand;end
+          end
+          class Table
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
             def _dump(level=0);@raw;end
           end
-
           class Tone
-            def self._load(raw)
-              obj=allocate
-              obj.instance_variable_set(:@raw,raw)
-              obj
-            end
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
             def _dump(level=0);@raw;end
           end
           class Color<Tone;end
 
-          def iv(obj,name)
-            obj.instance_variable_get('@'+name.to_s)
+          def iv(o,key);o.instance_variable_get('@'+key.to_s);end
+          def put(o,key,val);o.instance_variable_set('@'+key.to_s,val);end
+          def command(code,parameters=[],indent=0)
+            obj=RPG::EventCommand.allocate
+            put(obj,:code,code);put(obj,:parameters,parameters);put(obj,:indent,indent)
+            obj
           end
-
-          def put(obj,name,value)
-            obj.instance_variable_set('@'+name.to_s,value)
+          def move_command(code)
+            obj=RPG::MoveCommand.allocate
+            put(obj,:code,code);put(obj,:parameters,[]);obj
           end
-
-          def replace_once(source,old,replacement,label)
-            count=source.scan(old).length
-            raise "#{label}: expected one match, found #{count}" unless count==1
-            source.sub(old,replacement)
+          def build_page(graphic_name,move_type,motion_codes,list,sw=nil,death=false)
+            c=RPG::Event::Page::Condition.allocate
+            put(c,:switch1_valid,!sw.nil?)
+            put(c,:switch1_id,sw||1)
+            put(c,:switch2_valid,false);put(c,:switch2_id,1)
+            put(c,:variable_valid,death);put(c,:variable_id,death ? 4987 : 1)
+            put(c,:variable_value,death ? 5200 : 0)
+            put(c,:self_switch_valid,false);put(c,:self_switch_ch,'A')
+            g=RPG::Event::Page::Graphic.allocate
+            put(g,:tile_id,0);put(g,:character_name,graphic_name)
+            put(g,:character_hue,0);put(g,:direction,2);put(g,:pattern,0)
+            put(g,:opacity,255);put(g,:blend_type,0)
+            route=RPG::MoveRoute.allocate
+            put(route,:repeat,true);put(route,:skippable,true)
+            put(route,:list,motion_codes.map{|n|move_command(n)})
+            p=RPG::Event::Page.allocate
+            put(p,:condition,c);put(p,:graphic,g)
+            put(p,:move_type,move_type);put(p,:move_speed,3);put(p,:move_frequency,6)
+            put(p,:move_route,route);put(p,:walk_anime,true);put(p,:step_anime,false)
+            put(p,:direction_fix,false);put(p,:through,death)
+            put(p,:always_on_top,false);put(p,:trigger,4);put(p,:list,list)
+            p
           end
 
           root='site/knight/gameasync/Data/'
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          map_path=root+prefix+'Map025.rxdata'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          map_path=root+pre+'Map025.rxdata'
           scripts_path=root+'Scripts.rxdata'
-
           map=Marshal.load(File.binread(map_path))
           events=iv(map,:events)
           boss=events.fetch(29)
-          pages=iv(boss,:pages)
+          old_pages=iv(boss,:pages)
+          raise 'Expected V272 single boss page' unless old_pages.size==1
+          old=old_pages.first
+          raise 'V272 boss event changed' unless iv(old,:move_type)==0 && iv(old,:trigger)==0 && iv(old,:list).length==1
+          raise 'Wrong event name' unless iv(boss,:name).to_s.force_encoding('UTF-8').scrub.include?('제니스 퀸')
+          old_others=events.each_with_object({}){|(id,ev),h|h[id]=Marshal.dump(ev) unless id==29}
 
-          raise 'Unexpected Zenith page count' unless pages.length==1
-          page=pages.first
-          route=iv(page,:move_route)
-
-          raise 'Original pursuit route changed' unless
-            iv(page,:move_type)==3 &&
-            iv(page,:move_frequency)==6 &&
-            iv(page,:trigger)==0 &&
-            iv(route,:list).map{|cmd|iv(cmd,:code)}==[10,0]
-
-          raise 'Unexpected boss event commands' unless
-            iv(page,:list).length==1 &&
-            iv(iv(page,:list).first,:code)==0
-
-          other_events={}
-          events.each do |id,event|
-            other_events[id]=Marshal.dump(event) unless id==29
-          end
-
-          # Keep the original native route, but disable pursuit at map entry.
-          # Activation is controlled by the existing monster state update.
-          put(page,:move_type,0)
-
-          other_events.each do |id,raw|
-            raise "Unrelated event changed #{id}" unless
-              Marshal.dump(events[id])==raw
+          # Do not reuse an existing switch/variable: examine every native map and CE.
+          (Dir.glob(root+'*Map???.rxdata')+Dir.glob(root+'*CommonEvents.rxdata')).each do |filename|
+            item=Marshal.load(File.binread(filename))
+            cmds=[]
+            if item.is_a?(Array)
+              item.compact.each{|ce|cmds.concat(iv(ce,:list)||[])}
+            else
+              (iv(item,:events)||{}).values.each do |event|
+                (iv(event,:pages)||[]).each do |page|
+                  cond=iv(page,:condition)
+                  if cond
+                    raise "Switch 5987 already in use: #{filename}" if
+                      (iv(cond,:switch1_valid)&&iv(cond,:switch1_id)==5987) ||
+                      (iv(cond,:switch2_valid)&&iv(cond,:switch2_id)==5987)
+                    raise "Variable 4987 already in use: #{filename}" if
+                      iv(cond,:variable_valid)&&iv(cond,:variable_id)==4987
+                  end
+                  cmds.concat(iv(page,:list)||[])
+                end
+              end
+            end
+            cmds.each do |co|
+              p=iv(co,:parameters)
+              next unless p.is_a?(Array)
+              code=iv(co,:code)
+              if code==121 && p.length>=2 && p[0].is_a?(Integer) && p[1].is_a?(Integer)
+                raise "Switch ID collision #{filename}" if p[0]<=5987 && 5987<=p[1]
+              elsif code==122 && p.length>=2 && p[0].is_a?(Integer) && p[1].is_a?(Integer)
+                raise "Variable ID collision #{filename}" if p[0]<=4987 && 4987<=p[1]
+              elsif code==111
+                raise "Branch ID collision #{filename}" if
+                  (p[0]==0&&p[1]==5987)||(p[0]==1&&p[1]==4987)
+              end
+              raise "Script ID collision #{filename}" if
+                p.any?{|v|v.is_a?(String)&&v.match?(/\b(?:4987|5987)\b/)}
+            end
           end
 
           scripts=Marshal.load(File.binread(scripts_path))
-
-          raise 'Invalid script archive' unless
-            scripts.is_a?(Array) && scripts.length>=136
-
-          raise 'Native sprite script missing' unless
-            scripts[28].is_a?(Array) &&
-            scripts[28][1]=='Sprite_Character'
-
-          indexes=scripts.each_index.select do |i|
-            scripts[i].is_a?(Array) &&
-            scripts[i][1]=='SLMonsterV267'
-          end
-
-          raise 'Monster runtime missing or duplicated' unless indexes.length==1
-          index=indexes.first
-
-          original_other={}
+          raise 'Wrong script archive structure' unless scripts.is_a?(Array)&&scripts.length==138
+          raise 'Wrong native sprite entry' unless scripts[28][1]=='Sprite_Character'
+          idx=scripts.each_index.select{|i|scripts[i].is_a?(Array)&&scripts[i][1]=='SLMonsterV272'}
+          raise 'V272 runtime duplicate/missing' unless idx.size==1
+          idx=idx.first
+          all_other=scripts.each_with_index.each_with_object({}){|(row,i),h|h[i]=Marshal.dump(row) unless i==idx||i==28}
+          old_runtime=Zlib::Inflate.inflate(scripts[idx][2]).force_encoding('UTF-8')
+          raise 'Runtime encoding' unless old_runtime.valid_encoding?
+          verify=[':level=>60',':max_hp=>5200',':physical=>[50,100]',':magic=>[150,300]',
+                  ':accuracy=>9999',':hit_random=>[15,35]',':attack_wait=>20',':attack_range=>3',
+                  ':exp=>43212',':adena=>[64800,151200]',':damage_var=>7001','[:weapon,41,50]',
+                  'floor=80','[26,26,0,2,0,6]']
+          verify.each{|v|raise "V272 approved value missing: #{v}" unless old_runtime.include?(v)}
+          drops=old_runtime.scan(/\[:(item|weapon|armor),(\d+),(\d+)\]/)
+          raise 'V272 drop list is not 20' unless drops.length==20
           scripts.each_with_index do |entry,i|
-            original_other[i]=Marshal.dump(entry) unless
-              i==28 || i==index
+            next if i==idx
+            text=Zlib::Inflate.inflate(entry[2]).force_encoding('UTF-8').scrub
+            raise "ID used by another script #{i}: #{entry[1]}" if text.match?(/\b(?:4987|5987)\b/)
           end
+          sw=Zlib::Inflate.inflate(scripts[7][2])
+          vr=Zlib::Inflate.inflate(scripts[8][2])
+          raise 'Game_Switches limit differs' unless sw.include?('switch_id <= 6000')
+          raise 'Game_Variables limit differs' unless vr.include?('variable_id <= 5000')
 
-          runtime=Zlib::Inflate.inflate(scripts[index][2]).force_encoding('UTF-8')
-          native=Zlib::Inflate.inflate(scripts[28][2])
-
-          raise 'Monster runtime invalid encoding' unless runtime.valid_encoding?
-
-          approved=[
-            ':level=>60',
-            ':max_hp=>5200',
-            ':physical=>[50,100]',
-            ':magic=>[150,300]',
-            ':attack_wait=>20',
-            ':attack_range=>3',
-            ':accuracy=>9999',
-            ':exp=>43212',
-            ':adena=>[64800,151200]',
-            'floor=80',
-            '[26,26,0,2,0,6]',
-            '[:weapon,41,50]'
-          ]
-          approved.each do |marker|
-            raise "Approved parameter missing #{marker}" unless runtime.include?(marker)
-          end
-
-          drops=runtime.scan(/\[:(item|weapon|armor),(\d+),(\d+)\]/)
-          raise 'Drop table mismatch' unless drops.length==20
-
-          # DELETE the complete extra sprite update wrapper.
-          # No additional Sprite_Character class will be introduced.
-          start=runtime.index("\nclass Sprite_Character\n")
-          finish=start && runtime.index("\nmodule SLMonster\n",start+1)
-
-          raise 'Zenith sprite wrapper boundaries changed' unless
-            start && finish && start<finish
-
-          removed=runtime[start...finish]
-          raise 'Unexpected sprite wrapper' unless
-            removed.include?('alias slm_v267_original_update update') &&
-            removed.include?('SLMonster.frame_info') &&
-            removed.include?('rect.set(frame*cw,row*ch,cw,ch)')
-
-          runtime=runtime[0...start]+runtime[finish..-1]
-          raise 'Extra Sprite_Character remains' if
-            runtime.include?('class Sprite_Character')
-
-          # Edit the ORIGINAL renderer in script 28 instead.
-          # All ordinary monsters continue using four frame columns.
-          width=<<'WIDTH'.rstrip
-                  @slm_v272_cfg=nil
-                  if @character.is_a?(Game_Event)
-                    @slm_v272_cfg=SLMonster.config(
-                      @character.instance_variable_get(:@map_id),
-                      @character.instance_variable_get(:@id))
-                  end
-                  if @slm_v272_cfg
-                    name=@character.character_name.to_s
-                    suffix=name.sub(@slm_v272_cfg[:sprite],'')
-                    columns=@slm_v272_cfg[:frames][suffix] || 4
-                    @cw=bitmap.width/columns
-                  else
-                    @cw=bitmap.width/4
-                  end
-          WIDTH
-
-          native=replace_once(
-            native,
-            '@cw = bitmap.width / 4',
-            width,
-            'native sprite frame width'
-          )
-
-          # The V271 failure came from trying to match sx/sy formulas
-          # with an incorrect whitespace-ignoring regular expression.
-          # Leave those native formulas unchanged.
-          # Replace ONLY the source-rectangle assignment.
-          rect_pattern=/self\.src_rect\.set\([ \t]*sx[ \t]*,[ \t]*sy[ \t]*,[ \t]*@cw[ \t]*,[ \t]*@ch[ \t]*\)/
-
-          rectangle=<<'RECT'.rstrip
-                  if @slm_v272_cfg
-                    slm_info=SLMonster.frame_info(@character)
-                    if slm_info &&
-                       @character.character_name.to_s==@slm_v272_cfg[:sprite]+slm_info[0]
-                      sx=slm_info[1]*@cw
-                      sy=slm_info[2]*@ch
-                    end
-                  end
-                  self.src_rect.set(sx, sy, @cw, @ch)
-          RECT
-
-          native=replace_once(
-            native,
-            rect_pattern,
-            rectangle,
-            'native sprite source rectangle'
-          )
-
-          # Cache only the command graph.
-          # Preserve the original Interpreter lifecycle to avoid
-          # carrying interpreter state into the next attack.
-          runtime=replace_once(
-            runtime,
-            'attack_commands(c),',
-            '(s[:native_commands] ||= attack_commands(c)),',
-            'native attack command allocation'
-          )
-
-          # Update the boss state at most once per Graphics frame.
-          tick_pattern=/s=state\(map_id,event_id\)\r?\n[ \t]*s\[:tick\]\+=1/
-
-          tick=<<'TICK'.rstrip
-              s=state(map_id,event_id)
-              if defined?(Graphics) && Graphics.respond_to?(:frame_count)
-                frame=Graphics.frame_count
-                return if s[:last_update_frame]==frame
-                s[:last_update_frame]=frame
-              end
-              s[:tick]+=1
-
-              d=distance(ev)
-              if d
-                range=d[0]+d[1]
-                if s[:engaged]
-                  if range>=14
-                    s[:engaged]=false
-                    ev.instance_variable_set(:@move_type,0)
-                  end
-                elsif range<=10
-                  s[:engaged]=true
-                  ev.instance_variable_set(:@move_type,3)
-                end
-              end
-          TICK
-
-          runtime=replace_once(
-            runtime,
-            tick_pattern,
-            tick,
-            'single frame monster update'
-          )
-
-          # Replace, rather than wrap, the existing walking-state method.
-          # Preserve its original 24-frame threshold.
-          old_walk=<<'OLDWALK'
-            def self.walking?(ev,s)
-              moving=ev.respond_to?(:moving?) && ev.moving?
-              s[:last_move_tick]=s[:tick] if moving
-              moving || (s[:tick]-s[:last_move_tick]<=24)
+          # Reuse THE ZENITH QUEEN'S OWN already approved native combat command graph.
+          # Extract it from V272's source and generate it at build time, not at runtime.
+          start=old_runtime.index('  def self.event_command(code,params=[],indent=0)')
+          finish=start && old_runtime.index('  def self.magic_start(map_id,event_id)',start)
+          raise 'Native damage generator not found' unless start && finish
+          builder=Module.new
+          builder.module_eval(old_runtime[start...finish])
+          attack=builder.attack_commands({:physical=>[50,100],:magic=>[150,300],:accuracy=>9999})
+          raise "Unexpected native attack count #{attack.length}" unless attack.length.between?(45,60)
+          raise 'Wrong native 6:1 chance' unless attack.any?{|c|iv(c,:code)==122&&iv(c,:parameters)==[26,26,0,2,0,6]}
+          raise 'Original common damage graph changed' unless attack.count{|c|iv(c,:code)==117&&iv(c,:parameters)==[57]}==2
+          raise 'Magic minimum missing' unless attack.any?{|c|iv(c,:code)==111&&iv(c,:parameters)==[1,26,0,80,2]}
+          attack.each do |c|
+            put(c,:indent,iv(c,:indent)+1)
+            if iv(c,:code)==355
+              p=iv(c,:parameters)
+              raise 'Unexpected native magic source' unless p==['SLMonster.magic_start(25,29)']
+              put(c,:parameters,['SLZenithV273.magic_start(25,29)'])
             end
-          OLDWALK
-
-          new_walk=<<'NEWWALK'
-            def self.walking?(ev,s)
-              return s[:walk_cached] if s[:walk_cached_tick]==s[:tick]
-              moving=ev.respond_to?(:moving?) && ev.moving?
-              s[:last_move_tick]=s[:tick] if moving
-              s[:walk_cached]=moving || (s[:tick]-s[:last_move_tick]<=24)
-              s[:walk_cached_tick]=s[:tick]
-              s[:walk_cached]
-            end
-          NEWWALK
-
-          runtime=replace_once(
-            runtime,
-            old_walk.rstrip,
-            new_walk.rstrip,
-            'existing walking method'
-          )
-
-          raise 'Player attack input missing' unless
-            runtime.include?('player_strike(map_id,event_id)')
-
-          raise 'Native event update missing' unless
-            runtime.include?('SLMonster.update_event(self) if c')
-
-          raise 'Original native monster flag missing' unless
-            runtime.include?('@monster=true if c')
-
-          raise 'Native common event missing' unless
-            runtime.include?('f.call(117,[57],1)')
-
-          raise 'Physical/magic selection changed' unless
-            runtime.include?('[26,26,0,2,0,6]')
-
-          raise 'Drop inventory changed' unless
-            runtime.scan(/\[:(item|weapon|armor),(\d+),(\d+)\]/)==drops
-
-          raise 'Old passive damage restored' if
-            runtime.include?('def self.player_attack(')
-
-          runtime=runtime.gsub('slm_v267','slm_v272')
-
-          File.write('build/monster-runtime.rb',runtime,encoding:'UTF-8')
-          File.binwrite('build/native-sprite.rb',native)
-
-          raise 'Monster runtime syntax invalid' unless
-            system('ruby','-c','build/monster-runtime.rb')
-
-          raise 'Original sprite syntax invalid' unless
-            system('ruby','-c','build/native-sprite.rb')
-
-          scripts[28][2]=Zlib::Deflate.deflate(native,9)
-          scripts[index][0]=99827201
-          scripts[index][1]='SLMonsterV272'
-          scripts[index][2]=Zlib::Deflate.deflate(runtime,9)
-
-          original_other.each do |i,raw|
-            raise "Unrelated script changed #{i}" unless
-              Marshal.dump(scripts[i])==raw
           end
 
+          idle_list=[command(355,['SLZenithV273.tick(25,29)']),command(106,[2]),command(0)]
+          battle_list=[command(355,['SLZenithV273.tick(25,29)']),
+                       command(111,[12,'SLZenithV273.attack_due?(25,29)'])]+attack+
+                       [command(412,[],0),command(106,[2]),command(0)]
+          death_list=[command(355,['SLZenithV273.death_tick(25,29)']),command(106,[2]),command(0)]
+          put(boss,:pages,[
+            build_page('SLZenithIdle',1,[9,0],idle_list),
+            build_page('SLZenithWalk',3,[10,0],battle_list,5987,false),
+            build_page('SLZenithDeath',0,[0],death_list,nil,true)
+          ])
+          old_others.each{|id,raw|raise "Other event changed #{id}" unless Marshal.dump(events[id])==raw}
+
+          header_end=old_runtime.index('  @states={}')
+          raise 'Old standalone registry missing' unless header_end
+          header=old_runtime[0...header_end]
+          raise 'Registry header missing' unless header.scan('module SLMonster').length==1
+          raise 'Unexpected HP var occurrence' unless header.scan(':damage_var=>7001').length==1
+          header=header.sub('module SLMonster','module SLZenithV273').sub(':damage_var=>7001',':damage_var=>4987')
+          body=File.read('build/native_runtime_body.rb',encoding:'UTF-8')
+          runtime=header+body
+          raise 'Old extra event hooks retained' if runtime.include?('class Game_Event') || runtime.include?('class Sprite_Character') || runtime.include?('Interpreter.new(') || runtime.include?('module SLMonster')
+          raise 'Old invalid HP var remains' if runtime.include?('7001') || runtime.include?('7002')
+          raise 'Changed approved drop table' unless runtime.scan(/\[:(item|weapon|armor),(\d+),(\d+)\]/)==drops
+          File.write('build/runtime.rb',runtime,encoding:'UTF-8')
+          raise 'Native runtime syntax' unless system('ruby','-c','build/runtime.rb')
+
+          sprite=Zlib::Inflate.inflate(scripts[28][2])
+          raise 'Old sprite no longer present' unless sprite.scan('@slm_v272_cfg').length>=2
+          raise 'Old native renderer missing original override' unless sprite.include?('SLMonster.frame_info(@character)') && sprite.include?('SLMonster.config(')
+          sprite=sprite.gsub('@slm_v272_cfg','@slz_v273_cfg')
+          sprite=sprite.gsub('SLMonster.frame_info(@character)','SLZenithV273.frame_info(@character)')
+          sprite=sprite.gsub('SLMonster.config(','SLZenithV273.config(')
+          raise 'Old sprite reference remains' if sprite.include?('SLMonster') || sprite.include?('slm_v272')
+          File.binwrite('build/native-sprite.rb',sprite)
+          raise 'Native sprite syntax' unless system('ruby','-c','build/native-sprite.rb')
+          scripts[idx][0]=99827301
+          scripts[idx][1]='SLZenithV273'
+          scripts[idx][2]=Zlib::Deflate.deflate(runtime,9)
+          scripts[28][2]=Zlib::Deflate.deflate(sprite,9)
+          all_other.each{|i,raw|raise "Other script changed #{i}" unless Marshal.dump(scripts[i])==raw}
           File.binwrite(map_path,Marshal.dump(map))
           File.binwrite(scripts_path,Marshal.dump(scripts))
-
           restored=Marshal.load(File.binread(scripts_path))
-
-          raise 'Script inventory changed' unless
-            restored.length==scripts.length
-
-          raise 'Runtime serialization mismatch' unless
-            restored[index][1]=='SLMonsterV272' &&
-            Zlib::Inflate.inflate(restored[index][2]).b==runtime.b
-
-          raise 'Native renderer serialization mismatch' unless
-            Zlib::Inflate.inflate(restored[28][2]).b==native.b
-
-          puts "PASS original script count #{scripts.length}"
-          puts 'PASS extra Zenith sprite update wrapper removed'
-          puts 'PASS original sprite renderer retained'
-          puts 'PASS approved monster parameters and 20 drops preserved'
-          puts 'PASS native Interpreter retained, commands cached'
-          puts 'PASS one monster state update per Graphics frame'
-          RUBY
-
+          raise 'Changed original script archive length' unless restored.length==138
+          raise 'Zenith native script corrupt' unless Zlib::Inflate.inflate(restored[idx][2]).b==runtime.b
+          raise 'Native sprite script corrupt' unless Zlib::Inflate.inflate(restored[28][2]).b==sprite.b
+          puts "PASS 138 scripts; replaced V272 boss runtime in place; no aliases of Game_Event/Sprite_Character"
+          puts "PASS 3 independent boss pages (idle/battle/death), all native interpreter"
+          puts "PASS approved #{attack.length} attack commands embedded in event ONCE (physical:magic 6:1)"
+          puts 'PASS valid HP var 4987 and switch 5987, no invalid 7001 or 7002'
+          puts 'PASS original 20 rewards/drops, original graphics, unrelated events/scripts untouched'
+          V273_PATCH
           ruby -c build/patch.rb
           ruby build/patch.rb
 
-      - name: V272 Verify removed duplication
+      - name: V273 Native combat, rewards and renderer regression tests
         shell: bash
         run: |
           set -euo pipefail
+          cat > build/test_runtime.rb <<'V273_TEST_RUNTIME'
+          # encoding: UTF-8
+          class Game_Map
+            attr_accessor :map_id,:events,:need_refresh
+            def setup(mid);@map_id=mid;end
+          end
+          class Game_Event
+            attr_accessor :x,:y,:direction,:character_name
+            def initialize(mid,eid)
+              @map_id=mid;@id=eid;@x=100;@y=100;@direction=2
+              @character_name='SLZenithIdle';@erased=false
+            end
+            def moving?;false;end
+            def erase;@erased=true;end
+          end
+          module Graphics
+            @frames=0
+            def self.frame_count;@frames;end
+            def self.next(n=1);@frames+=n;end
+          end
+          module Input
+            C=13
+            @pressed=false
+            def self.trigger?(key);@pressed;end
+            def self.press?(key);@pressed;end
+            def self.pressed=(v);@pressed=v;end
+          end
+          class TestVariables
+            attr_reader :writes
+            def initialize(max);@max=max;@data={};@writes=[];end
+            def [](k);(k<=@max) ? @data.fetch(k,0) : 0;end
+            def []=(k,val);if k<=@max;@data[k]=val;@writes<<[k,val];end;end
+          end
+          class Party
+            attr_accessor :actors,:gold,:drops
+            def initialize(actor);@actors=[actor];@gold=0;@drops=[];end
+            def gain_gold(n);@gold+=n;end
+            def gain_item(id,n);@drops<<[:item,id,n];end
+            def gain_weapon(id,n);@drops<<[:weapon,id,n];end
+            def gain_armor(id,n);@drops<<[:armor,id,n];end
+          end
+          Actor=Struct.new(:hp,:atk,:agi,:exp)
+          Player=Struct.new(:x,:y,:direction,:animation_id)
+          $game_variables=TestVariables.new(5000)
+          $game_switches=TestVariables.new(6000)
+          $game_actors={}
+          $data_animations=Array.new(80){Object.new}
+          $mobile_auto_attack_active=false
+          $mobile_auto_attack_event_id=0
+          $m=nil
+          actor=Actor.new(30000,200,100,0)
+          $game_party=Party.new(actor)
+          $game_player=Player.new(120,120,2,0)
+          $game_map=Game_Map.new
+          load 'build/runtime.rb'
+          $game_map.setup(25)
+          boss=Game_Event.new(25,29)
+          $game_map.events={29=>boss}
+          cfg=SLZenithV273.config(25,29)
+          raise 'approved config missing' unless cfg[:level]==60 && cfg[:max_hp]==5200 && cfg[:drops].size==20
+          raise 'wrong approved attack' unless cfg[:physical]==[50,100] && cfg[:magic]==[150,300]
+          raise 'HP range wrong' unless cfg[:damage_var]==4987 && $game_variables[4987]==0
+          raise 'switch range wrong' unless $game_switches[5987]==false
+          Graphics.next(1)
+          200.times{Graphics.next(1);SLZenithV273.tick(25,29)}
+          raise 'boss activated while offscreen' if $game_switches[5987]
+          raise 'passive damage' unless $game_variables[4987]==0
+          $game_player.x=102;$game_player.y=102
+          Graphics.next(1)
+          SLZenithV273.tick(25,29)
+          raise 'native battle page did not activate' unless $game_switches[5987] && $game_map.need_refresh
+          $game_map.need_refresh=false
+          raise 'attacked before 20 frames' if SLZenithV273.attack_due?(25,29)
+          Graphics.next(25)
+          raise 'failed to issue native attack' unless SLZenithV273.attack_due?(25,29)
+          raise 'attack pulse repeated same frame' if SLZenithV273.attack_due?(25,29)
+          raise 'attack wrong animation' unless boss.character_name.start_with?('SLZenith')
+          SLZenithV273.magic_start(25,29)
+          raise 'magic effect missing' unless [25,14,15,16].include?($game_player.animation_id)
+          Graphics.next(25)
+          $game_player.x=100;$game_player.y=101;$game_player.direction=8
+          Input.pressed=true
+          SLZenithV273.tick(25,29)
+          raise 'native hit failed' unless $game_variables[4987]==200
+          raise 'hit animation not set' unless boss.character_name=='SLZenithHit'
+          # Same input in next engine tick is cool-down protected.
+          Graphics.next(1);SLZenithV273.tick(25,29)
+          raise 'repeat hit without wait' unless $game_variables[4987]==200
+          Input.pressed=false
+          $game_player.x=120;$game_player.y=120
+          Graphics.next(1);SLZenithV273.tick(25,29)
+          raise 'native pursuit failed to disengage' if $game_switches[5987]
+          SLZenithV273.hit(25,29,5000)
+          raise 'boss HP not capped at 5200' unless $game_variables[4987]==5200
+          raise 'death page not requested' unless $game_map.need_refresh
+          Graphics.next(1);SLZenithV273.death_tick(25,29)
+          raise 'XP not paid once' unless actor.exp==43212
+          raise 'gold outside approved band' unless (64800..151200).include?($game_party.gold)
+          startgold=$game_party.gold
+          Graphics.next(1);SLZenithV273.death_tick(25,29)
+          raise 'double reward' unless $game_party.gold==startgold && actor.exp==43212
+          Graphics.next(45);SLZenithV273.death_tick(25,29)
+          raise 'death erase failed' unless boss.instance_variable_get(:@erased)
+          raise 'native graphics' unless SLZenithV273.frame_info(boss)[3]==17
+          puts 'PASS V273 5000/6000 variable and switch bounds, recognition/disengage'
+          puts 'PASS V273 approved stats, 6:1 native command branch, attacks and CE magic'
+          puts 'PASS V273 input-only hit, no duplicate damage, HP5200, EXP43212, gold once'
+          puts 'PASS V273 death animation, erase, no parallel interpreter allocation'
+          V273_TEST_RUNTIME
 
-          python3 - <<'PY'
-          from pathlib import Path
+          cat > build/test_sprite.rb <<'V273_TEST_SPRITE'
+          class Game_Map
+            attr_accessor :map_id,:events
+            def setup(mid);@map_id=mid;end
+          end
+          class Game_Event
+            attr_accessor :tile_id,:character_name,:character_hue,:pattern,:direction,:transparent,:animation_id,
+            :opacity,:blend_type,:bush_depth
+            def initialize(mid,eid,char)
+              @map_id=mid;@id=eid;@tile_id=0;@character_name=char
+              @character_hue=0;@pattern=0;@direction=2;@transparent=false
+              @animation_id=0;@opacity=255;@blend_type=0;@bush_depth=0
+            end
+            def screen_x;30;end;def screen_y;50;end;def screen_z(h);h;end
+          end
+          module Graphics
+            def self.frame_count;27;end
+          end
+          class Rect
+            attr_reader :last
+            def set(*args);@last=args;end
+          end
+          class Bitmap
+            attr_reader :width,:height
+            def initialize(w,h);@width=w;@height=h;end
+          end
+          module RPG
+            class Sprite
+              attr_accessor :bitmap,:ox,:oy,:visible,:x,:y,:z,:opacity,:blend_type,:bush_depth
+              attr_reader :src_rect
+              def initialize(*args);@src_rect=Rect.new;end
+              def update;end
+              def animation(*args);end
+            end
+            module Cache
+              def self.character(name,hue)
+                case name
+                when 'SLZenithWalk' then Bitmap.new(1728,480)
+                when 'SLZenithIdle' then Bitmap.new(1584,480)
+                when 'SLZenithAttack' then Bitmap.new(1872,528)
+                else Bitmap.new(128,128)
+                end
+              end
+            end
+          end
+          $game_map=Game_Map.new;$game_map.map_id=25
+          $game_variables=Hash.new(0);$game_switches=Hash.new(false)
+          load 'build/runtime.rb'
+          load 'build/native-sprite.rb'
+          normal=Sprite_Character.new(nil,Game_Event.new(25,11,'Medusa'))
+          raise "Native normal sprite changed #{normal.src_rect.last}" unless normal.src_rect.last==[0,0,32,32]
+          boss=Game_Event.new(25,29,'SLZenithWalk')
+          sprite=Sprite_Character.new(nil,boss)
+          expected=[(27/2)%12*144,0,144,120]
+          raise "Bad original Zenith walk frame #{sprite.src_rect.last}" unless sprite.src_rect.last==expected
+          boss.character_name='SLZenithAttack'
+          sprite.update
+          raise "Bad original Zenith attack frame #{sprite.src_rect.last}" unless sprite.src_rect.last[2..3]==[144,132]
+          normal.update
+          raise 'Unrelated sprite corrupted' unless normal.src_rect.last==[0,0,32,32]
+          puts 'PASS V273 single native sprite renderer, original 12-column walk and 13-column attack'
+          puts 'PASS V273 unrelated four-column monster graphics unchanged'
+          V273_TEST_SPRITE
 
-          monster=Path('build/monster-runtime.rb').read_text('utf-8')
-          sprite=Path('build/native-sprite.rb').read_bytes()
+          cat > build/check_page.rb <<'V273_CHECK_PAGE'
+          require 'zlib'
+          module RPG
+           class Map;end;class MapInfo;end;class AudioFile;end;class CommonEvent;end
+           class Event;class Page;class Condition;end;class Graphic;end;end;end
+           class MoveRoute;end;class MoveCommand;end;class EventCommand;end
+          end
+          class Table
+           def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+           def _dump(n=0);@raw;end
+          end
+          class Tone
+           def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+           def _dump(n=0);@raw;end
+          end
+          class Color<Tone;end
+          def g(o,k);o.instance_variable_get('@'+k.to_s);end
+          base='site/knight/gameasync/Data/'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          map=Marshal.load(File.binread(base+pre+'Map025.rxdata'))
+          boss=g(map,:events).fetch(29)
+          pages=g(boss,:pages)
+          raise 'Native page count' unless pages.length==3
+          raise 'Native triggers' unless pages.map{|p|g(p,:trigger)}==[4,4,4]
+          raise 'Native move types' unless pages.map{|p|g(p,:move_type)}==[1,3,0]
+          raise 'Native pursuit differs' unless g(g(pages[1],:move_route),:list).map{|x|g(x,:code)}==[10,0]
+          raise 'Native switch invalid' unless g(g(pages[1],:condition),:switch1_id)==5987
+          raise 'Native death var invalid' unless g(g(pages[2],:condition),:variable_id)==4987 && g(g(pages[2],:condition),:variable_value)==5200
+          code=g(pages[1],:list)
+          raise 'Unbounded event loop' unless code.last.instance_variable_get(:@code)==0 && code[-2].instance_variable_get(:@code)==106
+          raise 'Missing 6:1' unless code.any?{|c|g(c,:code)==122 && g(c,:parameters)==[26,26,0,2,0,6]}
+          raise 'Missing magic floor' unless code.any?{|c|g(c,:code)==111 && g(c,:parameters)==[1,26,0,80,2]}
+          raise 'Missing CE57' unless code.count{|c|g(c,:code)==117 && g(c,:parameters)==[57]}==2
+          raise 'Wrong page batch' unless code.size==55
+          scripts=Marshal.load(File.binread(base+'Scripts.rxdata'))
+          raise 'Runtime name missing' unless scripts.count{|s|s[1]=='SLZenithV273'}==1
+          raise 'Old runtime remains' if scripts.any?{|s|%w[SLMonsterV272 SLMonsterV267 SLZenithV254].include?(s[1])}
+          runtime=Zlib::Inflate.inflate(scripts.find{|s|s[1]=='SLZenithV273'}[2])
+          raise 'Runtime has custom event update' if runtime.include?('class Game_Event') || runtime.include?('class Sprite_Character') || runtime.include?('Interpreter.new(')
+          puts 'PASS native 3-page event, 55 battle commands, one standard event interpreter'
+          puts 'PASS original CE57, 6:1 split, magic minimum 80, no extra event update'
+          V273_CHECK_PAGE
 
-          assert 'class Sprite_Character' not in monster
-          assert monster.count('class Game_Event')==1
-          assert monster.count('SLMonster.update_event(self) if c')==1
-          assert monster.count('Interpreter.new(0)')==1
-          assert monster.count('s[:native_commands] ||= attack_commands(c)')==1
-          assert 'last_update_frame' in monster
-          assert 'walk_cached_tick' in monster
-
-          assert sprite.count(b'class Sprite_Character')==1
-          assert sprite.count(b'SLMonster.frame_info(@character)')==1
-          assert sprite.count(b'@slm_v272_cfg')>=2
-
-          print('PASS no extra sprite update layer')
-          print('PASS one native renderer')
-          print('PASS one native attack Interpreter allocation site')
-          print('PASS original monster flag preserved')
-          PY
-
+          ruby -c build/runtime.rb
           ruby -c build/native-sprite.rb
-          ruby -c build/monster-runtime.rb
-          node --check site/knight/js/drive.js
-          node --check site/knight/js/sl-assets-v229r115.js
+          ruby build/check_page.rb
+          ruby build/test_runtime.rb
+          ruby build/test_sprite.rb
 
-      - name: V272 Refresh game resource hashes
+      - name: V273 Refresh exact game resource hashes and version metadata
         shell: bash
         run: |
           set -euo pipefail
-
-          python3 - <<'PY'
+          cat > build/update_pages.py <<'V273_UPDATE_META'
           from pathlib import Path
-          import hashlib,re
-
+          import re,hashlib
           root=Path('site')
           game=root/'knight/gameasync'
           mapping=game/'mapping.js'
-          text=mapping.read_text('utf-8')
-
-          targets=[
-              game/'Data/Scripts.rxdata',
-              game/'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap025.rxdata'
-          ]
-
-          for path in targets:
-              key='Data/'+path.name
-              digest=hashlib.md5(path.read_bytes()).hexdigest()
-              pattern='('+re.escape(key)+r'\?h=)[0-9a-f]{32}'
-              text,count=re.subn(
-                  pattern,
-                  lambda match:match.group(1)+digest,
-                  text
-              )
-              assert count==1,('Mapping hash mismatch',key,count)
-
-          mapping.write_text(text,encoding='utf-8')
-
+          src=mapping.read_text('utf-8')
+          for f in (game/'Data/Scripts.rxdata',game/'Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap025.rxdata'):
+              key='Data/'+f.name
+              digest=hashlib.md5(f.read_bytes()).hexdigest()
+              src,n=re.subn(r'('+re.escape(key)+r'\?h=)[0-9a-f]{32}',lambda m:m.group(1)+digest,src)
+              assert n==1,(key,n)
+          mapping.write_text(src,'utf-8')
           loader=root/'knight/js/sl-assets-v229r115.js'
           js=loader.read_text('utf-8')
-          assert js.count("var version='V267';")==1
-          loader.write_text(
-              js.replace("var version='V267';","var version='V272';"),
-              encoding='utf-8'
-          )
-
-          for name in ('index.html','knight/index.html'):
-              path=root/name
-              html=path.read_text('utf-8')
-              assert 'V267' in html,name
-              html=html.replace('V267','V272').replace('v267','v272')
-              path.write_text(html,encoding='utf-8')
-
-          print('PASS V272 mapping hashes and cache identifiers')
-          PY
-
-          node --check site/knight/gameasync/mapping.js
+          assert js.count("var version='V272';")==1
+          loader.write_text(js.replace("var version='V272';","var version='V273';"),'utf-8')
+          for rel in ('index.html','knight/index.html'):
+              f=root/rel
+              s=f.read_text('utf-8')
+              assert 'V272' in s,rel
+              f.write_text(s.replace('V272','V273').replace('v272','v273'),'utf-8')
+          print('PASS V273 manifest hashes, version labels; original drive.js unchanged')
+          V273_UPDATE_META
+          python3 build/update_pages.py
           node --check site/knight/js/drive.js
           node --check site/knight/js/sl-assets-v229r115.js
           node --check site/knight/js/dpad.js
+          node --check site/knight/gameasync/mapping.js
 
-      - name: V272 Verify all unrelated game data
+      - name: V273 Verify unrelated original game files are preserved
         shell: bash
         run: |
           set -euo pipefail
-
-          python3 - <<'PY'
+          cat > build/verify.py <<'V273_VERIFY'
           from pathlib import Path
-          import hashlib,json
-
+          import json,hashlib
           root=Path('site')
           before=json.loads(Path('build/before.json').read_text('utf-8'))
-          after={
-              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-
+          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
           pre='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          allowed={pre+'Map025.rxdata','knight/gameasync/Data/Scripts.rxdata','knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js','index.html','knight/index.html'}
+          assert len(after)==5610 and set(before)==set(after)
+          changed={name for name in before if before[name]!=after[name]}
+          assert changed==allowed,('Unauthorized changes',changed^allowed)
+          for key in before:
+              if key.startswith('knight/gameasync/Graphics/'):
+                  assert before[key]==after[key],key
+          for key in ('knight/js/drive.js','knight/js/dpad.js',pre+'Map016.rxdata',pre+'Map021.rxdata',pre+'CommonEvents.rxdata','knight/assets/map-047-v241.pack'):
+              assert before[key]==after[key],key
+          print('PASS changed only Map025, Scripts, mapping, version metadata; all other 5604 resources identical')
+          V273_VERIFY
+          python3 build/verify.py
 
-          allowed={
-              pre+'Map025.rxdata',
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/mapping.js',
-              'knight/js/sl-assets-v229r115.js',
-              'index.html',
-              'knight/index.html'
-          }
-
-          assert len(after)==5610
-          assert set(before)==set(after)
-
-          changed={key for key in before if before[key]!=after[key]}
-          assert changed==allowed,(
-              'Unexpected modifications',
-              sorted(changed^allowed)
-          )
-
-          protected=(
-              'knight/js/drive.js',
-              'knight/js/dpad.js',
-              pre+'Map016.rxdata',
-              pre+'Map021.rxdata',
-              pre+'CommonEvents.rxdata',
-              'knight/assets/map-047-v241.pack'
-          )
-
-          for name in protected:
-              assert before[name]==after[name],name
-
-          for name in before:
-              if name.startswith('knight/gameasync/Graphics/'):
-                  assert before[name]==after[name],name
-
-          print('PASS only Zenith event and the existing script archive changed')
-          print('PASS original browser loading code unchanged')
-          print('PASS Kurtz, Death Knight, original graphics and drops unchanged')
-          PY
-
-      - name: V272 Publish game
+      - name: V273 Publish game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
