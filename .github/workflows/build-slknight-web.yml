@@ -2,17 +2,17 @@
 # FILE: .github/workflows/build-slknight-web.yml
 # VERSION: V276.7.2
 # BASE: successful V276.7.1, run 41790334490.
-# BASE FILES: 5622 verified deployed game files.
+# BASE FILES: 5622 verified game files.
 # CHANGE: native Sprite_Character 4/8-frame selection.
+# FIX: detect native width expression without fixed bitmap name.
 # LEGACY: original 4-frame monsters unchanged.
-# NEW: SLZQWalk and SL8_ prefixed graphics use 8 frames.
-# DIRECTIONS: native 4 directions only.
-# RUNTIME: one original Sprite_Character.update.
+# NEW: SLZQWalk and SL8_ graphics use 8 frames.
+# DIRECTIONS: original four directions only.
+# RUNTIME: one native Sprite_Character.update.
 # REMOVE: queen-only duplicate update registration.
-# KEEP: all existing combat, animations, drops and respawn.
-# ROLLBACK: delete the single V276.7.2 patch step.
-# SAFETY: no direct GitHub source modification.
-# WARNING: runtime gameplay validation not yet performed.
+# KEEP: combat, animations, drops and respawn.
+# ROLLBACK: remove the V276.7.2 patch step.
+# VERSION: retain V276.7.2 until approved.
 
 name: build-slknight-web.yml | V276.7.2 | Clean Native Events and 2x Terrain
 
@@ -66,6 +66,7 @@ jobs:
           from pathlib import Path
 
           root=Path('site')
+
           files={
             str(p.relative_to(root)):
               hashlib.sha256(p.read_bytes()).hexdigest()
@@ -103,8 +104,8 @@ jobs:
             json.dumps(files),encoding='utf-8'
           )
 
-          print('PASS V276.7.1 5622 files restored')
-          print('PASS existing queen and native game retained')
+          print('PASS V276.7.1 baseline restored')
+          print('PASS 5622 original files')
           PY
 
       - name: V276.7.2 Native 4 and 8 frame branch
@@ -136,6 +137,7 @@ jobs:
               obj.instance_variable_set(:@raw,bytes)
               obj
             end
+
             def _dump(level=0)
               @raw
             end
@@ -147,6 +149,7 @@ jobs:
               obj.instance_variable_set(:@raw,bytes)
               obj
             end
+
             def _dump(level=0)
               @raw
             end
@@ -165,7 +168,7 @@ jobs:
           map_path=root+pre+'Map025.rxdata'
 
           # ------------------------------------------
-          # 1. Patch native Sprite_Character source.
+          # Native Sprite_Character.
           # No alias, no extra update, no timer.
           # ------------------------------------------
 
@@ -187,87 +190,131 @@ jobs:
           )
 
           script_id=matches.first
+
           original=Zlib::Inflate.inflate(
             scripts[script_id][2]
           )
 
           code=original.dup
 
-          width_anchor=
-            /^([ \t]*)@cw[ \t]*=[ \t]*(?:self\.)?bitmap\.width[ \t]*\/[ \t]*4[ \t]*$/
+          # Find the existing native assignments.
+          # Accept bitmap or charbitmap and CRLF.
+          # Preserve the original expression.
 
-          frame_anchor=
-            /^([ \t]*)sx[ \t]*=[ \t]*@character\.pattern[ \t]*\*[ \t]*@cw[ \t]*$/
+          width_lines=code.lines.select do |line|
+            line.match?(/^[ \t]*@cw[ \t]*=/) &&
+            line.match?(/\bwidth[ \t]*\/[ \t]*4\b/)
+          end
+
+          frame_lines=code.lines.select do |line|
+            line.match?(/^[ \t]*sx[ \t]*=/) &&
+            line.include?('@character.pattern')
+          end
 
           check(
-            code.scan(width_anchor).length==1,
-            'Native frame-width anchor mismatch'
+            width_lines.length==1,
+            'Native width lines: '+
+            code.lines.grep(/@cw[ \t]*=/).
+              map(&:strip).inspect
           )
 
           check(
-            code.scan(frame_anchor).length==1,
-            'Native frame-selection anchor mismatch'
+            frame_lines.length==1,
+            'Native frame lines: '+
+            code.lines.grep(/sx[ \t]*=/).
+              map(&:strip).inspect
           )
 
-          # Calculate image layout only when the native
-          # character bitmap is initialized or changed.
+          eol=code.include?("\r\n") ? "\r\n" : "\n"
 
-          code.sub!(width_anchor) do
-            indent=$1
-            [
-              '@sl_walk8 = (',
-              '  @character_name == "SLZQWalk" ||',
-              '  @character_name[0,4] == "SL8_"',
-              ')',
-              '@cw = bitmap.width / (@sl_walk8 ? 8 : 4)'
-            ].map{|line|indent+line}.join("\n")
-          end
+          width_line=width_lines.first
+          frame_line=frame_lines.first
 
-          # Preserve the original 4-frame pattern.
-          # Only 8-frame characters use movement progress.
+          indent=width_line[/\A[ \t]*/]
+          frame_indent=frame_line[/\A[ \t]*/]
 
-          code.sub!(frame_anchor) do
-            indent=$1
-            [
-              'sx = if @sl_walk8',
-              '  attacking = (',
-              '    @character.respond_to?(:sl_attack_active?) &&',
-              '    @character.sl_attack_active?',
-              '  )',
-              '  if @character.moving? && !attacking',
-              '    rx = @character.instance_variable_get(:@real_x)',
-              '    ry = @character.instance_variable_get(:@real_y)',
-              '    if rx && ry',
-              '      remaining = (',
-              '        (@character.x * 128 - rx).abs +',
-              '        (@character.y * 128 - ry).abs',
-              '      )',
-              '      progress = 128 - remaining',
-              '      progress = 0 if progress < 0',
-              '      progress = 127 if progress > 127',
-              '      (progress / 16) * @cw',
-              '    else',
-              '      0',
-              '    end',
-              '  else',
-              '    0',
-              '  end',
-              'else',
-              '  @character.pattern * @cw',
-              'end'
-            ].map{|line|indent+line}.join("\n")
-          end
+          # Replace only the original divisor 4.
+          # The original bitmap source is retained.
+
+          width_new=width_line.chomp.sub(
+            /(\bwidth[ \t]*\/[ \t]*)4\b/,
+            '\1(@sl_walk8 ? 8 : 4)'
+          )
+
+          check(
+            width_new!=width_line.chomp,
+            'Native width divisor not patched'
+          )
+
+          width_replacement=[
+            indent+'@sl_walk8 = (',
+            indent+'  @character.character_name == "SLZQWalk" ||',
+            indent+'  @character.character_name[0,4] == "SL8_"',
+            indent+')',
+            width_new
+          ].join(eol)+eol
+
+          check(
+            code.sub!(width_line,width_replacement),
+            'Native width replacement failed'
+          )
+
+          # Replace only native frame selection.
+          # Legacy pattern expression is preserved.
+
+          original_frame=frame_line.strip.sub(
+            /\Asx[ \t]*=[ \t]*/,
+            ''
+          )
+
+          frame_replacement=[
+            'sx = if @sl_walk8',
+            '  attacking = (',
+            '    @character.respond_to?(:sl_attack_active?) &&',
+            '    @character.sl_attack_active?',
+            '  )',
+            '  if @character.moving? && !attacking',
+            '    rx = @character.instance_variable_get(:@real_x)',
+            '    ry = @character.instance_variable_get(:@real_y)',
+            '    if rx && ry',
+            '      remaining = (',
+            '        (@character.x * 128 - rx).abs +',
+            '        (@character.y * 128 - ry).abs',
+            '      )',
+            '      progress = 128 - remaining',
+            '      progress = 0 if progress < 0',
+            '      progress = 127 if progress > 127',
+            '      (progress / 16) * @cw',
+            '    else',
+            '      0',
+            '    end',
+            '  else',
+            '    0',
+            '  end',
+            'else',
+            '  '+original_frame,
+            'end'
+          ].map{|line|frame_indent+line}.join(eol)+eol
+
+          check(
+            code.sub!(frame_line,frame_replacement),
+            'Native frame replacement failed'
+          )
 
           check(
             code!=original,
-            'Native character source was not changed'
+            'Native source was not changed'
           )
 
           check(
             code.include?('@sl_walk8') &&
-            code.include?('@character.pattern * @cw'),
-            'Both frame branches were not preserved'
+            code.include?('@character.pattern'),
+            'Original and new selectors missing'
           )
+
+          # Only the existing Sprite_Character
+          # script contents are replaced.
+          # No extra script entry is added.
 
           scripts[script_id][2]=Zlib::Deflate.deflate(code)
 
@@ -277,35 +324,38 @@ jobs:
           )
 
           saved=Marshal.load(File.binread(scripts_path))
+          original_scripts=Marshal.load(script_before)
 
           check(
             saved.length==137,
-            'Patched RGSS inventory mismatch'
+            'Patched RGSS count mismatch'
           )
 
           saved.each_with_index do |row,i|
             next if i==script_id
+
             check(
-              row==Marshal.load(script_before)[i],
-              'Unrelated original RGSS script changed'
+              row==original_scripts[i],
+              'Unrelated RGSS script changed'
             )
           end
 
           check(
-            Zlib::Inflate.inflate(saved[script_id][2])==code,
-            'Patched native script mismatch'
+            Zlib::Inflate.inflate(
+              saved[script_id][2]
+            )==code,
+            'Patched native source mismatch'
           )
 
           # ------------------------------------------
-          # 2. Remove the old queen-only update hook.
-          # The original 22 spawn commands remain.
+          # Remove queen-only runtime installer.
+          # Keep all original 22 spawn commands.
           # ------------------------------------------
 
           map_before=File.binread(map_path)
           map=Marshal.load(map_before)
 
           events=map.instance_variable_get(:@events)
-
           queen=events.fetch(29)
           pages=queen.instance_variable_get(:@pages)
 
@@ -319,23 +369,23 @@ jobs:
 
           check(
             commands.length==23,
-            'Original queen spawn command count mismatch'
+            'Original queen spawn count mismatch'
           )
 
           old_hook=commands.first
 
           check(
             old_hook.instance_variable_get(:@code)==355,
-            'Expected queen runtime installer not found'
+            'Queen runtime installer not found'
           )
 
-          text=old_hook.instance_variable_get(
+          old_text=old_hook.instance_variable_get(
             :@parameters
           )[0].to_s
 
           check(
-            text.include?('class Sprite_Character') &&
-            text.include?('slzq_v2767_original_update'),
+            old_text.include?('class Sprite_Character') &&
+            old_text.include?('slzq_v2767_original_update'),
             'Unexpected queen runtime installer'
           )
 
@@ -343,14 +393,18 @@ jobs:
 
           check(
             commands.length==22,
-            'Original 22 spawn commands not restored'
+            'Original 22 spawn commands missing'
           )
 
           page0.instance_variable_set(:@list,commands)
 
-          File.binwrite(map_path,Marshal.dump(map))
+          File.binwrite(
+            map_path,
+            Marshal.dump(map)
+          )
 
           verify=Marshal.load(File.binread(map_path))
+
           saved_pages=verify.instance_variable_get(
             :@events
           ).fetch(29).instance_variable_get(:@pages)
@@ -366,14 +420,15 @@ jobs:
             saved_pages.map{|p|
               p.instance_variable_get(:@list).length
             }==[22,1,217,2,20],
-            'Original queen event structure damaged'
+            'Original queen event pages damaged'
           )
 
-          puts 'PASS native 4/8-frame selection'
+          puts 'PASS native 4/8-frame branch'
+          puts 'PASS original width expression preserved'
           puts 'PASS original Sprite_Character.update retained'
           puts 'PASS no additional update method'
-          puts 'PASS original 4-frame pattern preserved'
-          puts 'PASS old queen-only renderer removed'
+          puts 'PASS legacy 4-frame pattern preserved'
+          puts 'PASS queen-only duplicate renderer removed'
           puts 'PASS original queen combat pages preserved'
 
           SLWALK8_RUBY
@@ -382,8 +437,7 @@ jobs:
           ruby build/slwalk8.rb
 
           # ------------------------------------------
-          # 3. Update only changed asset hashes and
-          #    display versions.
+          # Update changed hashes and display version.
           # ------------------------------------------
 
           python3 - <<'PY'
@@ -393,6 +447,7 @@ jobs:
           root=Path('site')
           game=root/'knight/gameasync'
           data=game/'Data'
+
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           mapping=game/'mapping.js'
@@ -405,7 +460,10 @@ jobs:
             path=data/name
             digest=hashlib.md5(path.read_bytes()).hexdigest()
 
-            token=re.escape('Data/'+name)+r'\?h=[0-9a-f]{32}'
+            token=(
+              re.escape('Data/'+name)+
+              r'\?h=[0-9a-f]{32}'
+            )
 
             content,count=re.subn(
               token,
@@ -414,11 +472,13 @@ jobs:
             )
 
             assert count==1,(
-              'Expected exactly one original mapping',
+              'Expected one original mapping',
               name,count
             )
 
-          mapping.write_text(content,encoding='utf-8')
+          mapping.write_text(
+            content,encoding='utf-8'
+          )
 
           loader=root/'knight/js/sl-assets-v229r115.js'
           text=loader.read_text('utf-8')
@@ -427,8 +487,10 @@ jobs:
           new="var version='V276.7.2';"
 
           assert text.count(old)==1
+
           loader.write_text(
-            text.replace(old,new),encoding='utf-8'
+            text.replace(old,new),
+            encoding='utf-8'
           )
 
           for name in (
@@ -441,14 +503,17 @@ jobs:
             assert 'V276.7.1' in text,name
 
             text=(
-              text.replace('V276.7.1','V276.7.2')
-                  .replace('?v=v276.7.1','?v=v276.7.2')
+              text.replace('V276.7.1','V276.7.2').
+                   replace('?v=v276.7.1','?v=v276.7.2')
             )
 
-            path.write_text(text,encoding='utf-8')
+            path.write_text(
+              text,encoding='utf-8'
+            )
 
-          old_hashes=json.loads(
-            Path('build/original_sha256.json').read_text('utf-8')
+          original_hashes=json.loads(
+            Path('build/original_sha256.json').
+              read_text('utf-8')
           )
 
           current={
@@ -458,13 +523,14 @@ jobs:
           }
 
           assert len(current)==5622
-          assert set(current)==set(old_hashes),(
-            'Unexpected files added or deleted'
+
+          assert set(current)==set(original_hashes),(
+            'Unexpected files added or removed'
           )
 
           changed={
-            name for name in old_hashes
-            if current[name]!=old_hashes[name]
+            name for name in original_hashes
+            if current[name]!=original_hashes[name]
           }
 
           expected={
@@ -477,13 +543,13 @@ jobs:
           }
 
           assert changed==expected,(
-            'Unexpected original file modification',
+            'Unexpected original modification',
             changed^expected
           )
 
           print('PASS six expected generated files changed')
-          print('PASS all remaining 5616 files unchanged')
-          print('PASS V276.7.2 display version')
+          print('PASS 5616 remaining files unchanged')
+          print('PASS V276.7.2 version retained')
           print('PASS native Script and Map025 hashes updated')
           PY
 
