@@ -4,15 +4,15 @@
 # BASE: successful V276.7.1, run 41790334490.
 # BASE FILES: 5622 verified game files.
 # CHANGE: native Sprite_Character 4/8-frame selection.
-# FIX: detect native width expression without fixed bitmap name.
+# WALK FIX: align SLZQWalk frame positions inside each cell.
 # LEGACY: original 4-frame monsters unchanged.
 # NEW: SLZQWalk and SL8_ graphics use 8 frames.
 # DIRECTIONS: original four directions only.
 # RUNTIME: one native Sprite_Character.update.
 # REMOVE: queen-only duplicate update registration.
 # KEEP: combat, animations, drops and respawn.
-# ROLLBACK: remove the V276.7.2 patch step.
-# VERSION: retain V276.7.2 until approved.
+# ROLLBACK: remove alignment step to restore prior walking PNG.
+# VERSION: retain V276.7.2.
 
 name: build-slknight-web.yml | V276.7.2 | Clean Native Events and 2x Terrain
 
@@ -107,6 +107,285 @@ jobs:
           print('PASS V276.7.1 baseline restored')
           print('PASS 5622 original files')
           PY
+
+      - name: Align queen walk frames without map movement
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install \
+            --disable-pip-version-check pillow
+
+          cat > build/align_slzq_walk.py <<'SLZQ_ALIGN'
+          from pathlib import Path
+          from statistics import median
+          from PIL import Image
+          import json
+
+          path=Path(
+            'site/knight/gameasync/Graphics/'
+            'Characters/SLZQWalk.png'
+          )
+
+          assert path.is_file(),path
+
+          original=Image.open(path).convert('RGBA')
+
+          COLS=8
+          ROWS=4
+
+          assert original.width%COLS==0
+          assert original.height%ROWS==0
+
+          CW=original.width//COLS
+          CH=original.height//ROWS
+
+          assert (CW,CH)==(168,144),(
+            'Unexpected original queen walk dimensions',
+            CW,CH
+          )
+
+          output=Image.new(
+            'RGBA',
+            original.size,
+            (0,0,0,0)
+          )
+
+          def analyze(frame):
+            alpha=frame.getchannel('A')
+            raw=alpha.getbbox()
+
+            assert raw is not None,(
+              'Empty walking frame'
+            )
+
+            mask=alpha.point(
+              lambda value:255 if value>=24 else 0
+            )
+
+            bbox=mask.getbbox()
+            assert bbox is not None
+
+            left,top,right,bottom=bbox
+
+            height=bottom-top
+
+            # Measure upper body rather than
+            # swinging arms and legs.
+            y1=top+round(height*0.12)
+            y2=top+round(height*0.60)
+
+            y1=max(top,min(y1,bottom-1))
+            y2=max(y1+1,min(y2,bottom))
+
+            pixels=alpha.load()
+
+            weight=0
+            sum_x=0
+
+            for y in range(y1,y2):
+              for x in range(left,right):
+                a=pixels[x,y]
+
+                if a<24:
+                  continue
+
+                weight+=a
+                sum_x+=x*a
+
+            body_x=(
+              sum_x/weight if weight
+              else (left+right-1)/2
+            )
+
+            return {
+              'body_x':body_x,
+              'foot_y':bottom-1,
+              'raw_bbox':raw
+            }
+
+          report=[]
+          corrected_count=0
+
+          for direction in range(ROWS):
+            frames=[]
+            metrics=[]
+
+            for index in range(COLS):
+              box=(
+                index*CW,
+                direction*CH,
+                (index+1)*CW,
+                (direction+1)*CH
+              )
+
+              frame=original.crop(box)
+              frames.append(frame)
+              metrics.append(analyze(frame))
+
+            # Shared fixed reference for this direction.
+            # Each frame retains its own limb pose.
+            target_x=median(
+              item['body_x'] for item in metrics
+            )
+
+            target_y=median(
+              item['foot_y'] for item in metrics
+            )
+
+            row_report=[]
+
+            for index,(frame,item) in enumerate(
+              zip(frames,metrics)
+            ):
+              dx=round(target_x-item['body_x'])
+              dy=round(target_y-item['foot_y'])
+
+              left,top,right,bottom=(
+                item['raw_bbox']
+              )
+
+              # Prevent pixel clipping at cell edges.
+              min_dx=-left
+              max_dx=CW-right
+              min_dy=-top
+              max_dy=CH-bottom
+
+              dx=max(min_dx,min(dx,max_dx))
+              dy=max(min_dy,min(dy,max_dy))
+
+              if dx!=0 or dy!=0:
+                corrected_count+=1
+
+              aligned=Image.new(
+                'RGBA',(CW,CH),(0,0,0,0)
+              )
+
+              aligned.paste(frame,(dx,dy))
+
+              # Verify that no visible pixel was lost.
+              source_alpha=sum(
+                frame.getchannel('A').getdata()
+              )
+              result_alpha=sum(
+                aligned.getchannel('A').getdata()
+              )
+
+              assert source_alpha==result_alpha,(
+                'Clipped visible walk pixels',
+                direction,index
+              )
+
+              output.paste(
+                aligned,
+                (index*CW,direction*CH)
+              )
+
+              row_report.append({
+                'frame':index,
+                'dx':dx,
+                'dy':dy,
+                'body_x_after':
+                  round(item['body_x']+dx,3),
+                'foot_y_after':
+                  item['foot_y']+dy
+              })
+
+            before_x=[
+              v['body_x'] for v in metrics
+            ]
+            before_y=[
+              v['foot_y'] for v in metrics
+            ]
+
+            after_x=[
+              v['body_x_after']
+              for v in row_report
+            ]
+            after_y=[
+              v['foot_y_after']
+              for v in row_report
+            ]
+
+            x_before=max(before_x)-min(before_x)
+            y_before=max(before_y)-min(before_y)
+
+            x_after=max(after_x)-min(after_x)
+            y_after=max(after_y)-min(after_y)
+
+            assert x_after<=x_before+1,(
+              'Horizontal alignment regressed',
+              direction
+            )
+
+            assert y_after<=y_before+1,(
+              'Vertical alignment regressed',
+              direction
+            )
+
+            report.append({
+              'direction':[2,4,6,8][direction],
+              'before_x_range':round(x_before,3),
+              'before_y_range':round(y_before,3),
+              'after_x_range':round(x_after,3),
+              'after_y_range':round(y_after,3),
+              'frames':row_report
+            })
+
+          assert corrected_count>0,(
+            'No original frame-position variation '
+            'was detected; source may require '
+            'a different walking correction'
+          )
+
+          # Generated site only.
+          # The restored baseline remains untouched.
+          output.save(path,optimize=True)
+
+          saved=Image.open(path).convert('RGBA')
+
+          assert saved.size==original.size
+          assert corrected_count<=32
+
+          Path(
+            'build/slzq_walk_alignment.json'
+          ).write_text(
+            json.dumps(
+              {
+                'frame_size':[CW,CH],
+                'corrected_frames':corrected_count,
+                'directions':report
+              },
+              indent=2
+            ),
+            encoding='utf-8'
+          )
+
+          for item in report:
+            print(
+              'Direction',item['direction'],
+              'X range',
+              item['before_x_range'],'->',
+              item['after_x_range'],
+              'Y range',
+              item['before_y_range'],'->',
+              item['after_y_range']
+            )
+
+          print(
+            'PASS queen walk alignment',
+            corrected_count,'of 32 frames'
+          )
+          print(
+            'PASS original poses and alpha preserved'
+          )
+          print(
+            'PASS no map-position changes'
+          )
+
+          SLZQ_ALIGN
+
+          python3 build/align_slzq_walk.py
 
       - name: V276.7.2 Native 4 and 8 frame branch
         shell: bash
@@ -476,6 +755,33 @@ jobs:
               name,count
             )
 
+          # Refresh the corrected walk PNG cache hash.
+          walk=(
+            game/'Graphics/Characters/SLZQWalk.png'
+          )
+
+          walk_digest=hashlib.md5(
+            walk.read_bytes()
+          ).hexdigest()
+
+          walk_token=(
+            re.escape(
+              'Graphics/Characters/SLZQWalk.png'
+            )+r'\?h=[0-9a-f]{32}'
+          )
+
+          content,count=re.subn(
+            walk_token,
+            'Graphics/Characters/SLZQWalk.png'
+            '?h='+walk_digest,
+            content
+          )
+
+          assert count==1,(
+            'Queen walk image mapping not unique',
+            count
+          )
+
           mapping.write_text(
             content,encoding='utf-8'
           )
@@ -536,6 +842,7 @@ jobs:
           expected={
             'knight/gameasync/Data/Scripts.rxdata',
             'knight/gameasync/Data/'+pre+'Map025.rxdata',
+            'knight/gameasync/Graphics/Characters/SLZQWalk.png',
             'knight/gameasync/mapping.js',
             'knight/js/sl-assets-v229r115.js',
             'index.html',
@@ -547,10 +854,10 @@ jobs:
             changed^expected
           )
 
-          print('PASS six expected generated files changed')
-          print('PASS 5616 remaining files unchanged')
+          print('PASS seven expected generated files changed')
+          print('PASS 5615 remaining files unchanged')
+          print('PASS corrected queen walk PNG mapping')
           print('PASS V276.7.2 version retained')
-          print('PASS native Script and Map025 hashes updated')
           PY
 
           node --check site/knight/gameasync/mapping.js
