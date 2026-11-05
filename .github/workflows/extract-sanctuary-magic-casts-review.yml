@@ -1,0 +1,461 @@
+# FILE: .github/workflows/review-sanctuary-magic-casts.yml
+# VERSION: V1.1 | CAST-FOCUSED CANDIDATE AUDIT
+# PURPOSE: original Sanctuary SPR -> real animated GIFs -> HTML viewer.
+# SCOPE: standalone original asset audit. NEVER touch SLKnight game, maps, Pages, or existing workflows.
+name: review-sanctuary-magic-casts.yml | V1.1 | Magic and Caster Motion Review
+
+"on":
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Magic FX is directionless; caster motions require 4-direction verification"
+        type: choice
+        required: true
+        default: magic
+        options: [magic, caster-monsters, caster-characters, all]
+      ids:
+        description: "Optional actor/effect IDs separated by commas/spaces (blank = L1J candidates)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sanctuary-sprite-audit-${{ github.ref }}-${{ inputs.scope }}
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXTRACTION_SCOPE: ${{ inputs.scope }}
+      FILTER_IDS: ${{ inputs.ids }}
+    steps:
+      - name: "Checkout existing Sanctuary actor roster (read-only)"
+        uses: actions/checkout@v4
+      - name: "Install verified decoder dependencies"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+          python3 -m pip install --disable-pip-version-check pillow==11.3.0
+      - name: "Download original Sanctuary archive and extract all 17 IDX/PAK pairs"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p downloads original packages
+          gh release download v1.0.0 -R gowellsik-hue/Game \
+            -p 'Sanctuary.of.Aden.-.Copy.*' -D downloads
+          test "$(find downloads -maxdepth 1 -name 'Sanctuary.of.Aden.-.Copy.z??' | wc -l)" -eq 45
+          test -s downloads/Sanctuary.of.Aden.-.Copy.zip
+          7z x downloads/Sanctuary.of.Aden.-.Copy.zip \
+            'Sanctuary of Aden - Copy/Sprite*.idx' \
+            'Sanctuary of Aden - Copy/Sprite*.pak' \
+            "-o${PWD}/original" -y
+          test "$(find original -name 'Sprite*.pak' | wc -l)" -eq 17
+          test "$(find original -name 'Sprite*.idx' | wc -l)" -eq 17
+          rm -rf downloads
+      - name: "Read actual SPR records, decode every selected frame, package HTML and GIFs"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/sanctuary_extract.py <<'PY'
+          from __future__ import annotations
+          import csv, io, json, os, re, struct, hashlib, zipfile
+          from pathlib import Path
+          from collections import defaultdict, Counter
+          from PIL import Image
+
+          ROOT=Path('original/Sanctuary of Aden - Copy')
+          OUT=Path('packages'); OUT.mkdir(exist_ok=True)
+          MODE=os.getenv('EXTRACTION_SCOPE','magic')
+          FILTER={int(x) for x in re.findall(r'\d+',os.getenv('FILTER_IDS',''))}
+          assert MODE in ('magic','caster-monsters','caster-characters','all')
+          MAGIC_REF={int(x) for x in '''10 129 167 168 169 170 171 172 189 221 226 227 228 230 236 243 245 252 744 745 746 747 748 749 750 752 754 755 756 757 758 759 760 762 763 829 830 832 870 871 1043 1115 1119 1160 1583 1606 1608 1662 1765 1776 1783 1794 1797 1798 1799 1800 1801 1804 1805 1809 1811 1812 1815 1819 1991 2059 2165 2170 2171 2173 2174 2175 2176 2177 2178 2179 2180 2181 2182 2184 2186 2228 2230 2231 2232 2234 2236 2241 2242 2243 2244 2245 2246 2247 2248 2249 2250 2251 2252 2261 2277 2280 2285 2286 2287 2288 2483 2510 2527 2537 2546 2739 2740 2748 2750 2759 2760 2761 2775 2806 2809 2810 2819 2941 2942 2943 2944 2945 2946 2947 2948 2949 2950 2951 2952 3104 3363 3393 3396 3417 3572 3685 3700 3705 3762 3909 3910 3911 3924 3932 3933 3934 3935 3936 3941 3942 3943 3944 4080 4156 4160 4163 4166 4184 4238 4326 4374 4375 4395 4396 4400 4401 4402 4406 4434 4539 4579 4584 4629 4648 4655 4660 4663 4673 4676 4696 4706 4824 4834 4836 4840 4846 5131 5261 5281 5301 5376 5410 5415 5445 5449 5469 5474 5521 5524 5550 5561 5570 5616 5626 5631 5633 5637 5638 5643 5651 5663 5789 5825 5826 5829 5830 5831 5832 5833 5847 5906 5907 5908 5909 5910 6342 6505 6506 6507 6508 6512 6516 6519 6523 6525 6526 6527 6528 6530 6531 6532 6551 6553 6572 6575 6576 6577 6578 6586 6588 6590 6598 6668 6703 6708 6709 6714 6715 6720 6721 6727 6813 6922 6975 6976 6988 7020'''.split()}
+          assert len(MAGIC_REF)==273
+          CHARACTERS={0:'Royal M',1:'Royal F',61:'Knight M',48:'Knight F',138:'Elf M',37:'Elf F',734:'Wizard M',1186:'Wizard F',2786:'Dark Elf M',2796:'Dark Elf F',6658:'Dragon Knight M',6661:'Dragon Knight F',6671:'Illusionist M',6650:'Illusionist F'}
+
+          # Prior 615 roster retained only for optional reference checks; the caster
+          # selection is instead based on L1J magic/summon mobskill records.
+          txt=Path('.github/workflows/audit-sanctuary-monsters.yml').read_text('utf8')
+          match=re.search(r'WANTED\s*=\s*set\(map\(int,\s*"""(.*?)"""\.split\(\)\)\)',txt,re.S)
+          if not match: raise RuntimeError('Cannot identify the verified V45 monster roster')
+          MONSTERS={int(x) for x in match.group(1).split()}
+          assert len(MONSTERS)==615
+
+          # IDX layout: little-endian count, then 28-byte entries (offset, name[20], size).
+          records=defaultdict(list); total=0
+          for idx in sorted(ROOT.glob('Sprite*.idx')):
+              pak=idx.with_suffix('.pak')
+              if not pak.is_file(): raise RuntimeError('Missing PAK for '+idx.name)
+              data=idx.read_bytes()
+              if len(data)<4: raise RuntimeError('Truncated index '+idx.name)
+              count=struct.unpack_from('<I',data,0)[0]
+              if len(data)!=4+28*count: raise RuntimeError('Invalid IDX layout '+idx.name)
+              for i in range(count):
+                  pos=4+i*28
+                  offset=struct.unpack_from('<I',data,pos)[0]
+                  fname=data[pos+4:pos+24].split(b'\0',1)[0].decode('cp949','replace')
+                  size=struct.unpack_from('<I',data,pos+24)[0]
+                  if size<1 or offset<0 or offset+size>pak.stat().st_size:
+                      raise RuntimeError('PAK record outside file '+idx.name+':'+fname)
+                  hit=re.fullmatch(r'(\d+)-(\d+)\.spr',fname,re.I)
+                  if hit:
+                      aid,sub=map(int,hit.groups())
+                      records[aid].append((sub,pak,offset,size,fname))
+                  total+=1
+          assert len(list(ROOT.glob('Sprite*.idx')))==17
+          assert total==158040, ('Original record count changed',total)
+          assert len(records)==8233, ('Original actor count changed',len(records))
+
+          # Magic effect graphics are separate from actors; there is NO direction for magic FX.
+          # The 273 spell IDs are references from external L1J, not names proven in Sanctuary.
+          magic=MAGIC_REF
+          # Only actors connected to magic/summon records in L1J NPC + mobskill
+          # (Type=2/3) are included here. These references are not Sanctuary
+          # action-to-SPR mappings, so NEVER call an unreviewed bank a cast motion.
+          CAST_MONSTER_REF={int(x) for x in '''53 173 183 185 187 240 951 1011 1112 1116 1123 1128 1180 1245 1390 1590 1603 1610 1616 1632 1649 1773 1780 1791 1828 2001 2112 2118 2268 2379 2389 2402 2409 2421 2468 2495 2524 2535 2538 2544 2738 2741 2747 2749 2757 2773 2803 2807 3066 3143 3154 3156 3178 3180 3182 3360 3364 3365 3376 3387 3568 3664 3678 3698 3744 3747 3783 3957 3989 4009 4010 4011 4012 4013 4017 4024 4025 4028 4029 4030 4034 4041 4051 4068 4091 4100 4121 4168 4171 4192 4364 4403 4404 4405 4407 4408 4410 4466 4493 4502 4517 4533 4544 4563 4576 4582 4587 4595 4612 4625 4652 4657 4667 4670 4693 4701 4912 4935 4937 5008 5072 5089 5212 5259 5265 5269 5274 5282 5284 5293 5297 5317 5324 5331 5338 5365 5373 5412 5442 5447 5461 5463 5471 5478 5484 5507 5511 5516 5547 5567 5608 5620 5655 5657 5677 5724 5739 5742 5745 5751 5754 5786 5818 6290 6562 6563 6566 6569 6581 6595 6645 6649 6664 6665 6699 6704'''.split()}
+          assert len(CAST_MONSTER_REF)==176
+          chosen={}
+          if MODE in ('magic','all'):chosen['magic']=magic
+          if MODE in ('caster-monsters','all'):chosen['caster-monsters']=CAST_MONSTER_REF
+          if MODE in ('caster-characters','all'):chosen['caster-characters']=set(CHARACTERS)
+          if FILTER:
+              chosen={kind:(ids & FILTER) for kind,ids in chosen.items()}
+              if not any(chosen.values()):raise RuntimeError('Selected IDs are not in this group')
+
+          # Verified original SPR decoder: effects remain directionless. Actor banks are NOT mapped to cast action yet.
+          class Reader:
+              def __init__(self,data): self.data=data;self.pos=0
+              def read(self,fmt):
+                  sz=struct.calcsize(fmt)
+                  if self.pos+sz>len(self.data):raise ValueError('Truncated SPR')
+                  out=struct.unpack_from(fmt,self.data,self.pos)
+                  self.pos+=sz
+                  return out[0] if len(out)==1 else out
+              def decode(self):
+                  count=self.read('<B');palette=None
+                  if count==255:
+                      n=self.read('<B') or 256
+                      palette=[self.read('<H') for _ in range(n)]
+                      count=self.read('<B')
+                  if not 1<=count<=240: raise ValueError('Unsupported frame count')
+                  frames=[]
+                  for _ in range(count):
+                      self.read('<hhhh');self.read('<HH');n=self.read('<H')
+                      if n>1500:raise ValueError('Excessive sprite blocks')
+                      frames.append([self.read('<bbBH') for _ in range(n)])
+                  nblocks=self.read('<i')
+                  if not 0<=nblocks<=20000:raise ValueError('Invalid block table')
+                  offsets=[self.read('<i') for _ in range(nblocks)]
+                  self.read('<i');start=self.pos
+                  used={b[3] for group in frames for b in group}
+                  if any(i>=nblocks for i in used):raise ValueError('Block ID outside table')
+                  decoded={}
+                  for block_id in sorted(used):
+                      p=start+offsets[block_id]
+                      if p<start or p+4>len(self.data):raise ValueError('Invalid block offset')
+                      def byte():
+                          nonlocal p
+                          if p>=len(self.data):raise ValueError('Truncated pixel data')
+                          x=self.data[p];p+=1;return x
+                      sx=byte();sy=byte();byte();h=byte();pixels=[]
+                      for y in range(h):
+                          x=sx
+                          for _ in range(byte()):
+                              x+=byte()//2
+                              for _ in range(byte()):
+                                  if palette is None:color=byte()|(byte()<<8)
+                                  else:
+                                      n=byte()
+                                      if n>=len(palette):raise ValueError('Palette out of range')
+                                      color=palette[n]
+                                  if x>=24 or sy+y>=24:raise ValueError('Pixel outside block')
+                                  if color!=32768:pixels.append((x,sy+y,color))
+                                  x+=1
+                      decoded[block_id]=pixels
+                  images=[]
+                  for group in frames:
+                      if not group:
+                          images.append(None);continue
+                      points=[]
+                      for a,b,kind,blockid in group:
+                          adjusted=a-1 if a<0 else a
+                          half=int(adjusted/2)
+                          points.append((24*(b+a-half),12*(b-half),blockid))
+                      minx=min(x for x,y,i in points); miny=min(y for x,y,i in points)
+                      maxx=max(x+24 for x,y,i in points);maxy=max(y+24 for x,y,i in points)
+                      w=maxx-minx;h=maxy-miny
+                      if not 1<=w<=1000 or not 1<=h<=1000:raise ValueError('Invalid canvas size')
+                      image=Image.new('RGBA',(w,h),(0,0,0,0));out=image.load()
+                      for x,y,bi in points:
+                          for px,py,c in decoded[bi]:
+                              out[x+px-minx,y+py-miny]=(((c>>10)&31)*255//31,((c>>5)&31)*255//31,(c&31)*255//31,255)
+                      images.append(image)
+                  return images
+
+          def gifify(frames):
+              visible=[x for x in frames if x is not None and x.getbbox()]
+              if not visible:raise ValueError('No visible frames')
+              w=max(x.width for x in visible);h=max(x.height for x in visible)
+              out=[]
+              for frame in frames:
+                  canvas=Image.new('RGBA',(w,h),(0,0,0,0))
+                  if frame is not None:
+                      canvas.alpha_composite(frame,((w-frame.width)//2,(h-frame.height)//2))
+                  pal=canvas.convert('RGB').quantize(colors=255)
+                  pal.paste(255,mask=canvas.getchannel('A').point(lambda x:255 if x<128 else 0))
+                  out.append(pal)
+              b=io.BytesIO()
+              out[0].save(b,format='GIF',save_all=True,append_images=out[1:],duration=150,
+                          loop=0,disposal=2,transparency=255,optimize=False)
+              raw=b.getvalue()
+              with Image.open(io.BytesIO(raw)) as chk:
+                  if chk.format!='GIF':raise ValueError('Invalid encoded GIF')
+                  chk.seek(chk.n_frames-1);chk.load()
+              return raw,len(frames)
+
+          # Each downloadable ZIP remains below the 512 MiB connector limit.
+          LIMIT=390*1024*1024
+          parts=[];size=0;arc=None
+          def new_part():
+              global arc,size
+              if arc is not None:arc.close()
+              p=OUT/f'part-{len(parts)+1:02d}.zip'
+              parts.append(p)
+              arc=zipfile.ZipFile(p,'w',compression=zipfile.ZIP_STORED,allowZip64=True)
+              size=0
+          new_part()
+          inventory=[];errors=[];counter=Counter();opened={}
+          def src(pak):
+              if pak not in opened:opened[pak]=pak.open('rb')
+              return opened[pak]
+          for kind,actors in chosen.items():
+              for aid in sorted(actors):
+                  source_rows=sorted(records.get(aid,[]),key=lambda x:(x[0],x[1].name))
+                  if not source_rows:
+                      errors.append([kind,aid,'','','missing_original_sprite']);continue
+                  for sub,pak,off,nbytes,fname in source_rows:
+                      if kind!='magic' and sub%8 not in (1,3,5,7):continue
+                      relative=f'gifs/{kind}/{pak.stem}/{aid}/{aid}-{sub}.gif'
+                      try:
+                          handle=src(pak);handle.seek(off);data=handle.read(nbytes)
+                          if len(data)!=nbytes:raise ValueError('Truncated PAK record')
+                          gif,nframes=gifify(Reader(data).decode())
+                          if size+len(gif)+len(relative)*2+512>LIMIT:new_part()
+                          arc.writestr(relative,gif)
+                          size+=len(gif)+len(relative)*2+512
+                          label=('L1J effect reference — original mapping UNVERIFIED' if aid in MAGIC_REF else 'not confirmed') if kind=='magic' else ('player cast BANK UNVERIFIED' if kind=='caster-characters' else 'monster magic actor BANK UNVERIFIED')
+                          inventory.append([kind,aid,sub,pak.name,fname,nframes,len(gif),relative,label,hashlib.sha256(data).hexdigest()])
+                          counter[kind]+=1
+                      except (ValueError,IndexError,OverflowError,MemoryError,OSError) as exc:
+                          errors.append([kind,aid,sub,pak.name,str(exc)[:200]])
+                  if len(inventory)%300==0 and inventory:
+                      print('DECODE PROGRESS',kind,aid,len(inventory),'GIFs',flush=True)
+          for handle in opened.values():handle.close()
+          arc.close()
+
+          def writecsv(headers,rows):
+              f=io.StringIO(newline='');w=csv.writer(f);w.writerow(headers);w.writerows(rows)
+              return f.getvalue().encode('utf-8-sig')
+          good=writecsv(['category','id','sub','pak','spr','frames','gif_bytes','gif_path','source_type','raw_sha256'],inventory)
+          bad=writecsv(['category','id','sub','pak','error'],errors)
+          manifest=[dict(category=x[0],id=x[1],sub=x[2],pak=x[3],frames=x[5],path=x[7],source_type=x[8]) for x in inventory]
+          info={'source':'Sanctuary of Aden - Copy v1.0.0 release','all_indexed_spr':total,
+                'all_original_ids':len(records),'scope':MODE,'id_filter':sorted(FILTER),
+                'selected_ids':{k:len(v) for k,v in chosen.items()},'decoded_gifs':dict(counter),
+                'failed_files':len(errors),'parts':len(parts),'magic_directional':False,
+                'magic_classification':'L1J reference GFX IDs only; Sanctuary effect names not verified',
+                'actor_cast_status':'ALL four-direction banks are preliminary comparison material: action18/19 to bank mapping not verified',
+                'monster_actor_selection':'L1J mobskill Type 2 or 3 by NPC gfxid; not original Sanctuary confirmed'}
+          html=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sanctuary original SPR animations</title><style>
+          *{box-sizing:border-box}body{margin:0;background:#101720;color:#edf2f8;font:14px system-ui,'Malgun Gothic',sans-serif}header{padding:16px 22px;background:#1c2c3e}h1{font-size:21px;margin:0}small{color:#aebdd0}main{display:grid;grid-template-columns:minmax(240px,330px) 1fr;min-height:calc(100vh - 85px)}aside{border-right:1px solid #36495c;padding:14px}section{padding:18px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}input,select,button{background:#203448;border:1px solid #49647e;color:white;border-radius:6px;padding:9px}input{width:100%;margin:10px 0}button{cursor:pointer}#items{height:65vh;overflow:auto;border:1px solid #425b72;border-radius:7px}.item{display:block;text-align:left;width:100%;border:0;border-radius:0;border-bottom:1px solid #3a4f64;padding:10px}.active{background:#275b7d}.viewer{display:flex;align-items:center;justify-content:center;min-height:360px;background:#253141;border:1px solid #43566a;border-radius:9px;margin:12px 0}.viewer img{image-rendering:pixelated;max-width:100%;max-height:65vh;object-fit:contain}.meta{font-size:12px;color:#bdd0df;overflow-wrap:anywhere}.notice{color:#f4cf84}#variant{max-width:min(80vw,500px)}@media(max-width:710px){main{grid-template-columns:1fr}#items{height:200px}}
+          </style></head><body><header><h1>생츄어리 원본 SPR · 마법 효과 / 시전 모션 검증</h1><small>마법 이펙트는 방향 없음 · 몬스터/캐릭터는 마법 시전 후보 동작만 검증 대상 (뱅크 미확정)</small></header><main><aside><label>분류 <select id="category"></select></label><input id="search" placeholder="SPR ID 검색" type="search"><div class="row"><button id="prev">이전</button><span id="page"></span><button id="next">다음</button></div><div id="items"></div></aside><section><h2 id="heading">원본 선택</h2><p class="meta" id="info"></p><div class="row"><label>동작/원본 파일 <select id="variant"></select></label><button id="replay">다시 재생</button><button id="openFile">원본 GIF 열기</button></div><div class="viewer"><img id="preview" alt="선택한 원본 SPR 애니메이션"></div><p id="detail" class="meta"></p><p class="notice">* 일반 이동·공격 모션을 마법 시전이라고 확정하지 않습니다. 마법 시전 뱅크는 아직 미확정이며, 제공되는 4방향 모션은 검증 후보입니다.</p><p class="meta">* 원본 시전 뱅크를 검증하기 전에는 '마법 시전 모션 추출 완료'가 아닙니다. ZIP은 모두 같은 폴더에 풉니다.</p></section></main>
+          <script id="manifest" type="application/json">__MANIFEST__</script><script>
+          const all=JSON.parse(document.getElementById('manifest').textContent),$=id=>document.getElementById(id);let category='',selected=-1,page=0,term='',variants=[];let tick=0;
+          const categories=[...new Set(all.map(x=>x.category))];categories.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v==='magic'?'마법 이펙트 후보':v==='caster-monsters'?'마법 사용 몬스터 (동작 미확정)':'캐릭터 시전 동작 (미확정)';$('category').append(o)});
+          function group(){let s=all.filter(x=>x.category===category);if(term)s=s.filter(x=>String(x.id).includes(term));return [...new Set(s.map(x=>x.id))].sort((a,b)=>a-b)}
+          function render(){const ids=group(),per=65,n=Math.max(1,Math.ceil(ids.length/per));page=Math.max(0,Math.min(page,n-1));$('page').textContent=(page+1)+' / '+n+' · '+ids.length+'개 ID';$('items').replaceChildren();ids.slice(page*per,(page+1)*per).forEach(id=>{const b=document.createElement('button');b.className='item'+(id===selected?' active':'');b.textContent='SPR '+id;b.onclick=()=>choose(id);$('items').append(b)});$('prev').disabled=page===0;$('next').disabled=page>=n-1;}
+          function choose(id){selected=id;variants=all.filter(x=>x.category===category&&x.id===id).sort((a,b)=>a.sub-b.sub);$('variant').replaceChildren();variants.forEach((r,i)=>{const o=document.createElement('option');o.value=i;const di=r.sub%8;const dir={1:'위',3:'오른쪽',5:'아래',7:'왼쪽'};o.textContent=category==='magic'?`원본 ${r.id}-${r.sub} (변형 ${r.sub})`:`뱅크 ${Math.floor(r.sub/8)*8} / ${dir[di]||'미분류'} / ${r.id}-${r.sub}`;$('variant').append(o)});$('heading').textContent=`SPR ${id} · ${category==='magic'?'마법 이펙트 후보':'마법 시전 동작 후보 (은행 미확정)'}`;$('info').textContent=`원본 동작/변형 ${variants.length}개`;if(variants.length)show(0);render()}
+          function show(i){const v=variants[i];if(!v)return;$('variant').value=i;const u=encodeURI(v.path);$('preview').src=u;$('detail').textContent=`${v.pak} / ${v.path} / 원본 ${v.frames}프레임 / ${v.source_type}`;}
+          $('category').onchange=e=>{category=e.target.value;page=0;term='';selected=-1;$('search').value='';render();if(group().length)choose(group()[0])};$('search').oninput=e=>{term=e.target.value.trim();page=0;render()};$('prev').onclick=()=>{page--;render()};$('next').onclick=()=>{page++;render()};$('variant').onchange=e=>show(+e.target.value);$('replay').onclick=()=>{const img=$('preview');const old=img.src;img.src='';img.src=old.split('?')[0]+'?restart='+ (++tick)};$('openFile').onclick=()=>{const v=variants[+$('variant').value];if(v)window.open(encodeURI(v.path),'_blank')};category=categories[0];$('category').value=category;render();if(group().length)choose(group()[0]);
+          </script></body></html>'''
+          html=html.replace('__MANIFEST__',json.dumps(manifest,ensure_ascii=False,separators=(',',':')).replace('</','<\\/'))
+          # This deliberately does not claim any actor bank is a confirmed spell-cast pose.
+          with zipfile.ZipFile(parts[0],'a') as z:
+              z.writestr('Sanctuary-SPR-viewer.html',html.encode('utf-8'))
+              z.writestr('Sanctuary-SPR-manifest.csv',good)
+              z.writestr('Sanctuary-SPR-errors.csv',bad)
+              z.writestr('Sanctuary-SPR-summary.json',json.dumps(info,ensure_ascii=False,indent=2).encode('utf8'))
+          (OUT/'summary.json').write_text(json.dumps(info,ensure_ascii=False,indent=2),'utf8')
+          (OUT/'errors.csv').write_bytes(bad)
+          for path in parts:
+              assert path.stat().st_size < 480*1024*1024,(path.name,path.stat().st_size)
+              with zipfile.ZipFile(path) as z:
+                  assert z.testzip() is None,path.name
+          print('FINISHED',json.dumps(info,ensure_ascii=False),flush=True)
+          PY
+          python3 -m py_compile /tmp/sanctuary_extract.py
+          python3 /tmp/sanctuary_extract.py
+          cat packages/summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Upload verified extraction report"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-extraction-report-${{ inputs.scope }}
+          path: |
+            packages/summary.json
+            packages/errors.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: "Upload part 01 (includes HTML viewer and CSV index)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-01
+          path: packages/part-01.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 02"
+        if: ${{ hashFiles('packages/part-02.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-02
+          path: packages/part-02.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 03"
+        if: ${{ hashFiles('packages/part-03.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-03
+          path: packages/part-03.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 04"
+        if: ${{ hashFiles('packages/part-04.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-04
+          path: packages/part-04.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 05"
+        if: ${{ hashFiles('packages/part-05.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-05
+          path: packages/part-05.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 06"
+        if: ${{ hashFiles('packages/part-06.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-06
+          path: packages/part-06.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 07"
+        if: ${{ hashFiles('packages/part-07.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-07
+          path: packages/part-07.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 08"
+        if: ${{ hashFiles('packages/part-08.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-08
+          path: packages/part-08.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 09"
+        if: ${{ hashFiles('packages/part-09.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-09
+          path: packages/part-09.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 10"
+        if: ${{ hashFiles('packages/part-10.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-10
+          path: packages/part-10.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 11"
+        if: ${{ hashFiles('packages/part-11.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-11
+          path: packages/part-11.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 12"
+        if: ${{ hashFiles('packages/part-12.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-12
+          path: packages/part-12.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 13"
+        if: ${{ hashFiles('packages/part-13.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-13
+          path: packages/part-13.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 14"
+        if: ${{ hashFiles('packages/part-14.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-14
+          path: packages/part-14.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 15"
+        if: ${{ hashFiles('packages/part-15.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-15
+          path: packages/part-15.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: "Upload part 16"
+        if: ${{ hashFiles('packages/part-16.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-${{ inputs.scope }}-part-16
+          path: packages/part-16.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
