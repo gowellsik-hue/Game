@@ -1,20 +1,20 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V276.7.2
+# VERSION: V276.7.3
 # BASE: successful V276.7.1, run 41790334490.
 # BASE FILES: 5622 verified game files.
 # CHANGE: native Sprite_Character 4/8-frame selection.
-# WALK FIX: head/torso subpixel alignment and loop check.
+# WALK FIX: 32-frame torso tracking and common four-way pivot.
 # LEGACY: original 4-frame monsters unchanged.
 # NEW: SLZQWalk and SL8_ graphics use 8 frames.
 # DIRECTIONS: original four directions only.
 # RUNTIME: one native Sprite_Character.update.
 # REMOVE: queen-only duplicate update registration.
 # KEEP: combat, animations, drops and respawn.
-# ROLLBACK: remove alignment step to restore prior walking PNG.
-# VERSION: retain V276.7.2.
+# ROLLBACK: remove frame-alignment step to restore prior PNG.
+# VERSION: V276.7.3; failed-build fixes do not bump version.
 
-name: build-slknight-web.yml | V276.7.2 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V276.7.3 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -108,405 +108,166 @@ jobs:
           print('PASS 5622 original files')
           PY
 
-      - name: Align queen walk frames without map movement
+      - name: Align queen walk 32 frames to one four-way pivot
         shell: bash
         run: |
           set -euo pipefail
 
           python3 -m pip install \
-            --disable-pip-version-check pillow
+            --disable-pip-version-check pillow numpy
 
           cat > build/align_slzq_walk.py <<'SLZQ_ALIGN'
           from pathlib import Path
           from statistics import median
           from PIL import Image
+          import numpy as np
           import json
-          import math
 
-          path=Path(
-            'site/knight/gameasync/Graphics/'
-            'Characters/SLZQWalk.png'
-          )
-
-          assert path.is_file(),path
-
+          path=Path('site/knight/gameasync/Graphics/Characters/SLZQWalk.png')
+          out_path=path
+          report_path=Path('build/slzq_walk_alignment.json')
           original=Image.open(path).convert('RGBA')
-
           COLS=8
           ROWS=4
-
-          assert original.width%COLS==0
-          assert original.height%ROWS==0
-
+          assert original.size==(1344,576),('Unexpected original image',original.size)
           CW=original.width//COLS
           CH=original.height//ROWS
+          assert (CW,CH)==(168,144)
 
-          assert (CW,CH)==(168,144),(
-            'Unexpected queen walk dimensions',
-            CW,CH
+          # Stable, textured abdomen regions examined on the original sheet.
+          # These are used for relative frame tracking, never as separate
+          # direction-specific output centers.
+          CORE_ROIS=(
+              (64,65,95,114),  # south-facing
+              (90,80,129,120), # west-facing
+              (39,81,77,123),  # east-facing
+              (62,94,94,130),  # north-facing
           )
+          TARGET_CENTER_X=84.0
+          TARGET_BASELINE_Y=133.0
+          SEARCH_RADIUS=20
 
-          # ------------------------------------------
-          # Stable head and torso measurement.
-          # Ignore the outer swinging limbs.
-          # ------------------------------------------
 
-          def region_anchor(frame,start,end):
-            alpha=frame.getchannel('A')
-            bbox=alpha.getbbox()
+          def luminance(frame):
+              rgb=np.asarray(frame,dtype=np.uint8)[:,:,:3].astype(np.float32)
+              return rgb[:,:,0]*0.299+rgb[:,:,1]*0.587+rgb[:,:,2]*0.114
 
-            assert bbox is not None,(
-              'Empty queen walk frame'
-            )
 
-            left,top,right,bottom=bbox
-            height=bottom-top
+          def registration(ref_frame,frame,roi):
+              x1,y1,x2,y2=roi
+              ref=luminance(ref_frame)[y1:y2,x1:x2]
+              mask=(np.asarray(ref_frame)[y1:y2,x1:x2,3]>=100).astype(np.float32)
+              assert mask.sum()>300,('Empty stable torso ROI',roi)
+              pattern=ref*mask
+              pattern_norm=float((ref*pattern).sum())
+              target=luminance(frame)
+              best=(-1.0,None,None)
+              hh,ww=ref.shape
+              for dy in range(-SEARCH_RADIUS,SEARCH_RADIUS+1):
+                  yy=y1+dy
+                  if yy<0 or yy+hh>CH:continue
+                  for dx in range(-SEARCH_RADIUS,SEARCH_RADIUS+1):
+                      xx=x1+dx
+                      if xx<0 or xx+ww>CW:continue
+                      candidate=target[yy:yy+hh,xx:xx+ww]
+                      den=pattern_norm*float((candidate*candidate*mask).sum())
+                      if den<=0:continue
+                      similarity=float((pattern*candidate).sum())/(den**0.5)
+                      if similarity>best[0]: best=(similarity,dx,dy)
+              score,dx,dy=best
+              assert score>=0.83,('Unable to register stable body',round(score,4))
+              return dx,dy,score
 
-            y1=top+round(height*start)
-            y2=top+round(height*end)
 
-            y1=max(top,min(y1,bottom-1))
-            y2=max(y1+1,min(y2,bottom))
+          def bbox(frame):
+              mask=frame.getchannel('A').point(lambda alpha:255 if alpha>=24 else 0)
+              rect=mask.getbbox()
+              assert rect is not None,'Empty frame'
+              return rect
 
-            pix=alpha.load()
 
-            centers=[]
-            weighted_y=0.0
-            total_weight=0.0
+          def shift(frame,dx,dy):
+              canvas=Image.new('RGBA',(CW,CH),(0,0,0,0))
+              canvas.paste(frame,(int(dx),int(dy)))
+              assert np.asarray(canvas.getchannel('A'),dtype=np.uint64).sum() == np.asarray(frame.getchannel('A'),dtype=np.uint64).sum(),('Clipped frame',dx,dy)
+              return canvas
 
-            for y in range(y1,y2):
-              points=[
-                (x,pix[x,y])
-                for x in range(left,right)
-                if pix[x,y]>=48
-              ]
 
-              if len(points)<4:
-                continue
+          def round_half_away(number):
+              return int(np.sign(number)*np.floor(abs(number)+0.5))
 
-              # Exclude the outer 20% of
-              # alpha mass on each side.
-              weights=sum(a for _,a in points)
-
-              lo=weights*0.20
-              hi=weights*0.80
-
-              acc=0
-              selected=[]
-
-              for x,a in points:
-                nxt=acc+a
-
-                if nxt>=lo and acc<=hi:
-                  selected.append((x,a))
-
-                acc=nxt
-
-              if not selected:
-                continue
-
-              mass=sum(a for _,a in selected)
-
-              centers.append(
-                sum(x*a for x,a in selected)/mass
-              )
-
-              weighted_y+=y*mass
-              total_weight+=mass
-
-            assert centers and total_weight,(
-              'Unable to locate head/torso'
-            )
-
-            return (
-              median(centers),
-              weighted_y/total_weight
-            )
-
-          def anchor(frame):
-            # Head is primary reference.
-            hx,hy=region_anchor(
-              frame,0.08,0.38
-            )
-
-            # Torso is secondary reference.
-            bx,by=region_anchor(
-              frame,0.30,0.56
-            )
-
-            return (
-              hx*0.75+bx*0.25,
-              hy*0.80+by*0.20
-            )
-
-          # ------------------------------------------
-          # Subpixel placement correction.
-          # Preserve sprite cell dimensions.
-          # Prevent movement across cell edges.
-          # ------------------------------------------
-
-          def shift_frame(frame,dx,dy):
-            bbox=frame.getchannel('A').getbbox()
-
-            assert bbox is not None
-
-            left,top,right,bottom=bbox
-
-            # At least the original visible
-            # sprite must stay inside its cell.
-            min_dx=float(-left)
-            max_dx=float(CW-right)
-
-            min_dy=float(-top)
-            max_dy=float(CH-bottom)
-
-            dx=max(min_dx,min(float(dx),max_dx))
-            dy=max(min_dy,min(float(dy),max_dy))
-
-            # Suppress insignificant movement.
-            if abs(dx)<0.025:
-              dx=0.0
-
-            if abs(dy)<0.025:
-              dy=0.0
-
-            if dx==0.0 and dy==0.0:
-              return frame,0.0,0.0
-
-            moved=frame.transform(
-              (CW,CH),
-              Image.Transform.AFFINE,
-              (1,0,-dx,0,1,-dy),
-              resample=Image.Resampling.BICUBIC,
-              fillcolor=(0,0,0,0)
-            )
-
-            return moved,dx,dy
-
-          def spread(points,axis):
-            values=[p[axis] for p in points]
-            return max(values)-min(values)
-
-          def seam(points):
-            # Frame 8 -> frame 1 loop.
-            a=points[0]
-            b=points[-1]
-
-            return math.hypot(
-              a[0]-b[0],
-              a[1]-b[1]
-            )
-
-          # ------------------------------------------
-          # Process exactly 32 walking frames.
-          # Each direction is independent.
-          # ------------------------------------------
-
-          result=Image.new(
-            'RGBA',
-            original.size,
-            (0,0,0,0)
-          )
-
+          output=Image.new('RGBA',original.size,(0,0,0,0))
           report=[]
           changed=0
-
-          for direction in range(ROWS):
-            frames=[]
-
-            for index in range(COLS):
-              box=(
-                index*CW,
-                direction*CH,
-                (index+1)*CW,
-                (direction+1)*CH
-              )
-
-              frame=original.crop(box)
-
-              assert frame.getchannel('A').getbbox()
-
-              frames.append(frame)
-
-            before=[
-              anchor(frame)
-              for frame in frames
-            ]
-
-            # One common fixed reference for
-            # all eight frames of this direction.
-            target_x=median(
-              p[0] for p in before
-            )
-
-            target_y=median(
-              p[1] for p in before
-            )
-
-            aligned=[]
-            frame_report=[]
-
-            for index,frame in enumerate(frames):
-              fixed=frame
-
-              total_dx=0.0
-              total_dy=0.0
-
-              # Two correction passes.
-              # Re-measure after the first shift.
-              for iteration in range(2):
-                current_x,current_y=anchor(fixed)
-
-                dx=target_x-current_x
-                dy=target_y-current_y
-
-                if abs(dx)<0.05:
-                  dx=0.0
-
-                if abs(dy)<0.05:
-                  dy=0.0
-
-                if dx==0.0 and dy==0.0:
-                  break
-
-                fixed,actual_dx,actual_dy=shift_frame(
-                  fixed,dx,dy
-                )
-
-                total_dx+=actual_dx
-                total_dy+=actual_dy
-
-              if (
-                abs(total_dx)>0.05 or
-                abs(total_dy)>0.05
-              ):
-                changed+=1
-
-              final_anchor=anchor(fixed)
-
-              aligned.append(fixed)
-
-              result.paste(
-                fixed,
-                (index*CW,direction*CH)
-              )
-
-              frame_report.append({
-                'frame':index+1,
-                'dx':round(total_dx,3),
-                'dy':round(total_dy,3),
-                'head_torso_x':round(
-                  final_anchor[0],3
-                ),
-                'head_torso_y':round(
-                  final_anchor[1],3
-                )
-              })
-
-            after=[
-              anchor(frame)
-              for frame in aligned
-            ]
-
-            values={
-              'direction':[2,4,6,8][direction],
-
-              'x_before':round(
-                spread(before,0),3
-              ),
-              'x_after':round(
-                spread(after,0),3
-              ),
-
-              'y_before':round(
-                spread(before,1),3
-              ),
-              'y_after':round(
-                spread(after,1),3
-              ),
-
-              'seam_before':round(
-                seam(before),3
-              ),
-              'seam_after':round(
-                seam(after),3
-              ),
-
-              'frames':frame_report
-            }
-
-            report.append(values)
-
-            print(
-              'Direction',values['direction'],
-              'X',values['x_before'],
-              '->',values['x_after'],
-              'Y',values['y_before'],
-              '->',values['y_after'],
-              'Seam',values['seam_before'],
-              '->',values['seam_after']
-            )
-
-          # ------------------------------------------
-          # Verify frame inventory and save.
-          # ------------------------------------------
+          for row in range(ROWS):
+              frames=[original.crop((j*CW,row*CH,(j+1)*CW,(row+1)*CH)) for j in range(COLS)]
+              moves=[registration(frames[0],frames[j],CORE_ROIS[row]) for j in range(COLS)]
+              tracked=[]
+              rects=[]
+              for frame,(dx,dy,score) in zip(frames,moves):
+                  corrected=shift(frame,-dx,-dy)
+                  tracked.append(corrected)
+                  rects.append(bbox(corrected))
+              # Turn uses frame 1 while stationary. Anchor ALL four directions
+              # to exactly the SAME frame-1 silhouette midpoint and foot baseline.
+              # Other 7 poses retain the frame-1 body landmark, not limb centroid.
+              visual_center_x=(rects[0][0]+rects[0][2]-1)/2
+              foot_baseline_y=rects[0][3]-1
+              global_dx=round_half_away(TARGET_CENTER_X-visual_center_x)
+              global_dy=round_half_away(TARGET_BASELINE_Y-foot_baseline_y)
+              aligned=[]
+              rows=[]
+              for j,(frame,(dx,dy,score)) in enumerate(zip(tracked,moves)):
+                  corrected=shift(frame,global_dx,global_dy)
+                  aligned.append(corrected)
+                  output.paste(corrected,(j*CW,row*CH))
+                  total_dx=-dx+global_dx
+                  total_dy=-dy+global_dy
+                  changed+=int(total_dx!=0 or total_dy!=0)
+                  rows.append({'frame':j+1,'dx':total_dx,'dy':total_dy,'core_similarity':round(score,4)})
+              final_rects=[bbox(f) for f in aligned]
+              final_centers=[(r[0]+r[2]-1)/2 for r in final_rects]
+              final_feet=[r[3]-1 for r in final_rects]
+              pivot_x=final_centers[0]
+              pivot_y=final_feet[0]
+              assert abs(pivot_x-TARGET_CENTER_X)<=0.5,(row,pivot_x)
+              assert abs(pivot_y-TARGET_BASELINE_Y)<=0.5,(row,pivot_y)
+              # Validate that the tracked torso core has zero horizontal/vertical
+              # offset from the first frame after alignment, including frame 8->1.
+              tracker=[]
+              shifted_roi=tuple((x+global_dx if i%2==0 else x+global_dy) for i,x in enumerate(CORE_ROIS[row]))
+              for j in range(COLS):
+                  ddx,ddy,score=registration(aligned[0],aligned[j],shifted_roi)
+                  assert abs(ddx)<=1 and abs(ddy)<=1,('Torso drift after correction',row,j,ddx,ddy)
+                  tracker.append((ddx,ddy))
+              report.append({'direction':(2,4,6,8)[row],
+                             'idle_center_before':round(visual_center_x,2),
+                             'idle_center_after':round(pivot_x,2),
+                             'idle_feet_before':round(foot_baseline_y,2),
+                             'idle_feet_after':round(pivot_y,2),
+                             'global_shift':[global_dx,global_dy],
+                             'body_residual':tracker,
+                             'frames':rows})
+              print('Dir',(2,4,6,8)[row],'pivotX',visual_center_x,'->',pivot_x,
+                    'floor',foot_baseline_y,'->',pivot_y,'global',(global_dx,global_dy),
+                    'body residual',tracker)
 
           assert len(report)==4
-
-          assert all(
-            len(item['frames'])==8
-            for item in report
-          )
-
-          assert changed>0,(
-            'No walk-frame displacement corrected'
-          )
-
-          # Only the generated PNG is replaced.
-          # No map or event position is modified.
-          result.save(path,optimize=True)
-
-          saved=Image.open(path).convert('RGBA')
-
-          assert saved.size==original.size
-
-          Path(
-            'build/slzq_walk_alignment.json'
-          ).write_text(
-            json.dumps(
-              {
-                'version':'V276.7.2',
-                'frame_size':[CW,CH],
-                'changed_frames':changed,
-                'directions':report
-              },
-              ensure_ascii=False,
-              indent=2
-            ),
-            encoding='utf-8'
-          )
-
-          print(
-            'PASS walk image alignment generated'
-          )
-          print(
-            'PASS 8 frames x 4 directions retained'
-          )
-          print(
-            'PASS first/last frame seam measured'
-          )
-          print(
-            'PASS map movement not modified'
-          )
-          print(
-            'PASS V276.7.2 retained'
-          )
-
+          assert changed>0
+          assert max(r['idle_center_after'] for r in report)-min(r['idle_center_after'] for r in report)<=0.5
+          assert max(r['idle_feet_after'] for r in report)-min(r['idle_feet_after'] for r in report)==0.0
+          output.save(out_path,optimize=True)
+          json.dump({'version':'V276.7.3','corrected_frames':changed,'center_target':TARGET_CENTER_X,
+                     'baseline_target':TARGET_BASELINE_Y,'directions':report},open(report_path,'w'),ensure_ascii=False,indent=2)
+          print('PASS four-direction turn anchors and eight-frame torso registration')
+          print('PASS 8-to-1 torso loop returns to the same origin')
+          print('PASS RGBA pixel values retained; no alpha clipped')
+          print('PASS V276.7.3 frame alignment completed')
           SLZQ_ALIGN
 
           python3 build/align_slzq_walk.py
 
-      - name: V276.7.2 Native 4 and 8 frame branch
+      - name: V276.7.3 Native 4 and 8 frame branch
         shell: bash
         run: |
           set -euo pipefail
@@ -909,7 +670,7 @@ jobs:
           text=loader.read_text('utf-8')
 
           old="var version='V276.7.1';"
-          new="var version='V276.7.2';"
+          new="var version='V276.7.3';"
 
           assert text.count(old)==1
 
@@ -928,8 +689,8 @@ jobs:
             assert 'V276.7.1' in text,name
 
             text=(
-              text.replace('V276.7.1','V276.7.2').
-                   replace('?v=v276.7.1','?v=v276.7.2')
+              text.replace('V276.7.1','V276.7.3').
+                   replace('?v=v276.7.1','?v=v276.7.3')
             )
 
             path.write_text(
@@ -976,7 +737,7 @@ jobs:
           print('PASS seven expected generated files changed')
           print('PASS 5615 remaining files unchanged')
           print('PASS corrected queen walk PNG mapping')
-          print('PASS V276.7.2 version retained')
+          print('PASS V276.7.3 version retained')
           PY
 
           node --check site/knight/gameasync/mapping.js
