@@ -1,20 +1,19 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V276.7.3
-# BASE: successful V276.7.1, run 41790334490.
+# VERSION: V276.7.4
+# BASE: successful V276.7.3, run 41944977806.
 # BASE FILES: 5622 verified game files.
-# CHANGE: native Sprite_Character 4/8-frame selection.
-# WALK FIX: 32-frame torso tracking and common four-way pivot.
-# LEGACY: original 4-frame monsters unchanged.
-# NEW: SLZQWalk and SL8_ graphics use 8 frames.
-# DIRECTIONS: original four directions only.
-# RUNTIME: one native Sprite_Character.update.
-# REMOVE: queen-only duplicate update registration.
-# KEEP: combat, animations, drops and respawn.
-# ROLLBACK: remove frame-alignment step to restore prior PNG.
-# VERSION: V276.7.3; failed-build fixes do not bump version.
+# WALK: retain successful 8-frame 4-direction walk.
+# ATTACK: retain native 5 normal / 1 strong / 1 magic.
+# POISON: normal and strong physical attacks.
+# WEB: original animation lookup and 64-second slow.
+# HIT: isolate Zenith Queen from Death Knight graphics.
+# ALIGN: common attack, hit, death and walk pivots.
+# DEATH: original 17 poses, double playback duration.
+# KEEP: original damage, drops, respawn and other monsters.
+# VERSION: failed-build fixes retain V276.7.4.
 
-name: build-slknight-web.yml | V276.7.3 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V276.7.4 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -39,64 +38,109 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Restore verified V276.7.1 game
+      - name: Restore successful V276.7.3 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 41790334490
+          run-id: 41944977806
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
+
+      - name: Restore original Sanctuary Hit source
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 41382471524
+          name: github-pages
+          github-token: ${{ github.token }}
+          path: sprite-baseline
 
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      - name: Verify original V276.7.1 baseline
+      - name: Verify successful game and original source
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p site build
+          mkdir -p site build build/v247
+
           test -s baseline/artifact.tar
+          test -s sprite-baseline/artifact.tar
+
           tar -xf baseline/artifact.tar -C site
 
+          mkdir -p \
+            build/v247/knight/gameasync/Graphics/Characters
+
+          tar -xf sprite-baseline/artifact.tar \
+            -C build/v247 \
+            ./knight/gameasync/Graphics/Characters/SLZenithHit.png
+
           python3 - <<'PY'
-          import hashlib,json
           from pathlib import Path
+          import hashlib,json
 
           root=Path('site')
 
           files={
             str(p.relative_to(root)):
               hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in root.rglob('*') if p.is_file()
+            for p in root.rglob('*')
+            if p.is_file()
           }
 
           assert len(files)==5622,(
-            'V276.7.1 baseline inventory mismatch',
+            'V276.7.3 inventory mismatch',
             len(files)
           )
 
-          data=root/'knight/gameasync/Data'
+          game=root/'knight/gameasync'
+          data=game/'Data'
+
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           for name in (
             'Scripts.rxdata',
             pre+'Map025.rxdata',
-            pre+'Map019.rxdata',
             pre+'CommonEvents.rxdata',
             pre+'Animations.rxdata'
           ):
             assert (data/name).is_file(),name
 
-          assert (
-            root/'knight/gameasync/Graphics/Characters/'
-            'SLZQWalk.png'
-          ).is_file()
+          graphics=game/'Graphics'
+
+          for name in (
+            'SLZQWalk.png',
+            'SLZQDeath.png',
+            'SLZQBlank.png'
+          ):
+            assert (graphics/'Characters'/name).is_file()
+
+          for kind in (
+            'normal','strong','magic','death'
+          ):
+            for direction in (2,4,6,8):
+              name=f'SLZQ_{kind}_D{direction}.png'
+              assert (graphics/'Animations'/name).is_file()
+
+          source=Path(
+            'build/v247/knight/gameasync/Graphics/'
+            'Characters/SLZenithHit.png'
+          )
+
+          assert source.is_file()
+
+          assert hashlib.sha256(
+            source.read_bytes()
+          ).hexdigest()==(
+            '9c2eaa2eb3f22a60266a4a8e0f6793a97592ce35b847d0469e2ee32190fa40e4'
+          ),'Original Sanctuary Hit image changed'
 
           for name in ('index.html','knight/index.html'):
-            assert 'V276.7.1' in (
+            assert 'V276.7.3' in (
               root/name
             ).read_text('utf-8')
 
@@ -104,11 +148,14 @@ jobs:
             json.dumps(files),encoding='utf-8'
           )
 
-          print('PASS V276.7.1 baseline restored')
-          print('PASS 5622 original files')
+          print('PASS V276.7.3 baseline restored')
+          print('PASS successful 8-frame walk retained')
+          print('PASS original Sanctuary hit source')
+          print('PASS original 5622 game files')
+
           PY
 
-      - name: Align queen walk 32 frames to one four-way pivot
+      - name: Align attack hit death to common four-way pivot
         shell: bash
         run: |
           set -euo pipefail
@@ -116,165 +163,376 @@ jobs:
           python3 -m pip install \
             --disable-pip-version-check pillow numpy
 
-          cat > build/align_slzq_walk.py <<'SLZQ_ALIGN'
+          cat > build/align_combat.py <<'ZQ_ART'
           from pathlib import Path
           from statistics import median
           from PIL import Image
           import numpy as np
           import json
 
-          path=Path('site/knight/gameasync/Graphics/Characters/SLZQWalk.png')
-          out_path=path
-          report_path=Path('build/slzq_walk_alignment.json')
-          original=Image.open(path).convert('RGBA')
-          COLS=8
-          ROWS=4
-          assert original.size==(1344,576),('Unexpected original image',original.size)
-          CW=original.width//COLS
-          CH=original.height//ROWS
-          assert (CW,CH)==(168,144)
-
-          # Stable, textured abdomen regions examined on the original sheet.
-          # These are used for relative frame tracking, never as separate
-          # direction-specific output centers.
-          CORE_ROIS=(
-              (64,65,95,114),  # south-facing
-              (90,80,129,120), # west-facing
-              (39,81,77,123),  # east-facing
-              (62,94,94,130),  # north-facing
+          root=Path(
+            'site/knight/gameasync/Graphics'
           )
-          TARGET_CENTER_X=84.0
-          TARGET_BASELINE_Y=133.0
-          SEARCH_RADIUS=20
 
+          chars=root/'Characters'
+          anims=root/'Animations'
 
-          def luminance(frame):
-              rgb=np.asarray(frame,dtype=np.uint8)[:,:,:3].astype(np.float32)
-              return rgb[:,:,0]*0.299+rgb[:,:,1]*0.587+rgb[:,:,2]*0.114
+          walk_path=chars/'SLZQWalk.png'
+          walk_before=walk_path.read_bytes()
 
+          walk=Image.open(walk_path).convert('RGBA')
 
-          def registration(ref_frame,frame,roi):
-              x1,y1,x2,y2=roi
-              ref=luminance(ref_frame)[y1:y2,x1:x2]
-              mask=(np.asarray(ref_frame)[y1:y2,x1:x2,3]>=100).astype(np.float32)
-              assert mask.sum()>300,('Empty stable torso ROI',roi)
-              pattern=ref*mask
-              pattern_norm=float((ref*pattern).sum())
-              target=luminance(frame)
-              best=(-1.0,None,None)
-              hh,ww=ref.shape
-              for dy in range(-SEARCH_RADIUS,SEARCH_RADIUS+1):
-                  yy=y1+dy
-                  if yy<0 or yy+hh>CH:continue
-                  for dx in range(-SEARCH_RADIUS,SEARCH_RADIUS+1):
-                      xx=x1+dx
-                      if xx<0 or xx+ww>CW:continue
-                      candidate=target[yy:yy+hh,xx:xx+ww]
-                      den=pattern_norm*float((candidate*candidate*mask).sum())
-                      if den<=0:continue
-                      similarity=float((pattern*candidate).sum())/(den**0.5)
-                      if similarity>best[0]: best=(similarity,dx,dy)
-              score,dx,dy=best
-              assert score>=0.83,('Unable to register stable body',round(score,4))
-              return dx,dy,score
+          assert walk.size==(1344,576)
 
+          CW=168
+          CH=144
 
-          def bbox(frame):
-              mask=frame.getchannel('A').point(lambda alpha:255 if alpha>=24 else 0)
-              rect=mask.getbbox()
-              assert rect is not None,'Empty frame'
-              return rect
+          WALK_X=84.0
+          WALK_Y=133.0
 
+          ANIM_X=96.0
+          ANIM_Y=157.0
 
-          def shift(frame,dx,dy):
-              canvas=Image.new('RGBA',(CW,CH),(0,0,0,0))
-              canvas.paste(frame,(int(dx),int(dy)))
-              assert np.asarray(canvas.getchannel('A'),dtype=np.uint64).sum() == np.asarray(frame.getchannel('A'),dtype=np.uint64).sum(),('Clipped frame',dx,dy)
-              return canvas
+          CELL=192
 
+          directions=(2,4,6,8)
 
-          def round_half_away(number):
-              return int(np.sign(number)*np.floor(abs(number)+0.5))
-
-          output=Image.new('RGBA',original.size,(0,0,0,0))
           report=[]
-          changed=0
-          for row in range(ROWS):
-              frames=[original.crop((j*CW,row*CH,(j+1)*CW,(row+1)*CH)) for j in range(COLS)]
-              moves=[registration(frames[0],frames[j],CORE_ROIS[row]) for j in range(COLS)]
-              tracked=[]
-              rects=[]
-              for frame,(dx,dy,score) in zip(frames,moves):
-                  corrected=shift(frame,-dx,-dy)
-                  tracked.append(corrected)
-                  rects.append(bbox(corrected))
-              # Turn uses frame 1 while stationary. Anchor ALL four directions
-              # to exactly the SAME frame-1 silhouette midpoint and foot baseline.
-              # Other 7 poses retain the frame-1 body landmark, not limb centroid.
-              visual_center_x=(rects[0][0]+rects[0][2]-1)/2
-              foot_baseline_y=rects[0][3]-1
-              global_dx=round_half_away(TARGET_CENTER_X-visual_center_x)
-              global_dy=round_half_away(TARGET_BASELINE_Y-foot_baseline_y)
-              aligned=[]
-              rows=[]
-              for j,(frame,(dx,dy,score)) in enumerate(zip(tracked,moves)):
-                  corrected=shift(frame,global_dx,global_dy)
-                  aligned.append(corrected)
-                  output.paste(corrected,(j*CW,row*CH))
-                  total_dx=-dx+global_dx
-                  total_dy=-dy+global_dy
-                  changed+=int(total_dx!=0 or total_dy!=0)
-                  rows.append({'frame':j+1,'dx':total_dx,'dy':total_dy,'core_similarity':round(score,4)})
-              final_rects=[bbox(f) for f in aligned]
-              final_centers=[(r[0]+r[2]-1)/2 for r in final_rects]
-              final_feet=[r[3]-1 for r in final_rects]
-              pivot_x=final_centers[0]
-              pivot_y=final_feet[0]
-              assert abs(pivot_x-TARGET_CENTER_X)<=0.5,(row,pivot_x)
-              assert abs(pivot_y-TARGET_BASELINE_Y)<=0.5,(row,pivot_y)
-              # Validate that the tracked torso core has zero horizontal/vertical
-              # offset from the first frame after alignment, including frame 8->1.
-              tracker=[]
-              shifted_roi=tuple((x+global_dx if i%2==0 else x+global_dy) for i,x in enumerate(CORE_ROIS[row]))
-              for j in range(COLS):
-                  ddx,ddy,score=registration(aligned[0],aligned[j],shifted_roi)
-                  assert abs(ddx)<=1 and abs(ddy)<=1,('Torso drift after correction',row,j,ddx,ddy)
-                  tracker.append((ddx,ddy))
-              report.append({'direction':(2,4,6,8)[row],
-                             'idle_center_before':round(visual_center_x,2),
-                             'idle_center_after':round(pivot_x,2),
-                             'idle_feet_before':round(foot_baseline_y,2),
-                             'idle_feet_after':round(pivot_y,2),
-                             'global_shift':[global_dx,global_dy],
-                             'body_residual':tracker,
-                             'frames':rows})
-              print('Dir',(2,4,6,8)[row],'pivotX',visual_center_x,'->',pivot_x,
-                    'floor',foot_baseline_y,'->',pivot_y,'global',(global_dx,global_dy),
-                    'body residual',tracker)
 
-          assert len(report)==4
-          assert changed>0
-          assert max(r['idle_center_after'] for r in report)-min(r['idle_center_after'] for r in report)<=0.5
-          assert max(r['idle_feet_after'] for r in report)-min(r['idle_feet_after'] for r in report)==0.0
-          output.save(out_path,optimize=True)
-          json.dump({'version':'V276.7.3','corrected_frames':changed,'center_target':TARGET_CENTER_X,
-                     'baseline_target':TARGET_BASELINE_Y,'directions':report},open(report_path,'w'),ensure_ascii=False,indent=2)
-          print('PASS four-direction turn anchors and eight-frame torso registration')
-          print('PASS 8-to-1 torso loop returns to the same origin')
-          print('PASS RGBA pixel values retained; no alpha clipped')
-          print('PASS V276.7.3 frame alignment completed')
-          SLZQ_ALIGN
+          def visual_anchor(frame):
+            alpha=np.asarray(
+              frame.getchannel('A'),
+              dtype=np.uint8
+            )
 
-          python3 build/align_slzq_walk.py
+            ys,xs=np.where(alpha>=24)
 
-      - name: V276.7.3 Native 4 and 8 frame branch
+            assert len(xs)>0,'Empty animation frame'
+
+            left=int(xs.min())
+            right=int(xs.max())+1
+            top=int(ys.min())
+            bottom=int(ys.max())+1
+
+            height=bottom-top
+
+            y1=top+round(height*0.15)
+            y2=top+round(height*0.60)
+
+            y1=max(top,min(y1,bottom-1))
+            y2=max(y1+1,min(y2,bottom))
+
+            centers=[]
+
+            for y in range(y1,y2):
+              row=alpha[y]
+              points=np.flatnonzero(row>=48)
+
+              if len(points)<4:
+                continue
+
+              weights=row[points].astype(
+                np.float64
+              )
+
+              cumulative=np.cumsum(weights)
+              total=float(cumulative[-1])
+
+              select=(
+                (cumulative>=total*0.20) &
+                (cumulative<=total*0.80)
+              )
+
+              if not np.any(select):
+                continue
+
+              px=points[select]
+              pw=weights[select]
+
+              centers.append(
+                float(np.sum(px*pw)/np.sum(pw))
+              )
+
+            if centers:
+              center_x=float(median(centers))
+            else:
+              center_x=(left+right-1)/2
+
+            return {
+              'x':center_x,
+              'foot':bottom-1,
+              'bbox':(left,top,right,bottom)
+            }
+
+          def shift_to(frame,target_x,target_y):
+            width,height=frame.size
+
+            before=visual_anchor(frame)
+
+            left,top,right,bottom=before['bbox']
+
+            dx=round(target_x-before['x'])
+            dy=round(target_y-before['foot'])
+
+            # Reject clipping rather than
+            # silently dropping original pixels.
+            dx=max(-left,min(dx,width-right))
+            dy=max(-top,min(dy,height-bottom))
+
+            corrected=Image.new(
+              'RGBA',frame.size,(0,0,0,0)
+            )
+
+            corrected.paste(frame,(dx,dy))
+
+            source_alpha=int(
+              np.asarray(
+                frame.getchannel('A'),
+                dtype=np.uint64
+              ).sum()
+            )
+
+            result_alpha=int(
+              np.asarray(
+                corrected.getchannel('A'),
+                dtype=np.uint64
+              ).sum()
+            )
+
+            assert source_alpha==result_alpha,(
+              'Visible pixel clipping',
+              dx,dy
+            )
+
+            after=visual_anchor(corrected)
+
+            return corrected,{
+              'dx':dx,
+              'dy':dy,
+              'before_x':round(before['x'],3),
+              'after_x':round(after['x'],3),
+              'before_y':before['foot'],
+              'after_y':after['foot'],
+              'residual_x':round(
+                abs(after['x']-target_x),3
+              ),
+              'residual_y':abs(
+                after['foot']-target_y
+              )
+            }
+
+          def process_atlas(kind,direction):
+            path=anims/f'SLZQ_{kind}_D{direction}.png'
+
+            original=Image.open(path).convert('RGBA')
+
+            assert original.size==(960,960)
+
+            count=17 if kind=='death' else 25
+
+            result=Image.new(
+              'RGBA',original.size,(0,0,0,0)
+            )
+
+            metrics=[]
+
+            for i in range(count):
+              col=i%5
+              row=i//5
+
+              x=col*CELL
+              y=row*CELL
+
+              frame=original.crop((
+                x,y,x+CELL,y+CELL
+              ))
+
+              corrected,metric=shift_to(
+                frame,ANIM_X,ANIM_Y
+              )
+
+              result.paste(corrected,(x,y))
+
+              metric['frame']=i+1
+              metrics.append(metric)
+
+            result.save(path,optimize=True)
+
+            assert Image.open(path).size==(960,960)
+
+            return metrics
+
+          def process_character(path):
+            image=Image.open(path).convert('RGBA')
+
+            assert image.size==(CW*4,CH*4)
+
+            result=Image.new(
+              'RGBA',image.size,(0,0,0,0)
+            )
+
+            measurements=[]
+
+            for row,direction in enumerate(directions):
+              metrics=[]
+
+              for col in range(4):
+                x=col*CW
+                y=row*CH
+
+                frame=image.crop((
+                  x,y,x+CW,y+CH
+                ))
+
+                corrected,metric=shift_to(
+                  frame,WALK_X,WALK_Y
+                )
+
+                result.paste(
+                  corrected,(x,y)
+                )
+
+                metric['frame']=col+1
+                metrics.append(metric)
+
+              measurements.append({
+                'direction':direction,
+                'frames':metrics
+              })
+
+            result.save(path,optimize=True)
+
+            return measurements
+
+          # Original Sanctuary two-frame Hit bank.
+          source=Image.open(
+            'build/v247/knight/gameasync/Graphics/'
+            'Characters/SLZenithHit.png'
+          ).convert('RGBA')
+
+          assert source.width%2==0
+          assert source.height%4==0
+
+          source_w=source.width//2
+          source_h=source.height//4
+
+          assert source_w<=CW
+          assert source_h<=CH
+
+          hit=Image.new(
+            'RGBA',(CW*4,CH*4),(0,0,0,0)
+          )
+
+          # Four columns retain legacy native
+          # 4-frame character compatibility.
+          hit_sequence=(0,1,1,0)
+
+          for row in range(4):
+            for col,source_index in enumerate(
+              hit_sequence
+            ):
+              cell=source.crop((
+                source_index*source_w,
+                row*source_h,
+                (source_index+1)*source_w,
+                (row+1)*source_h
+              ))
+
+              frame=Image.new(
+                'RGBA',(CW,CH),(0,0,0,0)
+              )
+
+              frame.paste(
+                cell,
+                (
+                  (CW-source_w)//2,
+                  CH-source_h
+                )
+              )
+
+              hit.paste(
+                frame,(col*CW,row*CH)
+              )
+
+          hit_path=chars/'SLZQHit.png'
+
+          assert not hit_path.exists(),(
+            'Unexpected existing Hit character'
+          )
+
+          hit.save(hit_path,optimize=True)
+
+          report.append({
+            'motion':'hit',
+            'directions':process_character(hit_path)
+          })
+
+          report.append({
+            'motion':'corpse',
+            'directions':process_character(
+              chars/'SLZQDeath.png'
+            )
+          })
+
+          for kind in (
+            'normal','strong','magic','death'
+          ):
+            for direction in directions:
+              metrics=process_atlas(
+                kind,direction
+              )
+
+              report.append({
+                'motion':kind,
+                'direction':direction,
+                'frames':metrics
+              })
+
+              print(
+                'PASS aligned',
+                kind,direction,len(metrics)
+              )
+
+          # Do not modify the successful walk.
+          assert walk_path.read_bytes()==walk_before
+
+          assert len(report)==18
+
+          Path(
+            'build/slzq_combat_alignment.json'
+          ).write_text(
+            json.dumps(
+              {
+                'version':'V276.7.4',
+                'walk_unchanged':True,
+                'walk_center':[WALK_X,WALK_Y],
+                'animation_pivot':[ANIM_X,ANIM_Y],
+                'directions':report
+              },
+              ensure_ascii=False,
+              indent=2
+            ),
+            encoding='utf-8'
+          )
+
+          print('PASS 12 attack animation atlases')
+          print('PASS 4 death animation atlases')
+          print('PASS 4-direction original Hit graphics')
+          print('PASS 4-direction corpse alignment')
+          print('PASS successful walk unchanged')
+          print('PASS no original visible pixels clipped')
+
+          ZQ_ART
+
+          python3 build/align_combat.py
+
+      - name: V276.7.4 Native combat and status patch
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > build/slwalk8.rb <<'SLWALK8_RUBY'
+          cat > build/zq_combat.rb <<'ZQ_COMBAT_RUBY'
           require 'zlib'
-          require 'fileutils'
 
           module RPG
             class Map;end
@@ -284,10 +542,15 @@ jobs:
                 class Graphic;end
               end
             end
+            class CommonEvent;end
             class EventCommand;end
-            class AudioFile;end
             class MoveRoute;end
             class MoveCommand;end
+            class AudioFile;end
+            class Animation
+              class Frame;end
+              class Timing;end
+            end
           end
 
           class Table
@@ -320,284 +583,721 @@ jobs:
             raise message unless value
           end
 
-          root='site/knight/gameasync/Data/'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          scripts_path=root+'Scripts.rxdata'
-          map_path=root+pre+'Map025.rxdata'
-
-          # ------------------------------------------
-          # Native Sprite_Character.
-          # No alias, no extra update, no timer.
-          # ------------------------------------------
-
-          script_before=File.binread(scripts_path)
-          scripts=Marshal.load(script_before)
-
-          check(
-            scripts.length==137,
-            'Original RGSS script count mismatch'
-          )
-
-          matches=scripts.each_index.select do |i|
-            scripts[i][1]=='Sprite_Character'
-          end
-
-          check(
-            matches.length==1,
-            'Sprite_Character must occur once'
-          )
-
-          script_id=matches.first
-
-          original=Zlib::Inflate.inflate(
-            scripts[script_id][2]
-          )
-
-          code=original.dup
-
-          # Find the existing native assignments.
-          # Accept bitmap or charbitmap and CRLF.
-          # Preserve the original expression.
-
-          width_lines=code.lines.select do |line|
-            line.match?(/^[ \t]*@cw[ \t]*=/) &&
-            line.match?(/\bwidth[ \t]*\/[ \t]*4\b/)
-          end
-
-          frame_lines=code.lines.select do |line|
-            line.match?(/^[ \t]*sx[ \t]*=/) &&
-            line.include?('@character.pattern')
-          end
-
-          check(
-            width_lines.length==1,
-            'Native width lines: '+
-            code.lines.grep(/@cw[ \t]*=/).
-              map(&:strip).inspect
-          )
-
-          check(
-            frame_lines.length==1,
-            'Native frame lines: '+
-            code.lines.grep(/sx[ \t]*=/).
-              map(&:strip).inspect
-          )
-
-          eol=code.include?("\r\n") ? "\r\n" : "\n"
-
-          width_line=width_lines.first
-          frame_line=frame_lines.first
-
-          indent=width_line[/\A[ \t]*/]
-          frame_indent=frame_line[/\A[ \t]*/]
-
-          # Replace only the original divisor 4.
-          # The original bitmap source is retained.
-
-          width_new=width_line.chomp.sub(
-            /(\bwidth[ \t]*\/[ \t]*)4\b/,
-            '\1(@sl_walk8 ? 8 : 4)'
-          )
-
-          check(
-            width_new!=width_line.chomp,
-            'Native width divisor not patched'
-          )
-
-          width_replacement=[
-            indent+'@sl_walk8 = (',
-            indent+'  @character.character_name == "SLZQWalk" ||',
-            indent+'  @character.character_name[0,4] == "SL8_"',
-            indent+')',
-            width_new
-          ].join(eol)+eol
-
-          check(
-            code.sub!(width_line,width_replacement),
-            'Native width replacement failed'
-          )
-
-          # Replace only native frame selection.
-          # Legacy pattern expression is preserved.
-
-          original_frame=frame_line.strip.sub(
-            /\Asx[ \t]*=[ \t]*/,
-            ''
-          )
-
-          frame_replacement=[
-            'sx = if @sl_walk8',
-            '  attacking = (',
-            '    @character.respond_to?(:sl_attack_active?) &&',
-            '    @character.sl_attack_active?',
-            '  )',
-            '  if @character.moving? && !attacking',
-            '    rx = @character.instance_variable_get(:@real_x)',
-            '    ry = @character.instance_variable_get(:@real_y)',
-            '    if rx && ry',
-            '      remaining = (',
-            '        (@character.x * 128 - rx).abs +',
-            '        (@character.y * 128 - ry).abs',
-            '      )',
-            '      progress = 128 - remaining',
-            '      progress = 0 if progress < 0',
-            '      progress = 127 if progress > 127',
-            '      (progress / 16) * @cw',
-            '    else',
-            '      0',
-            '    end',
-            '  else',
-            '    0',
-            '  end',
-            'else',
-            '  '+original_frame,
-            'end'
-          ].map{|line|frame_indent+line}.join(eol)+eol
-
-          check(
-            code.sub!(frame_line,frame_replacement),
-            'Native frame replacement failed'
-          )
-
-          check(
-            code!=original,
-            'Native source was not changed'
-          )
-
-          check(
-            code.include?('@sl_walk8') &&
-            code.include?('@character.pattern'),
-            'Original and new selectors missing'
-          )
-
-          # Only the existing Sprite_Character
-          # script contents are replaced.
-          # No extra script entry is added.
-
-          scripts[script_id][2]=Zlib::Deflate.deflate(code)
-
-          File.binwrite(
-            scripts_path,
-            Marshal.dump(scripts)
-          )
-
-          saved=Marshal.load(File.binread(scripts_path))
-          original_scripts=Marshal.load(script_before)
-
-          check(
-            saved.length==137,
-            'Patched RGSS count mismatch'
-          )
-
-          saved.each_with_index do |row,i|
-            next if i==script_id
-
-            check(
-              row==original_scripts[i],
-              'Unrelated RGSS script changed'
+          def iv(object,name)
+            object.instance_variable_get(
+              '@'+name.to_s
             )
           end
 
+          def put(object,name,value)
+            object.instance_variable_set(
+              '@'+name.to_s,value
+            )
+          end
+
+          def copy(object)
+            Marshal.load(Marshal.dump(object))
+          end
+
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          root='site/knight/gameasync/Data/'
+
+          scripts_path=root+'Scripts.rxdata'
+          common_path=root+pre+'CommonEvents.rxdata'
+          animations_path=root+pre+'Animations.rxdata'
+          map_path=root+pre+'Map025.rxdata'
+
+          scripts=Marshal.load(
+            File.binread(scripts_path)
+          )
+
+          common=Marshal.load(
+            File.binread(common_path)
+          )
+
+          animations=Marshal.load(
+            File.binread(animations_path)
+          )
+
+          map=Marshal.load(
+            File.binread(map_path)
+          )
+
+          check(scripts.length==137,'Script count changed')
+          check(common.length==1068,'CE baseline changed')
+          check(animations.length==924,'Animation baseline changed')
+
+          queen=iv(map,:events).fetch(29)
+          pages=iv(queen,:pages)
+
+          check(pages.length==5,'Queen page count changed')
+
           check(
-            Zlib::Inflate.inflate(
-              saved[script_id][2]
-            )==code,
-            'Patched native source mismatch'
+            pages.map{|p|iv(p,:list).length}==
+            [22,1,217,2,20],
+            'Queen combat or death graph changed'
           )
 
           # ------------------------------------------
-          # Remove queen-only runtime installer.
-          # Keep all original 22 spawn commands.
+          # Private Hit CE:
+          # keep Death Knight CE178 unchanged.
           # ------------------------------------------
 
-          map_before=File.binread(map_path)
-          map=Marshal.load(map_before)
+          hit_source=common.fetch(178)
 
-          events=map.instance_variable_get(:@events)
-          queen=events.fetch(29)
-          pages=queen.instance_variable_get(:@pages)
+          name=iv(hit_source,:name).
+            to_s.dup.force_encoding('UTF-8').scrub
 
           check(
-            pages.length==5,
-            'Queen functional pages changed'
+            name.include?('데스') ||
+            name.include?('맞음'),
+            'CE178 is not expected Death Knight Hit'
           )
 
-          page0=pages[0]
-          commands=page0.instance_variable_get(:@list)
+          original_hit=Marshal.dump(hit_source)
+
+          hit=copy(hit_source)
+          hit_id=common.length
+
+          put(hit,:id,hit_id)
+          put(hit,:name,'[ZQ] 전용 피격')
+
+          changed_graphics=0
+
+          def rewrite_hit_route(object)
+            changes=0
+
+            case object
+            when RPG::MoveCommand
+              if iv(object,:code)==41
+                params=iv(object,:parameters)
+
+                if params.is_a?(Array) &&
+                   params[0].is_a?(String)
+
+                  label=params[0].dup.
+                    force_encoding('UTF-8').scrub
+
+                  if label.include?('데스나이트')
+                    params[0]=(
+                      label.include?('맞음') ?
+                      'SLZQHit' : 'SLZQWalk'
+                    )
+                    changes+=1
+                  end
+                end
+              end
+
+              iv(object,:parameters).each do |p|
+                changes+=rewrite_hit_route(p)
+              end
+
+            when Array
+              object.each do |value|
+                changes+=rewrite_hit_route(value)
+              end
+
+            when RPG::MoveRoute
+              changes+=rewrite_hit_route(
+                iv(object,:list)
+              )
+
+            when RPG::EventCommand
+              changes+=rewrite_hit_route(
+                iv(object,:parameters)
+              )
+            end
+
+            changes
+          end
+
+          changed_graphics=rewrite_hit_route(
+            iv(hit,:list)
+          )
 
           check(
-            commands.length==23,
-            'Original queen spawn count mismatch'
+            changed_graphics>0,
+            'No native Death Knight Hit graphics found'
           )
-
-          old_hook=commands.first
 
           check(
-            old_hook.instance_variable_get(:@code)==355,
-            'Queen runtime installer not found'
+            Marshal.dump(common.fetch(178))==
+            original_hit,
+            'Shared Death Knight Hit changed'
           )
 
-          old_text=old_hook.instance_variable_get(
-            :@parameters
-          )[0].to_s
+          common << hit
 
           check(
-            old_text.include?('class Sprite_Character') &&
-            old_text.include?('slzq_v2767_original_update'),
-            'Unexpected queen runtime installer'
+            common.length==1069 &&
+            iv(common.fetch(1068),:id)==1068,
+            'Private Queen Hit event not registered'
           )
 
-          commands.shift
+          # ------------------------------------------
+          # Redirect private Queen references only.
+          # Other monsters retain CE178.
+          # ------------------------------------------
+
+          redirected=0
+
+          private_events=(
+            pages.flat_map{|page|iv(page,:list)}+
+            (1061..1067).flat_map{|id|
+              iv(common.fetch(id),:list)
+            }
+          )
+
+          private_events.each do |command|
+            next unless iv(command,:code)==117
+
+            params=iv(command,:parameters)
+
+            next unless params==[178]
+
+            put(command,:parameters,[hit_id])
+            redirected+=1
+          end
+
+          # Nested interpreter calls are handled
+          # by the scoped Interpreter hook below.
+          puts "Private Hit references redirected: #{redirected}"
+
+          # ------------------------------------------
+          # Preserve native attack damage and ratio.
+          # Add one status hook on each side of
+          # existing CE1066 damage calculation.
+          # ------------------------------------------
+
+          cycle=common.fetch(1064)
+          commands=iv(cycle,:list)
+
+          attack_calls=commands.each_index.select do |i|
+            c=commands[i]
+            iv(c,:code)==117 &&
+            iv(c,:parameters)==[1066]
+          end
 
           check(
-            commands.length==22,
-            'Original 22 spawn commands missing'
+            attack_calls.length==1,
+            'Native Queen damage call not unique'
           )
 
-          page0.instance_variable_set(:@list,commands)
+          index=attack_calls.first
+
+          sample=commands.find do |c|
+            iv(c,:code)==355
+          end
+
+          check(sample,'Native script command missing')
+
+          def script_command(sample,source)
+            command=copy(sample)
+            put(command,:code,355)
+            put(command,:indent,0)
+            put(command,:parameters,[source])
+            command
+          end
+
+          before=script_command(
+            sample,
+            'SLZQEffects.before_damage($game_variables[5987])'
+          )
+
+          after=script_command(
+            sample,
+            'SLZQEffects.after_damage($game_variables[5987])'
+          )
+
+          commands.insert(index,before)
+          commands.insert(index+2,after)
+
+          check(
+            commands.length==17,
+            'Unexpected Queen attack command count'
+          )
+
+          check(
+            commands.count{|c|
+              iv(c,:code)==117 &&
+              iv(c,:parameters)==[1066]
+            }==1,
+            'Original damage calculation duplicated'
+          )
+
+          # ------------------------------------------
+          # Death animation:
+          # 17 original frames -> 34 display frames.
+          # Keep original images and frame order.
+          # ------------------------------------------
+
+          (908..923).each do |id|
+            animation=animations.fetch(id)
+
+            check(
+              iv(animation,:id)==id,
+              'Queen animation index mismatch'
+            )
+
+            # Use the event-centered animation
+            # position consistently.
+            put(animation,:position,1)
+          end
+
+          (920..923).each do |id|
+            animation=animations.fetch(id)
+            frames=iv(animation,:frames)
+
+            check(
+              frames.length==17 &&
+              iv(animation,:frame_max)==17,
+              'Original death animation changed'
+            )
+
+            doubled=frames.flat_map do |frame|
+              [copy(frame),copy(frame)]
+            end
+
+            put(animation,:frames,doubled)
+            put(animation,:frame_max,34)
+          end
+
+          death_ce=common.fetch(1067)
+          death_list=iv(death_ce,:list)
+
+          waits=death_list.select do |c|
+            iv(c,:code)==106 &&
+            iv(c,:parameters)==[36]
+          end
+
+          check(
+            waits.length==1,
+            'Original death animation wait missing'
+          )
+
+          put(waits.first,:parameters,[70])
+
+          check(
+            (920..923).all?{|id|
+              anim=animations.fetch(id)
+              iv(anim,:frame_max)==34 &&
+              iv(anim,:frames).length==34
+            },
+            'Death duration not doubled'
+          )
+
+          # ------------------------------------------
+          # Player status logic:
+          # one existing Game_Player update.
+          # No extra Sprite_Character update.
+          # ------------------------------------------
+
+          status_source=<<'ZQ_STATUS_CODE'
+
+          module SLZQEffects
+            MAP_ID=25
+            EVENT_ID=29
+            POISON_CHANCE=20
+            POISON_FRAMES=360
+            POISON_TICK=180
+            POISON_DAMAGE=5
+            WEB_SECONDS=64
+
+            @previous_hp=nil
+            @last_roll=nil
+            @poison_until=0
+            @poison_tick_at=0
+            @slow_until=0
+            @old_speed=nil
+            @slow_speed=nil
+
+            def self.frame
+              Graphics.frame_count.to_i
+            end
+
+            def self.rate
+              value=(
+                Graphics.respond_to?(:frame_rate) ?
+                Graphics.frame_rate.to_i : 40
+              )
+              value>0 ? value : 40
+            end
+
+            def self.actor
+              return nil unless $game_actors
+              $game_actors[1]
+            end
+
+            def self.player
+              $game_player
+            end
+
+            def self.in_queen_map?
+              $game_map &&
+              $game_map.map_id==MAP_ID
+            end
+
+            def self.web_distance_ok?
+              return false unless in_queen_map?
+              return false unless player
+
+              event=$game_map.events[EVENT_ID]
+              return false unless event
+
+              dx=(event.x-player.x).abs
+              dy=(event.y-player.y).abs
+
+              [dx,dy].max<=2
+            end
+
+            def self.before_damage(roll)
+              target=actor
+              @last_roll=roll.to_i
+              @previous_hp=target ? target.hp.to_i : nil
+            end
+
+            def self.web_animation_id
+              return @web_animation_id if
+                defined?(@web_animation_id) &&
+                @web_animation_id
+
+              return nil unless
+                defined?($data_animations) &&
+                $data_animations
+
+              pattern=Regexp.new(
+                'web|spider|\\uAC70\\uBBF8|\\u8718\\u86DB',
+                Regexp::IGNORECASE
+              )
+
+              pair=$data_animations.each_with_index.find do |a,i|
+                next false unless a &&
+                  a.respond_to?(:name)
+
+                text=a.name.to_s.dup.
+                  force_encoding('UTF-8').scrub
+
+                text.match(pattern)
+              end
+
+              @web_animation_id=pair ? pair[1] : nil
+            end
+
+            def self.show_web
+              target=player
+              return unless target
+
+              id=web_animation_id
+              return unless id && id>0
+
+              if target.respond_to?(:animation_id=)
+                target.animation_id=id
+              end
+            end
+
+            def self.poison
+              return unless rand(100)<POISON_CHANCE
+
+              @poison_until=frame+POISON_FRAMES
+              @poison_tick_at=frame+POISON_TICK
+            end
+
+            def self.slow
+              return unless web_distance_ok?
+
+              target=player
+
+              speed=target.instance_variable_get(
+                :@move_speed
+              ).to_i
+
+              if @slow_until.to_i<=frame
+                @old_speed=speed
+                @slow_speed=[speed-1,1].max
+
+                target.instance_variable_set(
+                  :@move_speed,@slow_speed
+                )
+              end
+
+              @slow_until=frame+WEB_SECONDS*rate
+            end
+
+            def self.after_damage(roll)
+              return unless in_queen_map?
+
+              value=roll.to_i
+
+              # Web casting visual is distinct
+              # from successful damage.
+              show_web if value==1
+
+              target=actor
+              return unless target && @previous_hp
+
+              landed=(
+                target.hp.to_i < @previous_hp
+              )
+
+              return unless landed
+
+              if value==1
+                slow
+              elsif value==0 || (2..6).include?(value)
+                poison
+              end
+            ensure
+              @previous_hp=nil
+            end
+
+            def self.restore_speed(target)
+              return unless target
+
+              if @old_speed &&
+                 @slow_speed &&
+                 target.instance_variable_get(
+                   :@move_speed
+                 ).to_i==@slow_speed
+
+                target.instance_variable_set(
+                  :@move_speed,@old_speed
+                )
+              end
+
+              @slow_until=0
+              @old_speed=nil
+              @slow_speed=nil
+            end
+
+            def self.tick(target)
+              return unless target
+
+              unless in_queen_map?
+                restore_speed(target)
+                @poison_until=0
+                return
+              end
+
+              now=frame
+
+              if @slow_until.to_i>0 &&
+                 now>=@slow_until
+
+                restore_speed(target)
+              end
+
+              if @poison_until.to_i>now &&
+                 now>=@poison_tick_at.to_i
+
+                victim=actor
+
+                if victim && victim.hp.to_i>0
+                  victim.hp=[
+                    victim.hp.to_i-POISON_DAMAGE,0
+                  ].max
+                end
+
+                @poison_tick_at+=POISON_TICK
+              end
+
+              if @poison_until.to_i<=now
+                @poison_until=0
+              end
+            end
+          end
+
+          class Game_Player
+            unless method_defined?(:slzq_v27674_update)
+              alias slzq_v27674_update update
+
+              def update
+                slzq_v27674_update
+                SLZQEffects.tick(self)
+              end
+            end
+          end
+
+          ZQ_STATUS_CODE
+
+          # ------------------------------------------
+          # Scoped CE178 interception.
+          # No global rewrite of Death Knight.
+          # ------------------------------------------
+
+          interpreter_source=<<'ZQ_INTERPRETER_CODE'
+
+          class Interpreter
+            unless method_defined?(:slzq_v27674_command_117)
+              alias slzq_v27674_command_117 command_117
+
+              def command_117
+                is_queen=(
+                  $game_map &&
+                  $game_map.map_id==25 &&
+                  @event_id==29
+                )
+
+                original=@parameters
+
+                if is_queen &&
+                   original &&
+                   original[0]==178
+
+                  begin
+                    @parameters=[1068]
+                    slzq_v27674_command_117
+                  ensure
+                    @parameters=original
+                  end
+                else
+                  slzq_v27674_command_117
+                end
+              end
+            end
+          end
+
+          ZQ_INTERPRETER_CODE
+
+          def append_script(scripts,name,patch)
+            indices=scripts.each_index.select do |i|
+              scripts[i][1]==name
+            end
+
+            check(
+              indices.length==1,
+              'Original RGSS script missing: '+name
+            )
+
+            index=indices.first
+
+            source=Zlib::Inflate.inflate(
+              scripts[index][2]
+            )
+
+            check(
+              !source.include?('slzq_v27674'),
+              'Combat patch already installed'
+            )
+
+            updated=source.b+
+              "\n".b+
+              patch.b+
+              "\n".b
+
+            scripts[index][2]=Zlib::Deflate.deflate(
+              updated
+            )
+          end
+
+          append_script(
+            scripts,'Game_Player',status_source
+          )
+
+          append_script(
+            scripts,'Interpreter',interpreter_source
+          )
 
           File.binwrite(
-            map_path,
-            Marshal.dump(map)
+            'build/zq_status_syntax.rb',status_source
           )
 
-          verify=Marshal.load(File.binread(map_path))
-
-          saved_pages=verify.instance_variable_get(
-            :@events
-          ).fetch(29).instance_variable_get(:@pages)
-
-          check(
-            saved_pages[0].instance_variable_get(
-              :@list
-            ).length==22,
-            'Duplicate queen runtime remains'
+          File.binwrite(
+            'build/zq_interpreter_syntax.rb',
+            interpreter_source
           )
 
           check(
-            saved_pages.map{|p|
-              p.instance_variable_get(:@list).length
-            }==[22,1,217,2,20],
-            'Original queen event pages damaged'
+            system(
+              'ruby','-c','build/zq_status_syntax.rb'
+            ),
+            'Status runtime syntax failed'
           )
 
-          puts 'PASS native 4/8-frame branch'
-          puts 'PASS original width expression preserved'
-          puts 'PASS original Sprite_Character.update retained'
-          puts 'PASS no additional update method'
-          puts 'PASS legacy 4-frame pattern preserved'
-          puts 'PASS queen-only duplicate renderer removed'
-          puts 'PASS original queen combat pages preserved'
+          check(
+            system(
+              'ruby','-c','build/zq_interpreter_syntax.rb'
+            ),
+            'Interpreter runtime syntax failed'
+          )
 
-          SLWALK8_RUBY
+          File.binwrite(
+            scripts_path,Marshal.dump(scripts)
+          )
 
-          ruby -c build/slwalk8.rb
-          ruby build/slwalk8.rb
+          File.binwrite(
+            common_path,Marshal.dump(common)
+          )
+
+          File.binwrite(
+            animations_path,Marshal.dump(animations)
+          )
+
+          File.binwrite(
+            map_path,Marshal.dump(map)
+          )
 
           # ------------------------------------------
-          # Update changed hashes and display version.
+          # Readback and structural verification.
           # ------------------------------------------
+
+          verify_scripts=Marshal.load(
+            File.binread(scripts_path)
+          )
+
+          verify_common=Marshal.load(
+            File.binread(common_path)
+          )
+
+          verify_anims=Marshal.load(
+            File.binread(animations_path)
+          )
+
+          check(
+            verify_scripts.length==137,
+            'Unexpected RGSS script added'
+          )
+
+          check(
+            verify_common.length==1069,
+            'Queen Hit CE not added'
+          )
+
+          check(
+            verify_anims.length==924,
+            'Unexpected animation ID changes'
+          )
+
+          check(
+            (908..919).all?{|id|
+              iv(verify_anims.fetch(id),:frame_max)==25
+            },
+            'Original 25-frame attack changed'
+          )
+
+          check(
+            (920..923).all?{|id|
+              iv(verify_anims.fetch(id),:frame_max)==34
+            },
+            'Death animation length incorrect'
+          )
+
+          puts 'PASS original 5:1:1 attack structure'
+          puts 'PASS normal and strong poison hook'
+          puts 'PASS magic web and 64-second slow hook'
+          puts 'PASS scoped Queen Hit CE 1068'
+          puts 'PASS shared Death Knight CE178 preserved'
+          puts 'PASS 17 death poses held twice'
+          puts 'PASS native Sprite_Character left unchanged'
+
+          ZQ_COMBAT_RUBY
+
+          ruby -c build/zq_combat.rb
+          ruby build/zq_combat.rb
+
+      - name: Register updated graphics and native data
+        shell: bash
+        run: |
+          set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
@@ -612,12 +1312,18 @@ jobs:
           mapping=game/'mapping.js'
           content=mapping.read_text('utf-8')
 
+          # Register all changed RXData hashes.
           for name in (
             'Scripts.rxdata',
-            pre+'Map025.rxdata'
+            pre+'Map025.rxdata',
+            pre+'CommonEvents.rxdata',
+            pre+'Animations.rxdata'
           ):
             path=data/name
-            digest=hashlib.md5(path.read_bytes()).hexdigest()
+
+            digest=hashlib.md5(
+              path.read_bytes()
+            ).hexdigest()
 
             token=(
               re.escape('Data/'+name)+
@@ -631,46 +1337,89 @@ jobs:
             )
 
             assert count==1,(
-              'Expected one original mapping',
+              'Original data mapping not unique',
               name,count
             )
 
-          # Refresh the corrected walk PNG cache hash.
-          walk=(
-            game/'Graphics/Characters/SLZQWalk.png'
-          )
+          # Refresh animation and corpse graphics.
+          image_paths=[
+            game/'Graphics/Characters/SLZQDeath.png'
+          ]
 
-          walk_digest=hashlib.md5(
-            walk.read_bytes()
+          for kind in (
+            'normal','strong','magic','death'
+          ):
+            for direction in (2,4,6,8):
+              image_paths.append(
+                game/'Graphics/Animations'/
+                f'SLZQ_{kind}_D{direction}.png'
+              )
+
+          for path in image_paths:
+            assert path.is_file(),path
+
+            relative=str(
+              path.relative_to(game)
+            ).replace('\\','/')
+
+            digest=hashlib.md5(
+              path.read_bytes()
+            ).hexdigest()
+
+            token=(
+              re.escape(relative)+
+              r'\?h=[0-9a-f]{32}'
+            )
+
+            content,count=re.subn(
+              token,
+              relative+'?h='+digest,
+              content
+            )
+
+            assert count==1,(
+              'Original image mapping not unique',
+              relative,count
+            )
+
+          # New 4-direction Hit sprite.
+          hit=game/'Graphics/Characters/SLZQHit.png'
+
+          assert hit.is_file()
+
+          digest=hashlib.md5(
+            hit.read_bytes()
           ).hexdigest()
 
-          walk_token=(
-            re.escape(
-              'Graphics/Characters/SLZQWalk.png'
-            )+r'\?h=[0-9a-f]{32}'
+          entry=(
+            '["graphics/characters/slzqhit", '
+            '"Graphics/Characters/SLZQHit.png?h='
+            +digest+'"],'
           )
 
-          content,count=re.subn(
-            walk_token,
-            'Graphics/Characters/SLZQWalk.png'
-            '?h='+walk_digest,
-            content
-          )
+          assert 'graphics/characters/slzqhit' not in content
 
-          assert count==1,(
-            'Queen walk image mapping not unique',
-            count
+          anchor='];\n\nvar mapping = {};'
+
+          assert content.count(anchor)==1
+
+          content=content.replace(
+            anchor,
+            '\n'+entry+'\n'+anchor
           )
 
           mapping.write_text(
             content,encoding='utf-8'
           )
 
+          # Keep exact workflow filename and
+          # version-display locations.
           loader=root/'knight/js/sl-assets-v229r115.js'
+
           text=loader.read_text('utf-8')
 
-          old="var version='V276.7.1';"
-          new="var version='V276.7.3';"
+          old="var version='V276.7.3';"
+          new="var version='V276.7.4';"
 
           assert text.count(old)==1
 
@@ -686,18 +1435,43 @@ jobs:
             path=root/name
             text=path.read_text('utf-8')
 
-            assert 'V276.7.1' in text,name
+            assert 'V276.7.3' in text,name
 
             text=(
-              text.replace('V276.7.1','V276.7.3').
-                   replace('?v=v276.7.1','?v=v276.7.3')
+              text.replace(
+                'V276.7.3','V276.7.4'
+              ).replace(
+                '?v=v276.7.3','?v=v276.7.4'
+              )
             )
 
             path.write_text(
               text,encoding='utf-8'
             )
 
-          original_hashes=json.loads(
+          print('PASS 4 native RXData mappings')
+          print('PASS 16 original motion mappings')
+          print('PASS corrected corpse mapping')
+          print('PASS new Hit character mapping')
+          print('PASS V276.7.4 display version')
+
+          PY
+
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
+
+      - name: Verify V276.7.4 protected originals
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+
+          root=Path('site')
+
+          original=json.loads(
             Path('build/original_sha256.json').
               read_text('utf-8')
           )
@@ -705,43 +1479,101 @@ jobs:
           current={
             str(p.relative_to(root)):
               hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in root.rglob('*') if p.is_file()
+            for p in root.rglob('*')
+            if p.is_file()
           }
 
-          assert len(current)==5622
+          # Exactly one new source-derived character.
+          assert len(current)==5623,(
+            'Unexpected generated file count',
+            len(current)
+          )
 
-          assert set(current)==set(original_hashes),(
-            'Unexpected files added or removed'
+          added=set(current)-set(original)
+
+          assert added=={
+            'knight/gameasync/Graphics/'
+            'Characters/SLZQHit.png'
+          },('Unexpected new files',added)
+
+          removed=set(original)-set(current)
+
+          assert not removed,(
+            'Original files removed',removed
           )
 
           changed={
-            name for name in original_hashes
-            if current[name]!=original_hashes[name]
+            name for name in original
+            if original[name]!=current[name]
           }
 
-          expected={
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          allowed={
             'knight/gameasync/Data/Scripts.rxdata',
             'knight/gameasync/Data/'+pre+'Map025.rxdata',
-            'knight/gameasync/Graphics/Characters/SLZQWalk.png',
+            'knight/gameasync/Data/'+pre+'CommonEvents.rxdata',
+            'knight/gameasync/Data/'+pre+'Animations.rxdata',
+            'knight/gameasync/Graphics/Characters/SLZQDeath.png',
             'knight/gameasync/mapping.js',
             'knight/js/sl-assets-v229r115.js',
             'index.html',
             'knight/index.html'
           }
 
-          assert changed==expected,(
-            'Unexpected original modification',
-            changed^expected
+          for kind in (
+            'normal','strong','magic','death'
+          ):
+            for direction in (2,4,6,8):
+              allowed.add(
+                'knight/gameasync/Graphics/'
+                'Animations/'
+                f'SLZQ_{kind}_D{direction}.png'
+              )
+
+          assert changed<=allowed,(
+            'Unapproved original modification',
+            changed-allowed
           )
 
-          print('PASS seven expected generated files changed')
-          print('PASS 5615 remaining files unchanged')
-          print('PASS corrected queen walk PNG mapping')
-          print('PASS V276.7.3 version retained')
-          PY
+          required={
+            'knight/gameasync/Data/Scripts.rxdata',
+            'knight/gameasync/Data/'+pre+'CommonEvents.rxdata',
+            'knight/gameasync/Data/'+pre+'Animations.rxdata',
+            'knight/gameasync/mapping.js',
+            'knight/js/sl-assets-v229r115.js',
+            'index.html',
+            'knight/index.html'
+          }
 
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
+          assert required<=changed,(
+            'Expected modification missing',
+            required-changed
+          )
+
+          # V276.7.3 successful walk:
+          # byte-for-byte unchanged.
+          walk=(
+            'knight/gameasync/Graphics/'
+            'Characters/SLZQWalk.png'
+          )
+
+          assert current[walk]==original[walk],(
+            'Successful V276.7.3 walk was modified'
+          )
+
+          assert (
+            'knight/gameasync/Graphics/'
+            'Characters/SLZQBlank.png'
+          ) not in changed
+
+          print('PASS successful 8-frame walk untouched')
+          print('PASS all original files retained')
+          print('PASS only approved Queen graphics modified')
+          print('PASS original game combat data protected')
+          print('PASS V276.7.4 file inventory')
+
+          PY
 
       - name: Publish verified draft game
         uses: actions/upload-pages-artifact@v5
