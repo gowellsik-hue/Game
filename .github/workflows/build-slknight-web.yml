@@ -1,22 +1,28 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V1.1
-# BASE: verified successful run 42124364984
+# VERSION: V1.2
+# BASE: successful V1.1 run 42159828427
 #
-# FIX:
-# - Remove the failing method-signature parser.
-# - Remove fragile indentation-changing heredocs.
-# - Patch one exact location in existing move_rate.
-# - Reuse native Holy Walk switch 811.
-# - Holy Walk: movement x1.33, attack unchanged.
-# - No new timers, Game_Player hooks or Interpreter hooks.
-# - No polymorph attack-speed changes.
-# - No haste/bravery coefficient changes.
-# - No attack animation, combat or monster changes.
-# - Leave unverified Slow behavior unchanged.
-# - Keep version V1.1 on failure.
+# V1.2:
+# 1. Fix polymorph motion selection when bravery expires.
+# 2. Connect native Holy Walk cast to a 32-second buff.
+# 3. Prepare inactive 64-second Slow for future Zenith Queen magic.
+#
+# PRESERVE:
+# - Existing four-direction movement
+# - All existing polymorph attack-speed coefficients
+# - Original attack timing and animation frames
+# - Original potion speed multipliers
+# - Existing monster maps and combat logic
+# - Zenith Queen native recovery and death
+# - Original file names and asset inventory
+#
+# No blanket rewrite of all transformation events.
+# No new Game_Player or Interpreter update hooks.
+# No extra combat or graphics engine.
+# Stop safely if original event structure differs.
 
-name: build-slknight-web.yml | V1.1 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V1.2 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -41,16 +47,16 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Restore last successful game
+      - name: Restore successful V1.1 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 42124364984
+          run-id: 42159828427
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify successful baseline
+      - name: Verify and snapshot original game
         shell: bash
         run: |
           set -euo pipefail
@@ -68,24 +74,25 @@ jobs:
 
           files = {
               str(p.relative_to(root)):
-              hashlib.sha256(p.read_bytes()).hexdigest()
+                  hashlib.sha256(p.read_bytes()).hexdigest()
               for p in root.rglob('*')
               if p.is_file()
           }
 
           assert len(files) == 5623, (
-              'Baseline inventory', len(files)
+              'Unexpected original file count',
+              len(files)
           )
 
           pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           data = root / 'knight/gameasync/Data'
 
           for name in (
+              'Scripts.rxdata',
+              pre + 'CommonEvents.rxdata',
               pre + 'Map019.rxdata',
               pre + 'Map025.rxdata',
-              pre + 'CommonEvents.rxdata',
-              pre + 'Animations.rxdata',
-              'Scripts.rxdata'
+              pre + 'Animations.rxdata'
           ):
               assert (data / name).is_file(), name
 
@@ -102,147 +109,949 @@ jobs:
               encoding='utf-8'
           )
 
-          print('PASS original baseline and inventory')
+          print('PASS original V1.1 game restored')
+          print('PASS 5623 original files')
           PY_BASE
 
-      - name: Apply V1.1 minimal movement fix
+      - name: Apply V1.2 native speed and motion repairs
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > build/patch_v11.rb <<'END_SPEED_V11'
+          cat > build/v12_patch.rb <<'END_V12_PATCH'
+          # encoding: UTF-8
+
           require 'zlib'
           require 'digest'
 
-          path = 'site/knight/gameasync/Data/Scripts.rxdata'
+          module RPG
+            class CommonEvent; end
+            class EventCommand; end
+            class MoveRoute; end
+            class MoveCommand; end
+            class AudioFile; end
+          end
 
-          abort 'Missing Scripts.rxdata' unless File.file?(path)
+          class RawMarshalObject
+            def self._load(bytes)
+              object = allocate
+              object.instance_variable_set(:@raw, bytes)
+              object
+            end
 
-          original_bytes = File.binread(path)
-          scripts = Marshal.load(original_bytes)
-          original_scripts = Marshal.load(original_bytes)
+            def _dump(level = 0)
+              @raw
+            end
+          end
 
-          abort 'Unexpected Scripts format' unless scripts.is_a?(Array)
+          class Tone < RawMarshalObject; end
+          class Color < RawMarshalObject; end
+          class Table < RawMarshalObject; end
+          class Rect < RawMarshalObject; end
+
+          def check(value, message)
+            raise message unless value
+          end
+
+          def iv(object, name)
+            object.instance_variable_get('@' + name.to_s)
+          end
+
+          def put(object, name, value)
+            object.instance_variable_set('@' + name.to_s, value)
+          end
+
+          def cmd_code(command)
+            iv(command, :code).to_i
+          end
+
+          def cmd_params(command)
+            iv(command, :parameters) || []
+          end
+
+          def cmd_indent(command)
+            iv(command, :indent).to_i
+          end
+
+          def name_utf8(object)
+            iv(object, :name).to_s.dup
+              .force_encoding('UTF-8').scrub
+          end
+
+          def replace_once(source, before, after, description)
+            count = source.split(before, -1).length - 1
+
+            check(
+              count == 1,
+              "#{description}: expected one, got #{count}"
+            )
+
+            source.sub(before, after)
+          end
+
+          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          data = 'site/knight/gameasync/Data/'
+
+          script_path = data + 'Scripts.rxdata'
+          common_path = data + pre + 'CommonEvents.rxdata'
+
+          original_script_bytes = File.binread(script_path)
+          original_common_bytes = File.binread(common_path)
+
+          scripts = Marshal.load(original_script_bytes)
+          original_scripts = Marshal.load(original_script_bytes)
+
+          common = Marshal.load(original_common_bytes)
+          original_common = Marshal.load(original_common_bytes)
+
+          check(
+            common.length == 1069,
+            'Original CommonEvents count changed'
+          )
+
+          # --------------------------------------------------
+          # 1. EXISTING SPEED CONTROLLER
+          # --------------------------------------------------
 
           matches = scripts.each_index.select do |i|
-            row = scripts[i]
-            row.is_a?(Array) &&
-              row[1].to_s == 'V229 Unified Speed Rules'
+            entry = scripts[i]
+
+            entry.is_a?(Array) &&
+              entry[1].to_s == 'V229 Unified Speed Rules'
           end
 
-          abort 'Existing speed controller not unique' unless
-            matches.length == 1
-
-          index = matches.first
-          row = scripts.fetch(index)
-          original_source = Zlib::Inflate.inflate(row[2])
-
-          abort 'Original speed module missing' unless
-            original_source.include?('module SLV229')
-
-          abort 'Original movement method missing' unless
-            original_source.include?('    def self.move_rate')
-
-          abort 'Original attack controller missing' unless
-            original_source.include?('    def self.attack_rate')
-
-          abort 'Original morph attack table missing' unless
-            original_source.include?('    def self.attack_base_rate')
-
-          abort 'Original attack wait converter missing' unless
-            original_source.include?('    def self.convert_attack_wait(')
-
-          # Only the last three lines of the existing
-          # move_rate method are replaced.
-          # No separate speed method or timer is created.
-
-          before = [
-            '      polymorph_rate *= 2.0 if brave_active?',
-            '      polymorph_rate',
-            '    end'
-          ].join("\n")
-
-          after = [
-            '      polymorph_rate *= 2.0 if brave_active?',
-            '      polymorph_rate *= 1.33 if $game_switches && $game_switches[811]',
-            '      polymorph_rate',
-            '    end'
-          ].join("\n")
-
-          count = original_source.split(before, -1).length - 1
-
-          abort "Original movement mismatch: #{count}" unless
-            count == 1
-
-          modified_source = original_source.sub(before, after)
-
-          # Reversing the one substitution must reproduce
-          # the original script byte-for-byte.
-          abort 'Unapproved code change detected' unless
-            modified_source.sub(after, before) == original_source
-
-          abort 'Duplicate movement patch detected' unless
-            modified_source.split(after, -1).length - 1 == 1
-
-          # Verify syntax before writing the game database.
-          File.binwrite(
-            'build/verify_speed_v11.rb',
-            modified_source
+          check(
+            matches.length == 1,
+            'V229 Speed controller not unique'
           )
 
-          abort 'Speed source syntax error' unless
-            system('ruby', '-c', 'build/verify_speed_v11.rb')
+          speed_index = matches.first
+          speed_entry = scripts.fetch(speed_index)
 
-          # Replace the existing controller entry in place.
-          # Do not insert a new script.
-          row[2] = Zlib::Deflate.deflate(modified_source)
+          original_source = Zlib::Inflate.inflate(
+            speed_entry[2]
+          )
 
-          abort 'Script count changed' unless
-            scripts.length == original_scripts.length
+          check(
+            original_source.scan('module SLV229').length == 1,
+            'Original SLV229 module missing'
+          )
+
+          check(
+            !original_source.include?('def self.slow_active?'),
+            'Slow already exists: do not duplicate'
+          )
+
+          check(
+            !original_source.include?('def self.holy_walk_active?'),
+            'Holy Walk timer already exists'
+          )
+
+          # Preserve the existing per-form attack table.
+          original_attack_base = original_source[
+            /^    def self.attack_base_rate\n.*?^    end/m
+          ]
+
+          original_attack_wait = original_source[
+            /^    def self.convert_attack_wait\(.*?^    end/m
+          ]
+
+          original_apply_movement = original_source[
+            /^    def self.apply_movement\(.*?^    end/m
+          ]
+
+          check(
+            original_attack_base &&
+              original_attack_base.include?('when :dk52'),
+            'Existing polymorph attack table missing'
+          )
+
+          check(
+            original_attack_wait,
+            'Existing attack wait function missing'
+          )
+
+          check(
+            original_apply_movement,
+            'Existing movement application missing'
+          )
+
+          # Persistent status frames are stored in Game_System.
+          # The existing Speed.tick decrements them.
+          # There is no new Game_Player update hook.
+          #
+          # Holy Walk: 32 seconds, movement x1.33.
+          # Slow: 64 seconds, movement and attack x0.5.
+          #
+          # apply_slow is intentionally not called anywhere
+          # in V1.2. Zenith Queen magic will call it later.
+
+          status_methods = <<~SPEED_STATUS_METHODS
+              def self.holy_walk_frames
+                return 0 if $game_system.nil?
+                [get(:@slv12_holy_walk_frames).to_i, 0].max
+              end
+
+              def self.holy_walk_active?
+                holy_walk_frames > 0
+              end
+
+              def self.use_holy_walk(seconds = 32)
+                init
+                duration = [seconds.to_i, 0].max
+                put(:@slv12_holy_walk_frames, duration * fps)
+                apply_movement
+              end
+
+              def self.clear_holy_walk
+                return if $game_system.nil?
+                put(:@slv12_holy_walk_frames, 0)
+                apply_movement
+              end
+
+              def self.slow_frames
+                return 0 if $game_system.nil?
+                [get(:@slv12_slow_frames).to_i, 0].max
+              end
+
+              def self.slow_active?
+                slow_frames > 0
+              end
+
+              def self.apply_slow(seconds = 64)
+                init
+                duration = [seconds.to_i, 0].max
+                put(:@slv12_slow_frames, duration * fps)
+                apply_movement
+              end
+
+              def self.clear_slow
+                return if $game_system.nil?
+                put(:@slv12_slow_frames, 0)
+                apply_movement
+              end
+
+          SPEED_STATUS_METHODS
+
+          source = replace_once(
+            original_source,
+            "    def self.move_rate\n",
+            status_methods + "    def self.move_rate\n",
+            'Insert status methods'
+          )
+
+          # V1.1 previously read switch 811 directly.
+          # V1.2 uses the real 32-second status instead.
+
+          source = replace_once(
+            source,
+            '      polymorph_rate *= 1.33 if $game_switches && $game_switches[811]',
+            "      polymorph_rate *= 1.33 if holy_walk_active?\n" +
+            "      polymorph_rate *= 0.5 if slow_active?",
+            'Holy Walk and Slow movement'
+          )
+
+          # Apply Slow only in the existing attack_rate.
+          # All morph coefficients remain byte-identical.
+          source = replace_once(
+            source,
+            "      rate *= BRAVE_ATTACK if brave_active?\n      rate",
+            "      rate *= BRAVE_ATTACK if brave_active?\n" +
+            "      rate *= 0.5 if slow_active?\n" +
+            "      rate",
+            'Slow attack factor'
+          )
+
+          # Reuse the existing timer tick.
+          old_tick = (
+            '      put(:@slv229_brave_frames, old_brave - 1) ' +
+            'if old_brave > 0'
+          )
+
+          new_tick = old_tick + "\n" +
+            "      holy = holy_walk_frames\n" +
+            "      slow = slow_frames\n" +
+            "      put(:@slv12_holy_walk_frames, holy - 1) if holy > 0\n" +
+            "      put(:@slv12_slow_frames, slow - 1) if slow > 0"
+
+          source = replace_once(
+            source,
+            old_tick,
+            new_tick,
+            'Existing Speed.tick'
+          )
+
+          # No changes to original attack/morph calculations.
+          check(
+            source.include?(original_attack_base),
+            'Polymorph attack coefficients changed'
+          )
+
+          check(
+            source.include?(original_attack_wait),
+            'Attack wait logic changed'
+          )
+
+          check(
+            source.include?(original_apply_movement),
+            'Movement engine changed'
+          )
+
+          check(
+            source.scan('alias slv229_original_update').length == 1,
+            'Player update hook changed'
+          )
+
+          check(
+            source.scan(
+              'alias slv229_original_wait_command'
+            ).length == 1,
+            'Attack wait hook changed'
+          )
+
+          File.binwrite(
+            'build/v12_speed_runtime.rb',
+            source
+          )
+
+          check(
+            system(
+              'ruby', '-c', 'build/v12_speed_runtime.rb'
+            ),
+            'Modified speed source has syntax error'
+          )
+
+          # --------------------------------------------------
+          # 2. NATIVE HOLY WALK CAST
+          # --------------------------------------------------
+
+          holy_cast = common.fetch(800)
+          holy_status = common.fetch(801)
+
+          check(
+            name_utf8(holy_cast).include?('홀리워크'),
+            'CE800 is not Holy Walk'
+          )
+
+          check(
+            name_utf8(holy_status).include?('홀리워크'),
+            'CE801 is not Holy Walk'
+          )
+
+          check(
+            iv(holy_cast, :trigger).to_i == 0,
+            'Holy Walk cast trigger changed'
+          )
+
+          check(
+            iv(holy_status, :trigger).to_i == 2,
+            'Holy Walk parallel status changed'
+          )
+
+          check(
+            iv(holy_status, :switch_id).to_i == 811,
+            'Holy Walk native switch changed'
+          )
+
+          cast_list = iv(holy_cast, :list)
+
+          check(
+            cast_list.is_a?(Array) && !cast_list.empty?,
+            'Holy Walk cast command list missing'
+          )
+
+          # The buff is attached to an actual cast command,
+          # not merely to the native switch read by V1.1.
+          #
+          # Prefer the native SW811 ON command.
+          # If the original event uses a script to set SW811,
+          # attach after that exact script.
+          # Otherwise use its unique native spell animation.
+          #
+          # Do not create a second spell event or modify CE801.
+
+          cast_anchors = cast_list.each_index.select do |i|
+            c = cast_list[i]
+            p = cmd_params(c)
+
+            cmd_code(c) == 121 &&
+              p == [811, 811, 0]
+          end
+
+          if cast_anchors.empty?
+            cast_anchors = cast_list.each_index.select do |i|
+              c = cast_list[i]
+              p = cmd_params(c)
+
+              cmd_code(c) == 355 &&
+                p[0].to_s.match?(
+                  /\$game_switches\[811\]\s*=\s*true/
+                )
+            end
+          end
+
+          if cast_anchors.empty?
+            cast_anchors = cast_list.each_index.select do |i|
+              c = cast_list[i]
+              p = cmd_params(c)
+
+              cmd_code(c) == 207 &&
+                p[0].to_i == -1
+            end
+
+            check(
+              cast_anchors.length == 1,
+              'Holy Walk successful cast anchor not unique'
+            )
+          end
+
+          check(
+            !cast_anchors.empty?,
+            'No safe Holy Walk activation anchor'
+          )
+
+          check(
+            cast_anchors.length <= 4,
+            'Unexpected Holy Walk activation branches'
+          )
+
+          cast_anchors.reverse_each do |i|
+            template = cast_list[i]
+
+            command = Marshal.load(
+              Marshal.dump(template)
+            )
+
+            put(command, :code, 355)
+            put(
+              command,
+              :parameters,
+              ['SLV229::Speed.use_holy_walk(32)']
+            )
+            put(
+              command,
+              :indent,
+              cmd_indent(template)
+            )
+
+            cast_list.insert(i + 1, command)
+          end
+
+          check(
+            cast_list.count do |c|
+              cmd_code(c) == 355 &&
+                cmd_params(c)[0].to_s ==
+                'SLV229::Speed.use_holy_walk(32)'
+            end == cast_anchors.length,
+            'Holy Walk cast connection missing'
+          )
+
+          check(
+            Marshal.dump(common.fetch(801)) ==
+              Marshal.dump(original_common.fetch(801)),
+            'Original Holy Walk parallel event modified'
+          )
+
+          puts "PASS Holy Walk cast anchors=#{cast_anchors.inspect}"
+
+          # --------------------------------------------------
+          # 3. POLYMORPH GRAPHIC SELECTION
+          # --------------------------------------------------
+
+          # These are native polymorph identity variables.
+          # Their event IDs are the existing attack motions.
+          # No new attack event is generated.
+
+          transform_map = {
+            311 => 115,
+            58  => 7,
+            263 => 45,
+            264 => 49,
+            265 => 50,
+            309 => 42,
+            390 => 214,
+            627 => 208,
+            628 => 415,
+            629 => 416
+          }
+
+          transform_vars = transform_map.keys
+
+          motion_events = transform_map.values
+
+          # Potion, transform ownership and spell events
+          # must not be rewritten as animation selectors.
+          protected = [
+            1, 3, 4, 6, 8, 10, 17, 33, 34,
+            59, 60, 68, 107, 800, 801
+          ]
+
+          def branch_body(list, index)
+            depth = cmd_indent(list.fetch(index))
+            last = nil
+
+            ((index + 1)...list.length).each do |i|
+              c = list[i]
+
+              if cmd_code(c) == 412 &&
+                 cmd_indent(c) == depth
+                last = i
+                break
+              end
+            end
+
+            return [] if last.nil?
+
+            list[(index + 1)...last]
+          end
+
+          def player_graphic_change?(command)
+            return false unless cmd_code(command) == 209
+
+            p = cmd_params(command)
+            return false unless p[0].to_i == -1
+
+            route = p[1]
+            return false if route.nil?
+
+            commands = iv(route, :list) || []
+
+            commands.any? do |move|
+              iv(move, :code).to_i == 41
+            end
+          end
+
+          def transform_test?(command, ids)
+            return false unless cmd_code(command) == 111
+
+            p = cmd_params(command)
+
+            p[0].to_i == 1 &&
+              ids.include?(p[1].to_i)
+          end
+
+          def motion_selection?(commands, ids)
+            commands.any? do |c|
+              if player_graphic_change?(c)
+                true
+              elsif cmd_code(c) == 117
+                ids.include?(cmd_params(c)[0].to_i)
+              else
+                false
+              end
+            end
+          end
+
+          # The problem:
+          # Some graphics-selection branches use SW172
+          # (or its legacy SW1002) as their outer gate.
+          # When bravery expires, the transform variable
+          # can remain ON, but the motion caller changes.
+          #
+          # Preserve the original bravery condition.
+          # Add current polymorph identity as an OR.
+          #
+          # This is only for events that also contain
+          # native transform tests and motion commands.
+          #
+          # No global CE1 redirect.
+          # No blanket 79-event rewrite.
+          # No new animation or duplicate attack execution.
+
+          expression_172 = (
+            '$game_switches[172] || ' +
+            'SLV229::Speed.form != :knight'
+          )
+
+          expression_1002 = (
+            '$game_switches[1002] || ' +
+            'SLV229::Speed.form != :knight'
+          )
+
+          modified_motion_events = []
+          modified_gate_count = 0
+
+          common.each_with_index do |event, id|
+            next if id == 0 || event.nil?
+            next if protected.include?(id)
+
+            list = iv(event, :list)
+            next unless list.is_a?(Array)
+
+            has_transform_tests = list.any? do |c|
+              transform_test?(c, transform_vars)
+            end
+
+            next unless has_transform_tests
+
+            event_hits = 0
+
+            list.each_with_index do |c, index|
+              next unless cmd_code(c) == 111
+
+              p = cmd_params(c)
+
+              next unless (
+                p == [0, 172, 0] ||
+                p == [0, 1002, 0]
+              )
+
+              body = branch_body(list, index)
+              next if body.empty?
+
+              # The gate must directly control a player
+              # graphic route or an existing transform
+              # attack-motion call.
+              next unless motion_selection?(
+                body, motion_events
+              )
+
+              expression = (
+                p[1] == 172 ?
+                expression_172 :
+                expression_1002
+              )
+
+              put(
+                c,
+                :parameters,
+                [12, expression]
+              )
+
+              event_hits += 1
+              modified_gate_count += 1
+            end
+
+            if event_hits > 0
+              modified_motion_events << id
+
+              puts(
+                "MORPH_MOTION_FIX CE#{id} " +
+                "#{name_utf8(event)} gates=#{event_hits}"
+              )
+            end
+          end
+
+          check(
+            modified_gate_count > 0,
+            'No confirmed morph-motion switch gate found'
+          )
+
+          check(
+            modified_gate_count <= 100,
+            'Excessive motion edits rejected'
+          )
+
+          check(
+            modified_motion_events.uniq.length ==
+              modified_motion_events.length,
+            'Duplicate event modification'
+          )
+
+          # All unrelated CommonEvents remain identical.
+          allowed_common_ids = (
+            modified_motion_events + [800]
+          ).uniq
+
+          changed_common_ids = common.each_index.select do |i|
+            Marshal.dump(common[i]) !=
+              Marshal.dump(original_common[i])
+          end
+
+          check(
+            changed_common_ids.sort ==
+              allowed_common_ids.sort,
+            'Unexpected CommonEvents modifications'
+          )
+
+          protected.each do |id|
+            check(
+              Marshal.dump(common[id]) ==
+                Marshal.dump(original_common[id]),
+              "Protected CE#{id} changed"
+            )
+          end
+
+          # --------------------------------------------------
+          # 4. SAVE AND VERIFY
+          # --------------------------------------------------
+
+          speed_entry[2] = Zlib::Deflate.deflate(source)
 
           scripts.each_index do |i|
-            next if i == index
-            abort "Other script modified: #{i}" unless
-              scripts[i] == original_scripts[i]
+            next if i == speed_index
+
+            check(
+              scripts[i] == original_scripts[i],
+              "Unrelated script #{i} changed"
+            )
           end
 
-          File.binwrite(path, Marshal.dump(scripts))
-
-          # Read back the actual saved game database.
-          saved = Marshal.load(File.binread(path))
-
-          abort 'Saved script count mismatch' unless
-            saved.length == original_scripts.length
-
-          saved_source = Zlib::Inflate.inflate(
-            saved.fetch(index)[2]
+          File.binwrite(
+            script_path,
+            Marshal.dump(scripts)
           )
 
-          abort 'Saved speed code mismatch' unless
-            saved_source == modified_source
+          File.binwrite(
+            common_path,
+            Marshal.dump(common)
+          )
 
-          abort 'Attack or morph source changed' unless
-            saved_source.sub(after, before) == original_source
+          verified_scripts = Marshal.load(
+            File.binread(script_path)
+          )
 
-          saved.each_index do |i|
-            next if i == index
-            abort "Saved script modified: #{i}" unless
-              saved[i] == original_scripts[i]
+          verified_common = Marshal.load(
+            File.binread(common_path)
+          )
+
+          verified_source = Zlib::Inflate.inflate(
+            verified_scripts.fetch(speed_index)[2]
+          )
+
+          check(
+            verified_source == source,
+            'Saved speed script mismatch'
+          )
+
+          check(
+            verified_source.include?(original_attack_base),
+            'Saved morph attack coefficients changed'
+          )
+
+          check(
+            verified_source.include?(original_attack_wait),
+            'Saved attack frame conversion changed'
+          )
+
+          check(
+            verified_common.length == original_common.length,
+            'CommonEvent inventory changed'
+          )
+
+          check(
+            Marshal.dump(verified_common[801]) ==
+              Marshal.dump(original_common[801]),
+            'Native Holy Walk status was altered'
+          )
+
+          puts 'PASS V1.2 original Speed controller reused'
+          puts 'PASS Holy Walk cast and 32-second timer'
+          puts 'PASS Slow 64-second prepared, inactive'
+          puts "PASS graphic motion gates=#{modified_gate_count}"
+          puts "PASS modified motion CEs=#{modified_motion_events.inspect}"
+          puts 'PASS no extra attack event dispatch'
+          puts 'PASS original attack coefficients unchanged'
+          puts 'PASS original attack frames unchanged'
+          puts 'PASS original movement implementation unchanged'
+          puts 'PASS no new player/interpreter update hook'
+          END_V12_PATCH
+
+          ruby -c build/v12_patch.rb
+          ruby build/v12_patch.rb
+
+      - name: Test V1.2 speed statuses without altering game
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > build/v12_test.rb <<'END_V12_TEST'
+          # encoding: UTF-8
+
+          class Game_Player
+            attr_accessor :move_route_forcing
+
+            def update
+            end
           end
 
-          puts 'PASS V1.1 single movement calculation patch'
-          puts 'PASS native Holy Walk switch 811 reused'
-          puts 'PASS original morph attack speeds unchanged'
-          puts 'PASS original attack frame conversion unchanged'
-          puts 'PASS original haste and bravery unchanged'
-          puts 'PASS no new update hook or status timer'
-          puts 'PASS all other RPG scripts preserved'
-          END_SPEED_V11
+          class Interpreter
+            def command_106
+              true
+            end
+          end
 
-          ruby -c build/patch_v11.rb
-          ruby build/patch_v11.rb
+          module Graphics
+            def self.frame_rate
+              40
+            end
+          end
 
-      - name: Refresh mapping and visible V1.1
+          $game_system = Object.new
+          $game_player = Game_Player.new
+
+          $game_switches = Hash.new(false)
+          $game_variables = Hash.new(0)
+
+          load 'build/v12_speed_runtime.rb'
+
+          def check(value, message)
+            raise message unless value
+          end
+
+          speed = SLV229::Speed
+
+          base_move = speed.move_rate
+          base_attack = speed.attack_rate
+
+          check(
+            base_move == 1.0,
+            'Original unbuffed move speed wrong'
+          )
+
+          speed.use_holy_walk(32)
+
+          check(
+            speed.holy_walk_active?,
+            'Holy Walk did not activate'
+          )
+
+          check(
+            (speed.move_rate - 1.33).abs < 0.001,
+            'Holy Walk movement multiplier wrong'
+          )
+
+          check(
+            speed.attack_rate == base_attack,
+            'Holy Walk unexpectedly changed attack'
+          )
+
+          (32 * 40).times do
+            speed.tick
+          end
+
+          check(
+            !speed.holy_walk_active?,
+            'Holy Walk did not expire'
+          )
+
+          check(
+            speed.move_rate == base_move,
+            'Holy Walk movement not restored'
+          )
+
+          # Slow is test-triggered here only.
+          # It is not attached to the published monster AI.
+
+          speed.apply_slow(64)
+
+          check(
+            speed.slow_active?,
+            'Slow was not applied'
+          )
+
+          check(
+            (speed.move_rate - 0.5).abs < 0.001,
+            'Slow movement multiplier wrong'
+          )
+
+          check(
+            (speed.attack_rate -
+              base_attack * 0.5).abs < 0.001,
+            'Slow attack multiplier wrong'
+          )
+
+          (64 * 40).times do
+            speed.tick
+          end
+
+          check(
+            !speed.slow_active?,
+            'Slow did not expire'
+          )
+
+          check(
+            speed.move_rate == base_move,
+            'Slow movement not restored'
+          )
+
+          check(
+            speed.attack_rate == base_attack,
+            'Slow attack not restored'
+          )
+
+          # A real transform identity must survive
+          # independent bravery expiration.
+
+          $game_variables[265] = 1
+
+          check(
+            speed.form == :dk52,
+            'Death Knight transform not recognized'
+          )
+
+          original_morph_attack = speed.attack_base_rate
+
+          speed.use_brave(1)
+
+          check(
+            speed.brave_active?,
+            'Bravery did not activate'
+          )
+
+          40.times do
+            speed.tick
+          end
+
+          check(
+            !speed.brave_active?,
+            'Bravery did not expire'
+          )
+
+          check(
+            speed.form == :dk52,
+            'Bravery expiration cleared polymorph identity'
+          )
+
+          check(
+            speed.attack_base_rate ==
+              original_morph_attack,
+            'Polymorph attack coefficient changed'
+          )
+
+          condition = (
+            '$game_switches[172] || ' +
+            'SLV229::Speed.form != :knight'
+          )
+
+          check(
+            eval(condition) == true,
+            'Transform motion gate rejects valid polymorph'
+          )
+
+          $game_variables[265] = 0
+
+          check(
+            speed.form == :knight,
+            'Original knight form not restored'
+          )
+
+          check(
+            eval(condition) == false,
+            'Knight without bravery enters morph branch'
+          )
+
+          speed.use_brave(1)
+
+          check(
+            eval(condition) == true,
+            'Original bravery branch no longer works'
+          )
+
+          puts 'PASS Holy Walk 32 seconds'
+          puts 'PASS Holy Walk movement 1.33x, attack unchanged'
+          puts 'PASS Slow 64 seconds'
+          puts 'PASS Slow movement 0.5x'
+          puts 'PASS Slow attack 0.5x'
+          puts 'PASS transform survives bravery expiration'
+          puts 'PASS native bravery branch remains valid'
+          puts 'PASS no polymorph attack-speed change'
+          END_V12_TEST
+
+          ruby -c build/v12_test.rb
+          ruby build/v12_test.rb
+
+      - name: Refresh modified RPG cache hashes and version
         shell: bash
         run: |
           set -euo pipefail
@@ -253,90 +1062,103 @@ jobs:
           import re
 
           root = Path('site')
-          data = root / 'knight/gameasync/Data'
-          mapping = root / 'knight/gameasync/mapping.js'
+          game = root / 'knight/gameasync'
+          data = game / 'Data'
 
-          content = mapping.read_text('utf-8')
+          prefix = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          script_file = data / 'Scripts.rxdata'
-          digest = hashlib.md5(
-              script_file.read_bytes()
-          ).hexdigest()
+          mapping = game / 'mapping.js'
+          mapping_text = mapping.read_text('utf-8')
 
-          pattern = (
-              re.escape('Data/Scripts.rxdata') +
-              r'\?h=[0-9a-f]{32}'
+          changed_data = (
+              'Scripts.rxdata',
+              prefix + 'CommonEvents.rxdata'
           )
 
-          replacement = 'Data/Scripts.rxdata?h=' + digest
+          for filename in changed_data:
+              file_path = data / filename
 
-          content, count = re.subn(
-              pattern,
-              replacement,
-              content
+              digest = hashlib.md5(
+                  file_path.read_bytes()
+              ).hexdigest()
+
+              pattern = (
+                  re.escape('Data/' + filename) +
+                  r'\?h=[0-9a-f]{32}'
+              )
+
+              replacement = (
+                  'Data/' + filename + '?h=' + digest
+              )
+
+              mapping_text, count = re.subn(
+                  pattern,
+                  lambda _: replacement,
+                  mapping_text
+              )
+
+              assert count == 1, (
+                  'RPG data mapping not unique',
+                  filename,
+                  count
+              )
+
+          mapping.write_text(
+              mapping_text,
+              encoding='utf-8'
           )
-
-          assert count == 1, (
-              'Scripts mapping mismatch', count
-          )
-
-          mapping.write_text(content, encoding='utf-8')
 
           loader = root / 'knight/js/sl-assets-v229r115.js'
           loader_text = loader.read_text('utf-8')
 
-          versions = re.findall(
-              r"var version='([^']+)';",
-              loader_text
+          before = "var version='V1.1';"
+          after = "var version='V1.2';"
+
+          assert loader_text.count(before) == 1, (
+              'Unexpected existing version'
           )
-
-          assert len(versions) == 1, (
-              'Loader version mismatch', versions
-          )
-
-          old_version = versions[0]
-
-          loader_text = loader_text.replace(
-              "var version='" + old_version + "';",
-              "var version='V1.1';"
-          )
-
-          assert loader_text.count(
-              "var version='V1.1';"
-          ) == 1
 
           loader.write_text(
-              loader_text,
+              loader_text.replace(before, after),
               encoding='utf-8'
           )
 
-          for filename in ('index.html', 'knight/index.html'):
+          for filename in (
+              'index.html',
+              'knight/index.html'
+          ):
               path = root / filename
+
               html = path.read_text('utf-8')
 
-              assert old_version in html, (
-                  'Original display version missing', filename
+              assert 'V1.1' in html, (
+                  'Existing visible version missing',
+                  filename
               )
-
-              html = html.replace(old_version, 'V1.1')
 
               html = html.replace(
-                  '?v=' + old_version.lower(),
-                  '?v=v1.1'
+                  'V1.1',
+                  'V1.2'
+              ).replace(
+                  '?v=v1.1',
+                  '?v=v1.2'
               )
 
-              path.write_text(html, encoding='utf-8')
+              path.write_text(
+                  html,
+                  encoding='utf-8'
+              )
 
-              assert 'V1.1' in path.read_text('utf-8')
+              assert 'V1.2' in path.read_text('utf-8')
 
-          print('PASS V1.1 displayed')
-          print('PASS script mapping hash refreshed')
+          print('PASS script/common cache hashes updated')
+          print('PASS V1.2 visible version')
           PY_VERSION
 
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Verify exact V1.1 modification scope
+      - name: Verify protected native game data
         shell: bash
         run: |
           set -euo pipefail
@@ -356,17 +1178,18 @@ jobs:
 
           current = {
               str(p.relative_to(root)):
-              hashlib.sha256(p.read_bytes()).hexdigest()
+                  hashlib.sha256(p.read_bytes()).hexdigest()
               for p in root.rglob('*')
               if p.is_file()
           }
 
           assert len(current) == 5623, (
-              'Original file count changed'
+              'Original file count changed',
+              len(current)
           )
 
           assert set(original) == set(current), (
-              'Original file names changed'
+              'Original game file inventory changed'
           )
 
           changed = {
@@ -374,8 +1197,16 @@ jobs:
               if original[name] != current[name]
           }
 
+          prefix = (
+              'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          )
+
           allowed = {
               'knight/gameasync/Data/Scripts.rxdata',
+              (
+                  'knight/gameasync/Data/' +
+                  prefix + 'CommonEvents.rxdata'
+              ),
               'knight/gameasync/mapping.js',
               'knight/js/sl-assets-v229r115.js',
               'index.html',
@@ -383,26 +1214,43 @@ jobs:
           }
 
           assert changed == allowed, (
-              'Unexpected changes',
+              'Unexpected modified files',
               sorted(changed ^ allowed)
           )
 
-          for filename in ('index.html', 'knight/index.html'):
-              assert 'V1.1' in (
-                  root / filename
-              ).read_text('utf-8'), filename
+          data_prefix = (
+              'knight/gameasync/Data/' + prefix
+          )
 
-          print('PASS only five approved files changed')
-          print('PASS all CommonEvents unchanged')
-          print('PASS native Holy Walk event unchanged')
-          print('PASS original monster maps unchanged')
-          print('PASS Queen recovery and death unchanged')
-          print('PASS four-direction passage unchanged')
-          print('PASS original morph and attack data unchanged')
-          print('PASS V1.1 structural verification')
+          for filename in (
+              'Map019.rxdata',
+              'Map025.rxdata',
+              'Animations.rxdata'
+          ):
+              relative = data_prefix + filename
+
+              assert (
+                  original[relative] == current[relative]
+              ), relative
+
+          for filename in (
+              'index.html',
+              'knight/index.html'
+          ):
+              assert 'V1.2' in (
+                  root / filename
+              ).read_text('utf-8')
+
+          print('PASS six approved files changed')
+          print('PASS original map database unchanged')
+          print('PASS original monster abilities unchanged')
+          print('PASS original four-direction map data unchanged')
+          print('PASS Queen recovery/death unchanged')
+          print('PASS original animation database unchanged')
+          print('PASS V1.2 final data integrity')
           PY_FINAL
 
-      - name: Publish V1.1 game
+      - name: Publish V1.2 game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -414,7 +1262,9 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - uses: actions/configure-pages@v6
+
       - id: deployment
         uses: actions/deploy-pages@v5
