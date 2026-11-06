@@ -1,17 +1,22 @@
-# FILE: .github/workflows/review-sanctuary-magic-casts.yml
-# VERSION: V1.1 | CAST-FOCUSED CANDIDATE AUDIT
+
+# FILE: .github/workflows/extract-sanctuary-magic-casts-review.yml
+# VERSION: V1.4 | Preserve workflow title; V1.3 download verification / extract diagnostics
 # PURPOSE: original Sanctuary SPR -> real animated GIFs -> HTML viewer.
 # SCOPE: standalone original asset audit. NEVER touch SLKnight game, maps, Pages, or existing workflows.
-name: review-sanctuary-magic-casts.yml | V1.1 | Magic and Caster Motion Review
+name: review-sanctuary-magic-casts.yml | V1.4 | Magic and Caster Motion Review
 
 "on":
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/extract-sanctuary-magic-casts-review.yml"
   workflow_dispatch:
     inputs:
       scope:
         description: "Magic FX is directionless; caster motions require 4-direction verification"
         type: choice
         required: true
-        default: magic
+        default: all
         options: [magic, caster-monsters, caster-characters, all]
       ids:
         description: "Optional actor/effect IDs separated by commas/spaces (blank = L1J candidates)"
@@ -24,7 +29,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: sanctuary-sprite-audit-${{ github.ref }}-${{ inputs.scope }}
+  group: sanctuary-sprite-audit-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -33,34 +38,99 @@ jobs:
     timeout-minutes: 350
     env:
       GH_TOKEN: ${{ github.token }}
-      EXTRACTION_SCOPE: ${{ inputs.scope }}
+      EXTRACTION_SCOPE: ${{ github.event_name == 'push' && 'all' || inputs.scope || 'all' }}
       FILTER_IDS: ${{ inputs.ids }}
     steps:
       - name: "Checkout existing Sanctuary actor roster (read-only)"
         uses: actions/checkout@v4
-      - name: "Install verified decoder dependencies"
+      - name: "Prepare original extraction runner and decoder dependencies"
         shell: bash
         run: |
           set -euo pipefail
+          # This workflow is isolated; free unused runner SDKs before keeping
+          # 4.54 GB of split ZIPs plus 5.3 GB of extracted sprite IDX/PAKs.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          mkdir -p downloads original packages reports
+          echo "=== Runner disk before original archive ==="
+          df -h .
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full
           python3 -m pip install --disable-pip-version-check pillow==11.3.0
-      - name: "Download original Sanctuary archive and extract all 17 IDX/PAK pairs"
+          7z | head -n 2 || true
+
+      - name: "Download and verify all 46 original release parts"
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p downloads original packages
-          gh release download v1.0.0 -R gowellsik-hue/Game \
-            -p 'Sanctuary.of.Aden.-.Copy.*' -D downloads
-          test "$(find downloads -maxdepth 1 -name 'Sanctuary.of.Aden.-.Copy.z??' | wc -l)" -eq 45
-          test -s downloads/Sanctuary.of.Aden.-.Copy.zip
-          7z x downloads/Sanctuary.of.Aden.-.Copy.zip \
-            'Sanctuary of Aden - Copy/Sprite*.idx' \
-            'Sanctuary of Aden - Copy/Sprite*.pak' \
-            "-o${PWD}/original" -y
-          test "$(find original -name 'Sprite*.pak' | wc -l)" -eq 17
-          test "$(find original -name 'Sprite*.idx' | wc -l)" -eq 17
+          # V1.1 combined download, silent test and extract into one step.
+          # Preserve a diagnostic report even when a release part is missing.
+          trap 'rc=$?; echo "::error::Original release download / validation failed (exit $rc)"; df -h .; find downloads -maxdepth 1 -type f -printf "%f %s bytes\n" | sort | tail -n 50; exit "$rc"' ERR
+          echo "=== Downloading Sanctuary original client from GitHub Release v1.0.0 ==="
+          for attempt in 1 2 3; do
+            if gh release download v1.0.0 \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern 'Sanctuary.of.Aden.-.Copy.*' \
+                --dir downloads; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::gh release download failed on all 3 attempts"
+              exit 1
+            fi
+            echo "::warning::Download attempt $attempt failed, retrying original release"
+            rm -rf downloads
+            mkdir -p downloads
+            sleep 3
+          done
+          echo "=== Checking names and sizes of 46 split ZIP parts ==="
+          python3 - <<'PY_PARTS'
+          from pathlib import Path
+          base='Sanctuary.of.Aden.-.Copy'
+          root=Path('downloads')
+          expected={f'{base}.z{i:02d}':100000000 for i in range(1,46)}
+          expected[f'{base}.zip']=38808950
+          found={p.name:p.stat().st_size for p in root.iterdir() if p.is_file()}
+          missing=sorted(expected.keys()-found.keys())
+          wrong={n:{'expected':size,'actual':found[n]} for n,size in expected.items() if n in found and found[n]!=size}
+          extra=sorted(found.keys()-expected.keys())
+          print('Expected parts:',len(expected),'found:',len(found),'total bytes:',sum(found.values()),flush=True)
+          print('Missing:',missing,'wrong sizes:',wrong,'extra:',extra,flush=True)
+          if missing or wrong:
+              raise SystemExit('Original archive is incomplete; see missing and size mismatches above')
+          assert sum(found.values())==4538808950
+          print('VERIFIED: 46 complete archive parts / 4538808950 bytes',flush=True)
+          PY_PARTS
+          df -h .
+
+      - name: "Extract original 17 Sprite IDX/PAK pairs and verify paths"
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="downloads/Sanctuary.of.Aden.-.Copy.zip"
+          echo "=== Extracting only original Sprite IDX and PAK files ==="
+          if ! 7z x "$archive" \
+              'Sanctuary of Aden - Copy/Sprite*.idx' \
+              'Sanctuary of Aden - Copy/Sprite*.pak' \
+              "-o${PWD}/original" -y \
+              > reports/original-extract.log 2>&1; then
+            echo "::error::Original 7z archive extraction failed"
+            tail -n 110 reports/original-extract.log
+            exit 1
+          fi
+          tail -n 22 reports/original-extract.log
+          python3 - <<'PY_PAKS'
+          from pathlib import Path
+          root=Path('original/Sanctuary of Aden - Copy')
+          names=['Sprite']+[f'Sprite{i:02d}' for i in range(16)]
+          missing=[str(root/f'{base}.{ext}') for base in names for ext in ('idx','pak') if not (root/f'{base}.{ext}').is_file()]
+          if missing: raise SystemExit('Missing original Sprite files: '+repr(missing))
+          print('VERIFIED: 17 Sprite.pak + 17 Sprite.idx original files',flush=True)
+          print('Original extracted bytes:',sum(p.stat().st_size for p in root.glob('Sprite*')),flush=True)
+          PY_PAKS
           rm -rf downloads
+          echo "=== Disk after original extraction ==="
+          df -h .
+
       - name: "Read actual SPR records, decode every selected frame, package HTML and GIFs"
         shell: bash
         run: |
@@ -305,11 +375,20 @@ jobs:
           python3 /tmp/sanctuary_extract.py
           cat packages/summary.json >> "$GITHUB_STEP_SUMMARY"
 
+      - name: "Upload download/extraction diagnostic logs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-original-diagnostic-${{ env.EXTRACTION_SCOPE }}
+          path: reports/*.log
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: "Upload verified extraction report"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-extraction-report-${{ inputs.scope }}
+          name: sanctuary-extraction-report-${{ env.EXTRACTION_SCOPE }}
           path: |
             packages/summary.json
             packages/errors.csv
@@ -319,7 +398,7 @@ jobs:
       - name: "Upload part 01 (includes HTML viewer and CSV index)"
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-01
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-01
           path: packages/part-01.zip
           if-no-files-found: error
           retention-days: 30
@@ -328,7 +407,7 @@ jobs:
         if: ${{ hashFiles('packages/part-02.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-02
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-02
           path: packages/part-02.zip
           if-no-files-found: error
           retention-days: 30
@@ -337,7 +416,7 @@ jobs:
         if: ${{ hashFiles('packages/part-03.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-03
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-03
           path: packages/part-03.zip
           if-no-files-found: error
           retention-days: 30
@@ -346,7 +425,7 @@ jobs:
         if: ${{ hashFiles('packages/part-04.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-04
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-04
           path: packages/part-04.zip
           if-no-files-found: error
           retention-days: 30
@@ -355,7 +434,7 @@ jobs:
         if: ${{ hashFiles('packages/part-05.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-05
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-05
           path: packages/part-05.zip
           if-no-files-found: error
           retention-days: 30
@@ -364,7 +443,7 @@ jobs:
         if: ${{ hashFiles('packages/part-06.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-06
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-06
           path: packages/part-06.zip
           if-no-files-found: error
           retention-days: 30
@@ -373,7 +452,7 @@ jobs:
         if: ${{ hashFiles('packages/part-07.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-07
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-07
           path: packages/part-07.zip
           if-no-files-found: error
           retention-days: 30
@@ -382,7 +461,7 @@ jobs:
         if: ${{ hashFiles('packages/part-08.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-08
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-08
           path: packages/part-08.zip
           if-no-files-found: error
           retention-days: 30
@@ -391,7 +470,7 @@ jobs:
         if: ${{ hashFiles('packages/part-09.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-09
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-09
           path: packages/part-09.zip
           if-no-files-found: error
           retention-days: 30
@@ -400,7 +479,7 @@ jobs:
         if: ${{ hashFiles('packages/part-10.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-10
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-10
           path: packages/part-10.zip
           if-no-files-found: error
           retention-days: 30
@@ -409,7 +488,7 @@ jobs:
         if: ${{ hashFiles('packages/part-11.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-11
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-11
           path: packages/part-11.zip
           if-no-files-found: error
           retention-days: 30
@@ -418,7 +497,7 @@ jobs:
         if: ${{ hashFiles('packages/part-12.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-12
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-12
           path: packages/part-12.zip
           if-no-files-found: error
           retention-days: 30
@@ -427,7 +506,7 @@ jobs:
         if: ${{ hashFiles('packages/part-13.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-13
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-13
           path: packages/part-13.zip
           if-no-files-found: error
           retention-days: 30
@@ -436,7 +515,7 @@ jobs:
         if: ${{ hashFiles('packages/part-14.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-14
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-14
           path: packages/part-14.zip
           if-no-files-found: error
           retention-days: 30
@@ -445,7 +524,7 @@ jobs:
         if: ${{ hashFiles('packages/part-15.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-15
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-15
           path: packages/part-15.zip
           if-no-files-found: error
           retention-days: 30
@@ -454,7 +533,7 @@ jobs:
         if: ${{ hashFiles('packages/part-16.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sanctuary-original-${{ inputs.scope }}-part-16
+          name: sanctuary-original-${{ env.EXTRACTION_SCOPE }}-part-16
           path: packages/part-16.zip
           if-no-files-found: error
           retention-days: 30
