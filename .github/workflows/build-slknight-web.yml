@@ -1,26 +1,10 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V1.2
-# BASE: successful V1.1 run 42159828427
-#
-# FIX:
-# - Holy Walk uses its existing native switch and timer.
-# - Holy Walk movement bonus is BASE +0.33, not final x1.33.
-# - Slow is a new native CommonEvent spell/status pair.
-# - Slow lasts 64 seconds, using native event waits.
-# - Slow movement and attack penalties are BASE -0.5.
-# - Preserve existing haste/bravery/form multiplication.
-# - Correct only eligible polymorph motion-selection gates.
-#
-# DO NOT:
-# - Create another Speed timer or Game_Player hook.
-# - Modify the original Holy Walk CE800/CE801.
-# - Rewrite all transform events.
-# - Redirect CE1 to another attack event.
-# - Change existing attack animations or frame conversion.
-# - Modify maps, monster stats, drops or Zenith Queen.
-#
-# Failed builds retain version V1.2.
+# VERSION: V1.3
+# BASE: verified successful V1.2 run 42194617019
+# Scope: healer movement only. Other maps, monsters, NPCs,
+# spells, hires, buffs, speed rules, and animations remain unchanged.
+# The existing workflow title below is intentionally unchanged.
 
 name: build-slknight-web.yml | V1.2 | Clean Native Events and 2x Terrain
 
@@ -47,968 +31,310 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Restore successful V1.1
+      - name: Restore successful V1.2
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 42159828427
+          run-id: 42194617019
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify original game
+      - name: Verify inherited V1.2
         shell: bash
         run: |
           set -euo pipefail
-
           test -s baseline/artifact.tar
           mkdir -p site build
           tar -xf baseline/artifact.tar -C site
-
           python3 - <<'PY'
           from pathlib import Path
           import hashlib, json
-
           root = Path('site')
           files = {
-              str(p.relative_to(root)):
-              hashlib.sha256(p.read_bytes()).hexdigest()
+              str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in root.rglob('*') if p.is_file()
           }
-
           assert len(files) == 5623, len(files)
-
           pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          data = root / 'knight/gameasync/Data'
-
-          for name in (
-              'Scripts.rxdata',
-              pre + 'CommonEvents.rxdata',
-              pre + 'Map019.rxdata',
-              pre + 'Map025.rxdata',
-              pre + 'Animations.rxdata'
-          ):
-              assert (data / name).is_file(), name
-
-          Path('build/original.json').write_text(
-              json.dumps(files), encoding='utf-8'
-          )
-
-          print('PASS V1.1 original inventory')
-          PY
-
-      - name: Apply V1.2 native magic and motion corrections
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > build/patch_v12.rb <<'RUBY'
-          # encoding: UTF-8
-
-          require 'zlib'
-
-          module RPG
-            class CommonEvent; end
-            class EventCommand; end
-            class MoveRoute; end
-            class MoveCommand; end
-            class AudioFile; end
-            class Map; end
-            class Event
-              class Page
-                class Condition; end
-                class Graphic; end
-              end
-            end
-          end
-
-          class RawMarshalObject
-            def self._load(raw)
-              obj = allocate
-              obj.instance_variable_set(:@raw, raw)
-              obj
-            end
-            def _dump(depth = 0)
-              @raw
-            end
-          end
-
-          class Tone < RawMarshalObject; end
-          class Color < RawMarshalObject; end
-          class Rect < RawMarshalObject; end
-          class Table < RawMarshalObject; end
-
-          def check(ok, message)
-            abort "V1.2 ERROR: #{message}" unless ok
-          end
-
-          def get(obj, key)
-            obj.instance_variable_get("@#{key}")
-          end
-
-          def set(obj, key, value)
-            obj.instance_variable_set("@#{key}", value)
-          end
-
-          def code(c)
-            get(c, :code).to_i
-          end
-
-          def params(c)
-            get(c, :parameters) || []
-          end
-
-          def depth(c)
-            get(c, :indent).to_i
-          end
-
-          def event_name(e)
-            get(e, :name).to_s.dup
-              .force_encoding('UTF-8').scrub
-          end
-
-          def command(n, p = [], d = 0)
-            c = RPG::EventCommand.allocate
-            set(c, :code, n)
-            set(c, :parameters, p)
-            set(c, :indent, d)
-            c
-          end
-
-          def replace_one(text, from, to, description)
-            count = text.split(from, -1).length - 1
-            check(count == 1, "#{description}: count=#{count}")
-            text.sub(from, to)
-          end
-
-          PRE = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          ROOT = 'site/knight/gameasync/Data/'
-          SLOW_SWITCH = 5998
-          SLOW_VARIABLE = 4998
-
-          sp = ROOT + 'Scripts.rxdata'
-          cp = ROOT + PRE + 'CommonEvents.rxdata'
-
-          original_scripts_bytes = File.binread(sp)
-          original_common_bytes = File.binread(cp)
-
-          scripts = Marshal.load(original_scripts_bytes)
-          original_scripts = Marshal.load(original_scripts_bytes)
-          ce = Marshal.load(original_common_bytes)
-          original_ce = Marshal.load(original_common_bytes)
-
-          check(ce.size == 1069, 'CommonEvent inventory changed')
-
-          # ======================================
-          # 1. Locate existing Speed controller
-          # ======================================
-
-          matches = scripts.each_index.select do |i|
-            e = scripts[i]
-            e.is_a?(Array) &&
-              e[1].to_s == 'V229 Unified Speed Rules'
-          end
-
-          check(matches.size == 1, 'Speed controller missing')
-
-          si = matches.first
-          old = Zlib::Inflate.inflate(scripts[si][2])
-
-          attack_base = old[
-            /^    def self.attack_base_rate\n.*?^    end/m
-          ]
-          attack_wait = old[
-            /^    def self.convert_attack_wait\(.*?^    end/m
-          ]
-          movement = old[
-            /^    def self.apply_movement\(.*?^    end/m
-          ]
-
-          check(attack_base, 'Original attack table missing')
-          check(attack_wait, 'Original attack converter missing')
-          check(movement, 'Original movement method missing')
-
-          # ======================================
-          # 2. Native Holy Walk compatibility
-          # ======================================
-
-          holy_cast = ce.fetch(800)
-          holy_timer = ce.fetch(801)
-
-          check(
-            event_name(holy_cast).include?('홀리워크'),
-            'Original Holy Walk cast missing'
-          )
-
-          check(
-            event_name(holy_timer).include?('홀리워크'),
-            'Original Holy Walk timer missing'
-          )
-
-          check(
-            get(holy_timer, :trigger).to_i == 2,
-            'Holy Walk parallel trigger changed'
-          )
-
-          check(
-            get(holy_timer, :switch_id).to_i == 811,
-            'Holy Walk native status switch changed'
-          )
-
-          # CE800 and CE801 remain byte-identical.
-          # Only the Speed.move_rate calculation changes.
-          #
-          # The original V1.1 multiplies the FINAL
-          # movement rate by 1.33. That is incorrect.
-          #
-          # Correct rule:
-          # existing form/haste/bravery multiplication
-          # THEN +0.33 of the base movement rate.
-
-          source = replace_one(
-            old,
-            '      polymorph_rate *= 1.33 if $game_switches && $game_switches[811]',
-            [
-              '      polymorph_rate += 0.33 if $game_switches && $game_switches[811]',
-              '      polymorph_rate -= 0.5 if slow_active?'
-            ].join("\n"),
-            'Additive Holy Walk and Slow movement'
-          )
-
-          # ======================================
-          # 3. Native Slow magic state
-          # ======================================
-
-          # The spell uses native CommonEvent state.
-          # No Ruby status frames or second update hook.
-          #
-          # New cast CommonEvent:
-          #   reset elapsed variable, enable switch.
-          #
-          # New parallel CommonEvent:
-          #   wait 20 frames, increment elapsed,
-          #   end after 128 waits at 40 FPS = 64 sec.
-          #
-          # Existing Speed controller only READS switch.
-          # Zenith Queen is not connected in V1.2.
-
-          check(
-            !old.include?('def self.slow_active?'),
-            'Slow state already exists'
-          )
-
-          status_method = [
-            '    def self.slow_active?',
-            '      $game_switches && $game_switches[5998]',
-            '    end',
-            '',
-            ''
-          ].join("\n")
-
-          source = replace_one(
-            source,
-            "    def self.move_rate\n",
-            status_method + "    def self.move_rate\n",
-            'Slow native state reader'
-          )
-
-          # Attack uses the existing native rate.
-          # The reduction is BASE -0.5, not final x0.5.
-
-          source = replace_one(
-            source,
-            "      rate *= BRAVE_ATTACK if brave_active?\n      rate",
-            [
-              '      rate *= BRAVE_ATTACK if brave_active?',
-              '      rate -= 0.5 if slow_active?',
-              '      rate'
-            ].join("\n"),
-            'Additive Slow attack penalty'
-          )
-
-          # Existing original rate tables and engine
-          # functions must be preserved exactly.
-
-          check(
-            source.include?(attack_base),
-            'Original polymorph attack rates changed'
-          )
-
-          check(
-            source.include?(attack_wait),
-            'Original attack frames changed'
-          )
-
-          check(
-            source.include?(movement),
-            'Original movement engine changed'
-          )
-
-          check(
-            source.scan('alias slv229_original_update').size == 1,
-            'Player update hook changed'
-          )
-
-          check(
-            source.scan('alias slv229_original_wait_command').size == 1,
-            'Attack wait hook changed'
-          )
-
-          # ======================================
-          # 4. Protect switch/variable allocation
-          # ======================================
-
-          def check_reserved_ids(list)
-            list.each do |c|
-              p = params(c)
-
-              if code(c) == 121 && p.size >= 2
-                a, b = p[0].to_i, p[1].to_i
-                check(
-                  !SLOW_SWITCH.between?(a, b),
-                  'Slow switch ID already used'
-                )
-              end
-
-              if code(c) == 122 && p.size >= 2
-                a, b = p[0].to_i, p[1].to_i
-                check(
-                  !SLOW_VARIABLE.between?(a, b),
-                  'Slow variable ID already used'
-                )
-              end
-
-              if code(c) == 111
-                if p[0] == 0
-                  check(
-                    p[1].to_i != SLOW_SWITCH,
-                    'Slow switch condition already used'
-                  )
-                elsif p[0] == 1
-                  check(
-                    p[1].to_i != SLOW_VARIABLE,
-                    'Slow variable condition already used'
-                  )
-                end
-              end
-
-              if [355, 655].include?(code(c))
-                src = p[0].to_s
-                check(
-                  !src.match?(
-                    /\$game_switches\[\s*5998\s*\]/
-                  ),
-                  'Slow switch already scripted'
-                )
-                check(
-                  !src.match?(
-                    /\$game_variables\[\s*4998\s*\]/
-                  ),
-                  'Slow variable already scripted'
-                )
-              end
-            end
-          end
-
-          ce.compact.each do |e|
-            check_reserved_ids(get(e, :list) || [])
-          end
-
-          Dir.glob(ROOT + PRE + 'Map[0-9][0-9][0-9].rxdata').each do |path|
-            map = Marshal.load(File.binread(path))
-
-            (get(map, :events) || {}).each_value do |event|
-              (get(event, :pages) || []).each do |page|
-                check_reserved_ids(get(page, :list) || [])
-              end
-            end
-          end
-
-          # ======================================
-          # 5. Correct polymorph graphic gates
-          # ======================================
-
-          morph_vars = [
-            311, 58, 263, 264, 265,
-            309, 390, 627, 628, 629
-          ]
-
-          morph_attack_events = [
-            115, 7, 45, 49, 50,
-            42, 214, 208, 415, 416
-          ]
-
-          protected = [
-            1, 3, 4, 6, 8, 10, 17, 33, 34,
-            59, 60, 68, 107, 800, 801
-          ]
-
-          def transform_test?(c, ids)
-            p = params(c)
-            code(c) == 111 &&
-              p[0] == 1 &&
-              ids.include?(p[1].to_i)
-          end
-
-          def player_graphic?(c)
-            p = params(c)
-
-            if code(c) == 209 && p[0].to_i == -1
-              route = p[1]
-              return false unless route
-
-              return (get(route, :list) || []).any? do |mc|
-                get(mc, :code).to_i == 41
-              end
-            end
-
-            false
-          end
-
-          def positive_branch(list, index)
-            level = depth(list[index])
-            stop = nil
-
-            ((index + 1)...list.size).each do |i|
-              c = list[i]
-
-              if depth(c) == level &&
-                 [411, 412].include?(code(c))
-                stop = i
-                break
-              end
-            end
-
-            return [] unless stop
-            list[(index + 1)...stop]
-          end
-
-          def has_motion?(list, all, morph_ids, seen = [])
-            list.any? do |c|
-              if player_graphic?(c)
-                true
-              elsif code(c) == 117
-                target = params(c)[0].to_i
-
-                if morph_ids.include?(target)
-                  true
-                elsif seen.include?(target) ||
-                      seen.size >= 2 ||
-                      !all[target]
-                  false
-                else
-                  has_motion?(
-                    get(all[target], :list) || [],
-                    all,
-                    morph_ids,
-                    seen + [target]
-                  )
-                end
-              else
-                false
-              end
-            end
-          end
-
-          modified = []
-          changed_gates = 0
-
-          ce.each_with_index do |event, id|
-            next if event.nil? || id == 0
-            next if protected.include?(id)
-
-            list = get(event, :list) || []
-
-            next unless list.any? do |c|
-              transform_test?(c, morph_vars)
-            end
-
-            count = 0
-
-            list.each_with_index do |c, index|
-              next unless code(c) == 111
-
-              p = params(c)
-
-              next unless (
-                p == [0, 172, 0] ||
-                p == [0, 1002, 0]
-              )
-
-              body = positive_branch(list, index)
-              next if body.empty?
-
-              # Change only a gate that selects an
-              # existing polymorph graphics/motion path.
-              # Do not change pure bravery speed tests.
-
-              next unless has_motion?(
-                body, ce, morph_attack_events
-              )
-
-              expression = if p[1] == 172
-                '$game_switches[172] || SLV229::Speed.form != :knight'
-              else
-                '$game_switches[1002] || SLV229::Speed.form != :knight'
-              end
-
-              set(c, :parameters, [12, expression])
-
-              count += 1
-              changed_gates += 1
-            end
-
-            if count > 0
-              modified << id
-
-              puts(
-                "MORPH_FIX CE#{id} " +
-                "#{event_name(event)} gates=#{count}"
-              )
-            end
-          end
-
-          check(
-            changed_gates.between?(1, 80),
-            "No safe motion fix found or excess: #{changed_gates}"
-          )
-
-          # Do not rewrite CE1 or original transform
-          # activation and potion/timer events.
-          protected.each do |id|
-            check(
-              Marshal.dump(ce[id]) ==
-                Marshal.dump(original_ce[id]),
-              "Protected CE#{id} changed"
-            )
-          end
-
-          # ======================================
-          # 6. Add native Slow CommonEvents
-          # ======================================
-
-          def common_event(id, name, trigger, switch_id, list)
-            e = RPG::CommonEvent.allocate
-            set(e, :id, id)
-            set(e, :name, name.b)
-            set(e, :trigger, trigger)
-            set(e, :switch_id, switch_id)
-            set(e, :list, list)
-            e
-          end
-
-          slow_cast_id = ce.size
-          slow_timer_id = ce.size + 1
-
-          # Callable CommonEvent, reserved for
-          # later connection to Zenith Queen magic.
-
-          cast_list = [
-            command(122, [SLOW_VARIABLE, SLOW_VARIABLE, 0, 0, 0]),
-            command(121, [SLOW_SWITCH, SLOW_SWITCH, 0]),
-            command(0)
-          ]
-
-          ce << common_event(
-            slow_cast_id,
-            '[마법] 슬로우 발동',
-            0,
-            1,
-            cast_list
-          )
-
-          # Native parallel CommonEvent.
-          # Loop: wait 20 frames, increment 1.
-          # 128 waits = 2560 frames = 64 seconds at 40 FPS.
-
-          timer_list = [
-            command(112, [], 0),
-            command(106, [20], 1),
-            command(122, [SLOW_VARIABLE, SLOW_VARIABLE, 1, 0, 1], 1),
-            command(111, [1, SLOW_VARIABLE, 0, 128, 1], 1),
-            command(121, [SLOW_SWITCH, SLOW_SWITCH, 1], 2),
-            command(122, [SLOW_VARIABLE, SLOW_VARIABLE, 0, 0, 0], 2),
-            command(113, [], 2),
-            command(0, [], 2),
-            command(412, [], 1),
-            command(413, [], 0),
-            command(0)
-          ]
-
-          ce << common_event(
-            slow_timer_id,
-            '[마법] 슬로우 지속',
-            2,
-            SLOW_SWITCH,
-            timer_list
-          )
-
-          check(
-            ce.size == original_ce.size + 2,
-            'Slow event pair creation failed'
-          )
-
-          check(
-            get(ce[slow_timer_id], :switch_id) == SLOW_SWITCH,
-            'Slow timer switch mismatch'
-          )
-
-          check(
-            get(ce[slow_timer_id], :trigger) == 2,
-            'Slow timer not parallel'
-          )
-
-          # Original Holy Walk is strictly unchanged.
-          [800, 801].each do |id|
-            check(
-              Marshal.dump(ce[id]) ==
-                Marshal.dump(original_ce[id]),
-              "Holy Walk CE#{id} changed"
-            )
-          end
-
-          # ======================================
-          # 7. Save only expected modifications
-          # ======================================
-
-          source_check = 'build/v12_runtime.rb'
-          File.binwrite(source_check, source)
-
-          check(
-            system('ruby', '-c', source_check),
-            'Runtime Ruby syntax error'
-          )
-
-          scripts[si][2] = Zlib::Deflate.deflate(source)
-
-          scripts.each_index do |i|
-            next if i == si
-            check(
-              scripts[i] == original_scripts[i],
-              "Unrelated script #{i} changed"
-            )
-          end
-
-          changed_ce = original_ce.each_index.select do |i|
-            Marshal.dump(ce[i]) !=
-              Marshal.dump(original_ce[i])
-          end
-
-          check(
-            changed_ce.sort == modified.sort,
-            'Unexpected original CommonEvent changes'
-          )
-
-          File.binwrite(sp, Marshal.dump(scripts))
-          File.binwrite(cp, Marshal.dump(ce))
-
-          saved_scripts = Marshal.load(File.binread(sp))
-          saved_common = Marshal.load(File.binread(cp))
-
-          saved_source = Zlib::Inflate.inflate(
-            saved_scripts[si][2]
-          )
-
-          check(
-            saved_source == source,
-            'Saved Speed source mismatch'
-          )
-
-          check(
-            saved_source.include?(attack_base),
-            'Original attack coefficients lost'
-          )
-
-          check(
-            saved_source.include?(attack_wait),
-            'Original attack frame conversion lost'
-          )
-
-          check(
-            saved_source.include?(movement),
-            'Original movement implementation lost'
-          )
-
-          check(
-            saved_common.size == 1071,
-            'Final CommonEvent count wrong'
-          )
-
-          puts 'PASS V1.2 Speed controller preserved'
-          puts 'PASS Holy Walk uses original magic state'
-          puts 'PASS Holy Walk base movement +0.33'
-          puts 'PASS Slow native cast/status pair created'
-          puts 'PASS Slow base movement/attack -0.5'
-          puts 'PASS Slow 64-second native event duration'
-          puts "PASS polymorph gates corrected=#{changed_gates}"
-          puts "PASS modified morph events=#{modified.inspect}"
-          puts "INFO Slow cast CE=#{slow_cast_id}"
-          puts "INFO Slow timer CE=#{slow_timer_id}"
-          puts 'PASS no new Speed timer/update hook'
-          RUBY
-
-          ruby -c build/patch_v12.rb
-          ruby build/patch_v12.rb
-
-      - name: Test V1.2 additive speed rules
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > build/test_v12.rb <<'RUBY'
-          class Game_Player
-            attr_accessor :move_route_forcing
-            def update; end
-          end
-
-          class Interpreter
-            def command_106; true; end
-          end
-
-          module Graphics
-            def self.frame_rate; 40; end
-          end
-
-          $game_system = Object.new
-          $game_player = Game_Player.new
-          $game_switches = Hash.new(false)
-          $game_variables = Hash.new(0)
-
-          load 'build/v12_runtime.rb'
-
-          def check(value, message)
-            raise message unless value
-          end
-
-          def near(a, b)
-            (a - b).abs < 0.001
-          end
-
-          speed = SLV229::Speed
-
-          # Original normal movement.
-          check(near(speed.move_rate, 1.0), 'Base speed')
-
-          # Existing haste and bravery multiply.
-          speed.add_haste(300)
-          speed.use_brave(300)
-
-          check(near(speed.move_rate, 4.0), 'Haste+bravery')
-
-          original_attack = speed.attack_rate
-
-          # Holy Walk adds 0.33 to BASE movement.
-          $game_switches[811] = true
-
-          check(near(speed.move_rate, 4.33), 'Holy Walk 4.33')
-
-          check(
-            near(speed.attack_rate, original_attack),
-            'Holy Walk changed attack speed'
-          )
-
-          # Slow subtracts 0.5 from BASE movement.
-          $game_switches[5998] = true
-
-          check(near(speed.move_rate, 3.83), 'All buffs 3.83')
-
-          check(
-            near(speed.attack_rate, original_attack - 0.5),
-            'Slow attack is not additive'
-          )
-
-          # Holy Walk ended; Slow remains.
-          $game_switches[811] = false
-
-          check(
-            near(speed.move_rate, 3.5),
-            'Haste+bravery+Slow should be 3.5'
-          )
-
-          # Both statuses ended.
-          $game_switches[5998] = false
-
-          check(
-            near(speed.move_rate, 4.0),
-            'Movement recovery failed'
-          )
-
-          check(
-            near(speed.attack_rate, original_attack),
-            'Attack recovery failed'
-          )
-
-          # Bravery expiration must not clear transform.
-          $game_variables[265] = 1
-          check(speed.form == :dk52, 'DK form missing')
-
-          speed.use_brave(1)
-          40.times { speed.tick }
-
-          check(!speed.brave_active?, 'Bravery expiry')
-          check(speed.form == :dk52, 'Transform cleared')
-
-          # Baphomet original form rate is preserved.
-          $game_variables[265] = 0
-          $game_variables[263] = 1
-
-          # Haste remains, bravery expired.
-          check(near(speed.move_rate, 3.0), 'Baphomet base')
-
-          $game_switches[811] = true
-          $game_switches[5998] = true
-
-          check(
-            near(speed.move_rate, 2.83),
-            'Baphomet Holy Walk and Slow'
-          )
-
-          puts 'PASS base walking 1.0'
-          puts 'PASS haste + bravery 4.0'
-          puts 'PASS Holy Walk +0.33'
-          puts 'PASS Slow movement -0.5'
-          puts 'PASS Slow attack -0.5'
-          puts 'PASS combined movement 3.83'
-          puts 'PASS independent buff recovery'
-          puts 'PASS transform survives bravery expiry'
-          puts 'PASS original Baphomet multiplier'
-          RUBY
-
-          ruby -c build/test_v12.rb
-          ruby build/test_v12.rb
-
-      - name: Refresh cache and visible V1.2
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib, re
-
-          root = Path('site')
-          game = root / 'knight/gameasync'
-          data = game / 'Data'
-          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          mapping = game / 'mapping.js'
-          text = mapping.read_text('utf-8')
-
-          for name in (
-              'Scripts.rxdata',
-              pre + 'CommonEvents.rxdata'
-          ):
-              digest = hashlib.md5(
-                  (data / name).read_bytes()
-              ).hexdigest()
-
-              pattern = (
-                  re.escape('Data/' + name) +
-                  r'\?h=[0-9a-f]{32}'
-              )
-
-              value = 'Data/' + name + '?h=' + digest
-
-              text, count = re.subn(
-                  pattern, lambda _: value, text
-              )
-
-              assert count == 1, (name, count)
-
-          mapping.write_text(text, encoding='utf-8')
-
-          loader = root / 'knight/js/sl-assets-v229r115.js'
-          source = loader.read_text('utf-8')
-
-          old = "var version='V1.1';"
-          new = "var version='V1.2';"
-
-          assert source.count(old) == 1
-
-          loader.write_text(
-              source.replace(old, new),
-              encoding='utf-8'
-          )
-
-          for name in ('index.html', 'knight/index.html'):
-              path = root / name
-              html = path.read_text('utf-8')
-
-              assert 'V1.1' in html, name
-
-              html = html.replace('V1.1', 'V1.2')
-              html = html.replace('?v=v1.1', '?v=v1.2')
-
-              path.write_text(html, encoding='utf-8')
-
-          print('PASS game cache hashes updated')
-          print('PASS visible V1.2')
-          PY
-
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
-
-      - name: Verify unchanged game assets
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib, json
-
-          root = Path('site')
-          original = json.loads(
-              Path('build/original.json').read_text('utf-8')
-          )
-
-          current = {
-              str(p.relative_to(root)):
-              hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-
-          assert len(current) == 5623
-          assert set(current) == set(original)
-
-          changed = {
-              name for name in original
-              if original[name] != current[name]
-          }
-
-          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          allowed = {
+          for rel in (
               'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/Data/' +
-                  pre + 'CommonEvents.rxdata',
+              'knight/gameasync/Data/' + pre + 'Map029.rxdata',
+              'knight/gameasync/Data/' + pre + 'CommonEvents.rxdata',
+              'knight/gameasync/Data/' + pre + 'Animations.rxdata',
               'knight/gameasync/mapping.js',
               'knight/js/sl-assets-v229r115.js',
               'index.html',
-              'knight/index.html'
-          }
-
-          assert changed == allowed, sorted(changed ^ allowed)
-
-          for name in (
-              pre + 'Map019.rxdata',
-              pre + 'Map025.rxdata',
-              pre + 'Animations.rxdata'
+              'knight/index.html',
           ):
-              key = 'knight/gameasync/Data/' + name
-              assert original[key] == current[key]
-
-          for name in ('index.html', 'knight/index.html'):
-              assert 'V1.2' in (root / name).read_text('utf-8')
-
-          print('PASS only six approved files changed')
-          print('PASS original maps unchanged')
-          print('PASS original animation database unchanged')
-          print('PASS monster and Queen data unchanged')
-          print('PASS V1.2 verification completed')
+              assert rel in files, rel
+          assert "var version='V1.2';" in (
+              root / 'knight/js/sl-assets-v229r115.js'
+          ).read_text('utf-8')
+          (Path('build') / 'original.json').write_text(
+              json.dumps(files), encoding='utf-8'
+          )
+          print('PASS 5623 V1.2 files verified')
           PY
 
-      - name: Publish V1.2 game
+      - name: Apply V1.3 healer-only movement
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/patch_v13.rb <<'RUBY'
+          # encoding: utf-8
+          require 'zlib'
+          require 'digest'
+
+          sp = 'site/knight/gameasync/Data/Scripts.rxdata'
+          scripts = Marshal.load(File.binread(sp))
+          original = Marshal.load(File.binread(sp))
+
+          find_script = lambda do |name, expected_sha|
+            ids = scripts.each_index.select do |i|
+              scripts[i].is_a?(Array) && scripts[i][1].to_s == name
+            end
+            raise "Expected one #{name}" unless ids.size == 1
+            i = ids.first
+            source = Zlib::Inflate.inflate(scripts[i][2])
+            raise "Unexpected #{name} source" unless
+              Digest::SHA256.hexdigest(source) == expected_sha
+            [i, source]
+          end
+
+          ci, cs = find_script.call(
+            'Game_Character 3',
+            '89c2bcfda38725fb2ca702c51599c160e094c2044544069b619a5dbfe2ab63ad'
+          )
+          ei, es = find_script.call(
+            'Game_Event',
+            '9cb9f02120e07c888cff5f3d9ecdbebdd431062d9230385b4f4da557940b878b'
+          )
+
+          anchor = "  def move_toward_player\r\n"
+          raise 'Original follow method changed' unless cs.scan(anchor).size == 1
+          healer = <<'HEALER'
+              if @event && @event.name == '[ID힐러 마법사]' && $game_switches[185]
+                d = (@x - $game_player.x).abs + (@y - $game_player.y).abs
+                if d <= 2
+                  if d == 0
+                    case $game_player.direction
+                    when 2 then move_up
+                    when 4 then move_right
+                    when 6 then move_left
+                    when 8 then move_down
+                    end
+                  else
+                    move_away_from_player
+                  end
+                  return
+                end
+                return if d <= 5
+                if d >= 9
+                  dx, dy = case $game_player.direction
+                           when 2 then [0, -1]
+                           when 4 then [1, 0]
+                           when 6 then [-1, 0]
+                           when 8 then [0, 1]
+                           end
+                  if dx && dy
+                    [4, 3, 5].each do |n|
+                      tx = $game_player.x + dx * n
+                      ty = $game_player.y + dy * n
+                      next unless $game_map.valid?(tx, ty)
+                      next unless $game_map.passable?(tx, ty, 0, self)
+                      occupied = $game_map.events.values.any? do |e|
+                        e != self && e.x == tx && e.y == ty && e.character_name != ''
+                      end
+                      next if occupied
+                      moveto(tx, ty)
+                      break
+                    end
+                  end
+                  return
+                end
+              end
+          HEALER
+          cs2 = cs.sub(anchor, anchor + healer.gsub("\n", "\r\n").b)
+
+          through = "    @through = @page.through\r\n"
+          raise 'Event page collision anchor changed' unless es.scan(through).size == 1
+          es2 = es.sub(
+            through,
+            through + "    @through = false if @event.name == '[ID힐러 마법사]' && $game_switches[185]\r\n".b
+          )
+
+          File.binwrite('build/v13_character.rb', cs2)
+          File.binwrite('build/v13_event.rb', es2)
+          raise 'Character Ruby syntax error' unless system('ruby', '-c', 'build/v13_character.rb')
+          raise 'Event Ruby syntax error' unless system('ruby', '-c', 'build/v13_event.rb')
+
+          scripts[ci][2] = Zlib::Deflate.deflate(cs2)
+          scripts[ei][2] = Zlib::Deflate.deflate(es2)
+          changed = scripts.each_index.select do |i|
+            scripts[i] != original[i]
+          end
+          raise "Unrelated scripts changed #{changed.inspect}" unless changed.sort == [ci, ei].sort
+
+          File.binwrite(sp, Marshal.dump(scripts))
+          saved = Marshal.load(File.binread(sp))
+          raise 'Saved follow missing' unless Zlib::Inflate.inflate(saved[ci][2]) == cs2
+          raise 'Saved collision missing' unless Zlib::Inflate.inflate(saved[ei][2]) == es2
+          puts 'PASS V1.3: healer-only movement and collision, no new timer or AI'
+          RUBY
+          ruby -c build/patch_v13.rb
+          ruby build/patch_v13.rb
+
+      - name: Test V1.3 healer distance and teleport
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/test_v13.rb <<'RUBY'
+          # encoding: utf-8
+          class Game_Character
+            attr_accessor :x, :y, :direction, :character_name
+            def initialize(x=0,y=0,d=2,name='')
+              @x,@y,@direction,@character_name=x,y,d,name
+            end
+            def moveto(x,y); @x,@y=x,y; end
+            def moving?; false; end
+          end
+          class Game_Event < Game_Character
+            def initialize(x,y,d=2,name='[ID힐러 마법사]')
+              super(x,y,d,name)
+              @event=Struct.new(:name).new(name)
+            end
+          end
+          load 'build/v13_character.rb'
+          class Game_Character
+            def move_up(*); @y-=1; end
+            def move_down(*); @y+=1; end
+            def move_left(*); @x-=1; end
+            def move_right(*); @x+=1; end
+          end
+          class FakeMap
+            attr_accessor :events, :blocked
+            def initialize; @events={}; @blocked=[]; end
+            def valid?(x,y); x>=0 && y>=0 && x<100 && y<100; end
+            def passable?(x,y,d,event=nil); !@blocked.include?([x,y]); end
+          end
+          def check(ok,msg); raise msg unless ok; end
+          $game_switches=Hash.new(false)
+          $game_switches[185]=true
+          $game_map=FakeMap.new
+          $game_player=Game_Character.new(20,20,2)
+          healer=Game_Event.new(20,29)
+          $game_map.events={1=>healer}
+          healer.move_toward_player
+          check([healer.x,healer.y]==[20,16], 'Teleporter must land 4 behind')
+          healer.move_toward_player
+          check([healer.x,healer.y]==[20,16], 'Teleporter cannot repeat immediately')
+          (3..5).each do |d|
+            healer.moveto(20,20+d)
+            healer.move_toward_player
+            check([healer.x,healer.y]==[20,20+d], 'Hold distance')
+          end
+          (6..8).each do |d|
+            healer.moveto(20,20+d)
+            healer.move_toward_player
+            check([healer.x,healer.y]==[20,19+d], 'Native chase')
+          end
+          (1..2).each do |d|
+            healer.moveto(20,20+d)
+            healer.move_toward_player
+            check([healer.x,healer.y]==[20,21+d], 'Retreat')
+          end
+          $game_map.blocked=[[20,16]]
+          healer.moveto(20,29)
+          healer.move_toward_player
+          check([healer.x,healer.y]==[20,17], 'Blocked tile fallback')
+          $game_map.blocked=[[20,16],[20,17],[20,15]]
+          healer.moveto(20,29)
+          healer.move_toward_player
+          check([healer.x,healer.y]==[20,29], 'Unsafe tile teleport')
+          $game_map.blocked=[]
+          [2,4,6,8].each do |dir|
+            $game_player.direction=dir
+            dx,dy={2=>[0,-1],4=>[1,0],6=>[-1,0],8=>[0,1]}[dir]
+            healer.moveto(40,40)
+            healer.move_toward_player
+            check([healer.x,healer.y]==[20+4*dx,20+4*dy], 'Direction')
+          end
+          other=Game_Event.new(20,29,2,'[ID오우거]')
+          other.move_toward_player
+          check([other.x,other.y]==[20,28], 'Other NPC changed')
+          $game_switches[185]=false
+          healer.moveto(20,29)
+          healer.move_toward_player
+          check([healer.x,healer.y]==[20,28], 'Unhired event changed')
+          puts 'PASS V1.3 0..2 retreat, 3..5 hold, 6..8 chase'
+          puts 'PASS 9+ teleport behind 4, 3/5 fallback, all four directions'
+          puts 'PASS other NPC and unhired healer unaffected'
+          RUBY
+          ruby build/test_v13.rb
+
+      - name: Refresh V1.3 game cache and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, re
+          root=Path('site')
+          mapping=root/'knight/gameasync/mapping.js'
+          source=mapping.read_text('utf-8')
+          rel='Data/Scripts.rxdata'
+          digest=hashlib.md5((root/'knight/gameasync'/rel).read_bytes()).hexdigest()
+          source,count=re.subn(re.escape(rel)+r'\?h=[0-9a-f]{32}',
+                               lambda _: rel+'?h='+digest,source)
+          assert count == 1, count
+          mapping.write_text(source,encoding='utf-8')
+
+          loader=root/'knight/js/sl-assets-v229r115.js'
+          source=loader.read_text('utf-8')
+          assert source.count("var version='V1.2';") == 1
+          loader.write_text(source.replace("var version='V1.2';",
+                                           "var version='V1.3';"),encoding='utf-8')
+
+          for rel in ('index.html','knight/index.html'):
+              path=root/rel
+              source=path.read_text('utf-8')
+              assert 'V1.2' in source,rel
+              source=source.replace('V1.2','V1.3').replace('?v=v1.2','?v=v1.3')
+              path.write_text(source,encoding='utf-8')
+          print('PASS V1.3 caches and labels')
+          PY
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
+
+      - name: Verify no unrelated game changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          root=Path('site')
+          orig=json.loads(Path('build/original.json').read_text('utf-8'))
+          now={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+               for p in root.rglob('*') if p.is_file()}
+          assert len(now)==5623 and set(now)==set(orig)
+          changed={p for p in orig if now[p]!=orig[p]}
+          allowed={
+              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/mapping.js',
+              'knight/js/sl-assets-v229r115.js',
+              'index.html',
+              'knight/index.html',
+          }
+          assert changed==allowed,sorted(changed ^ allowed)
+          assert 'V1.3' in (root/'knight/index.html').read_text('utf-8')
+          print('PASS only five approved files changed')
+          print('PASS all 41 healer map files preserved')
+          print('PASS original monsters, magic, drops, animations unchanged')
+          PY
+
+      - name: Publish V1.3 game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -1023,6 +349,5 @@ jobs:
 
     steps:
       - uses: actions/configure-pages@v6
-
       - id: deployment
         uses: actions/deploy-pages@v5
