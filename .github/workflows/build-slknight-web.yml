@@ -1,12 +1,15 @@
 
 # FILE: .github/workflows/build-slknight-web.yml
-# VERSION: V1.3
-# BASE: verified successful V1.2 run 42194617019
-# Scope: healer movement only. Other maps, monsters, NPCs,
-# spells, hires, buffs, speed rules, and animations remain unchanged.
-# The existing workflow title below is intentionally unchanged.
+# VERSION: V1.4
+# BASE: successful V1.3 run 42315919970
+# APPROVED ONLY:
+# 1. Healer equipment/status/skill selection below knight.
+# 2. Item and skill hotbars 9 slots (3 x 3); raise dpad, ATK and X.
+# 3. Healer distance teleport threshold 20 (was 9).
+# Keep all other NPC, monster, map, battle, hire and buff logic.
+# This patch adds no timer, new combat engine or map events.
 
-name: build-slknight-web.yml | V1.2 | Clean Native Events and 2x Terrain
+name: build-slknight-web.yml | V1.4 | Clean Native Events and 2x Terrain
 
 "on":
   workflow_dispatch:
@@ -29,18 +32,17 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-
     steps:
-      - name: Restore successful V1.2
+      - name: Restore successful V1.3
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 42194617019
+          run-id: 42315919970
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify inherited V1.2
+      - name: Verify inherited V1.3
         shell: bash
         run: |
           set -euo pipefail
@@ -63,133 +65,564 @@ jobs:
               'knight/gameasync/Data/' + pre + 'CommonEvents.rxdata',
               'knight/gameasync/Data/' + pre + 'Animations.rxdata',
               'knight/gameasync/mapping.js',
+              'knight/js/dpad.js',
               'knight/js/sl-assets-v229r115.js',
               'index.html',
-              'knight/index.html',
+              'knight/index.html'
           ):
               assert rel in files, rel
-          assert "var version='V1.2';" in (
-              root / 'knight/js/sl-assets-v229r115.js'
-          ).read_text('utf-8')
-          (Path('build') / 'original.json').write_text(
-              json.dumps(files), encoding='utf-8'
-          )
-          print('PASS 5623 V1.2 files verified')
+          loader = (root / 'knight/js/sl-assets-v229r115.js').read_text('utf-8')
+          assert "var version='V1.3';" in loader
+          assert 'V1.3' in (root / 'knight/index.html').read_text('utf-8')
+          Path('build/original.json').write_text(json.dumps(files), encoding='utf-8')
+          print('PASS original V1.3 / 5623 files')
           PY
-
-      - name: Apply V1.3 healer-only movement
+      - name: Apply V1.4 healer selection, shared shortcuts and 20-tile teleport
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/patch_v13.rb <<'RUBY'
+          cat > build/v14_extensions.rb <<'RUBY_V14_EXT'
+          # V1.4 – Use existing actor, item/skill menus and spell states.
+          module SLV14Menu
+            def self.members
+              list = $game_party.actors.dup
+              if $game_switches && $game_switches[185] && !list.include?($game_actors[3])
+                list << $game_actors[3]
+              end
+              list
+            end
+            def self.actor(index)
+              members[index]
+            end
+          end
+
+          module SLV14Skills
+            MAGIC = [
+              [90, '그레이터 힐', '그힐', '힐러의 회복 마법'],
+              [91, '이뮨 투 함', '이뮨', '힐러 보호 마법'],
+              [92, '어드밴스 스피릿', '버프-어드밴스스피릿', '힐러 강화 마법'],
+              [93, '홀리 워크', '힐러 명령 주문서', '힐러의 홀리 워크'],
+            ]
+            def self.available?(id)
+              return false unless $game_switches && $game_switches[185]
+              case id
+              when 90 then true
+              when 91 then $game_switches[384]
+              when 92 then $game_switches[385]
+              when 93 then $game_switches[812]
+              else false
+              end
+            end
+            def self.prepare
+              return unless $data_skills && $game_actors
+              template = $data_skills[6]
+              return unless template
+              MAGIC.each do |spec|
+                id, name, icon, desc = spec
+                skill = $data_skills[id]
+                if skill.nil? || skill.name.to_s.empty?
+                  skill = template.clone
+                  skill.instance_variable_set(:@id, id)
+                  skill.instance_variable_set(:@name, name)
+                  skill.instance_variable_set(:@icon_name, icon)
+                  skill.instance_variable_set(:@description, desc)
+                  skill.instance_variable_set(:@sp_cost, 0)
+                  skill.instance_variable_set(:@scope, 0)
+                  skill.instance_variable_set(:@occasion, 0)
+                  skill.instance_variable_set(:@common_event_id, 0)
+                  $data_skills[id] = skill
+                end
+                if available?(id)
+                  $game_actors[3].learn_skill(id)
+                else
+                  $game_actors[3].forget_skill(id)
+                end
+              end
+            end
+            def self.slots
+              value = $game_system.instance_variable_get(:@sl_v14_skill_slots)
+              if !value.is_a?(Array)
+                value = Array.new(9, 0)
+              else
+                value = (value[0, 9] || []) + Array.new([9 - value.size, 0].max, 0)
+              end
+              $game_system.instance_variable_set(:@sl_v14_skill_slots, value)
+              value
+            end
+            def self.assigned?(slot)
+              slots[slot].to_i > 0
+            end
+            def self.index_pressed
+              return 0 if Keyboard.testkey(49) || Input.trigger?(Input::F7)
+              return 1 if Keyboard.testkey(50) || Input.trigger?(Input::F8)
+              return 2 if Keyboard.testkey(51) || Input.trigger?(Input::F9)
+              return 3 if Keyboard.testkey(52) || Input.trigger?(Input::CTRL)
+              return 4 if Keyboard.testkey(53) || Input.trigger?(Input::ALT)
+              return 5 if Keyboard.testkey(54) || Input.trigger?(Input::SHIFT)
+              return 6 if Keyboard.testkey(55)
+              return 7 if Keyboard.testkey(56)
+              return 8 if Keyboard.testkey(57)
+              nil
+            end
+            def self.assign_from_window(window, actor)
+              slot = index_pressed
+              return false if slot.nil?
+              skill = window ? window.skill : nil
+              if skill.nil? || actor.nil? || !actor.skill_learn?(skill.id)
+                $game_system.se_play($data_system.buzzer_se)
+                return true
+              end
+              if actor.id == 3 && !available?(skill.id)
+                $game_system.se_play($data_system.buzzer_se)
+                return true
+              end
+              slots[slot] = actor.id * 1000 + skill.id
+              $game_system.se_play($data_system.decision_se)
+              sync(true)
+              true
+            end
+            def self.buzzer
+              $game_system.se_play($data_system.buzzer_se)
+              false
+            end
+            def self.cast_healer(id)
+              return buzzer unless available?(id)
+              mp = $game_variables[459].to_i
+              case id
+              when 90 # Same 16 MP and 100..120 healing as original healer event.
+                actor = $game_actors[1]
+                return buzzer if mp < 16 || actor.hp >= actor.maxhp
+                $game_variables[459] = mp - 16
+                actor.hp += 100 + rand(21)
+                $game_player.animation_id = 269
+              when 91 # Reuse the native Immune status, expense and expiry CE603.
+                return buzzer if $game_switches[94] # Existing auto cast must not charge twice.
+                return buzzer if mp < 30 || $game_party.item_number(15) < 2
+                $game_variables[459] = mp - 30
+                $game_party.lose_item(15, 2)
+                $game_switches[382] = true
+                $game_switches[386] = true
+                $game_variables[853] = 0
+              when 92 # CE604 handles the existing timed buff and its removal.
+                return buzzer if $game_switches[95] # Existing auto cast must not charge twice.
+                return buzzer if mp < 20
+                $game_variables[459] = mp - 20
+                unless $game_switches[383]
+                  $game_actors[1].maxhp += 300
+                  $game_actors[1].maxsp += 30
+                end
+                $game_switches[92] = true
+                $game_switches[383] = true
+                $game_variables[854] = 0
+              when 93 # Native CE801 accounts for the 15 MP charge and duration.
+                return buzzer if mp < 15
+                $game_variables[879] = 0
+                $game_switches[811] = true
+              else
+                return buzzer
+              end
+              Guage.show if defined?(Guage)
+              $KeyIcon.ShowIcon if $KeyIcon
+              $메세지.set_text2('[힐러] ' + ($data_skills[id].name) + ' 시전') if $메세지
+              true
+            end
+            def self.cast_knight(id)
+              actor = $game_actors[1]
+              return buzzer unless actor.skill_learn?(id)
+              case id
+              when 7 then $game_switches[1007] = true
+              when 8 then $game_switches[1008] = true
+              when 9 then $game_switches[874] = true
+              when 1 then $game_temp.common_event_id = 80
+              else
+                skill = $data_skills[id]
+                return buzzer unless skill && skill.common_event_id.to_i > 0
+                $game_temp.common_event_id = skill.common_event_id
+              end
+              true
+            end
+            def self.cast_slot(slot)
+              value = slots[slot].to_i
+              return false if value <= 0
+              actor_id = value / 1000
+              skill_id = value % 1000
+              success = if actor_id == 3
+                cast_healer(skill_id)
+              elsif actor_id == 1
+                cast_knight(skill_id)
+              else
+                buzzer
+              end
+              sync(true)
+              success
+            end
+            def self.use_pressed
+              slot = index_pressed
+              return false if slot.nil? || !assigned?(slot)
+              cast_slot(slot)
+              true
+            end
+            def self.sync(force = false)
+              prepare
+              data = []
+              for slot in 0...9
+                value = slots[slot].to_i
+                actor_id = value / 1000
+                skill_id = value % 1000
+                skill = value > 0 ? $data_skills[skill_id] : nil
+                if skill && (actor_id == 1 || actor_id == 3)
+                  ready = actor_id == 1 ? $game_actors[1].skill_learn?(skill_id) : available?(skill_id)
+                  data << [skill_id, skill.icon_name.to_s, skill.name.to_s, skill.sp_cost.to_i, ready ? 1 : 0]
+                else
+                  data << [0, '', '', 0, 0]
+                end
+              end
+              # Keep the original six default icons and actions when unassigned.
+              actor = $game_party.actors[0]
+              [7, 8, 9, 1].each_with_index do |id, i|
+                next if assigned?(i) || actor.nil?
+                skill = actor.skill_learn?(id) ? $data_skills[id] : nil
+                data[i] = skill ? [id, skill.icon_name.to_s, skill.name.to_s, 0, 1] : [0, '', '', 0, 0]
+              end
+              unless assigned?(4)
+                item = $data_items[177]
+                data[4] = (item && $game_party.item_number(177) > 0) ? [177, item.icon_name.to_s, item.name.to_s, 0, 1] : [0, '', '', 0, 0]
+              end
+              signature = data.inspect
+              return if !force && @last_sync == signature
+              @last_sync = signature
+              data.each_with_index do |v, i|
+                puts('SLSKILL|STATE|' + (i + 1).to_s + '|' + v.map{|x|x.to_s.gsub('|', '/')}.join('|'))
+              end
+            end
+          end
+          RUBY_V14_EXT
+          cat > build/patch_v14.rb <<'RUBY_V14_PATCH'
           # encoding: utf-8
           require 'zlib'
           require 'digest'
+          SP = 'site/knight/gameasync/Data/Scripts.rxdata'
+          original_bytes = File.binread(SP)
+          scripts = Marshal.load(original_bytes)
+          base = Marshal.load(original_bytes)
 
-          sp = 'site/knight/gameasync/Data/Scripts.rxdata'
-          scripts = Marshal.load(File.binread(sp))
-          original = Marshal.load(File.binread(sp))
-
-          find_script = lambda do |name, expected_sha|
-            ids = scripts.each_index.select do |i|
-              scripts[i].is_a?(Array) && scripts[i][1].to_s == name
-            end
-            raise "Expected one #{name}" unless ids.size == 1
-            i = ids.first
-            source = Zlib::Inflate.inflate(scripts[i][2])
-            raise "Unexpected #{name} source" unless
-              Digest::SHA256.hexdigest(source) == expected_sha
-            [i, source]
+          def section(a, name)
+            matches = a.each_index.select{|i| a[i].is_a?(Array) && a[i][1].to_s == name}
+            raise "missing/duplicate script #{name}: #{matches.inspect}" unless matches.size == 1
+            i = matches[0]
+            [i, Zlib::Inflate.inflate(a[i][2]).force_encoding('UTF-8').gsub("\r\n", "\n")]
           end
 
-          ci, cs = find_script.call(
-            'Game_Character 3',
-            '89c2bcfda38725fb2ca702c51599c160e094c2044544069b619a5dbfe2ab63ad'
-          )
-          ei, es = find_script.call(
-            'Game_Event',
-            '9cb9f02120e07c888cff5f3d9ecdbebdd431062d9230385b4f4da557940b878b'
-          )
+          def replace_one(s, from, to, description)
+            from = from.gsub("\\n", "\n")
+            to = to.gsub("\\n", "\n")
+            count = s.split(from, -1).size - 1
+            raise "#{description} anchor count #{count}" unless count == 1
+            s.sub(from, to)
+          end
 
-          anchor = "  def move_toward_player\r\n"
-          raise 'Original follow method changed' unless cs.scan(anchor).size == 1
-          healer = <<'HEALER'
-              if @event && @event.name == '[ID힐러 마법사]' && $game_switches[185]
-                d = (@x - $game_player.x).abs + (@y - $game_player.y).abs
-                if d <= 2
-                  if d == 0
-                    case $game_player.direction
-                    when 2 then move_up
-                    when 4 then move_right
-                    when 6 then move_left
-                    when 8 then move_down
-                    end
-                  else
-                    move_away_from_player
-                  end
-                  return
+          def replace_two(s, from, to, description)
+            from = from.gsub("\\n", "\n")
+            to = to.gsub("\\n", "\n")
+            count = s.split(from, -1).size - 1
+            raise "#{description} anchor count #{count}" unless count == 2
+            s.gsub(from, to)
+          end
+
+          def change(scripts, name)
+            i, s = section(scripts, name)
+            original_sha = Digest::SHA256.hexdigest(s)
+            new_source = yield s
+            raise "#{name} unchanged" if s == new_source
+            File.binwrite("build/v14_#{i}.rb", new_source)
+            raise "Ruby syntax bad #{name}" unless system('ruby', '-c', "build/v14_#{i}.rb")
+            scripts[i][2] = Zlib::Deflate.deflate(new_source.b)
+            puts "UPDATED #{i}: #{name} #{original_sha[0,10]} -> #{Digest::SHA256.hexdigest(new_source)[0,10]}"
+          end
+
+          change(scripts, 'Game_Character 3') do |s|
+            replace_one(s, '      if d >= 9\n', '      if d >= 20\n', 'Healer teleport threshold')
+          end
+
+          change(scripts, 'Window_MenuStatus') do |s|
+            t=replace_one(s, '    @item_max = $game_party.actors.size\n', '    @item_max = SLV14Menu.members.size\n','Menu actor count')
+            t=replace_one(t, '    for i in 0...$game_party.actors.size\n', '    for i in 0...SLV14Menu.members.size\n','Menu actor loop')
+            replace_one(t, '      actor = $game_party.actors[i]\n', '      actor = SLV14Menu.actor(i)\n','Menu actor lookup')
+          end
+
+          change(scripts, 'Scene_Menu') do |s|
+            t=replace_one(s, '  def main\n', '  def main\n    SLV14Skills.prepare\n', 'Menu prepare skills')
+            replace_one(t,'$game_party.actors[@status_window.index].restriction', 'SLV14Menu.actor(@status_window.index).restriction', 'Menu skill restriction')
+          end
+
+          change(scripts, 'Scene_Skill') do |s|
+            t=replace_one(s, '    @actor = $game_party.actors[@actor_index]\n', '    @actor = SLV14Menu.actor(@actor_index)\n','Skill actor lookup')
+            t=replace_two(t,'      @actor_index %= $game_party.actors.size\n','      @actor_index %= SLV14Menu.members.size\n','Skill next actor')
+            t=replace_one(t,'      @actor_index += $game_party.actors.size - 1\n','      @actor_index += SLV14Menu.members.size - 1\n','Skill prior actor')
+            anchor='  def update_skill\n'
+            addition=<<'SRC'
+              return if SLV14Skills.assign_from_window(@skill_window, @actor)
+              if @actor && @actor.id == 3 && Input.trigger?(Input::C)
+                selected = @skill_window.skill
+                if selected && SLV14Skills.cast_healer(selected.id)
+                  $scene = Scene_Map.new
                 end
-                return if d <= 5
-                if d >= 9
-                  dx, dy = case $game_player.direction
-                           when 2 then [0, -1]
-                           when 4 then [1, 0]
-                           when 6 then [-1, 0]
-                           when 8 then [0, 1]
-                           end
-                  if dx && dy
-                    [4, 3, 5].each do |n|
-                      tx = $game_player.x + dx * n
-                      ty = $game_player.y + dy * n
-                      next unless $game_map.valid?(tx, ty)
-                      next unless $game_map.passable?(tx, ty, 0, self)
-                      occupied = $game_map.events.values.any? do |e|
-                        e != self && e.x == tx && e.y == ty && e.character_name != ''
-                      end
-                      next if occupied
-                      moveto(tx, ty)
-                      break
-                    end
-                  end
-                  return
-                end
+                return
               end
-          HEALER
-          cs2 = cs.sub(anchor, anchor + healer.gsub("\n", "\r\n").b)
-
-          through = "    @through = @page.through\r\n"
-          raise 'Event page collision anchor changed' unless es.scan(through).size == 1
-          es2 = es.sub(
-            through,
-            through + "    @through = false if @event.name == '[ID힐러 마법사]' && $game_switches[185]\r\n".b
-          )
-
-          File.binwrite('build/v13_character.rb', cs2)
-          File.binwrite('build/v13_event.rb', es2)
-          raise 'Character Ruby syntax error' unless system('ruby', '-c', 'build/v13_character.rb')
-          raise 'Event Ruby syntax error' unless system('ruby', '-c', 'build/v13_event.rb')
-
-          scripts[ci][2] = Zlib::Deflate.deflate(cs2)
-          scripts[ei][2] = Zlib::Deflate.deflate(es2)
-          changed = scripts.each_index.select do |i|
-            scripts[i] != original[i]
+          SRC
+            replace_one(t,anchor,anchor+addition,'Skill screen shortcut assignment')
           end
-          raise "Unrelated scripts changed #{changed.inspect}" unless changed.sort == [ci, ei].sort
 
-          File.binwrite(sp, Marshal.dump(scripts))
-          saved = Marshal.load(File.binread(sp))
-          raise 'Saved follow missing' unless Zlib::Inflate.inflate(saved[ci][2]) == cs2
-          raise 'Saved collision missing' unless Zlib::Inflate.inflate(saved[ei][2]) == es2
-          puts 'PASS V1.3: healer-only movement and collision, no new timer or AI'
-          RUBY
-          ruby -c build/patch_v13.rb
-          ruby build/patch_v13.rb
+          change(scripts,'Scene_Equip') do |s|
+            t=replace_one(s,'    @actor = $game_party.actors[@actor_index]\n','    @actor = SLV14Menu.actor(@actor_index)\n','Equip actor lookup')
+            t=replace_one(t,'    $game_temp.common_event_id = 553\n','    $game_temp.common_event_id = 553 unless @actor && @actor.id == 3\n','No knight recalculation for healer')
+            t=replace_two(t,'      @actor_index %= $game_party.actors.size\n','      @actor_index %= SLV14Menu.members.size\n','Equip next actor')
+            replace_one(t,'      @actor_index += $game_party.actors.size - 1\n','      @actor_index += SLV14Menu.members.size - 1\n','Equip prior actor')
+          end
 
-      - name: Test V1.3 healer distance and teleport
+          change(scripts,'Scene_Status') do |s|
+            t=replace_one(s,'    @actor = $game_party.actors[@actor_index]\n','    @actor = SLV14Menu.actor(@actor_index)\n','Status actor lookup')
+            t=replace_two(t,'      @actor_index %= $game_party.actors.size\n','      @actor_index %= SLV14Menu.members.size\n','Status next actor')
+            replace_one(t,'      @actor_index += $game_party.actors.size - 1\n','      @actor_index += SLV14Menu.members.size - 1\n','Status prior actor')
+          end
+
+          change(scripts,'Scene_Map') do |s|
+            t=replace_one(s, '  def sl_native_skill_icons\n', '  def sl_native_skill_icons\n    SLV14Skills.sync\n    return\n','Skill slot state integration')
+            t=replace_one(t,'  def main\n','  def main\n    SLV14Skills.prepare\n','Skill state at map entry')
+            t=replace_one(t,'if $game_switches[1011] == false\n','if $game_switches[1011] == false\n  SLV14Skills.use_pressed\n','Skill slot use existing frame')
+            guards=[
+              ['if Keyboard.getstate(49) || Input.trigger?(Input::F7)','if !SLV14Skills.assigned?(0) && (Keyboard.getstate(49) || Input.trigger?(Input::F7))'],
+              ['if Keyboard.getstate(50) || Input.trigger?(Input::F8)','if !SLV14Skills.assigned?(1) && (Keyboard.getstate(50) || Input.trigger?(Input::F8))'],
+              ['if Keyboard.getstate(51) || Input.trigger?(Input::F9)','if !SLV14Skills.assigned?(2) && (Keyboard.getstate(51) || Input.trigger?(Input::F9))'],
+              ['if Keyboard.getstate(52) || Input.trigger?(Input::CTRL)','if !SLV14Skills.assigned?(3) && (Keyboard.getstate(52) || Input.trigger?(Input::CTRL))'],
+              ['if Keyboard.testkey(53) || Input.trigger?(Input::ALT)','if !SLV14Skills.assigned?(4) && (Keyboard.testkey(53) || Input.trigger?(Input::ALT))'],
+              ['if Keyboard.testkey(54) || Input.trigger?(Input::SHIFT)','if !SLV14Skills.assigned?(5) && (Keyboard.testkey(54) || Input.trigger?(Input::SHIFT))'],
+              ['if Keyboard.testkey(55)','if !SLV14Skills.assigned?(6) && Keyboard.testkey(55)'],
+              ['if Keyboard.testkey(56)','if !SLV14Skills.assigned?(7) && Keyboard.testkey(56)']
+            ]
+            guards.each{|from,to|t=replace_one(t,from,to,'Skill legacy guard '+from)}
+            t
+          end
+
+          change(scripts,'Mobile Hotbar') do |s|
+            t=replace_one(s,'  LEGACY=[[1,70,86],[16,71],[3],[4,118],[127],[114]]\n',
+                          '  LEGACY=[[1,70,86],[16,71],[3],[4,118],[127],[114],[],[],[]]\n', 'Nine item defaults')
+            from=<<'SRC'
+              unless value.is_a?(Array)&&value.size==6
+                value=[0,0,0,0,0,0]
+                $game_system.instance_variable_set(:@sl_hotbar_slots,value)
+              end
+          SRC
+            to=<<'SRC'
+              unless value.is_a?(Array)
+                value = Array.new(9, 0)
+              else
+                value = (value[0, 9] || []) + Array.new([9 - value.size, 0].max, 0)
+              end
+              $game_system.instance_variable_set(:@sl_hotbar_slots, value)
+          SRC
+            t=replace_one(t,from,to,'Preserve existing six item slots')
+            t=replace_one(t,'    return 5 if Keyboard.testkey(70)\n',
+                          '    return 5 if Keyboard.testkey(70)\n    return 6 if Keyboard.testkey(74)\n    return 7 if Keyboard.testkey(75)\n    return 8 if Keyboard.testkey(76)\n', 'Additional item input JKL')
+            t=t.gsub('0...6', '0...9')
+            raise 'Item slot loops not expanded' unless t.include?('for i in 0...9')
+            extra=File.read('build/v14_extensions.rb',encoding:'UTF-8')
+            t + "\n" + extra
+          end
+
+          changed=scripts.each_index.select{|i|scripts[i] != base[i]}
+          expected_names=['Game_Character 3','Window_MenuStatus','Scene_Menu','Scene_Skill','Scene_Equip','Scene_Status','Scene_Map','Mobile Hotbar']
+          actual_names=changed.map{|i|scripts[i][1]}
+          raise "Unexpected modified sections #{actual_names.inspect}" unless actual_names.sort == expected_names.sort
+          File.binwrite(SP,Marshal.dump(scripts))
+          check=Marshal.load(File.binread(SP))
+          changed.each{|i|raise 'Bad saved script' unless Zlib::Inflate.inflate(check[i][2]) == Zlib::Inflate.inflate(scripts[i][2])}
+          puts 'PASS V1.4: eight tightly scoped original Ruby script sections'
+          RUBY_V14_PATCH
+          ruby -c build/patch_v14.rb
+          ruby build/patch_v14.rb
+
+      - name: Extend only existing mobile item and skill pads to 3 x 3
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/test_v13.rb <<'RUBY'
+          cat > build/patch_v14_js.py <<'PY_V14_UI'
+          from pathlib import Path
+
+          root = Path('site')
+          source_file = root / 'knight/js/dpad.js'
+          text = source_file.read_text('utf-8')
+
+          def one(src, old, new, name):
+              n=src.count(old)
+              if n!=1:
+                  raise RuntimeError(f'{name}: expected one, got {n}')
+              return src.replace(old, new)
+
+          def many(src,old,new,count,name):
+              n=src.count(old)
+              if n!=count:raise RuntimeError(f'{name}: expected {count}, got {n}')
+              return src.replace(old,new)
+
+          text = one(text,'const cols=portrait?3:2,rows=portrait?2:3;', 'const cols=3,rows=3;', '3x3 skill layout')
+          text = one(text,'const cols=portrait?3:2,rows=portrait?2:3,gap=portrait?8:6;', 'const cols=3,rows=3,gap=portrait?8:6;', '3x3 items layout')
+          text = one(text,'const atkY=Math.min(h*0.23,100),cancelY=Math.min(h*0.46,190);',
+              'const atkY=Math.max(20,Math.min(h*0.23,100)-20),cancelY=Math.max(75,Math.min(h*0.46,190)-20);', 'raise ATK and X')
+          text = one(text, 'true,(atkY+cancelY)/2,hotTop-zoneTop,cell,gap);',
+              'true,(atkY+cancelY)/2-18,hotTop-zoneTop,cell,gap);', 'raise Dpad')
+          text = one(text,'h*(0.22+0.43)/2,hotTop-zoneTop,cell,gap);',
+              'h*(0.22+0.43)/2-12,hotTop-zoneTop,cell,gap);','raise side dpad')
+          text = one(text,'centerBox(atk,cx,top+h*0.22,atkSize,atkSize);',
+              'centerBox(atk,cx,top+h*0.22-14,atkSize,atkSize);','raise side ATK')
+          text = one(text,'centerBox(cancel,cx,top+h*0.43,xSize,xSize);',
+              'centerBox(cancel,cx,top+h*0.43-14,xSize,xSize);','raise side X')
+          text = one(text,'window.slSkillStates=[null,null,null,null,null,null];',
+              'window.slSkillStates=Array(9).fill(null);','9 skill state data')
+          text = one(text,'window.slHotStates=[null,null,null,null,null,null];',
+              'window.slHotStates=Array(9).fill(null);','9 item state data')
+          text = many(text,'if(slot>=1&&slot<=6){','if(slot>=1&&slot<=9){',2,'9 slot parse')
+          text = one(text, "const slSkillKeys=[118,119,120,17,18,16];",
+              "const slSkillKeys=[118,119,120,17,18,16,55,56,57];", '9 skill keys')
+          text = many(text, "const labels=['a','s','d','q','z','f'],b=document.getElementById('sl-hot-'+labels[index]);",
+              "const labels=['a','s','d','q','z','f','j','k','l'],b=document.getElementById('sl-hot-'+labels[index]);",2,'9 item render and flash labels')
+          text = one(text,"const visible=slScene==='Scene_Map';",
+              "const visible=slScene==='Scene_Map'||slScene==='Scene_Skill';",'skill assignment mode')
+          text = one(text, 'for(let i=0;i<6;i++)skillButton(skillbar,i);',
+              'for(let i=0;i<9;i++)skillButton(skillbar,i);','nine skill buttons')
+          text = one(text,"hotButton(hot,0,'A',65);hotButton(hot,1,'S',83);hotButton(hot,2,'D',68);hotButton(hot,3,'Q',81);hotButton(hot,4,'Z',117);hotButton(hot,5,'F',116);",
+              "hotButton(hot,0,'A',65);hotButton(hot,1,'S',83);hotButton(hot,2,'D',68);hotButton(hot,3,'Q',81);hotButton(hot,4,'Z',117);hotButton(hot,5,'F',116);hotButton(hot,6,'J',74);hotButton(hot,7,'K',75);hotButton(hot,8,'L',76);",'nine item buttons')
+          text = one(text, 'grid-template-columns:repeat(3,46px);grid-template-rows:repeat(2,46px);',
+              'grid-template-columns:repeat(3,46px);grid-template-rows:repeat(3,46px);','skill CSS grid')
+          text = one(text, 'grid-template-columns:repeat(3,48px);grid-template-rows:repeat(2,48px);gap:8px;width:160px;height:104px;',
+              'grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,48px);gap:8px;width:160px;height:160px;','item CSS grid')
+          text = one(text, 'grid-template-columns:repeat(2,42px);grid-template-rows:repeat(3,42px);gap:6px;width:90px;height:138px',
+              'grid-template-columns:repeat(3,42px);grid-template-rows:repeat(3,42px);gap:6px;width:138px;height:138px','item side CSS grid')
+          source_file.write_text(text,'utf-8')
+          print('PASS nine skill/item buttons, portrait/landscape layout, higher controls')
+          PY_V14_UI
+          python3 build/patch_v14_js.py
+          node --check site/knight/js/dpad.js
+
+      - name: Test V1.4 actors, shortcuts, spells and teleport
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/test_v14.rb <<'RUBY_V14_TEST'
+          # encoding: utf-8
+          module Input
+            F7=118;F8=119;F9=120;CTRL=17;ALT=18;SHIFT=16
+            X=65;Y=83;Z=68;L=81;F6=117
+            @p={}
+            def self.trigger?(x);@p[x]||false;end
+            def self.simulate(h);@p=h;end
+          end
+          module Keyboard
+            @p={}
+            def self.testkey(x);@p[x]||false;end
+            def self.simulate(h);@p=h;end
+          end
+          module RPG
+           class Item;end
+           class Skill
+             attr_accessor :id,:name,:icon_name,:description,:sp_cost,:scope,:occasion,:common_event_id
+             def initialize(id,name)
+               @id=id;@name=name;@icon_name='dummy';@description='';@sp_cost=0;@scope=0;@occasion=0;@common_event_id=0
+             end
+           end
+          end
+          class Actor
+           attr_reader :id,:name,:skills
+           attr_accessor :hp,:maxhp,:maxsp,:sp
+           def initialize(id)
+            @id=id;@name=id==1 ? '기사' : '힐러 마법사';@skills=[];@hp=500;@maxhp=1000;@maxsp=100;@sp=100
+           end
+           def learn_skill(id);@skills << id unless @skills.include?(id);end
+           def forget_skill(id);@skills.delete(id);end
+           def skill_learn?(id);@skills.include?(id);end
+          end
+          class FakeParty
+           attr_accessor :actors
+           def initialize;@actors=[];end
+           def item_number(id);id==15 ? 5 : 0;end
+           def lose_item(id,n);@lost=[id,n];end
+           def lost;@lost;end
+          end
+          class GameSystem
+           def se_play(*args);end
+          end
+          class GamePlayer
+           attr_accessor :animation_id
+          end
+          class Guage
+           def self.show;end
+          end
+          class Scene_Item;def update_item;end;end
+          class Scene_Item2;def update_item;end;end
+          class Scene_Map;def update;end;end
+          $game_party=FakeParty.new
+          $game_actors={1=>Actor.new(1),3=>Actor.new(3)}
+          $game_party.actors=[$game_actors[1]]
+          $game_switches=Hash.new(false)
+          $game_variables=Hash.new(0)
+          $game_system=GameSystem.new
+          $data_system=Struct.new(:decision_se,:buzzer_se).new("decision","beep")
+          $game_player=GamePlayer.new
+          $game_temp=Struct.new(:common_event_id).new(0)
+          $data_skills=Array.new(100)
+          $data_skills[6]=RPG::Skill.new(6,'디스인티그레이트')
+          [1,7,8,9].each{|i|$data_skills[i]=RPG::Skill.new(i,'기사스킬 '+i.to_s)}
+          $data_items=Array.new(200)
+          $메세지=nil;$KeyIcon=nil
+          class FakeWindow
+           def skill;@skill;end
+           def initialize(skill);@skill=skill;end
+          end
+          load 'build/v14_130.rb'
+          def assert(x,m);raise 'V1.4 TEST FAILED: '+m unless x;end
+          assert(SLV14Menu.members.size==1,'unhired menu size')
+          $game_switches[185]=true
+          assert(SLV14Menu.members.size==2 && SLV14Menu.actor(1).id==3, 'hired menu second actor')
+          SLV14Skills.prepare
+          assert($game_actors[3].skill_learn?(90),'healer greater heal available')
+          assert(!$game_actors[3].skill_learn?(91),'immune scroll required')
+          $game_switches[384]=true;$game_switches[385]=true;$game_switches[812]=true
+          SLV14Skills.prepare
+          assert([90,91,92,93].all?{|id|$game_actors[3].skill_learn?(id)},'learned spells available')
+          $game_system.instance_variable_set(:@sl_hotbar_slots,[23,31,0,0,0,0])
+          assert(SLHotbar.slots.size==9 && SLHotbar.slots[0]==23 && SLHotbar.slots[1]==31, 'item slot migration')
+          assert(SLV14Skills.slots.size==9, 'skill slots 9')
+          Keyboard.simulate({55=>true})
+          assert(SLV14Skills.index_pressed==6,'skill seventh shortcut')
+          Keyboard.simulate({})
+          Input.simulate({Input::F8=>true})
+          assert(SLV14Skills.assign_from_window(FakeWindow.new($data_skills[91]),$game_actors[3]),'assign skill second slot')
+          assert(SLV14Skills.slots[1]==3091,'assign distinct healer actor id')
+          Input.simulate({})
+          $game_variables[459]=100
+          $game_actors[1].hp=500
+          assert(SLV14Skills.cast_healer(90),'greater heal cast')
+          assert($game_variables[459]==84 && $game_actors[1].hp.between?(600,620),'greater heal exact cost and range')
+          assert($game_player.animation_id==269,'existing heal animation')
+          assert(SLV14Skills.cast_healer(91),'immune cast')
+          assert($game_variables[459]==54 && $game_switches[382] && $game_switches[386] && $game_party.lost==[15,2],'immune native states and cost')
+          assert(SLV14Skills.cast_healer(92),'advance cast')
+          assert($game_actors[1].maxhp==1300 && $game_actors[1].maxsp==130,'advance one-time bonus')
+          assert($game_variables[459]==34 && $game_switches[383],'advance original switch')
+          assert(SLV14Skills.cast_healer(93),'holy cast')
+          assert($game_switches[811] && $game_variables[879]==0,'holy native timer')
+          $game_switches[94]=true
+          before_mp=$game_variables[459]
+          assert(!SLV14Skills.cast_healer(91) && $game_variables[459]==before_mp,'immune auto double charge guard')
+          $game_switches[94]=false
+          $game_switches[95]=true
+          assert(!SLV14Skills.cast_healer(92) && $game_variables[459]==before_mp,'advance auto double charge guard')
+          $game_switches[95]=false
+          assert(!SLV14Skills.cast_healer(94),'unverified cast must fail closed')
+          $game_switches[185]=false
+          assert(SLV14Menu.members.size==1 && !SLV14Skills.cast_healer(90),'unhired cannot cast')
+          puts 'PASS V1.4 menu actor, nine item/skill slots, save migration, 4 healer spells and cast guards'
+          RUBY_V14_TEST
+          cat > build/test_v14_teleport.rb <<'RUBY_V14_TELEPORT_TEST'
           # encoding: utf-8
           class Game_Character
             attr_accessor :x, :y, :direction, :character_name
@@ -205,7 +638,7 @@ jobs:
               @event=Struct.new(:name).new(name)
             end
           end
-          load 'build/v13_character.rb'
+          load 'build/v14_25.rb'
           class Game_Character
             def move_up(*); @y-=1; end
             def move_down(*); @y+=1; end
@@ -218,96 +651,91 @@ jobs:
             def valid?(x,y); x>=0 && y>=0 && x<100 && y<100; end
             def passable?(x,y,d,event=nil); !@blocked.include?([x,y]); end
           end
-          def check(ok,msg); raise msg unless ok; end
+          def check(ok,msg); raise 'V1.4 TELEPORT TEST: '+msg unless ok; end
           $game_switches=Hash.new(false)
           $game_switches[185]=true
           $game_map=FakeMap.new
           $game_player=Game_Character.new(20,20,2)
-          healer=Game_Event.new(20,29)
+          healer=Game_Event.new(20,40)
           $game_map.events={1=>healer}
           healer.move_toward_player
-          check([healer.x,healer.y]==[20,16], 'Teleporter must land 4 behind')
+          check([healer.x,healer.y]==[20,16], '20 tile -> four behind')
           healer.move_toward_player
-          check([healer.x,healer.y]==[20,16], 'Teleporter cannot repeat immediately')
+          check([healer.x,healer.y]==[20,16], 'no instantaneous teleport loop')
           (3..5).each do |d|
             healer.moveto(20,20+d)
             healer.move_toward_player
-            check([healer.x,healer.y]==[20,20+d], 'Hold distance')
+            check([healer.x,healer.y]==[20,20+d], "hold distance #{d}")
           end
-          (6..8).each do |d|
+          (6..19).each do |d|
             healer.moveto(20,20+d)
             healer.move_toward_player
-            check([healer.x,healer.y]==[20,19+d], 'Native chase')
+            check([healer.x,healer.y]==[20,19+d], "native chase #{d}")
           end
           (1..2).each do |d|
             healer.moveto(20,20+d)
             healer.move_toward_player
-            check([healer.x,healer.y]==[20,21+d], 'Retreat')
+            check([healer.x,healer.y]==[20,21+d], 'retreat')
           end
           $game_map.blocked=[[20,16]]
-          healer.moveto(20,29)
+          healer.moveto(20,40)
           healer.move_toward_player
-          check([healer.x,healer.y]==[20,17], 'Blocked tile fallback')
+          check([healer.x,healer.y]==[20,17], 'fallback to 3')
           $game_map.blocked=[[20,16],[20,17],[20,15]]
-          healer.moveto(20,29)
+          healer.moveto(20,40)
           healer.move_toward_player
-          check([healer.x,healer.y]==[20,29], 'Unsafe tile teleport')
+          check([healer.x,healer.y]==[20,40], 'all fallback blocked means stay')
           $game_map.blocked=[]
           [2,4,6,8].each do |dir|
             $game_player.direction=dir
             dx,dy={2=>[0,-1],4=>[1,0],6=>[-1,0],8=>[0,1]}[dir]
             healer.moveto(40,40)
             healer.move_toward_player
-            check([healer.x,healer.y]==[20+4*dx,20+4*dy], 'Direction')
+            check([healer.x,healer.y]==[20+4*dx,20+4*dy], "dir #{dir}")
           end
           other=Game_Event.new(20,29,2,'[ID오우거]')
           other.move_toward_player
-          check([other.x,other.y]==[20,28], 'Other NPC changed')
+          check([other.x,other.y]==[20,28], 'other NPC unchanged')
           $game_switches[185]=false
-          healer.moveto(20,29)
+          healer.moveto(20,40)
           healer.move_toward_player
-          check([healer.x,healer.y]==[20,28], 'Unhired event changed')
-          puts 'PASS V1.3 0..2 retreat, 3..5 hold, 6..8 chase'
-          puts 'PASS 9+ teleport behind 4, 3/5 fallback, all four directions'
-          puts 'PASS other NPC and unhired healer unaffected'
-          RUBY
-          ruby build/test_v13.rb
+          check([healer.x,healer.y]==[20,39], 'unhired healer unchanged')
+          puts 'PASS V1.4 teleport at 20, 6..19 chase, hold, retreat, fallback, four directions, isolation'
+          RUBY_V14_TELEPORT_TEST
+          ruby build/test_v14.rb
+          ruby build/test_v14_teleport.rb
 
-      - name: Refresh V1.3 game cache and version
+      - name: Refresh cache and visible V1.4
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib, re
+          import hashlib,re
           root=Path('site')
           mapping=root/'knight/gameasync/mapping.js'
           source=mapping.read_text('utf-8')
           rel='Data/Scripts.rxdata'
           digest=hashlib.md5((root/'knight/gameasync'/rel).read_bytes()).hexdigest()
           source,count=re.subn(re.escape(rel)+r'\?h=[0-9a-f]{32}',
-                               lambda _: rel+'?h='+digest,source)
-          assert count == 1, count
-          mapping.write_text(source,encoding='utf-8')
-
+                               lambda _:rel+'?h='+digest,source)
+          assert count==1,count
+          mapping.write_text(source,'utf-8')
           loader=root/'knight/js/sl-assets-v229r115.js'
           source=loader.read_text('utf-8')
-          assert source.count("var version='V1.2';") == 1
-          loader.write_text(source.replace("var version='V1.2';",
-                                           "var version='V1.3';"),encoding='utf-8')
-
+          assert source.count("var version='V1.3';")==1
+          loader.write_text(source.replace("var version='V1.3';", "var version='V1.4';"),'utf-8')
           for rel in ('index.html','knight/index.html'):
               path=root/rel
               source=path.read_text('utf-8')
-              assert 'V1.2' in source,rel
-              source=source.replace('V1.2','V1.3').replace('?v=v1.2','?v=v1.3')
-              path.write_text(source,encoding='utf-8')
-          print('PASS V1.3 caches and labels')
+              assert 'V1.3' in source,rel
+              path.write_text(source.replace('V1.3','V1.4').replace('?v=v1.3','?v=v1.4'),'utf-8')
+          print('PASS V1.4 display and JS cache hashes')
           PY
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Verify no unrelated game changes
+      - name: Verify V1.4 approved changes only
         shell: bash
         run: |
           set -euo pipefail
@@ -315,26 +743,28 @@ jobs:
           from pathlib import Path
           import hashlib,json
           root=Path('site')
-          orig=json.loads(Path('build/original.json').read_text('utf-8'))
-          now={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-               for p in root.rglob('*') if p.is_file()}
-          assert len(now)==5623 and set(now)==set(orig)
-          changed={p for p in orig if now[p]!=orig[p]}
+          original=json.loads(Path('build/original.json').read_text('utf-8'))
+          current={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in root.rglob('*') if p.is_file()}
+          assert len(current)==5623 and set(current)==set(original)
+          changed={p for p in original if original[p]!=current[p]}
           allowed={
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/mapping.js',
-              'knight/js/sl-assets-v229r115.js',
-              'index.html',
-              'knight/index.html',
+            'knight/gameasync/Data/Scripts.rxdata',
+            'knight/gameasync/mapping.js',
+            'knight/js/dpad.js',
+            'knight/js/sl-assets-v229r115.js',
+            'index.html',
+            'knight/index.html',
           }
-          assert changed==allowed,sorted(changed ^ allowed)
-          assert 'V1.3' in (root/'knight/index.html').read_text('utf-8')
-          print('PASS only five approved files changed')
-          print('PASS all 41 healer map files preserved')
-          print('PASS original monsters, magic, drops, animations unchanged')
+          assert changed==allowed, sorted(changed ^ allowed)
+          assert 'V1.4' in (root/'knight/index.html').read_text('utf-8')
+          print('PASS only 6 authorized files changed')
+          print('PASS all 41 healer maps untouched')
+          print('PASS monster / item database / event data untouched')
+          print('PASS no sprite rewrite or new timer')
           PY
 
-      - name: Publish V1.3 game
+      - name: Publish V1.4 game
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -346,7 +776,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - uses: actions/configure-pages@v6
       - id: deployment
