@@ -421,21 +421,50 @@ jobs:
           check(source.include?('def self.observe(event)') && source.include?('def self.pay(event,data)'),"existing reward observer preserved")
           scripts[idx][2]=Zlib::Deflate.deflate(source.b)
 
-          # Only repair original Mobile Hotbar's J/K/L input references.
-          # The native engine binds HOT7/8/9 directly to keys J/K/L.
-          # Keep original 1-6, inventory assignment, display, use and saving.
+          # Extend the original hotbar selector; inventory/use paths stay intact.
+          # Native MouseMiddle/MouseRight are already bound in the shipped engine.
+          # Do not use MouseLeft: ordinary touch can emulate a left click.
           hot=scripts.find{|it|it.is_a?(Array)&&it[1]=='Mobile Hotbar'}
           check(!hot.nil?,"original item hotbar")
           hot_code=Zlib::Inflate.inflate(hot[2]).force_encoding('UTF-8')
           check(hot_code.include?('KEYS=[Input::X,Input::Y,Input::Z,Input::L,Input::F6]'),"original 1-5 native inputs")
-          [74,75,76].each_with_index do |vk,i|
-            old="return #{i+6} if Keyboard.testkey(#{vk})"
-            check(hot_code.scan(old).size==1,"original JKL slot #{i+7}")
-            hot_code=hot_code.sub(old,"return #{i+6} if Input.trigger?(Input::HOT#{i+7})")
-          end
+          selector_before="    return 6 if Keyboard.testkey(74)\n    return 7 if Keyboard.testkey(75)\n    return 8 if Keyboard.testkey(76)\n"
+          selector_after="    return 8 if Input.trigger?(Input::MOUSEMIDDLE) && Input.trigger?(Input::MOUSERIGHT)\n" +
+                         "    return 6 if Input.trigger?(Input::MOUSEMIDDLE)\n" +
+                         "    return 7 if Input.trigger?(Input::MOUSERIGHT)\n"
+          check(hot_code.scan(selector_before).size==1,"original 7-9 selector missing")
+          hot_code=hot_code.sub(selector_before,selector_after)
           check(hot_code.include?('def self.assign_from_window(window)'),"original inventory assignment")
+          check(hot_code.include?('def self.use_triggered'),"original item use")
           check(hot_code.include?('for i in 0...9'),"original 9-slot display")
           hot[2]=Zlib::Deflate.deflate(hot_code.b)
+
+          # The existing touch tap handler remains; only 7-9 deliver native
+          # mouse middle/right events rather than unavailable J/K/L key codes.
+          dpad_path=File.join(SITE,'knight/js/dpad.js')
+          dpad=File.binread(dpad_path)
+          key_start="function simulateKeyEvent(type,keyCode,charCode){\n  var e=document.createEventObject?document.createEventObject():document.createEvent('Events');\n  if(e.initEvent)e.initEvent(type,true,true);\n  e.keyCode=keyCode;e.which=keyCode;e.charCode=charCode||0;\n"
+          key_new="function simulateKeyEvent(type,keyCode,charCode){\n" +
+                  "  if(keyCode===-2||keyCode===-3){\n" +
+                  "    const button=-keyCode-1;\n" +
+                  "    type=type==='keydown'?'mousedown':'mouseup';\n" +
+                  "    var e=new MouseEvent(type,{bubbles:true,cancelable:true,button:button,buttons:type==='mousedown'?(button===1?4:2):0});\n" +
+                  "  }else{\n" +
+                  "    var e=document.createEventObject?document.createEventObject():document.createEvent('Events');\n" +
+                  "    if(e.initEvent)e.initEvent(type,true,true);\n" +
+                  "    e.keyCode=keyCode;e.which=keyCode;e.charCode=charCode||0;\n" +
+                  "  }\n"
+          check(dpad.scan(key_start).size==1,'original native event bridge missing')
+          dpad=dpad.sub(key_start,key_new)
+          tap_before="b.classList.add('pressed');pulseKey(key,120);"
+          tap_after="b.classList.add('pressed');if(Array.isArray(key)){key.forEach(k=>pulseKey(k,120));}else{pulseKey(key,120);}"
+          check(dpad.scan(tap_before).size==1,'original touch tap handler missing')
+          dpad=dpad.sub(tap_before,tap_after)
+          slot_before="hotButton(hot,6,'J',74);hotButton(hot,7,'K',75);hotButton(hot,8,'L',76);"
+          slot_after="hotButton(hot,6,'J',-2);hotButton(hot,7,'K',-3);hotButton(hot,8,'L',[-2,-3]);"
+          check(dpad.scan(slot_before).size==1,'original touch 7-9 buttons missing')
+          dpad=dpad.sub(slot_before,slot_after)
+          File.binwrite(dpad_path,dpad)
           File.binwrite(sp,Marshal.dump(scripts))
           File.binwrite(cp_path,Marshal.dump(ces))
           MAP_IDS.each{|mid|File.binwrite(file(mid),Marshal.dump(maps.fetch(mid)))}
@@ -469,149 +498,6 @@ jobs:
           ruby -c build/patch_v16.rb
           ruby build/patch_v16.rb site
 
-      - name: Rebuild original mkxp-web engine with native JKL bindings
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool libtool-bin mm-common rake ruby \
-            imagemagick cmake pkg-config wget xz-utils bzip2
-          git clone https://github.com/pulsejet/mkxp-web.git build/mkxp-web
-          cd build/mkxp-web
-          git checkout e0437fdc5be29507e78d148a2b3f02d26ee1c779
-          python3 - <<'PY_V16_ENGINE'
-          from pathlib import Path
-          def one(file,old,new):
-              p=Path(file);s=p.read_text('utf8')
-              if s.count(old)!=1:
-                  raise RuntimeError(f'{file}: expected exactly one matching input source')
-              p.write_text(s.replace(old,new),encoding='utf8')
-
-          one('src/input.h',
-              'MouseLeft = 38, MouseMiddle = 39, MouseRight = 40',
-              'MouseLeft = 38, MouseMiddle = 39, MouseRight = 40,\n'
-              '\t\tHot7 = 41, Hot8 = 42, Hot9 = 43')
-          one('src/input.cpp','#define BUTTON_CODE_COUNT 24','#define BUTTON_CODE_COUNT 27')
-          one('src/input.cpp',
-              '\t21, 22, 23\n};',
-              '\t21, 22, 23, 24, 25, 26\n};')
-          # Static keyboard bindings are active even with saved custom keys.
-          one('src/input.cpp',
-              '{ SDL_SCANCODE_F9,     Input::F9    }',
-              '{ SDL_SCANCODE_F9,     Input::F9    },\n'
-              '\t{ SDL_SCANCODE_J,      Input::Hot7  },\n'
-              '\t{ SDL_SCANCODE_K,      Input::Hot8  },\n'
-              '\t{ SDL_SCANCODE_L,      Input::Hot9  }')
-          one('binding-mruby/input-binding.cpp',
-              '{ "MOUSERIGHT",  Input::MouseRight  }',
-              '{ "MOUSERIGHT",  Input::MouseRight  },\n'
-              '\t{ "HOT7", Input::Hot7 },\n'
-              '\t{ "HOT8", Input::Hot8 },\n'
-              '\t{ "HOT9", Input::Hot9 }')
-          # Pin mruby-onig-regexp to a revision compatible with mruby 2.1.2.
-          # mruby-marshal uses this gem as an existing transitive dependency.
-          cfg=Path('extra/build_config.rb')
-          cfg_text=cfg.read_text('utf8')
-          dep="    conf.gem :github => 'pulsejet/mruby-marshal'"
-          assert cfg_text.count(dep)==1, 'original marshal gem entry missing'
-          pinned="    conf.gem :github => 'mattn/mruby-onig-regexp', :checksum_hash => '76087d150d12f167e95ae10d326099b352cf3d18'\n"
-          cfg.write_text(cfg_text.replace(dep,pinned+dep,1),encoding='utf8')
-          # Explicitly exclude changes to default movement, combat and skill inputs.
-          assert 'Hot7 = 41, Hot8 = 42, Hot9 = 43' in Path('src/input.h').read_text()
-          print('PASS native C++ J/K/L -> HOT7-9 source changes')
-          PY_V16_ENGINE
-          # The upstream build.sh downloads mruby first; patch the pinned gem
-          # only AFTER that download and BEFORE its existing mruby build.
-          python3 - <<'PY_V16_ORDER'
-          from pathlib import Path
-          p=Path('build.sh')
-          script=p.read_text('utf8')
-          marker='# Build mruby\n'
-          assert script.count(marker)==1, 'upstream mruby build marker missing'
-          patch=r'''# Adjust the pinned gem to current host Ruby syntax.
-          onig=mruby/build/repos/wasm32-unknown-gnu/mruby-onig-regexp
-          mkdir -p "$(dirname "$onig")"
-          git clone -q https://github.com/mattn/mruby-onig-regexp.git "$onig"
-          git -C "$onig" checkout -q 76087d150d12f167e95ae10d326099b352cf3d18
-          gemfile="$onig/mrbgem.rake"
-          test "$(grep -Fc 'File.exists?' "$gemfile")" -eq 2
-          sed -i 's/File\.exists?/File.exist?/g' "$gemfile"
-          test "$(grep -Fc 'File.exists?' "$gemfile" || true)" -eq 0
-          '''
-          p.write_text(script.replace(marker,patch+marker,1),encoding='utf8')
-          PY_V16_ORDER
-          # Build upstream engine and keep the paired JS/WASM files together.
-          bash build.sh
-          test -s build/mkxp.js
-          test -s build/mkxp.wasm
-          cp build/mkxp.js ../../site/knight/mkxp.js
-          cp build/mkxp.wasm ../../site/knight/mkxp.wasm
-          echo 'PASS engine rebuilt with native 7-9 input mappings'
-
-      - name: Regression test original JKL item-slot registration
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/verify_v16.rb <<'RUBY_VERIFY'
-          require 'zlib'
-          module RPG;class Item;end;end
-          root=ARGV.fetch(0)
-          sc=Marshal.load(File.binread(File.join(root,'knight/gameasync/Data/Scripts.rxdata')))
-          hot=Zlib::Inflate.inflate(sc.find{|x|x.is_a?(Array)&&x[1]=='Mobile Hotbar'}[2])
-          [7,8,9].each do |n|
-            raise "native slot #{n} missing" unless hot.include?("Input.trigger?(Input::HOT#{n})")
-          end
-          raise 'inventory registration lost' unless hot.include?('def self.assign_from_window(window)')
-          raise 'item use lost' unless hot.include?('def self.use_triggered')
-          module Input
-            X=14; Y=15; Z=16; L=17; F6=26
-            HOT7=41; HOT8=42; HOT9=43
-            def self.trigger?(n);@test==n;end
-            def self.press_slot(n);@test=n;end
-          end
-          module Keyboard
-            def self.testkey(n);false;end
-          end
-          class Scene_Item;def update_item;end;end
-          class Scene_Item2;def update_item;end;end
-          class Scene_Map;def update;end;end
-          class RPG::Item
-            attr_accessor :id,:common_event_id,:scope,:consumable,:menu_se,:name,:icon_name
-            def initialize(id)
-              @id=id;@common_event_id=80;@scope=0;@consumable=false
-              @menu_se='ok';@name="Item#{id}";@icon_name='test'
-            end
-          end
-          class FakeSystem
-            def se_play(x);end
-          end
-          class FakeParty
-            def item_number(n);2;end
-            def item_can_use?(n);true;end
-            def lose_item(n,v);end
-          end
-          $game_system=FakeSystem.new
-          $game_party=FakeParty.new
-          $data_system=Struct.new(:decision_se,:buzzer_se).new('ok','bad')
-          $data_items=Array.new(200)
-          $game_temp=Struct.new(:common_event_id).new(0)
-          [101,102,103].each{|id|$data_items[id]=RPG::Item.new(id)}
-          eval(hot,TOPLEVEL_BINDING,'Mobile Hotbar')
-          raise 'not nine slots' unless SLHotbar.slots.size==9
-          [Input::HOT7,Input::HOT8,Input::HOT9].each_with_index do |key,i|
-            Input.press_slot(key)
-            selected=Struct.new(:item).new($data_items[101+i])
-            raise "register slot #{i+7}" unless SLHotbar.assign_from_window(selected)
-            raise "slot #{i+7} wrong item" unless SLHotbar.slots[6+i]==101+i
-            raise "use slot #{i+7}" unless SLHotbar.use_triggered
-            raise 'original item event lost' unless $game_temp.common_event_id==80
-          end
-          puts 'PASS Ruby native HOT7-9 item assignment/use (browser still requires live test)'
-          RUBY_VERIFY
-          ruby -c build/verify_v16.rb
-          ruby build/verify_v16.rb site | tail -1
-
       - name: Verify all non-target game files unchanged
         shell: bash
         run: |
@@ -631,11 +517,12 @@ jobs:
                 'knight/js/sl-assets-v229r115.js',
                 'index.html','knight/index.html'}
           mods|={pre+f'Map{mid:03d}.rxdata' for mid in (3,4,31,35,37,41)}
-          mods|={'knight/mkxp.js','knight/mkxp.wasm'}
+          mods|={'knight/js/dpad.js'}
           changed={k for k in after if before[k]!=after[k]}
           assert changed==mods, {'missing':sorted(mods-changed),'unexpected':sorted(changed-mods)}
           assert before[pre+'Map025.rxdata']==after[pre+'Map025.rxdata']
-          assert before['knight/js/dpad.js']==after['knight/js/dpad.js']
+          assert before['knight/mkxp.js']==after['knight/mkxp.js']
+          assert before['knight/mkxp.wasm']==after['knight/mkxp.wasm']
           mapping=(root/'knight/gameasync/mapping.js').read_text('utf8')
           for rel in sorted(mods):
             if '/Data/' not in rel:continue
@@ -644,7 +531,7 @@ jobs:
             assert mapping.count('Data/'+file.name+'?h='+digest)==1,rel
           assert "var version='V1.6';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
           print('PASS V1.6 changed exactly',len(changed),'files')
-          print('PASS Queen, all unrelated monsters and original hotbar UI unchanged')
+          print('PASS Queen, all unrelated monsters and original 1-6 hotbar unchanged')
           PY_V16_VERIFY
 
       - name: Publish V1.6
