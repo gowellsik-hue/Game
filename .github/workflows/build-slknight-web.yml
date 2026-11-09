@@ -1,3 +1,4 @@
+
 # FILE: .github/workflows/build-slknight-web.yml
 # VERSION: V1.13 (failed attempts do not increment the version)
 # BASE: successful V1.4 game artifact run 42326754572
@@ -815,9 +816,7 @@ jobs:
 
           puts 'PASS V1.12 original haste icon condition corrected'
 
-          # V1.13: replace the native shared movement/4-frame walking path.
-          # Keep the original RPG move-route speed commands (1..6) as inputs;
-          # convert them to direct rates at the shared movement boundary.
+          # V1.13: one native shared mover for the player and monsters.
           move_entry=scripts.find{|a|a.is_a?(Array)&&a[1]=='Game_Character 2'.b}
           check(!move_entry.nil?,'native Game_Character 2')
           move_code=Zlib::Inflate.inflate(move_entry[2]).force_encoding('UTF-8').gsub("\r\n","\n")
@@ -828,74 +827,79 @@ jobs:
           move_code=exact_source_replace(move_code,
             "class Game_Character\n",
             "class Game_Character\n  V113_NATIVE_RATES = [nil, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0].freeze\n",
-            'shared native move-rate constant')
+            'native move-rate constants')
           move_code=exact_source_replace(move_code,
             "  def update\n    # 점프중, 이동중, 정지중으로 분기\n",
             "  def update\n    was_moving = moving?\n    # 점프중, 이동중, 정지중으로 분기\n",
-            'shared movement pre-update state')
+            'shared native update state')
           move_code=exact_source_replace(move_code,
             'if @anime_count > 21 - @move_speed * 4',
-            'if (!was_moving || (!@walk_anime && @step_anime)) && @anime_count > 13',
-            'native time-based walking threshold')
+            'if (!was_moving || !@walk_anime) && @anime_count > 21 - @move_speed * 4',
+            'walking threshold only')
           move_code=exact_source_replace(move_code,
             '    distance = 2 ** @move_speed',
-            %q{    # One common path for player and monsters, including saved native event speeds.
-              rate = @sl_move_rate || V113_NATIVE_RATES[@move_speed.to_i] || 1.0
-              distance = 4.0 * rate},
-            'native exponential movement')
-          move_code=exact_source_replace(move_code,
-            %q{    # 이동시 애니메이션이 ON 의 경우
+            "    rate = @sl_move_rate || V113_NATIVE_RATES[@move_speed.to_i] || 1.0\n    distance = 4.0 * rate",
+            'old native exponential movement')
+          old_walk=<<'V113_WALK_OLD'
+              # 이동시 애니메이션이 ON 의 경우
               if @walk_anime
                 # 애니메이션 카운트를 1.5 늘린다
                 @anime_count += 1.5
               # 이동시 애니메이션이 OFF 로, 정지시 애니메이션이 ON 의 경우
               elsif @step_anime
                 # 애니메이션 카운트를 1 늘린다
-              end},
-            %q{    # Walking sprites track actual tile distance; no walking timer.
+                @anime_count += 1
+              end
+          V113_WALK_OLD
+          new_walk=<<'V113_WALK_NEW'
+              # Walking frames follow tile distance, not elapsed time.
               if @walk_anime
-                # The original 8-frame renderer already uses tile progress / 16.
                 unless @character_name == 'SLZQWalk' || @character_name.to_s[0,4] == 'SL8_'
                   dx = (@x * 128 - @real_x).abs
                   dy = (@y * 128 - @real_y).abs
                   progress = 128.0 - (dx > dy ? dx : dy)
-                  frame = (progress / 32.0).to_i
-                  @pattern = frame > 3 ? 3 : frame
+                  @pattern = ((progress - distance) / 32.0).to_i
+                  @pattern = 0 if @pattern < 0
+                  @pattern = 3 if @pattern > 3
                 end
                 @anime_count = 0
               elsif @step_anime
                 @anime_count += 1
-              end},
-            'old timed walk update')
-          move_code=exact_source_replace(move_code,
-            %q{        when 29  # 이동 속도의 변경
-                    @move_speed = command.parameters[0]},
-            %q{        when 29  # 이동 속도의 변경
+              end
+          V113_WALK_NEW
+          move_code=exact_source_replace(move_code,old_walk,new_walk,'old native timed walking')
+          old_route=<<'V113_ROUTE_OLD'
+                  when 29  # 이동 속도의 변경
                     @move_speed = command.parameters[0]
-                    # Forced player move-routes must override buff rate until release.
+          V113_ROUTE_OLD
+          new_route=<<'V113_ROUTE_NEW'
+                  when 29  # 이동 속도의 변경
+                    @move_speed = command.parameters[0]
                     if self.is_a?(Game_Player)
                       @sl_move_rate = V113_NATIVE_RATES[@move_speed.to_i] || 1.0
-                    end},
-            'forced move-route speed')
+                    end
+          V113_ROUTE_NEW
+          move_code=exact_source_replace(move_code,old_route,new_route,'native move-route speed change')
           RubyVM::InstructionSequence.compile(move_code)
           move_entry[2]=Zlib::Deflate.deflate(move_code.gsub("\n","\r\n").b)
-
-          # V1.13: reuse all existing haste/bravery/polymorph state and timer logic.
+          
           speed_entry=scripts.find{|a|a.is_a?(Array)&&a[1]=='V229 Unified Speed Rules'.b}
-          check(!speed_entry.nil?,'existing SLV229 movement controller')
+          check(!speed_entry.nil?,'existing speed-buff controller')
           speed_code=Zlib::Inflate.inflate(speed_entry[2]).force_encoding('UTF-8')
-          speed_code=exact_source_replace(speed_code,
-            %q{      # Game_Character#update_move uses 2 ** @move_speed map units/frame.
+          old_speed=<<'V113_SPEED_OLD'
+                # Game_Character#update_move uses 2 ** @move_speed map units/frame.
                 # Non-integer speed is required to preserve baphomet's 1.5x exactly.
                 step = BASE_MOVE_STEP + Math.log(move_rate) / Math.log(2.0)
-                player.instance_variable_set(:@move_speed, step)},
-            %q{      # Direct rate; the shared native mover multiplies by 4 once.
-                player.instance_variable_set(:@sl_move_rate, move_rate)},
-            'old haste/bravery/polymorph logarithmic conversion')
+                player.instance_variable_set(:@move_speed, step)
+          V113_SPEED_OLD
+          new_speed=<<'V113_SPEED_NEW'
+                player.instance_variable_set(:@sl_move_rate, move_rate)
+          V113_SPEED_NEW
+          speed_code=exact_source_replace(speed_code,old_speed,new_speed,'old logarithmic rate conversion')
           RubyVM::InstructionSequence.compile(speed_code)
           speed_entry[2]=Zlib::Deflate.deflate(speed_code.b)
-          puts 'PASS V1.13 native movement/animation and existing speed buffs unified'
-
+          puts 'PASS V1.13 shared movement and existing speed buffs'
+          
           # Extend the original hotbar selector; inventory/use paths stay intact.
           # Native MouseMiddle/MouseRight are already bound in the shipped engine.
           # Do not use MouseLeft: ordinary touch can emulate a left click.
