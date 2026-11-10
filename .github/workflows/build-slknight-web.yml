@@ -1,7 +1,7 @@
-# SLKnight V1.16 candidate: last-successful V1.15 website game baseline.
-# Only healer actor/stats/regen/bars/MP references and obstructing top-left version tag.
+# SLKnight V1.17 candidate: last-successful V1.15 website game baseline.
+# Healer native HP/MP/HUD, delete class label, keep EXP on rehire, party 20/80 + support bonus 20%.
 # No rebuilt engine, no hotbar redesign, no monster or speed changes.
-name: build-slknight-web.yml | V1.16 candidate | Healer Wizard Native HP MP
+name: build-slknight-web.yml | V1.17 candidate | Healer and Native Party EXP
 
 "on":
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
           test -s baseline/artifact.tar
           mkdir -p site build
           tar -xf baseline/artifact.tar -C site
-          python3 - <<'PY_V116_BEFORE'
+          python3 - <<'PY_V117_BEFORE'
           from pathlib import Path
           import hashlib,json
           root=Path('site')
@@ -52,13 +52,13 @@ jobs:
           assert "var version='V1.15';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
           (Path('build')/'v115_sha256.json').write_text(json.dumps(before),encoding='utf8')
           print('PASS last successful V1.15 website: 5623 files')
-          PY_V116_BEFORE
+          PY_V117_BEFORE
 
-      - name: Patch native wizard actor, existing events and existing HUD
+      - name: Apply V1.17 minimal healer and EXP changes to V1.15 baseline
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/patch_v116.rb <<'RUBY_V116'
+          cat > build/patch_v117.rb <<'RUBY_V117'
           # encoding: utf-8
           require 'zlib'
           require 'digest'
@@ -86,6 +86,7 @@ jobs:
             class Map;end
             class AudioFile;end
             class Actor;end
+            class Class;end
             class Event
               class Page
                 class Condition;end
@@ -101,7 +102,7 @@ jobs:
             class Armor;end
           end
 
-          def check(cond,label);raise "V1.16 original mismatch: #{label}" unless cond;end
+          def check(cond,label);raise "V1.17 original mismatch: #{label}" unless cond;end
           def iv(o,k);o.instance_variable_get(k);end
           def setiv(o,k,v);o.instance_variable_set(k,v);end
           def code(c);iv(c,:@code);end
@@ -126,35 +127,43 @@ jobs:
             puts "SCRIPT #{name} syntax PASS; delta #{edited.bytesize-original.bytesize}"
           end
 
-          # Wizard actor #3: preserve the original wizard MP curve (currently misplaced in DEX)
-          # and use the native actor parameter table, exactly as the player does.
+          # Wizard actor #3: preserve its native MP curve. RGSS Table._dump has a
+          # 20-byte header: 4 dimensions/axis fields + 4-byte element count.
+          # Each table cell is x + width*y, with x=0 HP, x=1 MP, x=2 STR, x=3 DEX.
           actor_file=File.join(DATA,PRE+'Actors.rxdata')
           actors=Marshal.load(File.binread(actor_file))
           a=actors.fetch(3)
           check(iv(a,:@name).to_s=='힐러 마법사'.b,'actor #3 name')
           check(iv(a,:@class_id)==3,'actor #3 wizard class')
           raw=iv(iv(a,:@parameters),:@raw)
-          dims,cols,rows,depth=raw.byteslice(0,16).unpack('V*')
-          check([dims,cols,rows,depth]==[2,6,100,1],"actor table geometry #{[dims,cols,rows,depth]}")
-          vals=raw.byteslice(16..-1).unpack('s<*')
-          check(vals.size==cols*rows+2,'actor table length with retained RGSS trailer')
-          check(vals[50*6+3]==604 && vals[50*6+0]==1 && vals[50*6+1]==1,'actor level50 original HP1 SP1 DEX604')
-          check((2..99).all?{|lv| vals[lv*6]==1&&vals[lv*6+1]==1&&vals[lv*6+2]==1&&vals[lv*6+4]==1&&vals[lv*6+5]==1},'actor old columns match')
+          dims,cols,rows,depth,cell_count=raw.byteslice(0,20).unpack('V*')
+          check([dims,cols,rows,depth,cell_count]==[2,6,100,1,600],"actor table header #{[dims,cols,rows,depth,cell_count]}")
+          vals=raw.byteslice(20..-1).unpack('s<*')
+          check(vals.size==cell_count,'actor table cell count')
+          check(vals[50*cols,cols]==[1,604,1,1,1,1],'actor level50 original HP1 MP604 other stats1')
+          check((1..99).all?{|lv| vals[lv*cols]==1 && vals[lv*cols+1]>0 && vals[lv*cols+2,4]==[1,1,1,1]},'original actor3 native MP curve and other columns')
           for lv in 1..99
-            wizard_mp=vals[lv*6+3]
+            wizard_mp=vals[lv*cols+1]
             check(wizard_mp>0 && wizard_mp<4000,"MP curve level #{lv}")
-            vals[lv*6+0]=12+(lv-1)*10+(lv-1)/2  # L1J CON16 wizard HP up: alternating +10,+11
-            vals[lv*6+1]=wizard_mp              # existing original MP curve, no arbitrary downgrade
-            vals[lv*6+2]=8                      # STR
-            vals[lv*6+3]=7                      # DEX
-            vals[lv*6+4]=16                     # CON through existing RGSS AGI slot
-            vals[lv*6+5]=18                     # INT
+            vals[lv*cols+0]=12+(lv-1)*10+(lv-1)/2  # L1J CON16 wizard HP up: alternating +10,+11
+            # Keep original actor3 native maximum MP (level 50: 604) without changing it.
+            vals[lv*cols+2]=8                      # STR
+            vals[lv*cols+3]=7                      # DEX
+            vals[lv*cols+4]=16                     # CON through existing RGSS AGI slot
+            vals[lv*cols+5]=18                     # INT
           end
-          setiv(iv(a,:@parameters),:@raw,raw.byteslice(0,16)+vals.pack('s<*'))
+          setiv(iv(a,:@parameters),:@raw,raw.byteslice(0,20)+vals.pack('s<*'))
           setiv(a,:@sl_wis,18) # Wizard's separately tracked WIS; no CHA addition.
           File.binwrite(actor_file,Marshal.dump(actors))
           check(vals[50*6,6]==[526,604,8,7,16,18],"wizard lvl50 recalculated #{vals[50*6,6]}")
           puts "ACTOR3 Lv50 HP #{vals[50*6]} MP #{vals[50*6+1]} STR8 DEX7 CON16 INT18 WIS18"
+
+          # Delete the redundant class name itself, not a conditional menu rendering rule.
+          class_file=File.join(DATA,PRE+'Classes.rxdata')
+          classes=Marshal.load(File.binread(class_file))
+          check(iv(classes.fetch(3),:@name).to_s=='힐러'.b,'original wizard class label')
+          setiv(classes[3],:@name,'')
+          File.binwrite(class_file,Marshal.dump(classes))
 
           # Existing healer MP regeneration CE9 keeps all native equipment bonuses.
           ce_file=File.join(DATA,PRE+'CommonEvents.rxdata')
@@ -162,7 +171,7 @@ jobs:
           ce9=iv(ces.fetch(9),:@list)
           check(iv(ces[9],:@name).to_s=='힐러 엠틱'.b,'CE9 original identity')
           check(code(ce9[0])==106&&param(ce9[0])==[300],'CE9 wait frame')
-          setiv(ce9[0],:@parameters,[Graphics_frame=800]) # 50 FPS (original Main) * 16s
+          setiv(ce9[0],:@parameters,[800]) # 50 FPS (original Main) * 16s
           check(code(ce9[1])==111&&param(ce9[1])==[1,459,1,278,4],'CE9 max condition')
           setiv(ce9[1],:@parameters,[12,'$game_actors[3].sp < $game_actors[3].maxsp'])
           check(code(ce9[3])==122 && param(ce9[3])==[554,554,0,0,11],'CE9 original blue potion MPR')
@@ -228,11 +237,13 @@ jobs:
               pg=pages[0]
               list=iv(pg,:@list)
               check(param(list[11])==[3,1,0,98] && param(list[12])==[3,0,1,1],'Map018 healer level reset+sync')
-              check(code(list[13])==122&&param(list[13])==[278,278,0,4,3,5],'Map018 old healer MP maximum random')
-              setiv(list[13],:@parameters,[278,278,0,0,0]) # equipment bonus only
-              check(param(list[16])==[554,554,0,0,11]&&param(list[19])==[554,554,0,0,3],'Map018 initial regen defaults')
-              setiv(list[16],:@parameters,[554,554,0,0,14]);setiv(list[19],:@parameters,[554,554,0,0,6])
-              list.insert(13,command(355,['$game_actors[3].maxsp=$game_actors[3].base_maxsp'],3))
+              list[11]=command(355,['a=$game_actors[3]; unless a.instance_variable_get(:@slv117_hired_once); a.level=$game_variables[1]; a.instance_variable_set(:@slv117_hired_once,true); end'],3)
+              list.delete_at(12)
+              check(code(list[12])==122&&param(list[12])==[278,278,0,4,3,5],'Map018 old healer MP maximum random')
+              setiv(list[12],:@parameters,[278,278,0,0,0]) # equipment bonus only
+              check(param(list[15])==[554,554,0,0,11]&&param(list[18])==[554,554,0,0,3],'Map018 initial regen defaults')
+              setiv(list[15],:@parameters,[554,554,0,0,14]);setiv(list[18],:@parameters,[554,554,0,0,6])
+              list.insert(12,command(355,['$game_actors[3].maxsp=$game_actors[3].base_maxsp'],3))
               hireidx=list.index{|c|code(c)==129&&param(c)==[3,1,0]}
               check(!hireidx.nil?,'Map018 actor3 hire command')
               list.insert(hireidx,command(317,[3,1,0,1,278],3)) # existing native maxSP change + equipment var278
@@ -281,11 +292,14 @@ jobs:
             t=replace_one_script(t,"    super(viewport) \n    @actor = $game_party.actors[0] ","    super(viewport) \n    @sl_actor_id = actor_id\n    @actor = (@sl_actor_id == 3 ? $game_actors[3] : $game_party.actors[0])",'HUD initial actor')
             # Existing savegames can contain actor3 HP/SP 1, migrate once when loading a hired healer.
             t=replace_one_script(t,"    return if @actor == nil  \n    #HP Border",%q{    return if @actor == nil
-              if @sl_actor_id == 3 && $game_switches[185] &&
-                 !@actor.instance_variable_get(:@sl_healer_v116_migrated)
-                @actor.hp = @actor.maxhp if @actor.hp <= 1
-                @actor.sp = @actor.maxsp if @actor.sp <= 1
-                @actor.instance_variable_set(:@sl_healer_v116_migrated,true)
+              if @sl_actor_id == 3 && $game_switches[185]
+                # A previously hired follower is not a first-time recruit on re-hire.
+                @actor.instance_variable_set(:@slv117_hired_once,true)
+                if !@actor.instance_variable_get(:@sl_healer_v117_table_fixed)
+                  @actor.hp = @actor.maxhp if @actor.hp <= 8
+                  @actor.sp = @actor.maxsp if @actor.sp <= 7
+                  @actor.instance_variable_set(:@sl_healer_v117_table_fixed,true)
+                end
               end
               #HP Border},'HUD healer saved-state migration')
             t=replace_one_script(t,"  def dispose\n    @actor = $game_party.actors[0] ","  def dispose\n    @actor = (@sl_actor_id == 3 ? $game_actors[3] : $game_party.actors[0])",'HUD dispose actor')
@@ -294,7 +308,7 @@ jobs:
               if @actor.hp == 0
               $scene = Scene_Gameover.new
             end
-              @actor = $game_party.actors[0] 
+              @actor = $game_party.actors[0]
               return if @actor == nil}
             newer=%q{  def update
               # The original player gameover remains exclusive to actor 1.
@@ -325,7 +339,7 @@ jobs:
             b=t.index("  def hud_pos_update\n");e=t.index('  end  ',b)
             check(b && e && e>b,'HUD position method end')
             h=t[b...e]
-            h=h.gsub('$game_player.screen_x','target.screen_x').gsub('$game_player.screen_z','target.screen_z')
+            h=h.gsub('$game_player.screen_x','target.screen_x').gsub('$game_player.screen_z','(@sl_actor_id == 3 ? target.screen_y : target.screen_z)')
             t=t[0...b]+h+t[e..]
             # Healer has a separate actor stat, so player's poison/visual state does not repaint healer bar.
             t=replace_one_script(t,'if $game_switches[375] || $game_switches[985]','if @sl_actor_id == 1 && ($game_switches[375] || $game_switches[985])','HUD poison state')
@@ -345,6 +359,158 @@ jobs:
             check(!old.nil? && old.scan('"Healer MP : "').length==5,'old legacy text exact block')
             s.sub(old,'')
           end
+          # The actual class name in Classes.rxdata is empty. The original menu code is untouched.
+          rewrite_script(scripts,'V230 Boss Respawn 60s 180s') do |s|
+            # Same per-event reward pipeline, no extra reward CE or second EXP event.
+            helpers=<<'SLV117_REWARD_HELPERS'
+            # Look up existing per-monster accumulated-damage variables once at load.
+            HP_INDEX={}
+            DATA.each do |mid,events|
+              lookup={}
+              events.each do |eid,row|
+                hpvar=row[6]
+                raise "SLV541 repeated damage variable #{mid}/#{hpvar}" if lookup.has_key?(hpvar)
+                lookup[hpvar]=eid
+              end
+              HP_INDEX[mid]=lookup
+            end
+            PARTY_RADIUS=8
+            def self.hp_event(mid,var)
+              h=HP_INDEX[mid]
+              h.nil? ? nil : h[var]
+            end
+            def self.reset_damage(mid,var)
+              return if $game_map.nil? || $game_map.map_id!=mid
+              h=$game_map.instance_variable_get(:@slv117_damage)
+              h.delete(var) unless h.nil?
+            end
+            def self.record_damage(mid,var,before_value,after_value,actor_id)
+              return if $game_map.nil? || $game_map.map_id!=mid
+              eid=hp_event(mid,var)
+              return if eid.nil?
+              info=DATA[mid][eid]
+              max_hp=info[4]
+              effective=[after_value.to_i,max_hp].min-[before_value.to_i,max_hp].min
+              return if effective<=0 || actor_id.nil? || actor_id.to_i<=0
+              h=$game_map.instance_variable_get(:@slv117_damage)
+              if h.nil?
+                h={}
+                $game_map.instance_variable_set(:@slv117_damage,h)
+              end
+              actors=h[var] || (h[var]={})
+              actors[actor_id]=actors.fetch(actor_id,0)+effective
+            end
+            def self.exp_members
+              return [] if $game_party.nil? || $game_actors.nil? || $game_player.nil?
+              members=[]
+              $game_party.actors.each do |a|
+                next if a.nil? || a.hp<=0 || a.id==3
+                members << a unless members.include?(a)
+              end
+              if $game_switches && $game_switches[185] && $game_map && $game_map.events
+                h=$game_actors[3]
+                evt=$game_map.events.values.find do |e|
+                  src=e.instance_variable_get(:@event)
+                  src && src.name=='[ID힐러 마법사]' && !e.transparent
+                end
+                if h && h.hp>0 && evt &&
+                   [(evt.x-$game_player.x).abs,(evt.y-$game_player.y).abs].max<=PARTY_RADIUS
+                  members << h unless members.include?(h)
+                end
+              end
+              members
+            end
+            def self.allocate_pool(amount,actors,weights)
+              out={}
+              return out if actors.empty? || amount<=0
+              total=0
+              actors.each {|a| total+=weights.fetch(a.id,0).to_i}
+              if total<=0
+                # No attribution in a pre-existing save: retain combat EXP on leader.
+                leader=actors.find{|a|a.id==1} || actors.first
+                out[leader.id]=amount
+                return out
+              end
+              assigned=0
+              parts=[]
+              actors.each do |a|
+                weighted=amount*weights.fetch(a.id,0).to_i
+                whole=weighted/total
+                out[a.id]=whole
+                assigned+=whole
+                parts << [-(weighted%total),a.id]
+              end
+              parts.sort!
+              (amount-assigned).times {|i| id=parts[i][1];out[id]+=1}
+              out
+            end
+            def self.distribute_exp(event,xp,info)
+              return if xp<=0
+              actors=exp_members
+              if actors.empty?
+                actor=$game_actors[1] if $game_actors
+                actor.exp=actor.exp+xp unless actor.nil?
+                return
+              end
+              if actors.size==1
+                a=actors[0]
+                a.exp=a.exp+xp
+                return
+              end
+              ledger=$game_map.instance_variable_get(:@slv117_damage) || {}
+              recorded=ledger[info[6]] || {}
+              damage={}
+              actors.each{|a|damage[a.id]=recorded.fetch(a.id,0)}
+              base=(xp*20)/100
+              by_damage=xp-base
+              amounts={}
+              actors.each{|a| amounts[a.id]=base/actors.size}
+              # Fractional base points go to attackers first, then by actor id.
+              order=actors.sort_by{|a|[-damage[a.id],a.id]}
+              (base%actors.size).times{|i|amounts[order[i].id]+=1}
+              allocate_pool(by_damage,actors,damage).each{|id,v|amounts[id]+=v}
+              support=actors.select{|a|a.id==3 || a.instance_variable_get(:@slv117_support_member)==true}
+              if !support.empty?
+                bonus=(xp*20)/100
+                support.each{|a|amounts[a.id]+=bonus/support.size}
+                (bonus%support.size).times{|i|amounts[support[i].id]+=1}
+              end
+              actors.each{|a|a.exp=a.exp+amounts[a.id]}
+            end
+          SLV117_REWARD_HELPERS
+            s=replace_one_script(s,"  def self.stat(mid,eid)\n",helpers+"  def self.stat(mid,eid)\n",'shared reward table helper insertion')
+            before=%q{    if xp>0 && $game_actors!=nil && $game_actors[1]!=nil
+                actor=$game_actors[1]
+                actor.exp=actor.exp+xp
+              end}
+            after=%q{    distribute_exp(event,xp,data) if xp>0 && $game_actors!=nil && $game_actors[1]!=nil
+              reset_damage(event.instance_variable_get(:@map_id),data[6])}
+            s=replace_one_script(s,before,after,'one original EXP award at monster death')
+            s=replace_one_script(s,"    @slv230_placed={}\n    SLV230BossRespawn.update(self)","    @slv230_placed={}\n    @slv117_damage={}\n    SLV230BossRespawn.update(self)",'reset per-map damage ledger on setup')
+            s
+          end
+          rewrite_script(scripts,'Interpreter 4') do |s|
+            crlf=s.include?("\r\n") ? "\r\n" : "\n"
+            s=s.gsub("\r\n","\n")
+            # Record actual increases in the existing monster damage variable, not a new damage formula.
+            s=replace_one_script(s,"    for i in @parameters[0] .. @parameters[1]\n      # 조작으로 분기",%q{    for i in @parameters[0] .. @parameters[1]
+                slv117_monster = (@parameters[0]==@parameters[1] && SLV541.hp_event(@map_id,i))
+                slv117_before = $game_variables[i] if slv117_monster && (@parameters[2]==0 || @parameters[2]==1)
+                # 조작으로 분기},'native variable damage operation begin')
+            s=replace_one_script(s,"      if $game_variables[i] < -99999999\n        $game_variables[i] = -99999999\n      end\n    end",%q{      if $game_variables[i] < -99999999
+                  $game_variables[i] = -99999999
+                end
+                if slv117_monster
+                  if @parameters[2]==1
+                    # For future party attackers, their interpreter can set this actor id.
+                    SLV541.record_damage(@map_id,i,slv117_before,$game_variables[i],@slv117_attacker_actor_id || 1)
+                  elsif @parameters[2]==0 && $game_variables[i]==0 && slv117_before!=0
+                    SLV541.reset_damage(@map_id,i)
+                  end
+                end
+              end},'native variable operation commit')
+            s.gsub("\n",crlf)
+          end
           # Preserve boss calculations, movement, healer AI, version V1.15 native logic.
           File.binwrite(sp_file,Marshal.dump(scripts))
           puts 'SCRIPTS original knight HUD + healer HUD, hotbar SP, old MP overlay removed; untouched remaining scripts'
@@ -353,7 +519,7 @@ jobs:
           # Without this, the game web loader could fetch an out-of-date cache copy.
           mapping_path=File.join(SITE,'knight/gameasync/mapping.js')
           mapping=File.binread(mapping_path).force_encoding('UTF-8')
-          ([actor_file,ce_file,sp_file]+changed_map_files).each do |path|
+          ([actor_file,class_file,ce_file,sp_file]+changed_map_files).each do |path|
             rel='Data/'+File.basename(path)
             digest=Digest::MD5.file(path).hexdigest
             rx=Regexp.new(Regexp.escape(rel)+'\?h=[a-f0-9]{32}')
@@ -361,35 +527,35 @@ jobs:
             mapping.gsub!(rx,"#{rel}?h=#{digest}")
           end
           File.binwrite(mapping_path,mapping)
-          puts "CACHE mapping.js refreshed exactly #{3+changed_map_files.length} changed game data assets"
+          puts "CACHE mapping.js refreshed exactly #{4+changed_map_files.length} changed game data assets"
 
           # Remove ONLY the obstructing upper-left tiny version badge, keep title/cache version.
           knight_html=File.join(SITE,'knight/index.html')
           html=File.binread(knight_html).force_encoding('UTF-8')
           old=html.lines.find{|l|l.include?('id="sl-build-version"')}
           check(old && old.include?('top:4px;left:5px') && old.include?('V1.15'),'original fixed top-left version badge')
-          html=html.sub(old,'').gsub('V1.15','V1.16').gsub('v1.15','v1.16')
+          html=html.sub(old,'').gsub('V1.15','V1.17').gsub('v1.15','v1.17')
           check(!html.include?('sl-build-version'),'top-left version badge removed')
           File.binwrite(knight_html,html)
           root_html=File.join(SITE,'index.html')
           root=File.binread(root_html).force_encoding('UTF-8')
           check(root.include?('SLKnight V1.15 + SLFairy'),'original root selection V1.15')
-          File.binwrite(root_html,root.gsub('V1.15','V1.16'))
+          File.binwrite(root_html,root.gsub('V1.15','V1.17'))
           js_file=File.join(SITE,'knight/js/sl-assets-v229r115.js')
           js=File.binread(js_file).force_encoding('UTF-8')
           check(js.include?("var version='V1.15';"),'current loader version original')
-          File.binwrite(js_file,js.sub("var version='V1.15';","var version='V1.16';"))
-          puts 'UI top-left badge removed; launcher and internal V1.16 labels updated'
-          puts 'PASS V1.16 source patch (user gameplay validation pending)'
-          RUBY_V116
-          ruby -c build/patch_v116.rb
-          ruby build/patch_v116.rb site
+          File.binwrite(js_file,js.sub("var version='V1.15';","var version='V1.17';"))
+          puts 'UI top-left badge removed; launcher and internal V1.17 labels updated'
+          puts 'PASS V1.17 source patch (user gameplay validation pending)'
+          RUBY_V117
+          ruby -c build/patch_v117.rb
+          ruby build/patch_v117.rb site
 
-      - name: Verify V1.16 changes and all other files unchanged
+      - name: Verify V1.17 changes and all other files unchanged
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY_V116_AFTER'
+          python3 - <<'PY_V117_AFTER'
           from pathlib import Path
           import hashlib,json,re
           root=Path('site')
@@ -401,6 +567,7 @@ jobs:
           allow={
               'knight/gameasync/Data/Scripts.rxdata',
               pre+'Actors.rxdata',
+              pre+'Classes.rxdata',
               pre+'CommonEvents.rxdata',
               'knight/gameasync/mapping.js',
               'knight/js/sl-assets-v229r115.js',
@@ -409,21 +576,21 @@ jobs:
           maps={x for x in changed if re.fullmatch(re.escape(pre)+r'Map[0-9]{3}\.rxdata',x)}
           assert len(maps)==38,(len(maps),maps)
           assert changed==allow|maps,sorted(changed^(allow|maps))
-          assert len(changed)==45,len(changed)
+          assert len(changed)==46,len(changed)
           assert before['knight/mkxp.js']==after['knight/mkxp.js']
           assert before['knight/mkxp.wasm']==after['knight/mkxp.wasm']
           mapping=(root/'knight/gameasync/mapping.js').read_text('utf8')
-          for rel in sorted(maps|{pre+'Actors.rxdata',pre+'CommonEvents.rxdata','knight/gameasync/Data/Scripts.rxdata'}):
+          for rel in sorted(maps|{pre+'Actors.rxdata',pre+'Classes.rxdata',pre+'CommonEvents.rxdata','knight/gameasync/Data/Scripts.rxdata'}):
               file=root/rel
               digest=hashlib.md5(file.read_bytes()).hexdigest()
               assert mapping.count('Data/'+file.name+'?h='+digest)==1,rel
           assert 'id="sl-build-version"' not in (root/'knight/index.html').read_text('utf8')
-          assert "var version='V1.16';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
-          print('PASS V1.16 exactly 45 targeted files: 38 healer maps, 3 game data, 1 mapping, 3 UI/version')
+          assert "var version='V1.17';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
+          print('PASS V1.17 exactly 46 targeted files: 38 healer maps, 4 game data, 1 mapping, 3 UI/version')
           print('PASS original engine, movement/speed, monsters, drops, other game files byte-identical')
-          PY_V116_AFTER
+          PY_V117_AFTER
 
-      - name: Publish V1.16 candidate
+      - name: Publish V1.17 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
