@@ -1,211 +1,306 @@
-# FILE: .github/workflows/audit-sanctuary-maps.yml
-# VERSION: V6.11
-# PURPOSE: Bypass further WinLicense layer-by-layer updates. Recover the distinct
-#          authentic TW13032701 native client from the original Sanctuary archive;
-#          trace real native socket receive call sites toward monster packet handlers.
-# SOURCE: user-supplied original Sanctuary release, not SLKnight or L1J SQL.
-# IMPORTANT: native socket call sites are NOT original initial monster spawn XY.
-# KEEP: workflow file/title unchanged except version; no changes to game or Pages.
-name: audit-sanctuary-maps.yml | V6.11 | Original Knight Scale Audit
+
+name: "audit-sanctuary-maps.yml | V6.12 | Universal Original Map Extraction"
 
 "on":
   workflow_dispatch:
+    inputs:
+      map_id:
+        description: "Original map folder number (e.g. 1, 2, 4)"
+        required: true
+        default: "4"
+        type: string
+      x0:
+        description: "Leftmost original world X"
+        required: true
+        default: "32512"
+        type: string
+      y0:
+        description: "Topmost original world Y"
+        required: true
+        default: "33024"
+        type: string
+      size:
+        description: "Square region side in original cells (64-1024, multiple of 64)"
+        required: true
+        default: "512"
+        type: string
   push:
     branches: [main]
     paths: [.github/workflows/audit-sanctuary-maps.yml]
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  alternate-original-client-receiver:
-    name: V6.11 | Locate native packet receive and its code path
+  extract-original-map:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
+      MAP_ID: ${{ inputs.map_id || '4' }}
+      MAP_X0: ${{ inputs.x0 || '32512' }}
+      MAP_Y0: ${{ inputs.y0 || '33024' }}
+      MAP_SIZE: ${{ inputs.size || '512' }}
     steps:
-      - name: V6.11 Download distinct original client volume directly
+      - name: Extract original map segments and tile files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p source reports
-          gh release download v1.0.0 -R gowellsik-hue/Game \
-            -p 'Sanctuary.of.Aden.-.Copy.z35' \
-            -D source --clobber
-          test "$(wc -c < source/Sanctuary.of.Aden.-.Copy.z35)" -eq 100000000
-      - name: V6.11 Extract original game client and trace packet receiver references
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/v611-native-receiver.py <<'PY_V611'
+          mkdir -p volumes source
+          cat > /tmp/extract-original-map.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import struct
+          import subprocess
+          import zlib
           from pathlib import Path
-          from collections import Counter
-          from math import log2
-          import csv, hashlib, json, re, struct, subprocess, sys, zlib
-          ZIP_VOLUME = 'Sanctuary.of.Aden.-.Copy.z35'
-          EXPECTED = 'Sanctuary of Aden - Copy/TW13032701.bin'
-          EXPECTED_SHA = '049e0579c193a666665eec0c10c4e28e8aa2184f1c0d26c1767e77212e6beda4'
-          def unzip_original(volume, out):
-              data = Path(volume).read_bytes()
-              start = 73614956
-              hdr = struct.unpack_from('<IHHHHHIIIHH', data, start)
-              signature, _, flags, method, _, _, _, _, _, name_len, extra_len = hdr
-              assert signature == 0x04034B50, 'Archive local ZIP header mismatch'
-              name = data[start+30:start+30+name_len].decode('utf-8' if flags & 0x800 else 'cp949')
-              assert name.replace('\\', '/') == EXPECTED, name
-              assert method == 8 and not(flags & 1), 'Expected unencrypted deflate'
-              raw_offset = start + 30 + name_len + extra_len
-              packed_size, unpacked_size, crc = 2332239, 2582376, 2104511809
-              assert raw_offset + packed_size <= len(data), 'Unexpected volume boundary'
-              extracted = zlib.decompress(data[raw_offset:raw_offset+packed_size], -15)
-              assert len(extracted) == unpacked_size and zlib.crc32(extracted) & 0xffffffff == crc
-              assert hashlib.sha256(extracted).hexdigest() == EXPECTED_SHA
-              Path(out).write_bytes(extracted)
-              return extracted
-          def u16(b,o): return struct.unpack_from('<H',b,o)[0]
-          def u32(b,o): return struct.unpack_from('<I',b,o)[0]
-          def inspect_exe(data, out):
-              assert data[:2] == b'MZ'
-              peoff = u32(data,0x3c);assert data[peoff:peoff+4] == b'PE\0\0'
-              number = u16(data,peoff+6)
-              opt_size = u16(data,peoff+20)
-              opt = peoff+24
-              magic=u16(data,opt);assert magic == 0x10b, 'Expected native 32-bit PE'
-              base=u32(data,opt+28)
-              entry=base+u32(data,opt+16)
-              import_rva=u32(data,opt+104)
-              sections=[]
-              for i in range(number):
-                  off=opt+opt_size+i*40
-                  name=data[off:off+8].rstrip(b'\0').decode('ascii','replace')
-                  size, rva, packed, raw, _, _, _, _, flags=struct.unpack_from('<IIIIIIHHI',data,off+8)
-                  blob=data[raw:raw+packed]; cnt=Counter(blob)
-                  entropy=round(-sum((n/len(blob))*log2(n/len(blob)) for n in cnt.values()),3) if blob else 0
-                  sections.append(dict(name=name,rva=rva,virtual_size=size,file_offset=raw,raw_size=packed,
-                                       flags=flags,executable=bool(flags & 0x20000000),entropy=entropy))
-              def from_rva(rva):
-                  if rva < u32(data,opt+60): return rva
-                  for sec in sections:
-                      if sec['rva'] <= rva < sec['rva']+max(sec['virtual_size'],sec['raw_size']):
-                          offset = rva-sec['rva']
-                          if offset < sec['raw_size']:
-                              return sec['file_offset']+offset
-                  raise ValueError('Unmapped or BSS RVA '+hex(rva))
-              def string(rva):
-                  pos=from_rva(rva)
-                  end=data.find(b'\0',pos,min(len(data),pos+1024))
-                  assert end>pos
-                  return data[pos:end].decode('latin1','replace')
-              imports=[]
-              if import_rva:
-                  try: desc=from_rva(import_rva)
-                  except ValueError: desc=None
-                  if desc is not None:
-                      for di in range(300):
-                          o=desc+di*20
-                          if o+20>len(data):break
-                          orig, _, _, name_rva, first = struct.unpack_from('<IIIII',data,o)
-                          if not(orig or name_rva or first):break
-                          try:
-                              dll=string(name_rva)
-                              thunk=orig or first
-                              for ti in range(6000):
-                                  to=from_rva(thunk+ti*4)
-                                  val=u32(data,to)
-                                  if not val:break
-                                  if val & 0x80000000:
-                                      imp='#'+str(val & 0xffff)
-                                  else:
-                                      imp=string(val+2)
-                                  imports.append((dll,imp,base+first+ti*4))
-                          except (ValueError,AssertionError,struct.error):
-                              continue
-              pattern=re.compile(r'^(?:recv|recvfrom|wsa(recv|recvfrom|send|sendto|socket[a-z]?)|send|sendto|socket|connect|wsaconnect|select|ioctlsocket|closesocket|gethostbyname|getaddrinfo|ntohl|htons)$',re.I)
-              target=[(dll,api,va) for dll,api,va in imports if re.search(r'ws2_32|wsock32',dll,re.I) and pattern.fullmatch(api)]
-              calls=[]
-              for dll,api,iat_va in target:
-                  if not pattern.fullmatch(api): continue
-                  for sec in sections:
-                      if not sec['executable']:continue
-                      blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
-                      for op in (b'\xff\x15', b'\xff\x25'):
-                          needle=op+struct.pack('<I',iat_va)
-                          pos=0
-                          while True:
-                              hit=blob.find(needle,pos)
-                              if hit<0:break
-                              va=base+sec['rva']+hit
-                              local=data[sec['file_offset']+max(0,hit-40):sec['file_offset']+min(len(blob),hit+50)]
-                              calls.append((dll,api,hex(iat_va),hex(va),'call' if op==b'\xff\x15' else 'jmp',local.hex()))
-                              pos=hit+1
-              # Also resolve near-call instructions which target an import jump thunk.
-              thunks={}
-              for dll,api,iat_va in target:
-                  jmp=b'\xff\x25'+struct.pack('<I',iat_va)
-                  for sec in sections:
-                      if not sec['executable']:continue
-                      blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
-                      pos=0
-                      while True:
-                          hit=blob.find(jmp,pos)
-                          if hit<0:break
-                          thunks[base+sec['rva']+hit]=(dll,api,iat_va)
-                          pos=hit+1
-              for sec in sections:
-                  if not sec['executable']:continue
-                  blob=data[sec['file_offset']:sec['file_offset']+sec['raw_size']]
-                  pos=0
-                  while True:
-                      hit=blob.find(b'\xe8',pos)
-                      if hit<0 or hit+5>len(blob):break
-                      source_va=base+sec['rva']+hit
-                      dest=(source_va+5+struct.unpack_from('<i',blob,hit+1)[0])&0xffffffff
-                      if dest in thunks:
-                          dll,api,iat_va=thunks[dest]
-                          lo=max(0,hit-32);hi=min(len(blob),hit+48)
-                          calls.append((dll,api,hex(iat_va),hex(source_va),'call-via-import-thunk',blob[lo:hi].hex()))
-                      pos=hit+1
-              out=Path(out);out.mkdir(exist_ok=True)
-              with (out/'native-packet-call-sites.csv').open('w',newline='') as f:
-                  writer=csv.writer(f);writer.writerow(['DLL','API','importVA','callSiteVA','operation','originalByteContext']);writer.writerows(calls)
-              (out/'native-imports.json').write_text(json.dumps({'imageBase':hex(base),'entryVA':hex(entry),'nativePESections':sections,
-                               'imports':[{'dll':d,'api':a,'iatVA':hex(x)} for d,a,x in imports],
-                               'nativePacketCallSites':len(calls)},indent=2))
-              notes=[f'Original EXE SHA256: {hashlib.sha256(data).hexdigest()}',
-                  f'Native entry: 0x{entry:08X}', f'Native import entries: {len(imports)}',
-                  f'Socket and relevant API imports: {len(target)}',
-                  f'Static native socket call sites: {len(calls)}',
-                  f'Executable sections: {sum(s["executable"] for s in sections)}',
-                  'Spawn IDs, counts and XY: not claimed from API call sites alone.',
-                  'Zero static socket call sites means no native receiver is identifiable from this PE without runtime evidence.']
-              (out/'native-packet-trace-results.txt').write_text('\n'.join(notes)+'\n',encoding='utf-8')
-              print('\n'.join(notes))
-              subprocess.run(['objdump','-d','-M','intel',str(out/'native-game-client.bin')],
-                  stdout=(out/'native-game-client.asm').open('w'),stderr=subprocess.DEVNULL,check=False)
-          if __name__ == '__main__':
-              if len(sys.argv)==3 and sys.argv[1]=='--test':
-                  path=Path(sys.argv[2]);dest=Path('reports');dest.mkdir(exist_ok=True)
-                  (dest/'native-game-client.bin').write_bytes(path.read_bytes())
-                  inspect_exe(path.read_bytes(),dest)
+
+          REPO = 'gowellsik-hue/Game'
+          RELEASE = 'v1.0.0'
+          ARCHIVE = 'Sanctuary.of.Aden.-.Copy'
+          VOLUMES = Path('volumes')
+          OUTPUT = Path('source')
+          PART_BYTES = 100000000
+          LAST_DISK = 45
+          MAP_ID = int(os.environ['MAP_ID'])
+          X0 = int(os.environ['MAP_X0'])
+          Y0 = int(os.environ['MAP_Y0'])
+          SIZE = int(os.environ['MAP_SIZE'])
+          assert 0 <= MAP_ID <= 9999, 'Invalid map folder number'
+          assert 0 <= X0 < 65536 and 0 <= Y0 < 65536, 'Invalid world origin'
+          assert 64 <= SIZE <= 1024 and SIZE % 64 == 0, 'Invalid map size'
+          assert X0 + SIZE <= 65536 and Y0 + SIZE <= 65536, 'Region outside world coordinate range'
+
+          def volume(disk):
+              assert 0 <= disk <= LAST_DISK, ('Invalid archive disk', disk)
+              name = f'{ARCHIVE}.z{disk + 1:02d}' if disk < LAST_DISK else f'{ARCHIVE}.zip'
+              path = VOLUMES / name
+              if not path.is_file():
+                  subprocess.run(
+                      ['gh', 'release', 'download', RELEASE, '-R', REPO,
+                       '-p', name, '-D', str(VOLUMES), '--clobber'], check=True)
+              assert path.stat().st_size == (PART_BYTES if disk < LAST_DISK else 38808950), name
+              return path
+
+          def disk_size(disk):
+              return PART_BYTES if disk < LAST_DISK else volume(LAST_DISK).stat().st_size
+
+          def take(disk, offset, length):
+              result = []
+              while length:
+                  assert 0 <= disk <= LAST_DISK
+                  available = disk_size(disk) - offset
+                  if available == 0:
+                      disk, offset = disk + 1, 0
+                      continue
+                  assert available > 0, ('Offset outside archive disk', disk, offset)
+                  n = min(available, length)
+                  with volume(disk).open('rb') as stream:
+                      stream.seek(offset)
+                      part = stream.read(n)
+                  assert len(part) == n, ('Unexpected archive EOF', disk, offset)
+                  result.append(part)
+                  length -= n
+                  disk, offset = disk + 1, 0
+              return b''.join(result)
+
+          def forward(disk, offset, length):
+              while length:
+                  n = min(length, disk_size(disk) - offset)
+                  assert n > 0
+                  length -= n
+                  offset += n
+                  if offset == disk_size(disk) and disk < LAST_DISK:
+                      disk, offset = disk + 1, 0
+              return disk, offset
+
+          trailer = volume(LAST_DISK).read_bytes()
+          eocd = trailer.rfind(b'PK\x05\x06')
+          assert eocd >= 0, 'Archive central directory footer missing'
+          _, last_disk, cd_disk, _, entries, cd_bytes, cd_offset, _ = struct.unpack_from(
+              '<IHHHHIIH', trailer, eocd)
+          assert last_disk == LAST_DISK and entries > 0 and cd_bytes > 0
+          central = take(cd_disk, cd_offset, cd_bytes)
+          records = {}
+          pos = 0
+          while pos < len(central):
+              assert central[pos:pos+4] == b'PK\x01\x02', ('Central record mismatch', pos)
+              fields = struct.unpack_from('<IHHHHHHIIIHHHHHII', central, pos)
+              (_, _, _, flags, method, _, _, crc, packed, unpacked,
+               name_len, extra_len, comment_len, disk, _, _, offset) = fields
+              name_bytes = central[pos+46:pos+46+name_len]
+              name = name_bytes.decode('utf-8' if flags & 0x800 else 'cp437')
+              key = name.casefold()
+              assert key not in records, ('Duplicate archive path', name)
+              records[key] = dict(name=name, flags=flags, method=method, crc=crc,
+                                  packed=packed, unpacked=unpacked, disk=disk, offset=offset)
+              pos += 46 + name_len + extra_len + comment_len
+          assert pos == cd_bytes and len(records) == entries, 'Incomplete central directory'
+
+          def select_one(pattern):
+              found = [r for r in records.values() if pattern.search(r['name'])]
+              assert len(found) == 1, ('Original file not unique or missing', pattern.pattern, len(found))
+              return found[0]
+
+          tile_idx = select_one(re.compile(r'(?:^|/)Tile\.idx$', re.I))
+          tile_pak = select_one(re.compile(r'(?:^|/)Tile\.pak$', re.I))
+          map_pattern = re.compile(r'(?:^|/)map/(\d+)/([0-9a-f]{8})\.(s32|seg)$', re.I)
+          available = {}
+          for rec in records.values():
+              match = map_pattern.search(rec['name'])
+              if match and int(match.group(1)) == MAP_ID:
+                  key = (match.group(2).lower(), match.group(3).lower())
+                  assert key not in available, ('Duplicate original map block', key)
+                  available[key] = rec
+          assert available, ('No original terrain files for map', MAP_ID)
+
+          stem_list = []
+          missing = []
+          selected = []
+          for by in range(Y0 // 64, (Y0 + SIZE - 1) // 64 + 1):
+              for bx in range(X0 // 64, (X0 + SIZE - 1) // 64 + 1):
+                  stem = f'{bx + 0x7e00:04x}{by + 0x7e00:04x}'
+                  present = [(ext, available[(stem, ext)]) for ext in ('s32', 'seg')
+                             if (stem, ext) in available]
+                  if not present:
+                      missing.append(stem)
+                      continue
+                  stem_list.append(stem)
+                  selected.extend(present)
+          assert selected, 'No original map blocks overlap the requested region'
+
+          def extract(rec, target):
+              assert not rec['flags'] & 1, ('Encrypted archive file', rec['name'])
+              disk, offset = rec['disk'], rec['offset']
+              header = take(disk, offset, 30)
+              if header[:4] != b'PK\x03\x04' and disk == 0 and offset == 0:
+                  offset += 4
+                  header = take(disk, offset, 30)
+              assert header[:4] == b'PK\x03\x04', ('Local header missing', rec['name'])
+              name_len, extra_len = struct.unpack_from('<HH', header, 26)
+              disk, offset = forward(disk, offset, 30 + name_len + extra_len)
+              compressed = take(disk, offset, rec['packed'])
+              if rec['method'] == 8:
+                  raw = zlib.decompress(compressed, -15)
+              elif rec['method'] == 0:
+                  raw = compressed
               else:
-                  volume=Path(sys.argv[1]);dest=Path(sys.argv[2]);dest.mkdir(exist_ok=True)
-                  raw=unzip_original(volume,dest/'native-game-client.bin')
-                  inspect_exe(raw,dest)
-          PY_V611
-          python3 -m py_compile /tmp/v611-native-receiver.py
-          python3 /tmp/v611-native-receiver.py \
-            source/Sanctuary.of.Aden.-.Copy.z35 reports
-          test -s reports/native-game-client.bin
-          test -s reports/native-imports.json
-          test -s reports/native-packet-trace-results.txt
-          cat reports/native-packet-trace-results.txt
-      - name: V6.11 Upload genuine client and packet call-site candidates
+                  raise ValueError(('Unsupported ZIP compression', rec['name'], rec['method']))
+              assert len(raw) == rec['unpacked'], ('Original size mismatch', rec['name'])
+              assert (zlib.crc32(raw) & 0xffffffff) == rec['crc'], ('Original CRC mismatch', rec['name'])
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(raw)
+              return dict(archive=rec['name'], file=target.relative_to(OUTPUT).as_posix(),
+                          size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+
+          outputs = []
+          for _, rec in selected:
+              target = OUTPUT / 'map' / str(MAP_ID) / Path(rec['name']).name
+              outputs.append(extract(rec, target))
+          for rec in (tile_idx, tile_pak):
+              outputs.append(extract(rec, OUTPUT / Path(rec['name']).name))
+          index = (OUTPUT / Path(tile_idx['name']).name).read_bytes()
+          tile_count = struct.unpack_from('<I', index)[0]
+          assert tile_count > 0 and len(index) == 4 + tile_count * 28, 'Original Tile.idx invalid'
+
+          first = bytearray(2 * SIZE * SIZE)
+          second = bytearray(2 * SIZE * SIZE)
+          coverage = bytearray(SIZE * SIZE)
+          preferred = {'s32': 0, 'seg': 0}
+          for stem in stem_list:
+              ext = 's32' if (stem, 's32') in available else 'seg'
+              preferred[ext] += 1
+              data = (OUTPUT / 'map' / str(MAP_ID) /
+                      Path(available[(stem, ext)]['name']).name).read_bytes()
+              layer1 = 32768 if ext == 's32' else 16384
+              layer2_count = struct.unpack_from('<H', data, layer1)[0]
+              layer3 = layer1 + 2 + layer2_count * (6 if ext == 's32' else 4)
+              stride = 4 if ext == 's32' else 2
+              assert layer3 + 4096 * stride <= len(data), ('Incomplete original Layer3', stem)
+              block_x = (int(stem[:4], 16) - 0x7e00) * 64
+              block_y = (int(stem[4:], 16) - 0x7e00) * 64
+              for ly in range(64):
+                  y = block_y + ly - Y0
+                  if not 0 <= y < SIZE:
+                      continue
+                  for lx in range(64):
+                      x = block_x + lx - X0
+                      if not 0 <= x < SIZE:
+                          continue
+                      src = layer3 + (ly * 64 + lx) * stride
+                      if ext == 's32':
+                          a, b = struct.unpack_from('<HH', data, src)
+                      else:
+                          a, b = data[src], data[src + 1]
+                      cell = y * SIZE + x
+                      assert not coverage[cell], ('Overlapping original blocks', x, y)
+                      struct.pack_into('<H', first, cell * 2, a)
+                      struct.pack_into('<H', second, cell * 2, b)
+                      coverage[cell] = 1
+          (OUTPUT / 'layer3-attr1-u16le.bin').write_bytes(first)
+          (OUTPUT / 'layer3-attr2-u16le.bin').write_bytes(second)
+          (OUTPUT / 'original-cell-coverage.bin').write_bytes(coverage)
+          metadata = dict(
+              source='Sanctuary of Aden - Copy / v1.0.0',
+              originalMapId=MAP_ID,
+              bounds=dict(x0=X0, y0=Y0, x1Exclusive=X0+SIZE, y1Exclusive=Y0+SIZE),
+              width=SIZE, height=SIZE,
+              requestedBlocks=len(stem_list) + len(missing),
+              sourceBlocks=len(stem_list), sourceFiles=len(selected),
+              missingBlocks=missing,
+              coveredCells=sum(coverage), totalCells=SIZE*SIZE,
+              preferredSourceBlocks=preferred,
+              tileIndexEntries=tile_count,
+              layer3AttributesAreRaw=True,
+              collisionMeaningVerified=False,
+              gameFilesModified=False,
+              files=outputs,
+          )
+          (OUTPUT / 'manifest.json').write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PASS original map', MAP_ID, 'bounds', X0, Y0, SIZE,
+                'blocks', len(stem_list), 'files', len(selected),
+                'missing', len(missing), 'covered cells', sum(coverage), '/', SIZE*SIZE,
+                flush=True)
+          PY
+          python3 -m py_compile /tmp/extract-original-map.py
+          python3 -u /tmp/extract-original-map.py
+
+      - name: Verify extracted source and derived attributes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          root = Path('source')
+          m = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+          n = m['width'] * m['height']
+          assert m['width'] == m['height']
+          assert m['requestedBlocks'] == m['sourceBlocks'] + len(m['missingBlocks'])
+          assert m['sourceBlocks'] == sum(m['preferredSourceBlocks'].values())
+          assert len(m['files']) == m['sourceFiles'] + 2
+          coverage = (root / 'original-cell-coverage.bin').read_bytes()
+          assert len(coverage) == n and sum(coverage) == m['coveredCells']
+          assert (root / 'layer3-attr1-u16le.bin').stat().st_size == 2 * n
+          assert (root / 'layer3-attr2-u16le.bin').stat().st_size == 2 * n
+          for item in m['files']:
+              path = root / item['file']
+              assert path.is_file() and path.stat().st_size == item['size']
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == item['sha256']
+          assert m['layer3AttributesAreRaw'] and not m['collisionMeaningVerified']
+          assert not m['gameFilesModified']
+          print('PASS source SHA256, coverage and Layer3 validation')
+          PY
+
+      - name: Upload original map extraction
         uses: actions/upload-artifact@v4
         with:
-          name: Sanctuary-Map-V6.11-Original-Alternate-Client-Receive-Tracing
-          path: reports/
-          retention-days: 60
-          compression-level: 1
+          name: Sanctuary-Original-Map-${{ env.MAP_ID }}-X${{ env.MAP_X0 }}-Y${{ env.MAP_Y0 }}-S${{ env.MAP_SIZE }}
+          path: source/
+          retention-days: 30
+          compression-level: 6
           if-no-files-found: error
