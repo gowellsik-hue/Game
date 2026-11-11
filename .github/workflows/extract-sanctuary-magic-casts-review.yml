@@ -447,7 +447,7 @@ jobs:
           from PIL import Image
           from collections import defaultdict
           import base64, csv, io, json, re, struct, zipfile, xml.etree.ElementTree as ET
-          
+
           ROOT=Path('original/Sanctuary of Aden - Copy')
           OUT=Path('packages')
           OUT.mkdir(exist_ok=True)
@@ -467,7 +467,7 @@ jobs:
                           items.append({'type':'passive','id':int(e.get('id')),'name':e.get('desc').split(' (')[0], 'graphic':None,'icon':int(e.get('icon')),'offIcon':None})
               except ET.ParseError:
                   pass
-          
+
           # Read the already-produced actual animated GIF manifest (same original SPR files).
           with zipfile.ZipFile(OUT/'part-01.zip') as z:
               html=z.read('Sanctuary-SPR-viewer.html').decode('utf-8')
@@ -480,8 +480,7 @@ jobs:
           for fxid in sorted(fx):
               if not any(row['graphic']==fxid for row in items):
                   items.append({'type':'effect','id':fxid,'name':'SPR '+str(fxid),'graphic':fxid,'icon':None,'offIcon':None})
-          
-          needed={str(v) for x in items for v in (x['icon'],x['offIcon']) if v is not None}
+
           icon_rows=defaultdict(list)
           special={}
           # Keep all duplicates in original pack order. Do not invent client precedence.
@@ -495,12 +494,42 @@ jobs:
                   off=struct.unpack_from('<I',data,pos)[0]
                   name=data[pos+4:pos+24].split(b'\0')[0].decode('cp949','replace')
                   size=struct.unpack_from('<I',data,pos+24)[0]
-                  if name.lower().endswith('.tbt') and name[:-4] in needed:
+                  if name.lower().endswith('.tbt'):
                       if off+size>pak.stat().st_size:raise RuntimeError('Invalid TBT offset')
                       icon_rows[name[:-4]].append((pak,off,size,name))
                   if pak.stem=='Sprite' and name in ('SpellIcon.idx','SpellDesc-k.tbl'):
+                      if name in special:raise RuntimeError('Duplicate '+name)
+                      if off+size>pak.stat().st_size:raise RuntimeError('Invalid '+name+' offset')
                       special[name]=(pak,off,size)
-          
+
+          def original_special(name):
+              if name not in special:raise RuntimeError('Missing original '+name)
+              pak,off,size=special[name]
+              with pak.open('rb') as f:
+                  f.seek(off)
+                  data=f.read(size)
+              if len(data)!=size:raise RuntimeError('Truncated original '+name)
+              return data
+
+          spell_index=original_special('SpellIcon.idx')
+          if len(spell_index)!=336:raise RuntimeError('Unexpected SpellIcon.idx length')
+          spell_icons=struct.unpack('<168H',spell_index)
+          assert sum(bool(x) for x in spell_icons)==129
+          names={}
+          desc=original_special('SpellDesc-k.tbl').decode('cp949')
+          lines=desc.splitlines()
+          if not lines or lines[0].strip()!='80':raise RuntimeError('Unexpected SpellDesc-k.tbl header')
+          for line in lines[1:]:
+              m=re.match(r'^(\d+)\s+(.+?)(?:\s+\([^()]*\))?\s*$',line.strip())
+              if m:names[int(m.group(1))]=m.group(2)
+          spell_rows=[{'type':'spell','id':slot,'name':names.get(slot,f'SpellIcon slot {slot}'),
+                       'graphic':None,'icon':None,'offIcon':None,'shortcutIcon':icon_id}
+                      for slot,icon_id in enumerate(spell_icons) if icon_id]
+          items=spell_rows+items
+          needed={str(v) for x in items for v in (x.get('icon'),x.get('offIcon'),x.get('shortcutIcon')) if v is not None}
+          missing={str(v) for v in spell_icons if v}-icon_rows.keys()
+          if missing:raise RuntimeError('Original shortcut icon files missing: '+str(sorted(missing,key=int)))
+
           def tbt_png(data):
               if len(data)<4:raise ValueError('short TBT')
               w,h=data[2],data[3]
@@ -528,11 +557,12 @@ jobs:
                           px[x,y]=(((c>>10)&31)*255//31,((c>>5)&31)*255//31,(c&31)*255//31,255)
               dst=io.BytesIO();im.save(dst,format='PNG')
               return dst.getvalue()
-          
+
           icons=defaultdict(list);icon_errors=[]
           lib=OUT/'magic-icons-and-viewer.zip'
           with zipfile.ZipFile(lib,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as dest:
               for key,rows in sorted(icon_rows.items(),key=lambda p:int(p[0])):
+                  if key not in needed:continue
                   for pak,off,size,name in rows:
                       with pak.open('rb') as f:
                           f.seek(off);rawdata=f.read(size)
@@ -547,7 +577,7 @@ jobs:
                       f.seek(off);data=f.read(size)
                   dest.writestr('original/'+name,data)
               dest.write(OUT/'original-status-effects.xml',arcname='original/effectlist2.xml')
-          
+
           # Index all original audio, but do not attach unrelated sounds to individual spells.
           sound_root=ROOT/'sound'
           audio=[]
@@ -565,14 +595,16 @@ jobs:
                   size=0
               z.write(src,arcname=entry['path']);size+=n
           if z:z.close()
-          
+
           for row in items:
               row['animations']=fx.get(row['graphic'],[])
               # The effectlist status icon is the top-right status icon, not proved shortcut art.
               row['buffImages']=icons.get(str(row['icon']),[]) if row['icon'] is not None else []
               row['offImages']=icons.get(str(row['offIcon']),[]) if row['offIcon'] is not None else []
-              row['skillImages']=row['buffImages'] if row['type']=='passive' else []
-          
+              row['skillImages']=icons.get(str(row['shortcutIcon']),[]) if row['type']=='spell' else (row['buffImages'] if row['type']=='passive' else [])
+          if any(not x['skillImages'] for x in spell_rows):
+              raise RuntimeError('At least one original shortcut icon failed to decode')
+
           # Only requested spell/resource fields are displayed.
           page='''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>생츄어리 전체 마법 리소스</title><style>
           *{box-sizing:border-box}body{margin:0;font:14px system-ui,'Malgun Gothic',sans-serif;background:#101821;color:#eef3fa}header{padding:14px 20px;background:#1b2d40}h1{margin:0;font-size:20px}main{display:grid;grid-template-columns:280px 1fr;min-height:calc(100vh - 70px)}aside{padding:14px;border-right:1px solid #41546a}section{padding:16px}.search,select{width:100%;padding:9px;background:#23364a;color:white;border:1px solid #50677f;border-radius:6px}#list{overflow:auto;height:73vh;margin-top:10px}.item{display:block;width:100%;text-align:left;cursor:pointer;padding:10px;background:#213044;color:white;border:0;border-bottom:1px solid #385168}.active{background:#30618b}.grid{display:grid;grid-template-columns:repeat(2,minmax(190px,1fr));gap:14px}.cell{border:1px solid #43566b;border-radius:8px;min-height:160px;padding:12px}.cell h3{font-size:15px;margin:0 0 10px}.gif{max-width:100%;height:180px;object-fit:contain;image-rendering:pixelated}.mini{image-rendering:pixelated;width:64px;height:64px;object-fit:contain}.row{display:flex;flex-wrap:wrap;gap:12px}figure{margin:0}figcaption{font-size:11px;color:#b7c9de}.muted{color:#acc0d2}audio{width:100%}#audioList{max-width:100%;margin-top:8px}.meta{font-size:12px;color:#b7c9de;margin-top:6px}@media(max-width:710px){main{display:block}#list{height:170px}.grid{grid-template-columns:1fr}}
@@ -581,8 +613,8 @@ jobs:
           const data=JSON.parse(document.getElementById('data').textContent),items=data.items,audio=data.audio,$=id=>document.getElementById(id);let selected=null;
           function options(el,arr,val,label){el.replaceChildren();for(const a of arr){const o=document.createElement('option');o.value=val(a);o.textContent=label(a);el.append(o)}}
           function imgs(el,arr){el.replaceChildren();for(const a of arr){const f=document.createElement('figure'),p=document.createElement('img'),c=document.createElement('figcaption');p.className='mini';p.src=a.path;c.textContent=a.pak;f.append(p,c);el.append(f)}}
-          function render(){const q=$('search').value.toLowerCase().trim();$('list').replaceChildren();for(const x of items){if(!(`${x.id} ${x.name} ${x.graphic||''}`).toLowerCase().includes(q))continue;const b=document.createElement('button');b.className='item'+(selected===x?' active':'');b.textContent=x.name+' · '+x.id;b.onclick=()=>pick(x);$('list').append(b)}}
-          function pick(x){selected=x;$('name').textContent=x.name+' · '+x.id;const v=x.animations||[];$('variants').replaceChildren();v.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`SPR ${a.id}-${a.sub} (${a.frames}프레임)`;$('variants').append(o)});function animate(){const a=v[Number($('variants').value)];$('fx').src=a?a.path:'';$('fxid').textContent=a?a.pak+' · '+a.path:(x.graphic?'SPR '+x.graphic+' 미추출':'연결 이펙트 ID 미확인')};$('variants').onchange=animate;animate();imgs($('shortcut'),x.skillImages||[]);$('shortcutId').textContent=x.skillImages.length?'원본 스킬 아이콘':'원본 단축창 연결 ID 미확인';imgs($('buff'),x.buffImages||[]);if(x.offImages?.length){const tag=document.createElement('span'),g=document.createElement('div');tag.className='muted';tag.textContent='해제';g.className='row';imgs(g,x.offImages);$('buff').append(tag,g)}$('buffId').textContent='등록 '+(x.icon??'미확인')+' / 해제 '+(x.offIcon??'미확인');$('soundNote').textContent='마법별 원본 효과음 연결 ID 미확인';render()}
+          function render(){const q=$('search').value.toLowerCase().trim();$('list').replaceChildren();for(const x of items){if(!(`${x.id} ${x.name} ${x.graphic||''}`).toLowerCase().includes(q))continue;const b=document.createElement('button');b.className='item'+(selected===x?' active':'');b.textContent=(x.type==='spell'?'마법 ':'')+x.name+' · '+x.id;b.onclick=()=>pick(x);$('list').append(b)}}
+          function pick(x){selected=x;$('name').textContent=x.name+' · '+x.id;const v=x.animations||[];$('variants').replaceChildren();v.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`SPR ${a.id}-${a.sub} (${a.frames}프레임)`;$('variants').append(o)});function animate(){const a=v[Number($('variants').value)];$('fx').src=a?a.path:'';$('fxid').textContent=a?a.pak+' · '+a.path:(x.graphic?'SPR '+x.graphic+' 미추출':'연결 이펙트 ID 미확인')};$('variants').onchange=animate;animate();imgs($('shortcut'),x.skillImages||[]);$('shortcutId').textContent=x.type==='spell'?'SpellIcon.idx 슬롯 '+x.id+' / 아이콘 '+x.shortcutIcon:(x.skillImages.length?'원본 스킬 아이콘':'원본 단축창 연결 ID 미확인');imgs($('buff'),x.buffImages||[]);if(x.offImages?.length){const tag=document.createElement('span'),g=document.createElement('div');tag.className='muted';tag.textContent='해제';g.className='row';imgs(g,x.offImages);$('buff').append(tag,g)}$('buffId').textContent='등록 '+(x.icon??'미확인')+' / 해제 '+(x.offIcon??'미확인');$('soundNote').textContent='마법별 원본 효과음 연결 ID 미확인';render()}
           function soundlist(){const term=$('soundSearch').value.trim().toLowerCase();const subset=audio.filter(x=>x.name.toLowerCase().includes(term)).slice(0,120);options($('audioList'),subset,x=>x.path,x=>x.path);$('audio').src=$('audioList').value||''}
           $('audioList').onchange=()=>{$('audio').src=$('audioList').value||''};$('soundSearch').oninput=soundlist;$('search').oninput=render;soundlist();render();if(items.length)pick(items[0]);
           </script></body></html>'''
@@ -597,7 +629,7 @@ jobs:
               with zipfile.ZipFile(p) as z:
                   assert z.testzip() is None
               assert p.stat().st_size < 480*1024*1024,p
-          print('MAGIC CATALOG',len(items),'effects',len(fx),'icon images',sum(map(len,icons.values())),'sounds',len(audio),'audio packages',part)
+          print('MAGIC CATALOG',len(items),'spell icons',len(spell_rows),'effects',len(fx),'icon images',sum(map(len,icons.values())),'sounds',len(audio),'audio packages',part)
           PY_SPELLS
           python3 -m py_compile /tmp/sanctuary_spell_package.py
           python3 /tmp/sanctuary_spell_package.py
