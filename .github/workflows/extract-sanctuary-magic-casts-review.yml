@@ -1,8 +1,8 @@
 # FILE: .github/workflows/extract-sanctuary-magic-casts-review.yml
-# VERSION: V1.7 | Original full-magic FX, sound, shortcut and buff-icon extraction
+# VERSION: V1.8 | Original full-magic FX, sound, shortcut and buff-icon extraction
 # PURPOSE: original Sanctuary SPR -> real animated GIFs -> HTML viewer.
 # SCOPE: standalone original asset audit. NEVER touch SLKnight game, maps, Pages, or existing workflows.
-name: extract-sanctuary-magic-casts-review.yml | V1.7 | Magic and Caster Motion Review
+name: extract-sanctuary-magic-casts-review.yml | V1.8 | Magic and Caster Motion Review
 
 "on":
   push:
@@ -52,7 +52,7 @@ jobs:
           df -h .
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full
-          python3 -m pip install --disable-pip-version-check pillow==11.3.0
+          python3 -m pip install --disable-pip-version-check pillow==11.3.0 pycryptodome==3.23.0
           7z | head -n 2 || true
 
       - name: "Download and verify all 46 original release parts"
@@ -150,7 +150,7 @@ jobs:
                             (bool(suffix) and suffix not in non_names and suffix not in ('.pak','.idx')) or
                             (not suffix and any(k in stem for k in keywords)))
               sound=low.startswith('sound/')
-              selected=required_sprite or pack_index or text_pack or loose_source or sound
+              selected=required_sprite or pack_index or suffix=='.pak' or text_pack or loose_source or sound
               reason=('Sprite base' if required_sprite else 'pack index' if pack_index else
                       'name pack' if text_pack else 'loose metadata' if loose_source else
                       'sound' if sound else 'not a name candidate')
@@ -782,6 +782,8 @@ jobs:
           from pathlib import Path
           from collections import defaultdict
           import csv, io, json, re, struct, zipfile, hashlib, xml.etree.ElementTree as ET
+          import subprocess
+          from Crypto.Cipher import DES
 
           ROOT=Path('original/Sanctuary of Aden - Copy')
           OUT=Path('packages')
@@ -807,12 +809,13 @@ jobs:
                      'startmsg','endmsg','text','textid','nameid','descid','stringid')
           CAND_EXT={'.tbl','.xml','.csv','.tsv','.txt','.ini','.json','.cfg',
                     '.properties','.lst','.dat','.db','.sqlite','.sqlite3','.str',
-                    '.loc','.res','.msg','.lang','.sql','.idx'}
+                    '.loc','.res','.msg','.lang','.sql','.idx','.html','.htm','.uml'}
           NON_NAMES={'.spr','.tbt','.wav','.mp3','.mid','.ogg','.flac','.bmp',
                      '.png','.jpg','.jpeg','.gif','.webp','.dds','.tga',
                      '.ico','.cur','.avi','.mp4','.mkv','.mov','.wmv',
                      '.exe','.dll','.so','.pdb','.ttf','.otf','.fnt',
-                     '.zip','.7z','.rar','.map','.tile'}
+                     '.zip','.7z','.rar','.map','.tile','.img','.s32',
+                     '.seg','.til','.alp','.ncl','.lmp','.sp','.lac'}
           NAME_WORDS=('name','item','weapon','armor','skill','spell','desc','text',
                       'string','message','icon','passive','action','motion','ui','resource')
 
@@ -845,6 +848,7 @@ jobs:
 
           source_rows=[];index_rows=[];text_rows=[];string_map=defaultdict(list);icon_index_candidates=[]
           source_errors=[];raw_files=0;name_files=[];archive_number=0
+          index_formats=[];text_idx_records=[];text_pak_decoded=0
           PART_LIMIT=175*1024*1024
           part_no=0;part_size=0;source_zip=None
           parts_dir=OUT/'name-source-parts';parts_dir.mkdir(exist_ok=True)
@@ -888,13 +892,18 @@ jobs:
                                   'unparsed',0,' | '.join(chunks)))
 
           def decode_text(raw):
-              choices=['utf-8-sig','utf-16','cp949']
-              if raw[:200].count(b'\x00')>20:choices.insert(2,'utf-16-le')
+              if raw.startswith((b'\xff\xfe',b'\xfe\xff')):
+                  choices=['utf-16','utf-8-sig','cp949']
+              elif raw[:256].count(b'\x00')>16:
+                  choices=['utf-16-le','utf-16-be','utf-8-sig','cp949']
+              else:
+                  choices=['utf-8-sig','cp949']
               for encoding in choices:
                   try:
                       s=raw.decode(encoding)
                       if '\x00' in s[:300]:continue
-                      if sum(ord(c)<32 and c not in '\r\n\t' for c in s[:2000])>20:continue
+                      n=min(len(s),2000)
+                      if not n or sum(ord(c)<32 and c not in '\r\n\t' for c in s[:n])>max(2,n//100):continue
                       return s,encoding
                   except UnicodeError:pass
               return None,None
@@ -976,35 +985,102 @@ jobs:
                   table_refs(text,source)
               return encoding,count
 
-          metadata_files=[]
-          # Complete census of every extracted IDX, not just Sprite or Text.
+          # The original Text.idx has a clear count but DES-encrypted 28-byte entries.
+          # The key and 16 round keys agree with the Lineage PakViewer reference decoder.
+          DES_KEY=bytes.fromhex('7e214023255e243c')
+          DES_CIPHER=DES.new(DES_KEY,DES.MODE_ECB)
+
+          def des_decode(data):
+              n=len(data)//8*8
+              return DES_CIPHER.decrypt(data[:n])+data[n:]
+
+          def index_records(idx,paired_pak):
+              data=idx.read_bytes()
+              if len(data)<4 or data.startswith(b'_EXTB$'):
+                  return None,'nonstandard',0
+              count=struct.unpack_from('<I',data)[0]
+              if count>1000000 or len(data)!=4+28*count:
+                  return None,'nonstandard',count
+              length=paired_pak.stat().st_size if paired_pak.is_file() else None
+              def probe(payload):
+                  good=0
+                  offsets=range(0,count, max(1,count//160))
+                  for i in offsets:
+                      pos=i*28
+                      off=struct.unpack_from('<I',payload,pos)[0]
+                      nbytes=struct.unpack_from('<i',payload,pos+24)[0]
+                      rawname=payload[pos+4:pos+24].split(b'\0',1)[0]
+                      if not rawname or b'\xef\xbf\xbd' in rawname:continue
+                      name=rawname.decode('cp949','replace')
+                      if '\ufffd' in name or any(ord(c)<32 for c in name):continue
+                      if not re.fullmatch(r'[\w .+@#()\-\\/]+',name,re.UNICODE):continue
+                      if nbytes<0 or (length is not None and off+nbytes>length):continue
+                      good+=1
+                  return good/max(1,len(offsets))
+              payload=data[4:]
+              plain=probe(payload)
+              if plain>=.70:return payload,'plain',count
+              decoded=des_decode(payload)
+              des_ratio=probe(decoded)
+              if des_ratio>=.70:return decoded,'DES-ECB',count
+              return None,f'unverified (plain={plain:.3f} DES={des_ratio:.3f})',count
+
+
+          def packed_data(raw,fmt):
+              return des_decode(raw) if fmt=='DES-ECB' else raw
+
+          # The known XML envelope adds a separate AES layer after the PAK block cipher.
+          def unpack_xml(data):
+              if data.lstrip().startswith(b'<'):return data
+              if not data.startswith(b'X'):return data
+              key='dc8401212a40200add25b9a70db9c94e'
+              iv=bytes.fromhex('3e0978aac4d53063300c5f9a807f2246')
+              size=(len(data)-4)//16*16
+              ciphertext=data[4:4+size]
+              aes=subprocess.run(['openssl','enc','-aes-128-ecb','-d','-nopad','-nosalt','-K',key],
+                                 input=ciphertext,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True).stdout
+              result=bytearray(data)
+              feedback=iv
+              for off in range(0,size,16):
+                  result[4+off:4+off+16]=bytes(a^b for a,b in zip(aes[off:off+16],feedback))
+                  feedback=ciphertext[off:off+16]
+              for off in range(size,len(data)-4):
+                  result[off+4]=data[off+4]^feedback[off-size]
+              result[0]=0x3c
+              return bytes(result)
+
+          # Complete census of every extracted IDX, including DES-protected Text.idx.
           for idx in sorted(ROOT.rglob('*.idx')):
               rel=idx.relative_to(ROOT).as_posix()
               data=idx.read_bytes()
               store_raw('index/'+rel,data)
-              if len(data)<4:
-                  source_errors.append((rel,'short IDX'));continue
-              count=struct.unpack_from('<I',data)[0]
-              if len(data)!=4+28*count:
-                  source_errors.append((rel,'nonstandard IDX (raw saved)'))
-                  pak=idx.with_suffix('.pak')
-                  if pak.is_file():save_unparsed_pak(pak,'nonstandard paired index')
-                  continue
               pak=idx.with_suffix('.pak')
               with_pak=pak.is_file()
+              records,fmt,count=index_records(idx,pak)
+              index_formats.append((rel,fmt,count,int(with_pak)))
+              if records is None:
+                  source_errors.append((rel,fmt+' (IDX preserved; record extraction unavailable)'))
+                  if with_pak:save_unparsed_pak(pak,'unrecognized paired index')
+                  continue
+              if idx.name.lower()=='text.idx':
+                  if fmt!='DES-ECB':
+                      raise RuntimeError('Text.idx encryption format unverified; do not claim full name extraction')
+                  text_idx_records=[(struct.unpack_from('<I',records,i*28)[0],
+                                     records[i*28+4:i*28+24].split(b'\0',1)[0].decode('cp949','replace'),
+                                     struct.unpack_from('<i',records,i*28+24)[0])
+                                    for i in range(count)]
               size=pak.stat().st_size if with_pak else 0
               handle=pak.open('rb') if with_pak else None
               try:
                   for i in range(count):
-                      pos=4+28*i
-                      offset=struct.unpack_from('<I',data,pos)[0]
-                      name=data[pos+4:pos+24].split(b'\0',1)[0].decode('cp949','replace')
-                      length=struct.unpack_from('<I',data,pos+24)[0]
+                      pos=i*28
+                      offset=struct.unpack_from('<I',records,pos)[0]
+                      name=records[pos+4:pos+24].split(b'\0',1)[0].decode('cp949','replace')
+                      length=struct.unpack_from('<i',records,pos+24)[0]
                       extension=Path(name).suffix.lower()
                       stem=Path(name).stem.lower()
                       candidate=(extension in CAND_EXT or
-                                 (bool(extension) and extension not in NON_NAMES and extension not in ('.pak',)) or
-                                 (not extension and any(k in stem for k in NAME_WORDS)))
+                                 (extension not in NON_NAMES and any(k in stem for k in NAME_WORDS)))
                       index_rows.append((rel,i,name,offset,length,int(candidate),int(with_pak)))
                       if not candidate:continue
                       if not with_pak:
@@ -1016,19 +1092,53 @@ jobs:
                           source_errors.append((rel+':'+name,'candidate short read'));continue
                       key=f'{rel}:{i:06d}:{name}'
                       stored=store_raw('pack/'+rel+'/'+f'{i:06d}-'+name,raw)
-                      if extension=='.idx' and len(raw)%2==0:
-                          values=struct.iter_unpack('<H',raw)
-                          for slot,(number,) in enumerate(values):
+                      material=packed_data(raw,fmt)
+                      if fmt=='DES-ECB':
+                          stored_plain=store_raw('decoded/'+rel+'/'+f'{i:06d}-'+name,material)
+                          text_pak_decoded+=1
+                      if extension=='.xml':
+                          try:material=unpack_xml(material)
+                          except (ValueError,subprocess.CalledProcessError) as exc:
+                              source_errors.append((key,'XML AES decode not confirmed: '+str(exc)[:80]))
+                      if extension=='.idx' and len(material)%2==0:
+                          for slot,(number,) in enumerate(struct.iter_unpack('<H',material)):
                               if number in icon_ids and number:
                                   icon_index_candidates.append((key,slot,number,'candidate only, structure unverified'))
-                      enc,rows=process_data(key,raw)
-                      source_rows.append((key,'packed',len(raw),enc,rows,stored))
+                      enc,rows=process_data(key,material)
+                      source_rows.append((key,'packed/'+fmt,len(raw),enc,rows,stored))
               finally:
                   if handle:handle.close()
-
           for pak in sorted(ROOT.rglob('*.pak')):
               if not pak.with_suffix('.idx').is_file():
                   save_unparsed_pak(pak,'unindexed candidate PAK')
+
+          backup_rows=[]
+          backup=ROOT/'Text - Copy.pak'
+          if backup.is_file() and text_idx_records:
+              candidates=[(off,nm,size) for off,nm,size in text_idx_records
+                          if size>0 and off+size<=backup.stat().st_size and
+                          (Path(nm).suffix.lower() in CAND_EXT or
+                           any(t in Path(nm).stem.lower() for t in NAME_WORDS))]
+              sample=candidates[::max(1,len(candidates)//80)][:80]
+              coherent=0
+              with backup.open('rb') as f:
+                  for off,nm,size in sample:
+                      f.seek(off);text,enc=decode_text(des_decode(f.read(size)))
+                      if text and (len(text)>16 or '\n' in text):coherent+=1
+                  ratio=coherent/max(1,len(sample))
+                  if ratio>=0.5:
+                      for off,nm,size in candidates:
+                          f.seek(off)
+                          decoded=des_decode(f.read(size))
+                          text,enc=decode_text(decoded)
+                          if text is None:continue
+                          backup_rows.append((nm,off,size,enc,text[:250].replace('\n',' ')))
+                          store_raw('backup-decoded/Text-Copy/'+nm,decoded)
+                  else:
+                      source_errors.append(('Text - Copy.pak',
+                                            'backup index compatibility unverified; raw copy preserved'))
+              print('BACKUP TEXT PROBE',len(candidates),'candidates',len(sample),
+                    'sample compatible',coherent,'decoded',len(backup_rows),flush=True)
 
           # Every loose text/data candidate from every directory, not a hand-picked XML list.
           for path in sorted(ROOT.rglob('*')):
@@ -1036,8 +1146,7 @@ jobs:
               rel=path.relative_to(ROOT).as_posix()
               ext=path.suffix.lower()
               if not (ext in CAND_EXT or
-                      (bool(ext) and ext not in NON_NAMES and ext not in ('.idx','.pak')) or
-                      (not ext and any(k in path.stem.lower() for k in NAME_WORDS))):
+                      (ext not in NON_NAMES and any(k in path.stem.lower() for k in NAME_WORDS))):
                   continue
               raw=path.read_bytes()
               stored=store_raw('loose/'+rel,raw)
@@ -1096,8 +1205,52 @@ jobs:
                                ('reports/original-pack-name-inventory.csv','original/Original-Pack-Name-Inventory.csv'),
                                ('packages/original-name-xml-audit.json','original/Original-XML-Decode-Audit.json')]:
               if Path(src).is_file():documents[name]=Path(src).read_bytes()
-          # Rewrite only the four pre-existing report entries, without duplicate ZIP members.
-          temporary=LIB.with_suffix('.v17-tmp.zip')
+          # A name belongs on an icon only when one non-placeholder Korean label is linked
+          # directly by a source. Numeric text IDs are never equated with icon IDs.
+          verified_korean={}
+          conflicts=[]
+          for icon in sorted(icon_ids):
+              matches=sorted({r[1].strip() for r in per_icon.get(icon,[])
+                              if re.search('[가-힣]',r[1]) and not r[1].startswith('SpellIcon slot ')})
+              if len(matches)==1:verified_korean[icon]=matches[0]
+              elif len(matches)>1:conflicts.append((icon,' | '.join(matches)))
+
+          # Rebuild the viewer's JSON from its own embedded source, preserving every PNG
+          # and all existing controls. It is updated only after full candidate resolution.
+          viewer_file=OUT/'All-TBT-Icons.html'
+          viewer=viewer_file.read_text('utf-8')
+          match=re.search(r'(<script id="icons" type="application/json">)(.*?)(</script>)',viewer,re.S)
+          if not match:raise RuntimeError('Original 5154 icon gallery JSON not found')
+          viewer_data=json.loads(match.group(2))
+          if len(viewer_data['items'])!=5154:raise RuntimeError('Gallery icon total changed')
+          for item in viewer_data['items']:
+              if int(item['id']) in verified_korean:
+                  item['verified_name']=verified_korean[int(item['id'])]
+          viewer=viewer[:match.start(2)]+json.dumps(viewer_data,ensure_ascii=False,separators=(',',':')).replace('</','<\\/')+viewer[match.end(2):]
+          needle="src.textContent=x.pak;b.append(im,no,src)"
+          if viewer.count(needle)!=1:raise RuntimeError('Original gallery renderer changed')
+          viewer=viewer.replace(needle,"src.textContent=x.verified_name?x.verified_name+' · '+x.pak:x.pak;b.append(im,no,src)")
+          viewer_file.write_text(viewer,encoding='utf-8')
+          summary['verified_unambiguous_korean_icon_ids']=len(verified_korean)
+          summary['conflicting_korean_icon_ids']=len(conflicts)
+          summary['idx_formats']=index_formats
+          summary['decoded_protected_name_records']=text_pak_decoded
+          summary['encrypted_text_idx_entries']=len(text_idx_records)
+          documents['original/Original-Unindexed-Backup-Name-Candidates.csv']=csv_bytes(
+              ('name','offset','bytes','encoding','text_preview_unverified'),backup_rows)
+          summary['backup_name_source_candidates']=len(backup_rows)
+          documents['original/Original-Index-Encryption-Formats.csv']=csv_bytes(
+              ('index','format','records','paired_pak_available'),index_formats)
+          documents['original/Original-Name-Conflicts.csv']=csv_bytes(
+              ('icon_id','conflicting_korean_labels'),conflicts)
+          documents['original/Verified-Unambiguous-Korean-Icon-Names.csv']=csv_bytes(
+              ('icon_id','korean_name'),sorted(verified_korean.items()))
+          documents['original/Name-Extraction-Summary.json']=json.dumps(
+              summary,ensure_ascii=False,indent=2).encode('utf-8')
+
+          # Replace updated report and viewer members exactly once, keeping existing assets intact.
+          temporary=LIB.with_suffix('.v18-tmp.zip')
+          documents['All-TBT-Icons.html']=viewer_file.read_bytes()
           with zipfile.ZipFile(LIB,'r') as old, zipfile.ZipFile(temporary,'w') as new:
               for info in old.infolist():
                   if info.filename not in documents:new.writestr(info,old.read(info.filename))
@@ -1111,9 +1264,11 @@ jobs:
           if LIB.stat().st_size>=480*1024*1024:
               raise RuntimeError('Name report archive exceeds upload size')
           for part in sorted(parts_dir.glob('*.zip')):
-              if part.stat().st_size>=480*1024*1024:raise RuntimeError('Raw name-source part too large')
+              if part.stat().st_size>=480*1024*1024:raise RuntimeError('Raw source ZIP damaged: over 480 MB')
               with zipfile.ZipFile(part) as z:
                   if z.testzip() is not None:raise RuntimeError('Raw source ZIP damaged')
+          if not text_idx_records or text_pak_decoded==0:
+              raise RuntimeError('Text.idx or Text.pak did not yield decoded name candidates')
           print('ORIGINAL NAME EXTRACTION',json.dumps(summary,ensure_ascii=False),flush=True)
           PY_NAMES
 
