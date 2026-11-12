@@ -1,5 +1,5 @@
 
-name: build-slknight-web.yml | V1.26 | Healer Aggro, Teleport Reset, Holy Walk Buff Icon
+name: build-slknight-web.yml | V1.27 | Healer Aggro, Teleport Reset, Holy Walk Buff Icon
 
 "on":
   workflow_dispatch:
@@ -69,262 +69,312 @@ jobs:
               assert struct.unpack('>II',png[16:24]) == dims
           Path('build/before.json').write_text(json.dumps(files,ensure_ascii=False),encoding='utf8')
           shutil.copyfile(root/needed[0], 'build/Scripts.v125.rxdata')
-          print('PASS: V1.25 successful deployed artifact / 5619 files / icons unchanged')
+          print('PASS: V1.25 deployed original 5619 files, holy walk 622/623 unchanged')
           PY
 
-      - name: Patch V1.26 existing scripts
+      - name: Patch V1.27 original scripts
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/patch_v126.rb <<'RUBY_V126'
+          cat > build/patch_v127.rb <<'RUBY_V127'
+          # encoding: UTF-8
           require 'zlib'
           require 'digest'
 
-          module RPG
-            class Map; end
-            class MapInfo; end
-            class CommonEvent; end
-            class Event
-              class Page
-                class Condition; end
-                class Graphic; end
-              end
-            end
-            class EventCommand; end
-            class MoveRoute; end
-            class MoveCommand; end
-            class AudioFile; end
-            class Tileset; end
-          end
-          [Color = Class.new, Tone = Class.new, Table = Class.new].each do |klass|
-            klass.define_singleton_method(:_load) do |raw|
-              obj = allocate
-              obj.instance_variable_set(:@sl_raw_payload, raw)
-              obj
-            end
-            klass.define_method(:_dump) { |_limit| @sl_raw_payload }
-          end
+          src_path = ARGV.fetch(0)
+          out_path = ARGV.fetch(1)
+          scripts = Marshal.load(File.binread(src_path))
 
-          ROOT = File.expand_path(ARGV.fetch(0))
-          KNIGHT = File.join(ROOT,'knight')
-          SCRIPTS = File.join(KNIGHT,'gameasync/Data/Scripts.rxdata')
-
-          DATA_PREFIX = File.join(KNIGHT,'gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO')
-          monster_count = 0
-          healer_count = 0
-          Dir.glob(DATA_PREFIX + 'Map[0-9][0-9][0-9].rxdata').sort.each do |path|
-            map = Marshal.load(File.binread(path))
-            map.instance_variable_get(:@events).each_value do |event|
-              healer_count += 1 if event.instance_variable_get(:@name).to_s.b == '[ID힐러 마법사]'.b
-              pages = event.instance_variable_get(:@pages)
-              monster_count += 1 if pages.any? do |page|
-                page.instance_variable_get(:@trigger) == 2 &&
-                  page.instance_variable_get(:@list).any? do |cmd|
-                    cmd.instance_variable_get(:@code) == 117 && cmd.instance_variable_get(:@parameters) == [62]
-                  end
-              end
+          module Patch
+            def self.check(v, label)
+              raise label unless v
+            end
+            def self.once(src, old, new_text, label)
+              n = src.scan(old).length
+              check(n == 1, "#{label}: found #{n} matches")
+              src.sub(old,new_text)
+            end
+            def self.method_span(src, first, last, label)
+              i=src.index(first)
+              j=src.index(last,i) if i
+              check(i && j && i<j, "#{label}: method bounds missing")
+              [src[0...i], src[i...j], src[j..-1]]
             end
           end
-          raise "Monster census #{monster_count}/427" unless monster_count == 427
-          raise "Healer census #{healer_count}/39" unless healer_count == 39
 
-          def check(value, msg)
-            raise msg unless value
-          end
-
-          def once(src, before, after, label)
-            n = src.scan(before).length
-            check(n == 1, "#{label}: #{n} matches")
-            src.sub(before,after)
-          end
-
-          scripts = Marshal.load(File.binread(SCRIPTS))
-          patched = []
-
-          def patch_script(scripts,name)
-            row = scripts.find {|r| r.is_a?(Array) && r[1].to_s == name.b }
-            check(row && row[2].is_a?(String), "Missing script #{name}")
-            src = Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
-            check(src.valid_encoding?,"Invalid UTF-8: #{name}")
-            nl = src.include?("\r\n") ? "\r\n" : "\n"
-            out = yield(src,nl)
-            check(out != src,"No changes in #{name}")
-            check(out.valid_encoding?,"Invalid result UTF-8: #{name}")
+          changed=[]
+          def patch(scripts, changed, name)
+            row=scripts.find{|r|r[1].to_s.b==name.b}
+            Patch.check(row,"No #{name}")
+            src=Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
+            Patch.check(src.valid_encoding?,"Invalid encoding #{name}")
+            Patch.check(!src.include?('sl_v126_'),"FAILED V1.26 source detected in #{name}")
+            nl=src.include?("\r\n") ? "\r\n" : "\n"
+            out=yield(src,nl)
+            Patch.check(out!=src,"Nothing changed #{name}")
             RubyVM::InstructionSequence.compile(out)
-            row[2] = Zlib::Deflate.deflate(out.b)
+            row[2]=Zlib::Deflate.deflate(out.b)
+            changed << name
           end
 
-          patch_script(scripts,'버프,물약 이미지 출력') do |src,nl|
-            old = '    $Buf_23.bitmap = RPG::Cache.icon("홀리워크버프")'
-            add = [old,'    $Buf_23.zoom_x = 32.0 / 38.0','    $Buf_23.zoom_y = 32.0 / 37.0'].join(nl)
-            once(src,old,add,'Holy Walk buff 623 zoom')
-          end
-          patched << '버프,물약 이미지 출력'
-
-          patch_script(scripts,'Game_Event') do |src,nl|
-            old = '    @list = @page.list'
-            add = [old,
-              '    @sl_v126_monster_attack = @trigger == 2 && @list.any? { |cmd| cmd.code == 117 && cmd.parameters[0] == 62 }',
-              '    @sl_v126_target_id = nil unless @sl_v126_monster_attack'].join(nl)
-            src = once(src,old,add,'Monster existing attack-page check')
+          patch(scripts,changed,'Game_Event') do |src,nl|
             old = '      @list = nil'
-            add = [old,'      @sl_v126_monster_attack = false','      @sl_v126_target_id = nil'].join(nl)
-            src = once(src,old,add,'Clear attack-page target on empty page')
+            src=Patch.once(src,old, old+nl+'      @sl_healer_touch_enabled = false','Clear healer touch eligibility')
+            old = '    @list = @page.list'
+            new_text = [old,
+              '    @sl_healer_touch_enabled = false',
+              '    if @trigger == 2',
+              '      switches = @list.select { |c| c.code == 121 && c.parameters[2] == 0 }.map { |c| c.parameters[0] }',
+              '      @sl_healer_touch_enabled = switches.any? { |sid|',
+              '        $data_common_events.any? { |ce| ce && ce.trigger == 2 && ce.switch_id == sid } ||',
+              '        SLMonsterAttackContext.map_attack_switch?(sid) }',
+              '    end'].join(nl)
+            src=Patch.once(src,old,new_text,'Healer touch eligibility on existing monster event')
 
-            anchor = '  def check_event_trigger_touch(x, y)'
-            helper = <<~'HELPER'
-            def sl_v126_monster_target
-              return $game_player unless @sl_v126_monster_attack
-              healer = @sl_v126_healer
-              if healer.nil? || !$game_map.events[healer.id].equal?(healer)
-                healer = $game_map.events.values.find do |event|
-                  data = event.instance_variable_get(:@event)
-                  data && data.name.to_s.unpack('C*') == '[ID힐러 마법사]'.unpack('C*')
+            a='  def check_event_trigger_touch(x, y)'
+            b='  def check_event_trigger_auto'
+            head,meth,tail=Patch.method_span(src,a,b,'Monster touch')
+            old='    if @trigger == 2 and x == $game_player.x and y == $game_player.y'
+            rep=[
+              '    if @trigger == 2',
+              '      hit_player = x == $game_player.x && y == $game_player.y',
+              '      healer = $game_map.events.values.find { |e| e.instance_variable_get(:@event) && e.instance_variable_get(:@event).name == \'[ID힐러 마법사]\' } if @sl_healer_touch_enabled && $game_switches[185]',
+              '      hit_healer = healer && !healer.transparent && !healer.instance_variable_get(:@sl_healer_teleport) && $game_actors[3] && $game_actors[3].hp > 0 && x == healer.x && y == healer.y',
+              '      if hit_player || hit_healer'
+            ].join(nl)
+            meth=Patch.once(meth,old,rep,'Player/healer contact branch')
+            meth=Patch.once(meth,'        start'+nl,'        @sl_touch_actor_id = hit_player ? 1 : 3 if @sl_healer_touch_enabled'+nl+'        start'+nl,'Touch actor assignment')
+            meth=Patch.once(meth,'      end'+nl+'    end'+nl, '      end'+nl+'      end'+nl+'    end'+nl,'Touch nested conditional')
+            src=head+meth+tail
+
+            a='  def check_event_trigger_auto'
+            b='  def update'
+            head,meth,tail=Patch.method_span(src,a,b,'Monster overlap')
+            old='    if @trigger == 2 and @x == $game_player.x and @y == $game_player.y'
+            rep=[
+              '    if @trigger == 2',
+              '      hit_player = @x == $game_player.x && @y == $game_player.y',
+              '      healer = $game_map.events.values.find { |e| e.instance_variable_get(:@event) && e.instance_variable_get(:@event).name == \'[ID힐러 마법사]\' } if @sl_healer_touch_enabled && $game_switches[185]',
+              '      hit_healer = healer && !healer.transparent && !healer.instance_variable_get(:@sl_healer_teleport) && $game_actors[3] && $game_actors[3].hp > 0 && @x == healer.x && @y == healer.y',
+              '      if hit_player || hit_healer'
+            ].join(nl)
+            meth=Patch.once(meth,old,rep,'Player/healer overlap branch')
+            meth=Patch.once(meth,'        start'+nl,'        @sl_touch_actor_id = hit_player ? 1 : 3 if @sl_healer_touch_enabled'+nl+'        start'+nl,'Overlap actor assignment')
+            meth=Patch.once(meth,'      end'+nl+'    end'+nl,'      end'+nl+'      end'+nl+'    end'+nl,'Overlap nested conditional')
+            src=head+meth+tail
+            old = '        @interpreter.setup(@list, @event.id)'
+            addon = [
+              old,
+              '        @interpreter.instance_variable_set(:@sl_attack_actor_id, nil)',
+              '        if @trigger == 4 && @page && @page.condition',
+              '          condition = @page.condition',
+              '          switches = []',
+              '          switches << condition.switch1_id if condition.switch1_valid',
+              '          switches << condition.switch2_id if condition.switch2_valid',
+              '          attack_sid = switches.find { |sid| SLMonsterAttackContext.healer_target(sid) == 3 }',
+              '          if attack_sid',
+              '            @interpreter.instance_variable_set(:@sl_attack_actor_id, 3)',
+              '            SLMonsterAttackContext.discard_first(attack_sid)',
+              '          end',
+              '        end'
+            ].join(nl)
+            Patch.once(src,old,addon,'Reuse existing map-parallel attack interpreter')
+          end
+
+          patch(scripts,changed,'Game_Character 3') do |src,nl|
+            head,meth,tail=Patch.method_span(src,'  def move_toward_player','  def move_away_from_player','Chase move')
+            old='    sx = @x - $game_player.x'+nl+'    sy = @y - $game_player.y'
+            rep=[
+              '    target = $game_player',
+              '    if self.is_a?(Game_Event) && @sl_healer_touch_enabled && $game_switches[185]',
+              '      healer = $game_map.events.values.find { |e| e.instance_variable_get(:@event) && e.instance_variable_get(:@event).name == \'[ID힐러 마법사]\' }',
+              '      if healer && !healer.transparent && !healer.instance_variable_get(:@sl_healer_teleport) && $game_actors[3] && $game_actors[3].hp > 0',
+              '        hd = (@x - healer.x).abs + (@y - healer.y).abs',
+              '        pd = (@x - $game_player.x).abs + (@y - $game_player.y).abs',
+              '        target = healer if hd < pd',
+              '      end',
+              '    end',
+              '    sx = @x - target.x',
+              '    sy = @y - target.y'
+            ].join(nl)
+            src=head+Patch.once(meth,old,rep,'Existing chase target re-use')+tail
+            head,meth,tail=Patch.method_span(src,'  def turn_toward_player','  def turn_away_from_player','Original turn direction')
+            old='    sx = @x - $game_player.x'+nl+'    sy = @y - $game_player.y'
+            rep=[
+              '    target = $game_player',
+              '    if self.is_a?(Game_Event) && @sl_touch_actor_id == 3',
+              '      healer = $game_map.events.values.find { |e| e.instance_variable_get(:@event) && e.instance_variable_get(:@event).name == \'[ID힐러 마법사]\' }',
+              '      target = healer if healer && !healer.transparent && !healer.instance_variable_get(:@sl_healer_teleport)',
+              '    end',
+              '    sx = @x - target.x',
+              '    sy = @y - target.y'
+            ].join(nl)
+            head+Patch.once(meth,old,rep,'Original monster faces actual hit target')+tail
+          end
+
+          patch(scripts,changed,'Verified Monster Attack 14') do |src,nl|
+            original = '    data=[map_id.to_i,event_id.to_i]'
+            recorded = '    event = $game_map.events[event_id.to_i] if $game_map && $game_map.map_id == map_id.to_i' + nl + '    data=[map_id.to_i,event_id.to_i,event && event.instance_variable_get(:@sl_touch_actor_id)]'
+            src=Patch.once(src,original,recorded,'Snapshot original attack target at existing registration')
+            anchor='  def self.start(switch_id,ids,coord_name,frames)'
+            addon=<<~'SNIP'
+            def self.healer_target(switch_id)
+              queue = @pending && @pending[switch_id.to_i]
+              return nil if !queue || queue.empty?
+              map_id,event_id,actor_id = queue.first
+              return nil unless map_id == $game_map.map_id
+              event = $game_map.events[event_id]
+              return nil unless event && !event.instance_variable_get(:@erased)
+              actor_id == 3 ? 3 : nil
+            end
+
+            def self.discard_first(switch_id)
+              queue = @pending && @pending[switch_id.to_i]
+              return unless queue && !queue.empty?
+              queue.shift
+              @pending.delete(switch_id.to_i) if queue.empty?
+            end
+
+            SNIP
+            match_helper=<<~'SNIP'
+            def self.map_attack_switch?(sid)
+              map = $game_map.instance_variable_get(:@map) if $game_map
+              return false unless map && $data_common_events
+              map.events.values.any? do |event|
+                event.pages.any? do |page|
+                  next false unless page.trigger == 4
+                  cond = page.condition
+                  next false unless (cond.switch1_valid && cond.switch1_id == sid) ||
+                    (cond.switch2_valid && cond.switch2_id == sid)
+                  page.list.any? do |cmd|
+                    cmd.code == 311 && cmd.parameters[0] == 1 ||
+                    cmd.code == 117 && (ce = $data_common_events[cmd.parameters[0]]) &&
+                      ce.name.to_s.b.start_with?('[공격]'.b)
+                  end
                 end
-                @sl_v126_healer = healer
               end
-              active = $game_switches[185] && healer && !healer.transparent &&
-                       !healer.instance_variable_get(:@sl_healer_teleport) &&
-                       $game_actors[3] && $game_actors[3].hp > 0
-              if @sl_v126_target_id == 3
-                return healer if active
-                return nil if @starting || lock?
-                @sl_v126_target_id = nil
-              end
-              return $game_player unless active
-              return $game_player if @starting || lock?
-              player_distance = (@x - $game_player.x).abs + (@y - $game_player.y).abs
-              healer_distance = (@x - healer.x).abs + (@y - healer.y).abs
-              if healer_distance < player_distance
-                @sl_v126_target_id = 3
-                return healer
-              end
-              $game_player
             end
-            HELPER
-            src = once(src,anchor,helper.lines.map{|line|line.chomp}.join(nl) + nl + '  ' + anchor.strip,'Monster shared target selector')
 
-            old = 'if @trigger == 2 and x == $game_player.x and y == $game_player.y'
-            add = 'if @trigger == 2 && (target = sl_v126_monster_target) && x == target.x && y == target.y'
-            src = once(src,old,add,'Monster touch target')
-            old = 'if @trigger == 2 and @x == $game_player.x and @y == $game_player.y'
-            add = 'if @trigger == 2 && (target = sl_v126_monster_target) && @x == target.x && @y == target.y'
-            once(src,old,add,'Monster overlap target')
+            SNIP
+            src=Patch.once(src,anchor,match_helper.lines.map{|s|s.chomp}.join(nl)+nl+'  '+anchor.strip,'Check original map-parallel attack watchers')
+            snippet=addon.lines.map{|s|s.chomp}.join(nl)
+            Patch.once(src,anchor,snippet+nl+'  '+anchor.strip,'Reuse existing attack registration')
           end
-          patched << 'Game_Event'
 
-          patch_script(scripts,'Game_Character 3') do |src,nl|
-            a = src.index('  def move_toward_player')
-            b = src.index('  def move_away_from_player',a)
-            check(a && b, 'Move toward player branch missing')
-            pre = src[0...a]
-            method = src[a...b]
-            tail = src[b..-1]
-            old = '    sx = @x - $game_player.x' + nl + '    sy = @y - $game_player.y'
-            add = ['    target = self.is_a?(Game_Event) ? sl_v126_monster_target : $game_player',
-                   '    return if target.nil?',
-                   '    sx = @x - target.x',
-                   '    sy = @y - target.y'].join(nl)
-            pre + once(method,old,add,'Monster chase target') + tail
+          patch(scripts,changed,'Interpreter 4') do |src,nl|
+            head,meth,tail=Patch.method_span(src,'  def command_121','  def command_122','Switch handler')
+            anchor='      $game_switches[i] = (@parameters[2] == 0)'
+            lines=[
+              '      if @event_id.to_i > 0 && @parameters[2] == 0 && !$game_switches[i] && $game_map.map_id == @map_id',
+              '        monster = $game_map.events[@event_id]',
+              '        if monster && monster.instance_variable_get(:@sl_healer_touch_enabled) && monster.instance_variable_get(:@sl_touch_actor_id) == 3 &&',
+                  '          ($data_common_events.any? { |event| event && event.trigger == 2 && event.switch_id == i } || SLMonsterAttackContext.map_attack_switch?(i))',
+              '          SLMonsterAttackContext.register(i,@map_id,@event_id)',
+              '        end',
+              '      end',
+              anchor
+            ]
+            meth=Patch.once(meth,anchor,lines.join(nl),'Connect legacy monster attack switch')
+            src=head+meth+tail
+            old='      actor = $game_actors[@parameters[4]]'
+            add='      actor = $game_actors[@sl_attack_actor_id == 3 && @parameters[4] == 1 ? 3 : @parameters[4]]'
+            Patch.once(src,old,add,'Existing attack actor stats')
           end
-          patched << 'Game_Character 3'
 
-          patch_script(scripts,'Interpreter 1') do |src,nl|
-            anchor = '  def iterate_actor(parameter)'
-            helper = <<~'HELPER'
-            def sl_v126_attack_monster
-              return nil if @event_id.to_i <= 0 || $game_map.nil? || @map_id != $game_map.map_id
-              monster = $game_map.events[@event_id]
-              return nil unless monster && monster.instance_variable_get(:@sl_v126_monster_attack)
-              return nil unless @depth > 0 || @list.equal?(monster.list)
-              monster
-            end
-            def sl_v126_actor_id(id)
-              return id unless id == 1
-              monster = sl_v126_attack_monster
-              return id unless monster && monster.instance_variable_get(:@sl_v126_target_id) == 3
-              healer = monster.instance_variable_get(:@sl_v126_healer)
-              return nil unless healer && $game_switches[185] && !healer.transparent &&
-                !healer.instance_variable_get(:@sl_healer_teleport) &&
-                $game_actors[3] && $game_actors[3].hp > 0
-              3
-            end
-            HELPER
-            src = once(src,anchor,helper.lines.map{|line|line.chomp}.join(nl) + nl + '  ' + anchor.strip,'Interpreter attack target')
-            old = '  def iterate_actor(parameter)' + nl
-            add = [ '  def iterate_actor(parameter)',
-                    '    parameter = sl_v126_actor_id(parameter)',
-                    '    return if parameter.nil?' ].join(nl) + nl
-            once(src,old,add,'Actor iterator target')
+          patch(scripts,changed,'Game_CommonEvent') do |src,nl|
+            old='        @interpreter.setup(self.list, 0)'
+            new_text=[
+              old,
+              '        attacker = SLMonsterAttackContext.healer_target(self.switch_id)',
+              '        @interpreter.instance_variable_set(:@sl_attack_actor_id, attacker)',
+              '        if attacker == 3 && !self.list.any? { |command| command.parameters.any? { |p| p.is_a?(String) && p.include?(\'SLMonsterAttackContext.start\') } }',
+              '          SLMonsterAttackContext.discard_first(self.switch_id)',
+              '        end'
+            ].join(nl)
+            Patch.once(src,old,new_text,'Existing common event attacker context')
           end
-          patched << 'Interpreter 1'
 
-          patch_script(scripts,'Interpreter 2') do |src,nl|
-            a = src.index('  def get_character(parameter)')
-            b = src.index('  def operate_value(',a)
-            check(a && b,'Interpreter character access missing')
-            old = '      return $game_player'
-            add = [ '      monster = sl_v126_attack_monster',
-                    '      if monster && monster.instance_variable_get(:@sl_v126_target_id) == 3',
-                    '        return nil if sl_v126_actor_id(1).nil?',
-                    '        return monster.instance_variable_get(:@sl_v126_healer)',
-                    '      end',
-                    old ].join(nl)
-            src[0...a] + once(src[a...b],old,add,'Interpreter monster graphic target') + src[b..-1]
+          patch(scripts,changed,'Interpreter 3') do |src,nl|
+            old='      actor = $game_actors[@parameters[1]]'
+            new_text='      actor = $game_actors[@sl_attack_actor_id == 3 && @parameters[1] == 1 ? 3 : @parameters[1]]'
+            src=Patch.once(src,old,new_text,'Existing attack actor condition')
+            old='      result = (Input.press?(@parameters[1]))'
+            new_text=[
+              '      monster = $game_map.events[@event_id] if @map_id == $game_map.map_id && @event_id.to_i > 0',
+              '      healer_contact = @parameters[1] == 13 && monster && monster.instance_variable_get(:@sl_touch_actor_id) == 3',
+              '      result = healer_contact ? false : Input.press?(@parameters[1])'
+            ].join(nl)
+            src=Patch.once(src,old,new_text,'Preserve player attack input on healer contact')
+            old='      @child_interpreter.setup(common_event.list, @event_id)'
+            new_text=[old,'      @child_interpreter.instance_variable_set(:@sl_attack_actor_id, @sl_attack_actor_id)'].join(nl)
+            Patch.once(src,old,new_text,'Carry actor through existing common event call')
           end
-          patched << 'Interpreter 2'
 
-          patch_script(scripts,'Interpreter 3') do |src,nl|
-            old = '      actor = $game_actors[@parameters[1]]'
-            add = [ '      actor_id = sl_v126_actor_id(@parameters[1])',
-                    '      actor = actor_id ? $game_actors[actor_id] : nil' ].join(nl)
-            once(src,old,add,'Actor conditions during attack')
+          patch(scripts,changed,'Interpreter 1') do |src,nl|
+            head,meth,tail=Patch.method_span(src,'  def iterate_actor(parameter)','  def iterate_enemy','Actor iterator')
+            a='    # 파티 전체의 경우'
+            b=[
+              '    if @sl_attack_actor_id == 3 && (parameter == 1 || parameter == 0)',
+              '      healer = $game_map.events.values.find { |e| e.instance_variable_get(:@event) && e.instance_variable_get(:@event).name == \'[ID힐러 마법사]\' }',
+              '      return unless $game_switches[185] && healer && !healer.transparent && !healer.instance_variable_get(:@sl_healer_teleport) && $game_actors[3] && $game_actors[3].hp > 0',
+              '      parameter = 3',
+              '    end',
+              a
+            ].join(nl)
+            meth=Patch.once(meth,a,b,'Reuse existing actor damage iterator')
+            head+meth+tail
           end
-          patched << 'Interpreter 3'
 
-          patch_script(scripts,'Interpreter 4') do |src,nl|
-            old = '      actor = $game_actors[@parameters[4]]'
-            add = [ '      actor_id = sl_v126_actor_id(@parameters[4])',
-                    '      actor = actor_id ? $game_actors[actor_id] : nil' ].join(nl)
-            once(src,old,add,'Actor stats during attack')
+          patch(scripts,changed,'Interpreter 2') do |src,nl|
+            head,meth,tail=Patch.method_span(src,'  def get_character(parameter)','  def operate_value(','Actor animation lookup')
+            old='      return $game_player'
+            new_text=[
+              '      if @sl_attack_actor_id == 3',
+              '        healer = $game_map.events.values.find { |e| e.instance_variable_get(:@event) && e.instance_variable_get(:@event).name == \'[ID힐러 마법사]\' }',
+              '        return healer if healer && !healer.transparent && !healer.instance_variable_get(:@sl_healer_teleport)',
+              '        return nil',
+              '      end',
+              old
+            ].join(nl)
+            head+Patch.once(meth,old,new_text,'Reuse existing hit animation target')+tail
           end
-          patched << 'Interpreter 4'
 
-          check(patched.length == 7 && patched.uniq.length == 7, 'Wrong script patch count')
-          File.binwrite(SCRIPTS, Marshal.dump(scripts))
+          patch(scripts,changed,'버프,물약 이미지 출력') do |src,nl|
+            old='    $Buf_23.bitmap = RPG::Cache.icon("홀리워크버프")'
+            Patch.once(src,old,[old,'    $Buf_23.zoom_x = 32.0 / 38.0','    $Buf_23.zoom_y = 32.0 / 37.0'].join(nl),'Original Holy Walk 623 display only')
+          end
 
-          mapping_path = File.join(KNIGHT,'gameasync/mapping.js')
-          mapping = File.binread(mapping_path).force_encoding('UTF-8')
+          Patch.check(changed.length==9,"Unexpected changed scripts #{changed.inspect}")
+          File.binwrite(out_path,Marshal.dump(scripts))
+          puts "PASS patch script count=#{changed.length}: #{changed.join(', ')}"
+          RUBY_V127
+          ruby -c build/patch_v127.rb
+          ruby build/patch_v127.rb site/knight/gameasync/Data/Scripts.rxdata site/knight/gameasync/Data/Scripts.rxdata
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, hashlib
+          root = Path('site')
+          scripts = root/'knight/gameasync/Data/Scripts.rxdata'
+          mapping = root/'knight/gameasync/mapping.js'
+          content = mapping.read_text('utf8')
           token = 'Data/Scripts.rxdata?h='
-          regex = Regexp.new(Regexp.escape(token) + '[0-9a-f]{32}')
-          check(mapping.scan(regex).length == 1, 'Script mapping hash mismatch')
-          mapping = mapping.sub(regex,token + Digest::MD5.file(SCRIPTS).hexdigest)
-          File.binwrite(mapping_path,mapping)
-
-          html = File.join(KNIGHT,'index.html')
-          data = File.binread(html).force_encoding('UTF-8')
-          check(data.include?('V1.25') && data.include?('v1.25'),'V1.25 HTML version missing')
-          File.binwrite(html,data.gsub('V1.25','V1.26').gsub('v1.25','v1.26'))
-
-          root_html = File.join(ROOT,'index.html')
-          data = File.binread(root_html).force_encoding('UTF-8')
-          check(data.include?('V1.25'),'V1.25 launcher missing')
-          File.binwrite(root_html,data.gsub('V1.25','V1.26'))
-
-          loader = File.join(KNIGHT,'js/sl-assets-v229r115.js')
-          data = File.binread(loader).force_encoding('UTF-8')
-          check(data.scan("var version='V1.25';").size == 1,'V1.25 loader marker missing')
-          File.binwrite(loader,data.sub("var version='V1.25';","var version='V1.26';"))
-          puts "PASS: #{patched.length} original scripts edited, no event edits"
-          puts 'PASS: 623 upper-right buff 32x32 display only; original icon preserved'
-          puts 'PASS: original attack event/CE62 reused with healer target and teleport exclusion'
-          RUBY_V126
-          ruby -c build/patch_v126.rb
-          ruby build/patch_v126.rb site
+          regex = re.compile(re.escape(token) + '[0-9a-f]{32}')
+          assert len(regex.findall(content)) == 1, 'Existing Scripts hash missing'
+          mapping.write_text(regex.sub(token + hashlib.md5(scripts.read_bytes()).hexdigest(), content), 'utf8')
+          for filename in ('knight/index.html', 'index.html'):
+              path = root/filename
+              text = path.read_text('utf8')
+              assert 'V1.25' in text, filename
+              path.write_text(text.replace('V1.25','V1.27').replace('v1.25','v1.27'), 'utf8')
+          loader = root/'knight/js/sl-assets-v229r115.js'
+          content = loader.read_text('utf8')
+          assert content.count("var version='V1.25';") == 1
+          loader.write_text(content.replace("var version='V1.25';","var version='V1.27';"), 'utf8')
+          PY
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Verify V1.26 exact change scope
+      - name: Verify V1.27 exact change scope and damage target
         shell: bash
         run: |
           set -euo pipefail
@@ -346,40 +396,41 @@ jobs:
               'knight/index.html',
               'index.html',
           }
-          assert changed == allowed, ('Unapproved file modifications', sorted(changed ^ allowed))
+          assert changed == allowed, ('Unapproved modifications', sorted(changed ^ allowed))
           scripts = root/'knight/gameasync/Data/Scripts.rxdata'
           mapping = (root/'knight/gameasync/mapping.js').read_text('utf8')
-          token = 'Data/Scripts.rxdata?h='
-          assert mapping.count(token + hashlib.md5(scripts.read_bytes()).hexdigest()) == 1
-          assert "var version='V1.26';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
-          assert 'SLKnight V1.26' in (root/'knight/index.html').read_text('utf8')
-          assert 'bitmap-map.js?v=v1.26' in (root/'knight/index.html').read_text('utf8')
-          assert 'V1.26' in (root/'index.html').read_text('utf8')
-          pre = 'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          assert pre+'Map043.rxdata' not in after and pre+'Map044.rxdata' not in after
-          print('PASS: exactly five allowed files changed, 5619 files retained')
+          assert mapping.count('Data/Scripts.rxdata?h=' + hashlib.md5(scripts.read_bytes()).hexdigest()) == 1
+          assert "var version='V1.27';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
+          assert 'SLKnight V1.27' in (root/'knight/index.html').read_text('utf8')
+          assert 'bitmap-map.js?v=v1.27' in (root/'knight/index.html').read_text('utf8')
+          assert 'V1.27' in (root/'index.html').read_text('utf8')
+          print('PASS: 5619 files maintained, only five approved game files modified; all maps unchanged')
           PY
           ruby - <<'RUBY'
+          # encoding: UTF-8
+          require 'zlib'
           before = Marshal.load(File.binread('build/Scripts.v125.rxdata'))
           after = Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
-          raise 'Scripts count mismatch' unless before.length == after.length
+          raise 'Script count changed' unless before.length == after.length
           changed = []
-          before.each_with_index do |prev,i|
-            cur = after[i]
-            next if prev == cur
-            raise 'Script metadata changed' unless prev[0] == cur[0] && prev[1] == cur[1] && prev.size == cur.size
-            changed << prev[1].to_s.b
+          before.zip(after).each do |original, updated|
+            next if original == updated
+            raise 'Script metadata changed' unless original.size == updated.size && original[0] == updated[0] && original[1] == updated[1]
+            changed << original[1].to_s.force_encoding('UTF-8')
+            text = Zlib::Inflate.inflate(updated[2]).force_encoding('UTF-8')
+            raise 'Failed V1.26 code remains' if text.include?('sl_v126_')
+            RubyVM::InstructionSequence.compile(text)
           end
           expected = [
-            'Game_Character 3','Game_Event',
-            'Interpreter 1','Interpreter 2','Interpreter 3','Interpreter 4',
-            '버프,물약 이미지 출력'
-          ].map(&:b)
-          raise "Unexpected script changes: #{changed.inspect}" unless changed.sort == expected.sort
-          puts 'PASS: seven permitted original scripts changed; all other scripts byte-identical'
+            'Game_Event', 'Game_Character 3', 'Verified Monster Attack 14',
+            'Interpreter 1', 'Interpreter 2', 'Interpreter 3', 'Interpreter 4',
+            'Game_CommonEvent', '버프,물약 이미지 출력'
+          ]
+          raise "Unapproved scripts: #{changed.inspect}" unless changed.sort == expected.sort
+          puts 'PASS: nine original scripts only, V1.26 custom target logic removed'
           RUBY
 
-      - name: Publish V1.26 candidate
+      - name: Publish V1.27 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
