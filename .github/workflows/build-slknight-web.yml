@@ -1,5 +1,5 @@
 
-name: build-slknight-web.yml | V1.30 | Healer Aggro, Teleport Reset, Holy Walk Buff Icon
+name: build-slknight-web.yml | V1.31 | Healer Aggro, Teleport Reset, Holy Walk Buff Icon
 
 "on":
   workflow_dispatch:
@@ -23,465 +23,196 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: Restore V1.29 deployed original
+      - name: Restore V1.30 deployed game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 43248867808
+          run-id: 43373491899
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify exact V1.29 baseline
+      - name: Verify V1.30 original
         shell: bash
         run: |
           set -euo pipefail
           test -s baseline/artifact.tar
-          mkdir -p site build/v130/original build/v130/modified
+          mkdir -p site build/v131
           tar -xf baseline/artifact.tar -C site
-          python3 <<'PY_BASE'
+          python3 <<'PY'
           from pathlib import Path
-          import hashlib,json,shutil
-          root=Path('site')
-          files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert len(files)==5619,('File count',len(files))
-          scripts=root/'knight/gameasync/Data/Scripts.rxdata'
-          assert scripts.is_file()
-          assert 'SLKnight V1.29' in (root/'knight/index.html').read_text('utf8')
-          assert "var version='V1.29';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
-          Path('build/v130/before.json').write_text(json.dumps(files,ensure_ascii=False),encoding='utf8')
-          shutil.copy2(scripts,'build/v130/Scripts.v129.rxdata')
-          print('PASS V1.29 baseline: 5619 original files')
-          PY_BASE
+          import hashlib, json
+          root = Path('site')
+          before = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in root.rglob('*') if p.is_file()}
+          assert len(before) == 5619, len(before)
+          assert 'SLKnight V1.30' in (root/'knight/index.html').read_text('utf-8')
+          assert "var version='V1.30';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf-8')
+          assert (root/'knight/gameasync/Data/Scripts.rxdata').is_file()
+          Path('build/v131/before.json').write_text(json.dumps(before, ensure_ascii=False), 'utf-8')
+          print('PASS V1.30 deployed original, 5619 files')
+          PY
+          cp site/knight/gameasync/Data/Scripts.rxdata build/v131/Scripts.v130.rxdata
 
-      - name: Change only original target branches
+      - name: Restore only first healer/player recognition branch
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v130/extract.rb <<'RUBY_EXTRACT'
+          ruby <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
-          path, output = ARGV
-          raise 'Missing paths' unless path && output
-          Dir.mkdir(output) unless Dir.exist?(output)
-          names=['Game_Event','Game_Character 3','Interpreter 2','Interpreter 4']
-          scripts=Marshal.load(File.binread(path))
-          raise 'Unexpected script count' unless scripts.size==137
-          found=[]
-          scripts.each do |row|
-            next unless row.is_a?(Array) && row[2].is_a?(String)
-            name=row[1].to_s.dup.force_encoding('UTF-8')
-            next unless names.include?(name)
-            File.binwrite(File.join(output,name+'.rb'),Zlib::Inflate.inflate(row[2]))
-            found<<name
-          end
-          raise "Wrong source scripts: #{found}" unless found.sort==names.sort
-          puts 'PASS four existing scripts extracted'
-          RUBY_EXTRACT
-          cat > build/v130/patch_scripts.py <<'PY_PATCH'
-          from pathlib import Path
-          import subprocess
-          base=Path('original'); out=Path('modified'); out.mkdir(exist_ok=True)
+          path = 'site/knight/gameasync/Data/Scripts.rxdata'
+          scripts = Marshal.load(File.binread(path))
+          raise 'Unexpected script count' unless scripts.size == 137
+          row = scripts.find { |r| r.is_a?(Array) && r[1].to_s.dup.force_encoding('UTF-8') == 'Game_Character 3' }
+          raise 'Game_Character 3 not found' unless row
+          source = Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
+          old = "    if self.is_a?(Game_Event) && @sl_combat_event && @trigger == 2\n      target = sl_combat_target\n      return unless target\n    end"
+          restored = [
+            '    if self.is_a?(Game_Event) && @sl_combat_event && @trigger == 2',
+            '      if @sl_target_actor_id.nil?',
+            '        healer = $game_map.sl_healer_event',
+            '        active = $game_switches[185] && healer && !healer.transparent &&',
+            '                 !healer.instance_variable_get(:@sl_healer_teleport) &&',
+            '                 $game_actors[3] && $game_actors[3].hp > 0',
+            '        pd = (@x - $game_player.x).abs + (@y - $game_player.y).abs',
+            '        hd = active ? (@x - healer.x).abs + (@y - healer.y).abs : nil',
+            '        @sl_target_actor_id = [hd && hd < pd ? 3 : 1]',
+            '      end',
+            '      target = sl_combat_target',
+            '      return unless target',
+            '    end'
+          ].join("\n")
+          raise "Unexpected V1.30 recognition block #{source.scan(old).size}" unless source.scan(old).size == 1
+          updated = source.sub(old, restored)
+          RubyVM::InstructionSequence.compile(updated)
+          row[2] = Zlib::Deflate.deflate(updated.b)
+          File.binwrite(path, Marshal.dump(scripts))
+          File.binwrite('build/v131/Game_Character 3.rb', updated)
+          puts 'PASS only first recognition restored; teleport and target branches unchanged'
+          RUBY
 
-          def patch(name,replacements):
-              p=base/(name+'.rb')
-              text=p.read_bytes().decode('utf-8')
-              nl='\r\n' if '\r\n' in text else '\n'
-              for label,old,new in replacements:
-                  old=old.replace('\n',nl); new=new.replace('\n',nl)
-                  count=text.count(old)
-                  if count!=1: raise RuntimeError(f'{name}/{label}: {count} matches')
-                  text=text.replace(old,new,1)
-              q=out/(name+'.rb');q.write_bytes(text.encode('utf-8'))
-              result=subprocess.run(['ruby','-c',str(q)],capture_output=True,text=True)
-              if result.returncode: raise RuntimeError(result.stderr)
-              print('PASS',name,', '.join(t[0] for t in replacements))
-
-          patch('Game_Event',[
-              ('teleport branch without target mutation',
-               '    @sl_target_actor_id[0] = 0\n    @sl_target_actor_id = nil\n    nil',
-               '    nil'),
-          ])
-          patch('Game_Character 3',[
-              ('remove forced target reset on healer teleport',
-               '''            $game_map.events.each_value do |event|
-                        target = event.instance_variable_get(:@sl_target_actor_id)
-                        if target && target[0] == 3
-                          target[0] = 0
-                          event.instance_variable_set(:@sl_target_actor_id, nil)
-                        end
-                      end
-          ''',
-               ''),
-              ('remove nearest-based target reselection',
-               '''      healer = $game_map.sl_healer_event
-                active = $game_switches[185] && healer && !healer.transparent &&
-                         !healer.instance_variable_get(:@sl_healer_teleport) &&
-                         $game_actors[3] && $game_actors[3].hp > 0
-                if (@sl_target_actor_id && @sl_target_actor_id[0] == 3) && !active
-                  @sl_target_actor_id[0] = 0
-                  @sl_target_actor_id = nil
-                  return
-                end
-                if @sl_target_actor_id.nil?
-                  pd = (@x - $game_player.x).abs + (@y - $game_player.y).abs
-                  hd = active ? (@x - healer.x).abs + (@y - healer.y).abs : nil
-                  @sl_target_actor_id = [hd && hd < pd ? 3 : 1]
-                end
-          ''',
-               ''),
-          ])
-          patch('Interpreter 2',[
-              ('hit-animation target in main event',
-               '      return $game_player if @main && @sl_attack_target && @sl_attack_target[0] == 3',
-               '      return $game_player if @main && @sl_contact_actor_id == 1'),
-          ])
-          patch('Interpreter 4',[
-              ('remove implicit actor-1 target when absent',
-               '          target = source.instance_variable_get(:@sl_target_actor_id) || [1]',
-               '          target = source.instance_variable_get(:@sl_target_actor_id)'),
-          ])
-          PY_PATCH
-          cat > build/v130/assemble.rb <<'RUBY_ASSEMBLE'
-          # encoding: UTF-8
-          require 'zlib'
-          path, changed_dir = ARGV
-          raise 'Missing paths' unless path && changed_dir
-          scripts=Marshal.load(File.binread(path))
-          raise 'Wrong script count' unless scripts.length==137
-          expected=['Game_Event','Game_Character 3','Interpreter 2','Interpreter 4']
-          changed=[]
-          scripts.each do |row|
-            next unless row.is_a?(Array) && row[2].is_a?(String)
-            name=row[1].to_s.dup.force_encoding('UTF-8')
-            file=File.join(changed_dir,name+'.rb')
-            next unless File.file?(file)
-            before=Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
-            after=File.binread(file).force_encoding('UTF-8')
-            raise "No change #{name}" if before==after
-            RubyVM::InstructionSequence.compile(after)
-            row[2]=Zlib::Deflate.deflate(after.b)
-            changed<<name
-          end
-          raise "Unexpected script changes #{changed}" unless changed.sort==expected.sort
-          File.binwrite(path,Marshal.dump(scripts))
-          puts 'PASS exactly four existing scripts patched, 133 unchanged'
-          RUBY_ASSEMBLE
-          ruby build/v130/extract.rb site/knight/gameasync/Data/Scripts.rxdata build/v130/original
-          (cd build/v130 && python3 patch_scripts.py)
-          ruby build/v130/assemble.rb site/knight/gameasync/Data/Scripts.rxdata build/v130/modified
-
-      - name: Link resurrection scroll to existing choice and death pages
+      - name: Update cache hash and V1.31 version
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v130/patch_revive.rb <<'RUBY_REVIVE'
-          # encoding: UTF-8
-          require 'fileutils'
-          require 'digest'
-          module RPG
-            class Item; end
-            class CommonEvent; end
-            class EventCommand; end
-            class AudioFile; end
-            class State; end
-            class Map; end
-            class MapInfo; end
-            class MoveRoute; end
-            class MoveCommand; end
-            class Event; class Page; class Condition; end; class Graphic; end; end; end
-          end
-          [Color=Class.new,Tone=Class.new,Table=Class.new].each do |klass|
-            klass.define_singleton_method(:_load) { |raw| obj=allocate; obj.instance_variable_set(:@raw,raw); obj }
-            klass.define_method(:_dump) { |_limit| @raw }
-          end
-          input, output = ARGV
-          raise 'Missing data paths' unless input && output
-          FileUtils.mkdir_p(output)
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          items_file=File.join(input,prefix+'Items.rxdata')
-          commons_file=File.join(input,prefix+'CommonEvents.rxdata')
-          items=Marshal.load(File.binread(items_file))
-          commons=Marshal.load(File.binread(commons_file))
-          item=items.fetch(38)
-          raise 'Unexpected resurrection scroll' unless item.instance_variable_get(:@name).to_s.b.include?('부활 주문서'.b) &&
-            item.instance_variable_get(:@common_event_id)==0 && item.instance_variable_get(:@scope)==0 &&
-            item.instance_variable_get(:@consumable)==false
-          raise 'Not the expected CE211 choice source' unless commons[211].instance_variable_get(:@name).to_s.b.include?('축순'.b)
-          raise 'Unexpected common event slot' unless commons.size==1071 && commons[-1].instance_variable_get(:@id)==1070
-          original_items=items.map{|x|x && Digest::SHA256.hexdigest(Marshal.dump(x))}
-          original_commons=commons.map{|x|x && Digest::SHA256.hexdigest(Marshal.dump(x))}
-
-          id=commons.size
-          revive=Marshal.load(Marshal.dump(commons[211]))
-          revive.instance_variable_set(:@id,id)
-          revive.instance_variable_set(:@name,'[주문서]부활')
-          revive.instance_variable_set(:@trigger,0)
-          revive.instance_variable_set(:@switch_id,1)
-
-          def cmd(code,indent,params=[])
-            o=RPG::EventCommand.allocate
-            o.instance_variable_set(:@code,code)
-            o.instance_variable_set(:@indent,indent)
-            o.instance_variable_set(:@parameters,params)
-            o
-          end
-          # The existing death page A remains until command 116 erases the event.
-          # No added timer, new actor, MP recovery, or erase-reset routine.
-          can_revive='$game_actors[3].hp == 0 && (h=$game_map.sl_healer_event) && !h.instance_variable_get(:@erased) && $game_self_switches[[$game_map.map_id,h.id,"A"]]'
-          revive.instance_variable_set(:@list,[
-            cmd(102,0,[['힐러 마법사'],5]),
-            cmd(402,0,[0,'힐러 마법사']),
-            cmd(111,1,[12,can_revive]),
-            cmd(355,2,['$game_actors[3].hp = [$game_actors[3].maxhp / 3, 1].max']),
-            cmd(121,2,[185,185,0]),
-            cmd(126,2,[38,1,0,1]),
-            cmd(0,2),
-            cmd(412,1),
-            cmd(0,1),
-            cmd(403,0),
-            cmd(0,1),
-            cmd(404,0),
-            cmd(0,0)
-          ])
-          commons << revive
-          item.instance_variable_set(:@common_event_id,id)
-          raise 'Unexpected modification to items' unless items.each_with_index.all?{|o,i|i==38 || (o && Digest::SHA256.hexdigest(Marshal.dump(o)))==original_items[i]}
-          raise 'Original common events modified' unless commons[0...id].each_with_index.all?{|o,i|(o && Digest::SHA256.hexdigest(Marshal.dump(o)))==original_commons[i]}
-          File.binwrite(File.join(output,prefix+'Items.rxdata'), Marshal.dump(items))
-          File.binwrite(File.join(output,prefix+'CommonEvents.rxdata'), Marshal.dump(commons))
-          puts "PASS item 38 linked to cloned choice event #{id}, original events preserved"
-          puts 'PASS one healer option, physical cancel, HP one-third, MP unchanged, 116 timeout'
-          RUBY_REVIVE
-          ruby build/v130/patch_revive.rb site/knight/gameasync/Data site/knight/gameasync/Data
-
-      - name: Update existing cache hashes and version markers
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/v130/update_version.py <<'PY_VERSION'
+          python3 <<'PY'
           from pathlib import Path
-          import hashlib,re
-          root=Path('site')
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          files=['Scripts.rxdata',prefix+'Items.rxdata',prefix+'CommonEvents.rxdata']
-          p=root/'knight/gameasync/mapping.js'
-          s=p.read_text('utf8')
-          for name in files:
-              path=root/'knight/gameasync/Data'/name
-              rx=re.compile(re.escape('Data/'+name+'?h=')+r'[0-9a-f]{32}')
-              assert len(rx.findall(s))==1,name
-              s=rx.sub('Data/'+name+'?h='+hashlib.md5(path.read_bytes()).hexdigest(),s)
-          p.write_text(s,encoding='utf8')
-          for name in ['index.html','knight/index.html']:
-              p=root/name
-              s=p.read_text('utf8')
-              assert 'V1.29' in s
-              p.write_text(s.replace('V1.29','V1.30').replace('v1.29','v1.30'),encoding='utf8')
-          p=root/'knight/js/sl-assets-v229r115.js'
-          s=p.read_text('utf8')
-          assert s.count("var version='V1.29';")==1
-          p.write_text(s.replace("var version='V1.29';","var version='V1.30';"),encoding='utf8')
-          print('PASS exact three Data hashes and version markers')
-          PY_VERSION
-          python3 build/v130/update_version.py
+          import hashlib, re
+          root = Path('site')
+          script = root/'knight/gameasync/Data/Scripts.rxdata'
+          mapping = root/'knight/gameasync/mapping.js'
+          data = mapping.read_text('utf-8')
+          pattern = re.compile(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}')
+          assert len(pattern.findall(data)) == 1
+          mapping.write_text(pattern.sub('Data/Scripts.rxdata?h='+hashlib.md5(script.read_bytes()).hexdigest(), data), 'utf-8')
+          for name in ['index.html', 'knight/index.html']:
+              p = root/name
+              text = p.read_text('utf-8')
+              assert 'V1.30' in text, name
+              p.write_text(text.replace('V1.30', 'V1.31').replace('v1.30', 'v1.31'), 'utf-8')
+          p = root/'knight/js/sl-assets-v229r115.js'
+          text = p.read_text('utf-8')
+          assert text.count("var version='V1.30';") == 1
+          p.write_text(text.replace("var version='V1.30';", "var version='V1.31';"), 'utf-8')
+          PY
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Verify original files and healer behavior
+      - name: Verify first target, teleport and untouched scripts
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v130/audit.py <<'PY_AUDIT'
-          from pathlib import Path
-          import hashlib,json,sys
-          root=Path('site')
-          prev=json.loads(Path(sys.argv[1]).read_text('utf8'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          pfx='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          expected={'knight/gameasync/Data/Scripts.rxdata',
-                    'knight/gameasync/Data/'+pfx+'Items.rxdata',
-                    'knight/gameasync/Data/'+pfx+'CommonEvents.rxdata',
-                    'knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js',
-                    'index.html','knight/index.html'}
-          changed={p for p in prev if prev[p]!=after.get(p)}
-          assert set(prev)==set(after) and len(after)==5619
-          assert changed==expected,(len(changed),sorted(changed^expected))
-          assert "var version='V1.30';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
-          assert 'SLKnight V1.30' in (root/'knight/index.html').read_text('utf8')
-          prefix=pfx
-          s=(root/'knight/gameasync/mapping.js').read_text('utf8')
-          for name in ['Scripts.rxdata',pfx+'Items.rxdata',pfx+'CommonEvents.rxdata']:
-              hash=hashlib.md5((root/'knight/gameasync/Data'/name).read_bytes()).hexdigest()
-              assert s.count('Data/'+name+'?h='+hash)==1
-          print('PASS exact 7 files changed; 5619 filenames preserved; original maps, animations, Holy Walk intact')
-          PY_AUDIT
-          cat > build/v130/test_runtime.rb <<'RUBY_RUNTIME'
+          ruby <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
-          module Test
-           def self.ok(value, label)
-            raise "FAIL #{label}" unless value
-            puts "PASS #{label}"
-           end
+          old = Marshal.load(File.binread('build/v131/Scripts.v130.rxdata'))
+          new = Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
+          raise 'Script count differs' unless old.size == 137 && new.size == 137
+          changed = old.zip(new).filter_map { |a,b| a == b ? nil : a[1].to_s.dup.force_encoding('UTF-8') }
+          raise "Unexpected scripts: #{changed.inspect}" unless changed == ['Game_Character 3']
+          raw = Zlib::Inflate.inflate(new.find { |r| r[1].to_s.dup.force_encoding('UTF-8') == 'Game_Character 3' }[2]).force_encoding('UTF-8')
+          raise 'Restoration missing' unless raw.include?('@sl_target_actor_id = [hd && hd < pd ? 3 : 1]')
+          raise 'Duplicate first recognition' unless raw.scan('if @sl_target_actor_id.nil?').size == 1
+          RubyVM::InstructionSequence.compile(raw)
+          puts 'PASS only Game_Character 3 changed, 136 scripts intact'
+          RUBY
+          ruby <<'RUBY_TEST'
+          class Game_Character
+            attr_accessor :x, :y, :transparent, :direction
+            def initialize; @x=0; @y=0; @transparent=false; @direction=2; end
+            def moving?; false; end
+          end
+          class Interpreter; end
+          load 'build/v131/Game_Character 3.rb'
+          load 'build/v131/Game_Event.rb' if File.file?('build/v131/Game_Event.rb')
+          # Extract unmodified Game_Event directly from the current scripts.
+          unless defined?(Game_Event)
+            require 'zlib'
+            scripts = Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
+            row = scripts.find { |r| r[1].to_s.dup.force_encoding('UTF-8') == 'Game_Event' }
+            eval(Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8'), TOPLEVEL_BINDING)
           end
           class Game_Character
-           attr_accessor :x,:y,:transparent,:direction
-           def initialize; @x=0; @y=0;@transparent=false;@direction=2;end
-           def moving?;false;end
-           def move_up(*);@last_move=:up;end
-           def move_down(*);@last_move=:down;end
-           def move_left(*);@last_move=:left;end
-           def move_right(*);@last_move=:right;end
+            def move_up(*); end
+            def move_down(*); end
+            def move_left(*); end
+            def move_right(*); end
           end
-          class Interpreter;end
-          root=ARGV.fetch(0)
-          load File.join(root,'Game_Character 3.rb')
-          load File.join(root,'Game_Event.rb')
-          load File.join(root,'Interpreter 2.rb')
-          load File.join(root,'Interpreter 4.rb')
-          class Game_Character
-           def move_up(*);@last_move=:up;end
-           def move_down(*);@last_move=:down;end
-           def move_left(*);@last_move=:left;end
-           def move_right(*);@last_move=:right;end
-          end
-          Actor=Struct.new(:hp,:maxhp,:sp)
-          Map=Struct.new(:map_id,:sl_healer_event,:events,:common_events)
-          $game_map=Map.new(2,nil,{},{});
-          $game_player=Game_Character.new
-          $game_player.x=0;$game_player.y=0
-          $game_switches=Hash.new(false);$game_switches[185]=true
-          $game_actors={3=>Actor.new(100,120,77)}
-          healer=Game_Event.allocate
-          healer.x=6;healer.y=6;healer.transparent=false
-          $game_map.sl_healer_event=healer
-          monster=Game_Event.allocate
-          monster.instance_variable_set(:@sl_combat_event,true)
-          monster.instance_variable_set(:@trigger,2)
-          monster.instance_variable_set(:@sl_target_actor_id,[3])
-          monster.x=7;monster.y=7
-          $game_map.events={1=>monster,2=>healer}
-          ref=monster.instance_variable_get(:@sl_target_actor_id)
-          Test.ok(monster.sl_combat_target.equal?(healer),'healer target works')
-          healer.instance_variable_set(:@sl_healer_teleport,[9,9,100])
-          Test.ok(monster.sl_combat_target.nil?,'healer is not targetable during teleport')
-          monster.move_toward_player
-          Test.ok(ref==[3] && monster.instance_variable_get(:@sl_target_actor_id).equal?(ref),'no forced aggro reassignment during teleport')
+          Actor = Struct.new(:hp)
+          MapStub = Struct.new(:sl_healer_event, :events)
+          $game_map = MapStub.new(nil,{})
+          $game_player = Game_Character.new
+          $game_player.x=2; $game_player.y=2
+          $game_switches = Hash.new(false); $game_switches[185]=true
+          $game_actors = {3 => Actor.new(100)}
+          healer = Game_Event.allocate
+          healer.x=20; healer.y=19; healer.transparent=false
+          $game_map.sl_healer_event = healer
+          mob = Game_Event.allocate
+          mob.x=21; mob.y=20
+          mob.instance_variable_set(:@sl_combat_event,true)
+          mob.instance_variable_set(:@trigger,2)
+          $game_map.events = {1 => mob, 2 => healer}
+          def check(ok, label); raise "FAIL #{label}" unless ok; puts "PASS #{label}"; end
+          mob.move_toward_player
+          ref = mob.instance_variable_get(:@sl_target_actor_id)
+          check(ref == [3], 'first recognition: healer')
+          $game_player.x=21; $game_player.y=21
+          mob.move_toward_player
+          check(mob.instance_variable_get(:@sl_target_actor_id).equal?(ref), 'no reassignment to closer knight')
+          healer.instance_variable_set(:@sl_healer_teleport,[2,2,100])
+          mob.move_toward_player
+          check(mob.sl_combat_target.nil? && mob.instance_variable_get(:@sl_target_actor_id).equal?(ref), 'teleport: healer not targetable, target not replaced')
           healer.instance_variable_set(:@sl_healer_teleport,nil)
-          Test.ok(monster.sl_combat_target.equal?(healer),'original healer target branch resumes')
-          monster.instance_variable_set(:@sl_target_actor_id,nil)
-          monster.move_toward_player
-          Test.ok(monster.instance_variable_get(:@sl_target_actor_id).nil?,'no distance-based target reassignment')
-          int=Interpreter.new
-          int.instance_variable_set(:@main,true)
-          int.instance_variable_set(:@sl_attack_target,[3])
-          int.instance_variable_set(:@sl_contact_actor_id,3)
-          Test.ok(int.get_character(-1).equal?(healer),'main-event hit-animation target is healer')
-          int.instance_variable_set(:@sl_contact_actor_id,1)
-          Test.ok(int.get_character(-1).equal?($game_player),'hero attack branch keeps original player')
-          int.instance_variable_set(:@sl_contact_actor_id,3)
-          healer.instance_variable_set(:@sl_healer_teleport,[9,9,100])
-          Test.ok(int.get_character(-1).nil?,'no animation to teleporting healer')
-          puts 'ALL TARGET BRANCH TESTS PASSED'
-          RUBY_RUNTIME
-          cat > build/v130/test_revive.rb <<'RUBY_TEST_REVIVE'
-          # encoding: UTF-8
-          module RPG
-           class Item; end;class CommonEvent;end;class EventCommand;end;class AudioFile;end;class State;end; class MoveRoute;end;class MoveCommand;end;class Map;end;class MapInfo;end
-          end
-          [Color=Class.new,Tone=Class.new,Table=Class.new].each do |klass|
-           klass.define_singleton_method(:_load){|raw|o=allocate;o.instance_variable_set(:@raw,raw);o}
-           klass.define_method(:_dump){|_|@raw}
-          end
-          root=ARGV.fetch(0)
-          pfx='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          items=Marshal.load(File.binread(File.join(root,pfx+'Items.rxdata')))
-          ce=Marshal.load(File.binread(File.join(root,pfx+'CommonEvents.rxdata')))
-          raise 'Item linkage failed' unless items[38].instance_variable_get(:@common_event_id)==1071
-          c=ce[1071].instance_variable_get(:@list)
-          cmds=c.map{|x|[x.instance_variable_get(:@code),x.instance_variable_get(:@indent),x.instance_variable_get(:@parameters)]}
-          raise 'Unexpected commands' unless cmds.map(&:first)==[102,402,111,355,121,126,0,412,0,403,0,404,0]
-          raise 'Wrong choice' unless cmds[0][2]==[['힐러 마법사'],5] && cmds[9][0]==403
-          Actor=Struct.new(:hp,:maxhp,:sp)
-          Healer=Struct.new(:id)
-          Map=Struct.new(:map_id,:sl_healer_event)
-          $game_actors={3=>Actor.new(0,100,71)}
-          h=Healer.new(7)
-          h.instance_variable_set(:@erased,false)
-          $game_map=Map.new(2,h)
-          $game_self_switches=Hash.new(false)
-          $game_self_switches[[2,7,'A']]=true
-          condition=cmds[2][2][1]
-          raise 'Dead healer before erase should be eligible' unless eval(condition)
-          h.instance_variable_set(:@erased,true)
-          raise 'Healer after death-page erase should be ineligible' if eval(condition)
-          h.instance_variable_set(:@erased,false)
-          eval(cmds[3][2][0])
-          raise 'HP or MP changed incorrectly' unless $game_actors[3].hp==33 && $game_actors[3].sp==71
-          raise 'Alive healer must be ineligible' if eval(condition)
-          raise 'Switch and scroll consumption ordering' unless cmds[4][2]==[185,185,0] && cmds[5][2]==[38,1,0,1]
-          puts 'PASS active death-page-only revival, HP one-third, MP preserved, one choice, physical cancellation'
-          RUBY_TEST_REVIVE
-          cat > build/v130/verify_death.rb <<'RUBY_DEATH'
-          # encoding: UTF-8
-          module RPG
-           class Map;end;class MapInfo;end;class Event;class Page;class Condition;end;class Graphic;end;end;end
-           class EventCommand;end;class MoveRoute;end;class MoveCommand;end;class AudioFile;end;class Tileset;end
-          end
-          [Color=Class.new,Tone=Class.new,Table=Class.new].each do|klass|
-           klass.define_singleton_method(:_load){|raw|o=allocate;o.instance_variable_set(:@raw,raw);o}
-           klass.define_method(:_dump){|_|@raw}
-          end
-          root=ARGV.fetch(0)
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          healers=0;maps=0
-          Dir.glob(File.join(root,prefix+'Map[0-9][0-9][0-9].rxdata')).sort.each do |path|
-           map=Marshal.load(File.binread(path))
-           next unless map.instance_variable_get(:@events)
-           found=false
-           map.instance_variable_get(:@events).each_value do |event|
-            next unless event.instance_variable_get(:@name).to_s.b=='[ID힐러 마법사]'.b
-            found=true;healers+=1
-            pages=event.instance_variable_get(:@pages)
-            death=pages.select do|pg|
-             c=pg.instance_variable_get(:@condition)
-             c.instance_variable_get(:@self_switch_valid) && c.instance_variable_get(:@self_switch_ch)=='A'
-            end
-            raise "Wrong death page in #{path}" unless death.length==1
-            list=death[0].instance_variable_get(:@list)
-            seq=list.map{|e|e.instance_variable_get(:@code)}
-            raise "Unexpected death-page sequence #{seq} in #{path}" unless seq==[106,116,0]
-            raise 'Not 200 wait units' unless list[0].instance_variable_get(:@parameters)==[200]
-           end
-           maps+=1 if found
-          end
-          raise "Wrong healer count #{healers},#{maps}" unless [healers,maps]==[39,39]
-          puts 'PASS 39 unmodified healer death events, original wait 200 x 2 and command 116'
-          RUBY_DEATH
-          python3 build/v130/audit.py build/v130/before.json
-          ruby <<'RUBY_SCRIPTS'
-          require 'zlib'
-          a=Marshal.load(File.binread('build/v130/Scripts.v129.rxdata'))
-          b=Marshal.load(File.binread('site/knight/gameasync/Data/Scripts.rxdata'))
-          raise 'Script count' unless a.size==137 && b.size==137
-          changes=[]
-          a.zip(b).each do |x,y|
-            next if x==y
-            raise 'Script metadata changed' unless x[0]==y[0] && x[1]==y[1] && x.length==y.length
-            name=x[1].to_s.dup.force_encoding('UTF-8')
-            RubyVM::InstructionSequence.compile(Zlib::Inflate.inflate(y[2]).force_encoding('UTF-8'))
-            changes<<name
-          end
-          expected=['Game_Event','Game_Character 3','Interpreter 2','Interpreter 4']
-          raise "Wrong scripts #{changes}" unless changes.sort==expected.sort
-          puts 'PASS four existing scripts modified, 133 original scripts unchanged' 
-          RUBY_SCRIPTS
-          ruby build/v130/test_runtime.rb build/v130/modified
-          ruby build/v130/test_revive.rb site/knight/gameasync/Data
-          ruby build/v130/verify_death.rb site/knight/gameasync/Data
+          check(mob.sl_combat_target.equal?(healer), 'teleport end: same healer target')
+          mob2 = Game_Event.allocate
+          mob2.x=21; mob2.y=21
+          mob2.instance_variable_set(:@sl_combat_event,true)
+          mob2.instance_variable_set(:@trigger,2)
+          $game_player.x=21; $game_player.y=20
+          mob2.move_toward_player
+          check(mob2.instance_variable_get(:@sl_target_actor_id)==[1], 'first recognition: knight')
+          healer.x=21; healer.y=22
+          mob2.move_toward_player
+          check(mob2.instance_variable_get(:@sl_target_actor_id)==[1], 'knight target not replaced by healer')
+          RUBY_TEST
+          python3 <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          root = Path('site')
+          before = json.loads(Path('build/v131/before.json').read_text('utf-8'))
+          after = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in root.rglob('*') if p.is_file()}
+          changed = {k for k in before if before[k] != after.get(k)}
+          expected = {'knight/gameasync/Data/Scripts.rxdata', 'knight/gameasync/mapping.js',
+                      'knight/js/sl-assets-v229r115.js', 'knight/index.html', 'index.html'}
+          assert len(after) == 5619 and set(after) == set(before)
+          assert changed == expected, sorted(changed ^ expected)
+          print('PASS 5619 original files, only Scripts, mapping and three version files changed')
+          PY
 
-      - name: Publish V1.30 candidate
+      - name: Publish V1.31 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
