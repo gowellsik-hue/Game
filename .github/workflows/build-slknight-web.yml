@@ -57,19 +57,21 @@ jobs:
           assert "var version='V1.31';" in (
               root/'knight/js/sl-assets-v229r115.js'
           ).read_text('utf-8')
-
-          script = root/'knight/gameasync/Data/Scripts.rxdata'
-          assert script.is_file()
+          assert (
+              root/'knight/gameasync/Data/Scripts.rxdata'
+          ).is_file()
 
           Path('build/v132/before.json').write_text(
-              json.dumps(before, ensure_ascii=False), 'utf-8'
+              json.dumps(before, ensure_ascii=False),
+              encoding='utf-8'
           )
-
-          print('PASS V1.31 baseline, 5619 files')
+          print('PASS V1.31 original, 5619 files')
           PY
-          cp site/knight/gameasync/Data/Scripts.rxdata build/v132/Scripts.v131.rxdata
 
-      - name: Correct existing healer and hit branches
+          cp site/knight/gameasync/Data/Scripts.rxdata build/v132/Scripts.v131.rxdata
+          cp site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata build/v132/CommonEvents.v131.rxdata
+
+      - name: Correct existing healer event branches
         shell: bash
         run: |
           set -euo pipefail
@@ -83,25 +85,25 @@ jobs:
 
           changed = []
 
-          patch = lambda do |name, replacements|
-            matches = scripts.select do |row|
+          patch = lambda do |name, edits|
+            rows = scripts.select do |row|
               row.is_a?(Array) &&
                 row[1].to_s.dup.force_encoding('UTF-8') == name
             end
-            raise "Missing or duplicated script #{name}" unless matches.size == 1
+            raise "Missing or duplicated #{name}" unless rows.size == 1
 
-            row = matches.first
+            row = rows.first
             source = Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
             raise "Invalid encoding #{name}" unless source.valid_encoding?
 
             newline = source.include?("\r\n") ? "\r\n" : "\n"
 
-            replacements.each do |old, replacement|
-              old = old.gsub("\n", newline)
-              replacement = replacement.gsub("\n", newline)
-              count = source.scan(old).length
-              raise "#{name}: unexpected branch #{count}" unless count == 1
-              source = source.sub(old, replacement)
+            edits.each do |old_text, new_text|
+              old_text = old_text.gsub("\n", newline)
+              new_text = new_text.gsub("\n", newline)
+              count = source.scan(old_text).size
+              raise "#{name}: branch matches #{count}" unless count == 1
+              source = source.sub(old_text, new_text)
             end
 
             RubyVM::InstructionSequence.compile(source)
@@ -110,110 +112,190 @@ jobs:
             puts "PASS #{name}"
           end
 
+          refresh_old = '        c = page.condition'
+
+          refresh_new = [
+            '        c = page.condition',
+            "        if @event.name == '[ID힐러 마법사]' &&",
+            '           (!$game_switches[185] || !$game_actors[3] ||',
+            '            $game_actors[3].hp <= 0) &&',
+            "           !(c.self_switch_valid && c.self_switch_ch == 'A')",
+            '          next',
+            '        end'
+          ].join("\n")
+
+          erase_old = [
+            '  def erase',
+            '    @erased = true'
+          ].join("\n")
+
+          erase_new = [
+            '  def erase',
+            "    if @event.name == '[ID힐러 마법사]' &&",
+            '       $game_actors[3] && $game_actors[3].hp <= 0 &&',
+            "       $game_self_switches[[@map_id, @id, 'A']]",
+            "      $game_self_switches[[@map_id, @id, 'A']] = false",
+            '      $game_switches[188] = false',
+            '    end',
+            '    @erased = true'
+          ].join("\n")
+
           patch.call('Game_Event', [
-            [
-              '        c = page.condition',
-              <<~'NEW'.rstrip
-                      c = page.condition
-                      if @event.name == '[ID힐러 마법사]' &&
-                         (!$game_switches[185] || !$game_actors[3] ||
-                          $game_actors[3].hp <= 0) &&
-                         !(c.self_switch_valid && c.self_switch_ch == 'A')
-                        next
-                      end
-              NEW
-            ],
-            [
-              "  def erase\n    @erased = true",
-              <<~'NEW'.rstrip
-                def erase
-                  if @event.name == '[ID힐러 마법사]' &&
-                     $game_actors[3] && $game_actors[3].hp <= 0 &&
-                     $game_self_switches[[@map_id, @id, 'A']]
-                    $game_self_switches[[@map_id, @id, 'A']] = false
-                    $game_switches[188] = false
-                  end
-                  @erased = true
-              NEW
-            ]
+            [refresh_old, refresh_new],
+            [erase_old, erase_new]
           ])
+
+          map_old = "    @sl_healer_event = @events.values.find { |e| e.instance_variable_get(:@event).name == '[ID힐러 마법사]' }"
+
+          map_new = [
+            '    if @sl_healer_event && $game_actors[3] &&',
+            '       $game_actors[3].hp <= 0 &&',
+            "       $game_self_switches[[@sl_healer_event.instance_variable_get(:@map_id), @sl_healer_event.id, 'A']]",
+            '      @sl_healer_event.erase',
+            '    end',
+            map_old
+          ].join("\n")
 
           patch.call('Game_Map', [
-            [
-              '    @map_id = map_id',
-              <<~'NEW'.rstrip
-                    if @sl_healer_event && $game_actors[3] &&
-                       $game_actors[3].hp <= 0 &&
-                       $game_self_switches[[@map_id, @sl_healer_event.id, 'A']]
-                      @sl_healer_event.erase
-                    end
-                    @map_id = map_id
-              NEW
-            ],
-            [
-              '      if $data_common_events[i].trigger == 2',
-              '      if $data_common_events[i].trigger == 2 || i == 137'
-            ]
+            [map_old, map_new]
           ])
 
-          patch.call('Game_CommonEvent', [
-            [
-              '      @sl_attack_target = nil',
-              <<~'NEW'.rstrip
-                      @sl_attack_target = nil unless
-                        self.trigger == 1 && self.switch_id == 493 &&
-                        $game_switches[self.switch_id]
-              NEW
-            ]
-          ])
-
-          patch.call('Interpreter 1', [
-            [
-              '        setup(common_event.list, 0)',
-              <<~'NEW'.rstrip
-                        setup(common_event.list, 0)
-                        if i == 137 && $game_map.common_events[i]
-                          @sl_attack_target =
-                            $game_map.common_events[i].instance_variable_get(:@sl_attack_target)
-                        end
-              NEW
-            ]
-          ])
-
-          patch.call('Interpreter 4', [
-            [
-              'if @parameters[2] == 0 && !$game_switches[i] && @event_id.to_i > 0',
-              'if @parameters[2] == 0 && !$game_switches[i] && (@event_id.to_i > 0 || (i == 493 && @sl_attack_target))'
-            ],
-            [
-              'if source && source.instance_variable_get(:@sl_combat_event)',
-              'if (source && source.instance_variable_get(:@sl_combat_event)) || (i == 493 && @sl_attack_target)'
-            ],
-            [
-              'target = source.instance_variable_get(:@sl_target_actor_id)',
-              'target = (i == 493 && @sl_attack_target) || source.instance_variable_get(:@sl_target_actor_id)'
-            ],
-            [
-              'next unless common_event.trigger == 2 && common_event.switch_id == i',
-              'next unless common_event.switch_id == i && (common_event.trigger == 2 || (i == 493 && common_event.trigger == 1))'
-            ]
-          ])
-
-          expected = [
-            'Game_Event',
-            'Game_Map',
-            'Game_CommonEvent',
-            'Interpreter 1',
-            'Interpreter 4'
-          ]
-
-          raise "Wrong patch scope #{changed.inspect}" unless changed.sort == expected.sort
+          raise "Wrong script changes #{changed.inspect}" unless
+            changed.sort == ['Game_Event', 'Game_Map']
 
           File.binwrite(path, Marshal.dump(scripts))
-          puts 'PASS five existing scripts patched'
+          puts 'PASS existing healer page, erase and map-transition branches'
           RUBY
 
-      - name: Update cache hash and V1.32 version
+      - name: Correct existing healer hit-motion branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby <<'RUBY'
+          # encoding: UTF-8
+          require 'zlib'
+          require 'digest'
+
+          module RPG
+            class CommonEvent; end
+            class EventCommand; end
+            class MoveRoute; end
+            class MoveCommand; end
+            class AudioFile; end
+            class State; end
+          end
+
+          [Color=Class.new, Tone=Class.new, Table=Class.new].each do |klass|
+            klass.define_singleton_method(:_load) do |raw|
+              object = allocate
+              object.instance_variable_set(:@raw, raw)
+              object
+            end
+            klass.define_method(:_dump) { |_limit| @raw }
+          end
+
+          prefix = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          path = 'site/knight/gameasync/Data/' + prefix + 'CommonEvents.rxdata'
+
+          commons = Marshal.load(File.binread(path))
+          raise 'Common event list missing' unless commons.size > 137
+
+          ce57 = commons.fetch(57)
+          ce137 = commons.fetch(137)
+
+          raise 'CE57 missing' unless ce57
+          raise 'CE137 missing' unless ce137
+
+          original = commons.map do |event|
+            event && Digest::SHA256.hexdigest(Marshal.dump(event))
+          end
+
+          original_list = ce57.instance_variable_get(:@list)
+          hit_list = ce137.instance_variable_get(:@list)
+
+          raise 'CE57 list missing' unless
+            original_list.is_a?(Array) && !original_list.empty?
+
+          raise 'CE137 list missing' unless
+            hit_list.is_a?(Array) && !hit_list.empty?
+
+          hit_routes = hit_list.select do |command|
+            command.instance_variable_get(:@code) == 209 &&
+              command.instance_variable_get(:@parameters)[0] == -1
+          end
+
+          raise 'Existing CE137 hit route missing' if hit_routes.empty?
+
+          scripts = Marshal.load(
+            File.binread('site/knight/gameasync/Data/Scripts.rxdata')
+          )
+
+          interpreter3 = scripts.find do |row|
+            row[1].to_s.dup.force_encoding('UTF-8') == 'Interpreter 3'
+          end
+
+          interpreter2 = scripts.find do |row|
+            row[1].to_s.dup.force_encoding('UTF-8') == 'Interpreter 2'
+          end
+
+          raise 'Interpreter 3 missing' unless interpreter3
+          raise 'Interpreter 2 missing' unless interpreter2
+
+          child_source = Zlib::Inflate.inflate(
+            interpreter3[2]
+          ).force_encoding('UTF-8')
+
+          character_source = Zlib::Inflate.inflate(
+            interpreter2[2]
+          ).force_encoding('UTF-8')
+
+          raise 'Original common-event target inheritance missing' unless
+            child_source.include?(
+              '@child_interpreter.instance_variable_set(:@sl_attack_target, @sl_attack_target)'
+            )
+
+          raise 'Original hit-character branch missing' unless
+            character_source.include?('@sl_attack_target') &&
+            character_source.include?('sl_healer_event')
+
+          def event_command(code, indent, parameters=[])
+            command = RPG::EventCommand.allocate
+            command.instance_variable_set(:@code, code)
+            command.instance_variable_set(:@indent, indent)
+            command.instance_variable_set(:@parameters, parameters)
+            command
+          end
+
+          branch = [
+            event_command(
+              111, 0,
+              [12, '@sl_attack_target && @sl_attack_target[0] == 3']
+            ),
+            event_command(117, 1, [137]),
+            event_command(115, 1),
+            event_command(0, 1),
+            event_command(412, 0)
+          ]
+
+          ce57.instance_variable_set(
+            :@list,
+            branch + original_list
+          )
+
+          differences = commons.each_with_index.filter_map do |event, index|
+            current = event && Digest::SHA256.hexdigest(Marshal.dump(event))
+            index if original[index] != current
+          end
+
+          raise "Unexpected CE changes #{differences.inspect}" unless
+            differences == [57]
+
+          File.binwrite(path, Marshal.dump(commons))
+          puts 'PASS CE57 healer branch to existing CE137'
+          puts 'PASS original knight branch and CE137 unchanged'
+          RUBY
+
+      - name: Update cache hashes and V1.32 version
         shell: bash
         run: |
           set -euo pipefail
@@ -223,34 +305,51 @@ jobs:
           import re
 
           root = Path('site')
-          script = root/'knight/gameasync/Data/Scripts.rxdata'
+          data_dir = root/'knight/gameasync/Data'
           mapping = root/'knight/gameasync/mapping.js'
+          content = mapping.read_text('utf-8')
 
-          data = mapping.read_text('utf-8')
-          pattern = re.compile(r'Data/Scripts\.rxdata\?h=[0-9a-f]{32}')
+          prefix = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          assert len(pattern.findall(data)) == 1
-          data = pattern.sub(
-              'Data/Scripts.rxdata?h=' +
-              hashlib.md5(script.read_bytes()).hexdigest(),
-              data
-          )
-          mapping.write_text(data, 'utf-8')
+          for name in [
+              'Scripts.rxdata',
+              prefix + 'CommonEvents.rxdata'
+          ]:
+              path = data_dir/name
+              pattern = re.compile(
+                  re.escape('Data/' + name + '?h=') +
+                  r'[0-9a-f]{32}'
+              )
+
+              assert len(pattern.findall(content)) == 1, name
+
+              content = pattern.sub(
+                  'Data/' + name + '?h=' +
+                  hashlib.md5(path.read_bytes()).hexdigest(),
+                  content
+              )
+
+          mapping.write_text(content, 'utf-8')
 
           for name in ['index.html', 'knight/index.html']:
-              p = root/name
-              text = p.read_text('utf-8')
+              path = root/name
+              text = path.read_text('utf-8')
               assert 'V1.31' in text, name
-              p.write_text(
+              path.write_text(
                   text.replace('V1.31', 'V1.32').replace('v1.31', 'v1.32'),
                   'utf-8'
               )
 
-          p = root/'knight/js/sl-assets-v229r115.js'
-          text = p.read_text('utf-8')
+          loader = root/'knight/js/sl-assets-v229r115.js'
+          text = loader.read_text('utf-8')
+
           assert text.count("var version='V1.31';") == 1
-          p.write_text(
-              text.replace("var version='V1.31';", "var version='V1.32';"),
+
+          loader.write_text(
+              text.replace(
+                  "var version='V1.31';",
+                  "var version='V1.32';"
+              ),
               'utf-8'
           )
           PY
@@ -258,58 +357,99 @@ jobs:
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Verify exact script and file changes
+      - name: Verify exact V1.32 changes
         shell: bash
         run: |
           set -euo pipefail
           ruby <<'RUBY'
+          # encoding: UTF-8
           require 'zlib'
+          require 'digest'
 
-          before = Marshal.load(
+          original = Marshal.load(
             File.binread('build/v132/Scripts.v131.rxdata')
           )
-          after = Marshal.load(
+
+          current = Marshal.load(
             File.binread('site/knight/gameasync/Data/Scripts.rxdata')
           )
 
           raise 'Script count changed' unless
-            before.size == 137 && after.size == 137
+            original.size == 137 && current.size == 137
 
-          changed = before.zip(after).filter_map do |old, current|
-            next if old == current
+          changed = original.zip(current).filter_map do |before, after|
+            next if before == after
             raise 'Script metadata changed' unless
-              old[0] == current[0] && old[1] == current[1]
-            current[1].to_s.dup.force_encoding('UTF-8')
+              before[0] == after[0] && before[1] == after[1]
+            after[1].to_s.dup.force_encoding('UTF-8')
           end
 
-          expected = [
-            'Game_Event',
-            'Game_Map',
-            'Game_CommonEvent',
-            'Interpreter 1',
-            'Interpreter 4'
-          ]
+          raise "Unexpected scripts #{changed.inspect}" unless
+            changed.sort == ['Game_Event', 'Game_Map']
 
-          raise "Unexpected changes #{changed.inspect}" unless
-            changed.sort == expected.sort
-
-          before.zip(after).each do |old, current|
-            next unless old[1].to_s.dup.force_encoding('UTF-8') == 'Game_Character 3'
-            raise 'Aggro or teleport script changed' unless old == current
-          end
-
-          after.each do |row|
+          current.each do |row|
             next unless row.is_a?(Array) && row[2].is_a?(String)
             name = row[1].to_s.dup.force_encoding('UTF-8')
-            next unless expected.include?(name)
+            next unless changed.include?(name)
             RubyVM::InstructionSequence.compile(
               Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
             )
           end
 
-          puts 'PASS five existing scripts modified'
-          puts 'PASS 132 other scripts unchanged'
-          puts 'PASS original aggro and teleport script unchanged'
+          puts 'PASS Game_Event and Game_Map only'
+          puts 'PASS Game_Character 3, existing aggro, teleport and all other scripts unchanged'
+
+          module RPG
+            class CommonEvent; end
+            class EventCommand; end
+            class MoveRoute; end
+            class MoveCommand; end
+            class AudioFile; end
+            class State; end
+          end
+
+          [Color=Class.new, Tone=Class.new, Table=Class.new].each do |klass|
+            klass.define_singleton_method(:_load) do |raw|
+              object = allocate
+              object.instance_variable_set(:@raw, raw)
+              object
+            end
+            klass.define_method(:_dump) { |_limit| @raw }
+          end
+
+          prefix = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          old_ce = Marshal.load(
+            File.binread('build/v132/CommonEvents.v131.rxdata')
+          )
+          new_ce = Marshal.load(
+            File.binread(
+              'site/knight/gameasync/Data/' + prefix + 'CommonEvents.rxdata'
+            )
+          )
+
+          raise 'Common event count changed' unless
+            old_ce.size == new_ce.size
+
+          differences = old_ce.zip(new_ce).each_with_index.filter_map do |pair, index|
+            before, after = pair
+            next if Marshal.dump(before) == Marshal.dump(after)
+            index
+          end
+
+          raise "Unexpected common events #{differences.inspect}" unless
+            differences == [57]
+
+          old_list = old_ce[57].instance_variable_get(:@list)
+          new_list = new_ce[57].instance_variable_get(:@list)
+
+          raise 'Original CE57 commands changed' unless
+            Marshal.dump(new_list[5..-1]) == Marshal.dump(old_list)
+
+          raise 'CE137 changed' unless
+            Marshal.dump(new_ce[137]) == Marshal.dump(old_ce[137])
+
+          puts 'PASS CE57 branch only, original commands unchanged'
+          puts 'PASS original CE137 and all other common events unchanged'
           RUBY
 
           python3 <<'PY'
@@ -321,13 +461,17 @@ jobs:
           before = json.loads(
               Path('build/v132/before.json').read_text('utf-8')
           )
+
           after = {
               str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in root.rglob('*') if p.is_file()
           }
 
+          prefix = 'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
           expected = {
               'knight/gameasync/Data/Scripts.rxdata',
+              prefix + 'CommonEvents.rxdata',
               'knight/gameasync/mapping.js',
               'knight/js/sl-assets-v229r115.js',
               'knight/index.html',
@@ -335,22 +479,30 @@ jobs:
           }
 
           changed = {
-              k for k in before if before[k] != after.get(k)
+              path for path in before
+              if before[path] != after.get(path)
           }
 
           assert len(after) == 5619
           assert set(after) == set(before)
           assert changed == expected, sorted(changed ^ expected)
 
-          script = root/'knight/gameasync/Data/Scripts.rxdata'
           mapping = (
               root/'knight/gameasync/mapping.js'
           ).read_text('utf-8')
 
-          assert (
-              'Data/Scripts.rxdata?h=' +
-              hashlib.md5(script.read_bytes()).hexdigest()
-          ) in mapping
+          for name in [
+              'Scripts.rxdata',
+              'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOCommonEvents.rxdata'
+          ]:
+              data = (
+                  root/'knight/gameasync/Data'/name
+              ).read_bytes()
+
+              assert (
+                  'Data/' + name + '?h=' +
+                  hashlib.md5(data).hexdigest()
+              ) in mapping
 
           assert 'SLKnight V1.32' in (
               root/'knight/index.html'
@@ -360,9 +512,10 @@ jobs:
               root/'knight/js/sl-assets-v229r115.js'
           ).read_text('utf-8')
 
-          print('PASS 5619 original file names retained')
-          print('PASS no unrelated game data changes')
-          print('PASS V1.32 cache hash and version markers')
+          print('PASS 5619 original files retained')
+          print('PASS six approved files changed')
+          print('PASS all original map data unchanged')
+          print('PASS V1.32 version and cache hashes')
           PY
 
       - name: Publish V1.32 candidate
