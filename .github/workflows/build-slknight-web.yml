@@ -1,5 +1,4 @@
-
-name: build-slknight-web.yml | V2.1 | Healer Aggro, Teleport Reset, Holy Walk Buff Icon
+name: build-slknight-web.yml | V2.2 | Healer Aggro, Teleport Reset, Holy Walk Buff Icon
 
 "on":
   workflow_dispatch:
@@ -25,799 +24,367 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Restore V1.36 game without modifying other game features
+      - name: Restore exact deployed V2.1 game without rebuilding existing features
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 43703021854
+          run-id: 43714437330
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify original game and retain exact file hashes
+      - name: Verify V2.1 source and prepare existing extraction environment
         shell: bash
         run: |
           set -euo pipefail
           test -s baseline/artifact.tar
-          mkdir -p site build/v21 source
+          mkdir -p site build/v22
           tar -xf baseline/artifact.tar -C site
-          python3 <<'PY'
-          from pathlib import Path
-          import hashlib,json,struct
-          root=Path('site');output=Path('build/v21')
-          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in root.rglob('*') if p.is_file()}
-          assert len(before)==5619,('Wrong last deployed game',len(before))
-          assert 'SLKnight V1.36' in (root/'knight/index.html').read_text('utf-8')
-          assert "var version='V1.36';" in (root/'knight/js/sl-assets-v229r115.js').read_text('utf-8')
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          base=root/'knight/gameasync/Data'
-          for name,dest in [('Scripts.rxdata','Scripts.v136.original.rxdata'),
-                            (prefix+'Map047.rxdata','Map047.v136.original.rxdata'),
-                            (prefix+'Map029.rxdata','Map029.v136.original.rxdata')]:
-              p=base/name
-              assert p.is_file(),('Original game source missing',name)
-              (output/dest).write_bytes(p.read_bytes())
-          pack=root/'knight/assets/map-047-v241.pack'
-          h=pack.read_bytes()
-          n=struct.unpack_from('<I',h)[0]
-          manifest=json.loads(h[4:4+n]);assert manifest['map_id']==47 and len(manifest['files'])==194
-          (output/'map-047-v241.original.pack').write_bytes(h)
-          (output/'before.json').write_text(json.dumps(before,sort_keys=True),'utf-8')
-          print('PASS last deployed V1.36 original: 5619 files and original 194 map assets')
-          PY
-
-      - name: Retrieve exact Sanctuary Map0 native source files
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release download v1.0.0 -R gowellsik-hue/Game \
-            -p 'Sanctuary.of.Aden.-.Copy.z32' \
-            -p 'Sanctuary.of.Aden.-.Copy.z33' \
-            -p 'Sanctuary.of.Aden.-.Copy.z34' \
-            -p 'Sanctuary.of.Aden.-.Copy.z35' \
-            -p 'Sanctuary.of.Aden.-.Copy.z36' \
-            -p 'Sanctuary.of.Aden.-.Copy.zip' \
-            -D source --clobber
-          for n in 32 33 34 35 36; do test -s "source/Sanctuary.of.Aden.-.Copy.z${n}"; done
-          test -s source/Sanctuary.of.Aden.-.Copy.zip
+          test -s site/knight/gameasync/Data/Scripts.rxdata
+          test -s site/knight/assets/map-047-v241.pack
+          grep -q 'SLKnight V2.1' site/knight/index.html
+          grep -q "var version='V2.1';" site/knight/js/sl-assets-v229r115.js
           python3 -m venv .venv
           .venv/bin/python -m pip install --quiet --disable-pip-version-check 'Pillow>=11,<13'
 
-      - name: Reconstruct complete native Map0 artwork and full walkability
+      - name: Capture exact V2.1 deployed game inventory
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v21/build_map047_original.py <<'V21_SOURCE_EOF'
+          mkdir -p build/v22
+          python3 - <<'PY'
           from pathlib import Path
-          from collections import Counter
+          import hashlib,json
+          root=Path('site')
+          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+          assert len(before)==6003,('Wrong V2.1 deployed game',len(before))
+          Path('build/v22/v21-original-filehash.json').write_text(json.dumps(before,sort_keys=True),'utf8')
+          PY
+
+      - name: Retrieve all original Sanctuary Map4 source files
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 43157706909
+          name: Sanctuary-Original-Map-4-Full
+          github-token: ${{ github.token }}
+          path: source-map4
+
+      - name: Build original Map048 graphics and 194-point river boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v22/build_map048.py <<'V22_MAP48_SOURCE_EOF'
+          from pathlib import Path
           from functools import lru_cache
-          import hashlib, json, os, re, struct, sys, time, zlib
-          from PIL import Image, ImageChops, ImageStat
+          from PIL import Image,ImageChops,ImageDraw
+          import collections,hashlib,json,re,struct,time
           from io import BytesIO
 
-          SITE=Path('site'); ROOT=Path('source'); OUT=Path('build/v21')
-          OUT.mkdir(parents=True,exist_ok=True)
           W,H=768,384
-          PX,PY=W*16,H*16
-          SHIFT_X,SHIFT_Y=175*16,10*16
-          STEM='Sanctuary.of.Aden.-.Copy'
-          raw=(ROOT/(STEM+'.zip')).read_bytes()
-          records=[]; pos=0
-          while True:
-              pos=raw.find(b'PK\x01\x02',pos)
-              if pos<0 or pos+46>len(raw):break
-              fields=struct.unpack_from('<IHHHHHHIIIHHHHHII',raw,pos)
-              name_len,ex,comment=fields[10:13]
-              end=pos+46+name_len+ex+comment
-              if not 0<name_len<=1024 or end>len(raw):pos+=4;continue
-              name=raw[pos+46:pos+46+name_len].decode('utf-8' if fields[3]&0x800 else 'cp949','replace').replace('\\','/')
-              if re.search(r'/map/0/[0-9a-f]{8}\.s32$',name,re.I) or name.lower().endswith(('/tile.idx','/tile.pak')):
-                  records.append({'name':name,'method':fields[4],'crc':fields[7], 'packed':fields[8], 'size':fields[9], 'disk':fields[13], 'offset':fields[16]})
-              pos=end
-          maps=[x for x in records if re.search(r'/map/0/[0-9a-f]{8}\.s32$',x['name'],re.I)]
-          assert len(maps)==64,('Original Map0 source must have all 64 S32 blocks',len(maps))
-          assert len({r['name'].lower() for r in records})==66,('Duplicate/missing original data',len(records))
-          @lru_cache(maxsize=3)
-          def volume(disk):
-              assert 0<=disk<=45,('Invalid archive disk',disk)
-              n=STEM+(f'.z{disk+1:02d}' if disk<45 else '.zip')
-              return (ROOT/n).read_bytes()
-          def read_span(d,o,n):
-              out=bytearray()
-              while len(out)<n:
-                  data=volume(d); k=min(n-len(out),len(data)-o)
-                  assert k>=0,('Archive offset beyond EOF',d,o)
-                  if k==0:d+=1;o=0;continue
-                  out.extend(data[o:o+k]);o+=k
-                  if o==len(data):d+=1;o=0
-              return bytes(out)
-          def advance(d,o,n):
-              while n:
-                  data=volume(d);k=min(n,len(data)-o)
-                  assert k>=0
-                  if k==0:d+=1;o=0;continue
-                  o+=k;n-=k
-                  if o==len(data):d+=1;o=0
-              return d,o
-          def extract(rec):
-              d,o=rec['disk'],rec['offset'];head=read_span(d,o,30)
-              assert head[:4]==b'PK\x03\x04',('Missing original file header',rec['name'])
-              n,ex=struct.unpack_from('<HH',head,26)
-              d,o=advance(d,o,30+n+ex)
-              packed=read_span(d,o,rec['packed'])
-              data=zlib.decompress(packed,-15) if rec['method']==8 else packed
-              assert len(data)==rec['size'] and (zlib.crc32(data)&0xffffffff)==rec['crc'],('Original CRC error',rec['name'])
-              return data
-          idx=extract(next(r for r in records if r['name'].lower().endswith('/tile.idx')))
-          pak=extract(next(r for r in records if r['name'].lower().endswith('/tile.pak')))
+          PW,PH=W*16,H*16
+          XORG,YORG=32448,32064
+          UORG=64854
+          XSHIFT,YSHIFT=4,2679
+          SITE=Path('site')
+          ROOT=Path('source-map4')
+          OUT=Path('build/v22')
+          OUT.mkdir(parents=True,exist_ok=True)
+          state=json.loads('{"mapId":4,"status":"river-aligned-draft-not-game-verified","sightOverlapCells":44,"sourceMap":{"x0":32448,"y0":32064,"width":1856,"height":1536,"sourceBlocks":602},"landmarks":[{"name":"글루디오","x":32608,"y":32734},{"name":"우드벡","x":32640,"y":33203},{"name":"은기사","x":33080,"y":33386}],"riverCut":[{"x":32520,"y":32440},{"x":32522,"y":32447},{"x":32525,"y":32454},{"x":32525,"y":32464},{"x":32525,"y":32474},{"x":32524,"y":32485},{"x":32524,"y":32494},{"x":32524,"y":32504},{"x":32525,"y":32512},{"x":32526,"y":32521},{"x":32528,"y":32528},{"x":32531,"y":32535},{"x":32535,"y":32542},{"x":32539,"y":32546},{"x":32545,"y":32550},{"x":32555,"y":32550},{"x":32568,"y":32546},{"x":32583,"y":32542},{"x":32598,"y":32537},{"x":32610,"y":32534},{"x":32622,"y":32532},{"x":32632,"y":32532},{"x":32640,"y":32533},{"x":32648,"y":32534},{"x":32658,"y":32534},{"x":32668,"y":32534},{"x":32676,"y":32535},{"x":32685,"y":32537},{"x":32693,"y":32538},{"x":32702,"y":32539},{"x":32712,"y":32539},{"x":32722,"y":32538},{"x":32733,"y":32537},{"x":32743,"y":32537},{"x":32754,"y":32535},{"x":32765,"y":32534},{"x":32777,"y":32532},{"x":32788,"y":32531},{"x":32798,"y":32531},{"x":32807,"y":32531},{"x":32818,"y":32529},{"x":32829,"y":32528},{"x":32839,"y":32528},{"x":32847,"y":32529},{"x":32856,"y":32531},{"x":32863,"y":32533},{"x":32872,"y":32534},{"x":32880,"y":32535},{"x":32890,"y":32535},{"x":32899,"y":32535},{"x":32910,"y":32534},{"x":32921,"y":32533},{"x":32932,"y":32532},{"x":32942,"y":32532},{"x":32950,"y":32533},{"x":32958,"y":32535},{"x":32965,"y":32538},{"x":32972,"y":32540},{"x":32981,"y":32542},{"x":32988,"y":32544},{"x":32995,"y":32546},{"x":33001,"y":32550},{"x":33004,"y":32557},{"x":33004,"y":32567},{"x":33005,"y":32575},{"x":33006,"y":32584},{"x":33006,"y":32594},{"x":33005,"y":32605},{"x":33005,"y":32614},{"x":33005,"y":32624},{"x":33005,"y":32634},{"x":33004,"y":32645},{"x":33001,"y":32657},{"x":33000,"y":32668},{"x":32999,"y":32679},{"x":32999,"y":32688},{"x":33000,"y":32697},{"x":33003,"y":32704},{"x":33005,"y":32711},{"x":33006,"y":32720},{"x":33006,"y":32729},{"x":33004,"y":32742},{"x":33001,"y":32754},{"x":32998,"y":32767},{"x":32993,"y":32782},{"x":32987,"y":32797},{"x":32981,"y":32813},{"x":32977,"y":32826},{"x":32978,"y":32835},{"x":32982,"y":32841},{"x":32988,"y":32845},{"x":32993,"y":32849},{"x":32999,"y":32853},{"x":33005,"y":32857},{"x":33009,"y":32863},{"x":33010,"y":32871},{"x":33007,"y":32883},{"x":33005,"y":32896},{"x":33001,"y":32909},{"x":32999,"y":32921},{"x":32998,"y":32932},{"x":32998,"y":32942},{"x":33000,"y":32949},{"x":33001,"y":32957},{"x":33003,"y":32966},{"x":33001,"y":32977},{"x":32999,"y":32989},{"x":32996,"y":33001},{"x":32995,"y":33012},{"x":32995,"y":33022},{"x":32998,"y":33029},{"x":33000,"y":33036},{"x":33004,"y":33042},{"x":33009,"y":33047},{"x":33015,"y":33051},{"x":33022,"y":33053},{"x":33032,"y":33053},{"x":33041,"y":33053},{"x":33050,"y":33054},{"x":33057,"y":33057},{"x":33063,"y":33060},{"x":33068,"y":33065},{"x":33074,"y":33069},{"x":33081,"y":33071},{"x":33089,"y":33074},{"x":33095,"y":33077},{"x":33098,"y":33083},{"x":33102,"y":33090},{"x":33107,"y":33094},{"x":33112,"y":33099},{"x":33117,"y":33104},{"x":33121,"y":33109},{"x":33129,"y":33111},{"x":33137,"y":33113},{"x":33144,"y":33115},{"x":33152,"y":33117},{"x":33159,"y":33120},{"x":33169,"y":33120},{"x":33181,"y":33117},{"x":33192,"y":33116},{"x":33201,"y":33116},{"x":33210,"y":33117},{"x":33218,"y":33119},{"x":33226,"y":33121},{"x":33232,"y":33125},{"x":33238,"y":33128},{"x":33243,"y":33133},{"x":33249,"y":33137},{"x":33254,"y":33142},{"x":33257,"y":33148},{"x":33260,"y":33155},{"x":33260,"y":33165},{"x":33261,"y":33173},{"x":33261,"y":33183},{"x":33263,"y":33190},{"x":33267,"y":33196},{"x":33269,"y":33204},{"x":33268,"y":33214},{"x":33263,"y":33229},{"x":33260,"y":33242},{"x":33256,"y":33256},{"x":33251,"y":33270},{"x":33249,"y":33282},{"x":33250,"y":33291},{"x":33252,"y":33298},{"x":33255,"y":33305},{"x":33258,"y":33311},{"x":33260,"y":33320},{"x":33261,"y":33328},{"x":33264,"y":33334},{"x":33268,"y":33341},{"x":33271,"y":33348},{"x":33274,"y":33354},{"x":33277,"y":33361},{"x":33279,"y":33368},{"x":33283,"y":33374},{"x":33286,"y":33381},{"x":33289,"y":33388},{"x":33291,"y":33395},{"x":33292,"y":33404},{"x":33294,"y":33412},{"x":33296,"y":33419},{"x":33298,"y":33427},{"x":33302,"y":33433},{"x":33304,"y":33440},{"x":33308,"y":33446},{"x":33312,"y":33452},{"x":33313,"y":33461},{"x":33313,"y":33470},{"x":33311,"y":33482},{"x":33311,"y":33492},{"x":33312,"y":33501},{"x":33315,"y":33507},{"x":33321,"y":33510}]}')
+          assert state['mapId']==4 and state['status']=='river-aligned-draft-not-game-verified'
+          assert len(state['riverCut'])==194 and state['sightOverlapCells']==44
+          assert state['sourceMap']=={'x0':32448,'y0':32064,'width':1856,'height':1536,'sourceBlocks':602}
+          manifest=json.loads((ROOT/'manifest.json').read_text('utf-8'))
+          assert manifest['originalMapId']==4 and manifest['sourceBlocks']==602 and manifest['sourceFiles']==790
+          assert len(manifest['files'])==792 and len(manifest['missingBlocks'])==94
+          assert manifest['coveredCells']==2465792 and manifest['preferredSourceBlocks']=={'s32':559,'seg':43}
+
+          def fx(wx,wy):return 6*(wx+wy-UORG)+XSHIFT
+          def fy(wx,wy):return 3*(wy-wx)+YSHIFT
+
+          cities={p['name']:(round(fx(p['x'],p['y'])/16),round(fy(p['x'],p['y'])/16)) for p in state['landmarks']}
+          assert cities=={'글루디오':(183,191),'우드벡':(371,273),'은기사':(605,225)}
+          line=[(fx(p['x'],p['y']),fy(p['x'],p['y'])) for p in state['riverCut']]
+          assert all(line[i+1][0]>line[i][0] for i in range(len(line)-1))
+          # Native preview's 44-cell sight strip is 132 pixels at the Map048 source scale.
+          mask=Image.new('L',(PW,PH),0)
+          d=ImageDraw.Draw(mask)
+          d.polygon([(x,y-44*3) for x,y in line]+[(line[-1][0],PH),(line[0][0],PH)],fill=255)
+          del d
+          landmask=Image.new('L',(PW,PH),0)
+          d=ImageDraw.Draw(landmask)
+          d.polygon(line+[(line[-1][0],PH),(line[0][0],PH)],fill=255)
+          del d
+          # Art outside the review boundary remains absent. The sight strip has NO passage.
+          mask_small=landmask.resize((W,H),Image.Resampling.NEAREST)
+
+          idx=(ROOT/'Tile.idx').read_bytes()
+          pak=(ROOT/'Tile.pak').read_bytes()
           n=struct.unpack_from('<I',idx)[0]
-          assert n>4000 and len(idx)==4+28*n,('Original Tile.idx invalid',n)
+          assert n==4958 and len(idx)==4+n*28
           files={}
           for i in range(n):
-              p=4+i*28
-              off=struct.unpack_from('<I',idx,p)[0]
-              name=idx[p+4:p+24].split(b'\0')[0].decode('ascii','replace').lower()
-              size=struct.unpack_from('<I',idx,p+24)[0]
-              assert name not in files and off+size<=len(pak),('Bad Tile.pak file',name)
-              files[name]=(off,size)
-          print('PASS original source',len(maps),'blocks',n,'tile files',flush=True)
-          blocks=[]
-          for rec in maps:
-              data=extract(rec)
-              name=Path(rec['name']).stem.lower()
-              bx,by=int(name[:4],16),int(name[4:],16)
-              blocks.append((bx,by,name,data))
-          xs=sorted({x for x,y,s,d in blocks});ys=sorted({y for x,y,s,d in blocks})
-          assert len(xs)==8 and len(ys)==8 and len(blocks)==64,('Incomplete 512x512 native Map0',xs,ys)
-          assert xs==list(range(xs[0],xs[0]+8)) and ys==list(range(ys[0],ys[0]+8))
-          attr=bytearray(512*512*2)
-          coverage=bytearray(512*512)
-          for bx,by,stem,data in blocks:
-              count=struct.unpack_from('<H',data,128*64*4)[0]
-              layer3=128*64*4+2+count*6
-              assert layer3+4096*4<=len(data),('Missing original attributes',stem)
-              for y in range(64):
-                  for x in range(64):
-                      i=(by-ys[0])*64*512+(bx-xs[0])*64+y*512+x
-                      assert not coverage[i]
-                      a,b=struct.unpack_from('<HH',data,layer3+(y*64+x)*4)
-                      struct.pack_into('<H',attr,i*2,a)
-                      coverage[i]=1
-          assert sum(coverage)==512*512
-          (OUT/'attr1_512x512_le.bin').write_bytes(attr)
-          (OUT/'map0-coverage.json').write_text(json.dumps({'width':512,'height':512,'blocks':64,'covered':sum(coverage),'xs':[xs[0],xs[-1]],'ys':[ys[0],ys[-1]]},indent=2))
-          walk=bytearray(2*W*H); attrs=memoryview(attr).cast('H')
-          # The verified Map047 whole-island projection is in native 32-pixel coordinates.
-          for y in range(H):
-              py=y*32+48
-              for x in range(W):
-                  px=x*32+16
-                  sx=round(256+px/48-py/24)
-                  sy=round(-256+px/48+py/24)
-                  sx=min(511,max(0,sx));sy=min(511,max(0,sy))
-                  tile=384 if attrs[sy*512+sx]&1==0 else 385
-                  struct.pack_into('<H',walk,2*(y*W+x),tile)
-          (OUT/'map47-full-walk.bin').write_bytes(walk)
-          print('PASS 768x384 original full-map collision attributes',flush=True)
+           p=4+i*28
+           off=struct.unpack_from('<I',idx,p)[0]
+           name=idx[p+4:p+24].split(b'\0')[0].decode('ascii','replace').lower()
+           size=struct.unpack_from('<I',idx,p+24)[0]
+           assert name not in files and off+size<=len(pak)
+           files[name]=(off,size)
+          source_files=collections.defaultdict(dict)
+          for e in manifest['files']:
+           p=ROOT/e['file']
+           assert p.is_file() and p.stat().st_size==e['size']
+           assert hashlib.sha256(p.read_bytes()).hexdigest()==e['sha256'],('bad source hash',e['file'])
+           if not e['file'].lower().endswith(('.s32','.seg')):continue
+           stem=p.stem.lower();ext=p.suffix.lower()
+           assert ext not in source_files[stem]
+           source_files[stem][ext]=p
+          assert len(source_files)==602
 
-          @lru_cache(maxsize=14000)
+          stats=collections.Counter()
+          missing_tiles=collections.Counter()
+          @lru_cache(maxsize=20000)
           def tile_bitmap(tile,index):
-              info=files.get(f'{tile}.til')
-              if not info:return None
-              off,size=info
-              blob=memoryview(pak)[off:off+size]
-              if len(blob)<12:return None
-              frames=struct.unpack_from('<I',blob,0)[0]
-              if not (0<=index<frames<=2048):return None
-              base=4+4*(frames+1)
-              a,b=struct.unpack_from('<II',blob,4+index*4)
-              if a>=b or base+b>len(blob):return None
-              frame=blob[base+a:base+b]
-              typ=frame[0]
-              if typ not in (0,1,2,3,6,7,8,9,16,17,18,19,22,23,34,35):return None
-              rgba=bytearray(24*24*4)
-              def dot(x,y,val):
-                  if 0<=x<24 and 0<=y<24:
-                      j=4*(y*24+x)
-                      rgba[j]=(val>>10&31)*255//31
-                      rgba[j+1]=(val>>5&31)*255//31
-                      rgba[j+2]=(val&31)*255//31
-                      rgba[j+3]=255
-              p=1
-              try:
-                  if not typ&2:
-                      for y in range(24):
-                          q=(y+1)*2 if y<12 else (23-y)*2
-                          x0=0 if typ&1 else 24-q
-                          for x in range(q):
-                              val=struct.unpack_from('<H',frame,p)[0];p+=2;dot(x0+x,y,val)
-                  else:
-                      xo,yo,_,rows=struct.unpack_from('<BBBB',frame,p);p+=4
-                      for y in range(rows):
-                          x=xo;segments=frame[p];p+=1
-                          for seg in range(segments):
-                              x+=frame[p]//2;p+=1
-                              span=frame[p];p+=1
-                              for j in range(span):
-                                  val=struct.unpack_from('<H',frame,p)[0];p+=2;dot(x+j,yo+y,val)
-                              x+=span
-              except (struct.error,IndexError):return None
-              return Image.frombytes('RGBA',(24,24),bytes(rgba)).resize((12,12),Image.Resampling.NEAREST)
+           info=files.get(f'{tile}.til')
+           if info is None:
+            missing_tiles[('file',tile)]+=1;return None
+           off,size=info
+           blob=memoryview(pak)[off:off+size]
+           if len(blob)<12:missing_tiles[('short',tile)]+=1;return None
+           frames=struct.unpack_from('<I',blob,0)[0]
+           if not (0<=index<frames<=2048):
+            missing_tiles[('frame',tile,index)]+=1;return None
+           base=4+4*(frames+1)
+           a,b=struct.unpack_from('<II',blob,4+index*4)
+           if a==b:return None
+           if a>b or base+b>len(blob):
+            missing_tiles[('offset',tile,index)]+=1;return None
+           frame=blob[base+a:base+b]
+           typ=frame[0]
+           if typ not in (0,1,2,3,6,7,8,9,16,17,18,19,22,23,34,35):
+            missing_tiles[('type',tile,index,typ)]+=1;return None
+           rgba=bytearray(24*24*4)
+           def dot(x,y,val):
+            if 0<=x<24 and 0<=y<24:
+             j=4*(y*24+x)
+             rgba[j]=(val>>10&31)*255//31
+             rgba[j+1]=(val>>5&31)*255//31
+             rgba[j+2]=(val&31)*255//31
+             rgba[j+3]=255
+           p=1
+           try:
+            if not typ&2:
+             for y in range(24):
+              q=(y+1)*2 if y<12 else (23-y)*2
+              x0=0 if typ&1 else 24-q
+              for x in range(q):
+               val=struct.unpack_from('<H',frame,p)[0];p+=2;dot(x0+x,y,val)
+            else:
+             xo,yo,_,rows=struct.unpack_from('<BBBB',frame,p);p+=4
+             for y in range(rows):
+              x=xo;segments=frame[p];p+=1
+              for seg in range(segments):
+               x+=frame[p]//2;p+=1
+               span=frame[p];p+=1
+               for j in range(span):
+                val=struct.unpack_from('<H',frame,p)[0];p+=2;dot(x+j,yo+y,val)
+               x+=span
+           except (struct.error,IndexError):
+            missing_tiles[('parse',tile,index)]+=1;return None
+           # Scale original 12x12 native Map047 pixels to half for the 1,856x1,536 mainland projection.
+           return Image.frombytes('RGBA',(24,24),bytes(rgba)).resize((6,6),Image.Resampling.NEAREST)
 
-          # Existing V241 native projection plus the fixed full-map coordinate offset.
-          floor=[];layer2=[];objects=[];layer5=[];bounds={};sizes={}
-          for bx,by,stem,data in blocks:
-              ox=(bx-0x7fff)*64+0x7fff-63
-              oy=(by-0x7fff)*64+0x7fff-63
-              for yy in range(64):
-                  for xx in range(128):
-                      index,tile,_=struct.unpack_from('<BHB',data,4*(yy*128+xx))
-                      nx=ox+xx//2;ny=oy+yy
-                      x=12*(nx+ny-65024)-2800+12*(xx&1)+SHIFT_X
-                      y=6*(ny-nx)-166+SHIFT_Y
-                      if x>-12 and y>-12 and x<PX and y<PY:
-                          floor.append((x,y,tile,index))
-              p=128*64*4
-              count=struct.unpack_from('<H',data,p)[0];p+=2
-              for j in range(count):
-                  xx,yy,index,tile,_=struct.unpack_from('<BBBHB',data,p);p+=6
-                  nx=ox+xx//2;ny=oy+yy
-                  x=12*(nx+ny-65024)-2800+12*(xx&1)+SHIFT_X
-                  y=6*(ny-nx)-166+SHIFT_Y
-                  if x>-12 and y>-12 and x<PX and y<PY:
-                      layer2.append((x,y,tile,index))
-              p+=64*64*4
-              ngroups=struct.unpack_from('<i',data,p)[0];p+=4
-              assert 0<=ngroups<100000,('Bad Layer4 group count',stem)
-              for i in range(ngroups):
-                  gid,num=struct.unpack_from('<hH',data,p);p+=4
-                  key=(stem,gid)
-                  assert key not in sizes
-                  sizes[key]=num
-                  box=[PX,PY,-1,-1]
-                  for k in range(num):
-                      xx,yy,layer,index,tile,_=struct.unpack_from('<BBBBhB',data,p);p+=7
-                      if tile<0:continue
-                      nx=ox+xx//2;ny=oy+yy
-                      x=12*(nx+ny-65024)-2800+12*(xx&1)+SHIFT_X
-                      y=6*(ny-nx)-166+SHIFT_Y
-                      if x<PX and y<PY and x+12>0 and y+12>0:
-                          box[0]=min(x,box[0]);box[1]=min(y,box[1])
-                          box[2]=max(x+12,box[2]);box[3]=max(y+12,box[3])
-                          objects.append((layer,x,y,tile,index))
-                  if box[2]>box[0] and box[3]>box[1]:
-                      bounds[key]=[max(0,box[0]),max(0,box[1]),min(PX,box[2]),min(PY,box[3])]
-              n5=struct.unpack_from('<i',data,p)[0];p+=4
-              assert 0<=n5<200000,('Bad Layer5 count',stem)
-              for i in range(n5):
-                  xx,yy,gid,typ=struct.unpack_from('<BBHB',data,p+i*5)
-                  nx=ox+xx//2;ny=oy+yy
-                  x=12*(nx+ny-65024)-2800+6*(xx&1)+SHIFT_X
-                  y=6*(ny-nx)-166+SHIFT_Y
-                  cx=(x+8)//16;cy=(y+8)//16
-                  if 0<=cx<W and 0<=cy<H:layer5.append((cx,cy,stem,gid,typ))
-          print('PASS full source traversal floor=%d layer2=%d objects=%d layer5=%d'%(len(floor),len(layer2),len(objects),len(layer5)),flush=True)
+          # Verify every file (including both-format duplicates), but draw one preferred source per stem.
+          ground=Image.new('RGBA',(PW,PH),(0,0,0,255))
+          upper_entries=[];bound={};size_lookup={};layer5=[]
+          parse_errors=[];nused=0
+          start=time.time()
+          for item,stem in enumerate(sorted(source_files)):
+           ext='.s32' if '.s32' in source_files[stem] else '.seg'
+           path=source_files[stem][ext];raw=path.read_bytes();s32=(ext=='.s32')
+           bx=(int(stem[:4],16)-0x7e00)*64
+           by=(int(stem[4:],16)-0x7e00)*64
+           cols=128 if s32 else 64
+           def xy(xx,yy,half=False):
+            wx=bx+(xx//2 if s32 else xx);wy=by+yy
+            return fx(wx,wy)+(6 if half and s32 and xx&1 else 0),fy(wx,wy)
+           def on_canvas(x,y):return x<PW and y<PH and x+6>0 and y+6>0
+           # check both .s32 and .seg separately for structure and parsability
+           for other_ext,other_path in source_files[stem].items():
+            rd=other_path.read_bytes();is32=other_ext=='.s32'
+            first_size=32768 if is32 else 16384
+            n2=struct.unpack_from('<H',rd,first_size)[0]
+            p=first_size+2+n2*(6 if is32 else 4)+4096*(4 if is32 else 2)
+            g=struct.unpack_from('<i',rd,p)[0];p+=4
+            assert 0<=g<=30000,(stem,'layer4 groups',g)
+            for i in range(g):
+             gid,num=struct.unpack_from('<hH',rd,p);p+=4+num*(7 if is32 else 5)
+            num5=struct.unpack_from('<i',rd,p)[0];p+=4+num5*5
+            assert 0<=num5<200000 and p<=len(rd),(stem,'native layer totals',num5,p,len(rd))
+            stats['source_files_verified']+=1
+            stats['preferred_'+other_ext]+=int(other_ext==ext)
+           # Floor and Layer2 draw using existing Map047 tile renderer.
+           for yy in range(64):
+            for xx in range(cols):
+             index,tile,_=struct.unpack_from('<BHB',raw,4*(yy*cols+xx))
+             x,y=xy(xx,yy,True)
+             stats['floor_original']+=1
+             if not on_canvas(x,y):continue
+             stats['floor_clipped']+=1
+             # SEG stores base Tile.idx identifiers in the low twelve bits.
+             bmp=tile_bitmap(tile if s32 else tile&0x0fff,index)
+             if bmp is not None:
+              ground.alpha_composite(bmp,(x,y));stats['floor_drawn']+=1
+           p=64*cols*4
+           n2=struct.unpack_from('<H',raw,p)[0];p+=2
+           for i in range(n2):
+            if s32:
+             xx,yy,index,tile,_=struct.unpack_from('<BBBHB',raw,p);p+=6
+            else:
+             xx,yy,index,tile=struct.unpack_from('<BBBB',raw,p);p+=4
+            x,y=xy(xx,yy,True)
+            stats['layer2_original']+=1
+            if not on_canvas(x,y):continue
+            stats['layer2_clipped']+=1
+            bmp=tile_bitmap(tile,index)
+            if bmp is not None:
+             ground.alpha_composite(bmp,(x,y));stats['layer2_drawn']+=1
+           p+=4096*(4 if s32 else 2)
+           ngroups=struct.unpack_from('<i',raw,p)[0];p+=4
+           stats['layer4_groups_original']+=ngroups
+           for i in range(ngroups):
+            gid,num=struct.unpack_from('<hH',raw,p);p+=4
+            key=(stem,gid)
+            assert key not in size_lookup
+            size_lookup[key]=num
+            box=[PW,PH,-1,-1]
+            for j in range(num):
+             if s32:
+              xx,yy,layer,index,tile,_=struct.unpack_from('<BBBBhB',raw,p);p+=7
+             else:
+              xx,yy,layer,index,tile=struct.unpack_from('<BBBBB',raw,p);p+=5
+             stats['layer4_original']+=1
+             if tile<0:continue
+             x,y=xy(xx,yy,True)
+             if not on_canvas(x,y):continue
+             stats['layer4_clipped']+=1
+             box[0]=min(x,box[0]);box[1]=min(y,box[1]);box[2]=max(x+6,box[2]);box[3]=max(y+6,box[3])
+             upper_entries.append((layer,x,y,tile,index))
+            if box[2]>box[0] and box[3]>box[1]:
+             bound[key]=[max(0,box[0]),max(0,box[1]),min(PW,box[2]),min(PH,box[3])]
+           n5=struct.unpack_from('<i',raw,p)[0];p+=4
+           for j in range(n5):
+            xx,yy,gid,typ=struct.unpack_from('<BBHB',raw,p+j*5)
+            x,y=xy(xx,yy,False)
+            gx=(x+4)//16;gy=(y+4)//16
+            stats['layer5_original']+=1
+            if 0<=gx<W and 0<=gy<H:
+             layer5.append((gx,gy,stem,gid,typ));stats['layer5_clipped']+=1
+           nused+=1
+           if nused%100==0:print('RENDER',nused,'/',len(source_files),'floor',stats['floor_drawn'],'L4',len(upper_entries),'time',round(time.time()-start,1),flush=True)
 
-          # Pixel-perfect source renderer; no interpolation or invented scenery.
-          panos=SITE/'knight/gameasync/Graphics/Panoramas';panos.mkdir(parents=True,exist_ok=True)
-          ground_image=Image.new('RGBA',(PX,PY),(0,0,0,255))
-          for dataset in (floor,layer2):
-              for x,y,tile,index in dataset:
-                  pic=tile_bitmap(tile,index)
-                  if pic is not None:
-                      ground_image.alpha_composite(pic,(x,y))
-          # Verify all original 96 tile regions against the deployed V1.36 original.
-          # Fixed offset restores exactly the old village alignment.
-          original_pack=(OUT/'map-047-v241.original.pack').read_bytes()
-          header_size=struct.unpack_from('<I',original_pack,0)[0]
-          original_head=json.loads(original_pack[4:4+header_size])
-          assert original_head['kind']=='map' and original_head['map_id']==47
-          assert len(original_head['files'])==194,('Original installed map pack changed',len(original_head['files']))
-          original_body=memoryview(original_pack)[4+header_size:]
-          ground_in_pack={row[0]:(row[1],row[2]) for row in original_head['files']
-                          if re.fullmatch(r'graphics/panoramas/slti_47_c\d+_\d+',row[0])}
-          assert len(ground_in_pack)==96,('Original preloaded ground image count changed',len(ground_in_pack))
-          comparisons=[]
-          for gx in range(12):
-              for gy in range(8):
-                  key=f'graphics/panoramas/slti_47_c{gx}_{gy}'
-                  offset,length=ground_in_pack[key]
-                  assert 0<=offset and length>8 and offset+length<=len(original_body)
-                  with Image.open(BytesIO(original_body[offset:offset+length])) as loaded:
-                      old=loaded.convert('RGB')
-                  assert old.size==(512,512),('Original preloaded ground size changed',key)
-                  candidate=ground_image.crop((gx*512+SHIFT_X,gy*512+SHIFT_Y,(gx+1)*512+SHIFT_X,(gy+1)*512+SHIFT_Y)).convert('RGB')
-                  diff=ImageChops.difference(old,candidate)
-                  mae=sum(ImageStat.Stat(diff).mean)/3
-                  comparisons.append(mae)
-          assert max(comparisons)<25,('Reconstructed original ground differs from displayed V1.36 ground',max(comparisons))
-          print('PASS all 96 actually displayed preloaded ground chunks align, worst MAE=',round(max(comparisons),3),flush=True)
-
-          objects.sort(key=lambda row:row[0])
-          upper_image=Image.new('RGBA',(PX,PY))
-          for _,x,y,tile,index in objects:
-              pic=tile_bitmap(tile,index)
-              if pic is not None:upper_image.alpha_composite(pic,(x,y))
-          fg=[];images=[]
-          for gx in range(24):
-              for gy in range(12):
-                  a=gx*512;b=gy*512
-                  floor_name=f'SLTI_47_C{gx}_{gy}.png'
-                  upper_name=f'SLTI_47_L4_C{gx}_{gy}.png'
-                  crop=ground_image.crop((a,b,a+512,b+512)).convert('RGB')
-                  crop.save(panos/floor_name,optimize=True)
-                  images.append(floor_name)
-                  crop=upper_image.crop((a,b,a+512,b+512))
-                  crop.save(panos/upper_name,optimize=True)
-                  if crop.getbbox():fg.append([gx,gy]);images.append(upper_name)
-          assert len(images)==288+len(fg),('Wrong source image inventory',len(images))
-          assert len(fg)>73,('Expanded map must have original native structures',len(fg))
-
-          referenced={ (stem,gid) for cx,cy,stem,gid,typ in layer5 if (stem,gid) in bounds }
-          ordered=sorted(referenced)
-          assert 0<len(ordered)<65535
+          assert stats['source_files_verified']==790 and nused==602
+          print('RENDER ground completed after',round(time.time()-start,1),'seconds','L4 count',len(upper_entries),flush=True)
+          # Fade image region: black outside all source boundaries; only native ground/structures are rendered.
+          ground.paste((0,0,0,255),mask=ImageChops.invert(mask))
+          upper=Image.new('RGBA',(PW,PH))
+          upper_entries.sort(key=lambda x:x[0])
+          for i,(_,x,y,tile,index) in enumerate(upper_entries):
+           bmp=tile_bitmap(tile,index)
+           if bmp is not None:
+            upper.alpha_composite(bmp,(x,y));stats['layer4_drawn']+=1
+           if i and i%300000==0:print('RENDER upper',i,'/',len(upper_entries),'time',round(time.time()-start,1),flush=True)
+          upper.putalpha(ImageChops.multiply(upper.getchannel('A'),mask))
+          # Original layer5 reference -> original Layer4 group, and foreground occlusion strictly on walkable side.
+          refs={(stem,gid) for gx,gy,stem,gid,typ in layer5 if mask_small.getpixel((gx,gy)) and (stem,gid) in bound}
+          ordered=sorted(refs)
+          assert len(ordered)<65535
           serial={key:i+1 for i,key in enumerate(ordered)}
-          boxes=[[0,0,0,0]]+[bounds[key] for key in ordered]
+          boxes=[[0,0,0,0]]+[bound[key] for key in ordered]
           groups=[0]*(W*H);weights=[-1]*(W*H)
-          for cx,cy,stem,gid,typ in layer5:
-              key=(stem,gid)
-              if key not in serial:continue
-              cell=cy*W+cx
-              score=sizes[key]
-              if score>weights[cell]:groups[cell]=serial[key];weights[cell]=score
-          assert any(groups),('Original Layer5 group projection missing')
-          atlas=Image.new('RGB',(W,H),(0,0,0));atlas.putdata([(v&255,(v>>8)&255,0) for v in groups]);atlas.save(panos/'SLTI_47_GID.png',optimize=True)
-          images.append('SLTI_47_GID.png')
-          hex_bounds=''.join(''.join(f'{p:04x}' for p in box) for box in boxes)
+          for gx,gy,stem,gid,typ in layer5:
+           if not mask_small.getpixel((gx,gy)):continue
+           key=(stem,gid)
+           if key not in serial:continue
+           cell=gy*W+gx;score=size_lookup[key]
+           if score>weights[cell]:groups[cell]=serial[key];weights[cell]=score
+          assert any(groups), 'Source layer5 groups missing'
+          atlas=Image.new('RGB',(W,H))
+          atlas.putdata([(v&255,(v>>8)&255,0) for v in groups])
+          panos=SITE/'knight/gameasync/Graphics/Panoramas'
+          panos.mkdir(parents=True,exist_ok=True)
+          atlas.save(panos/'SLTI_48_GID.png',optimize=True)
+          images=[];fg=[]
+          for gx in range(24):
+           for gy in range(12):
+            x,y=gx*512,gy*512
+            name=f'SLTI_48_C{gx}_{gy}.png'
+            crop=ground.crop((x,y,x+512,y+512)).convert('RGB');crop.save(panos/name,optimize=True);images.append(name)
+            name=f'SLTI_48_L4_C{gx}_{gy}.png'
+            crop=upper.crop((x,y,x+512,y+512))
+            if crop.getbbox():fg.append([gx,gy]);crop.save(panos/name,optimize=True);images.append(name)
+          images.append('SLTI_48_GID.png')
+          hex_bounds=''.join(''.join(f'{c:04x}' for c in box) for box in boxes)
           assert len(hex_bounds)==16*len(boxes)
-          (OUT/'map47-group-bounds.hex').write_text(hex_bounds,'ascii')
-          (OUT/'map47-foreground-keys.json').write_text(json.dumps(fg,separators=(',',':')),'utf-8')
-          (OUT/'map47-generated-files.json').write_text(json.dumps(images,separators=(',',':')),'utf-8')
-          (OUT/'source-metrics.json').write_text(json.dumps(dict(map_w=W,map_h=H,raw_block_count=len(blocks),floor_tiles=len(floor),layer2_tiles=len(layer2),layer4_tiles=len(objects),layer5_records=len(layer5),original_ground_compared=len(comparisons),max_ground_mae=max(comparisons),generated_images=len(images),foreground_images=len(fg),group_count=len(ordered)),indent=2),'utf-8')
-          print('PASS full Map047 ground, original Layer4 and Layer5 lookup',len(images),'PNGs',len(ordered),'groups',flush=True)
-          V21_SOURCE_EOF
-          .venv/bin/python build/v21/build_map047_original.py
+          (OUT/'map48-group-bounds.hex').write_text(hex_bounds,'ascii')
+          (OUT/'map48-foreground-keys.json').write_text(json.dumps(fg,separators=(',',':')),'utf8')
+          (OUT/'map48-generated-files.json').write_text(json.dumps(images,separators=(',',':')),'utf8')
+          # Validate collision attributes per native original coverage and river cut.
+          rawattr=(ROOT/'layer3-attr1-u16le.bin').read_bytes()
+          coverage=(ROOT/'original-cell-coverage.bin').read_bytes()
+          assert len(rawattr)==2*1856*1536 and len(coverage)==1856*1536
+          # Use native mosaic interpolated river y for every Map048 pixel x.
+          line_y=[0]*PW
+          for i in range(len(line)-1):
+           x0,y0=line[i];x1,y1=line[i+1]
+           for xp in range(max(0,x0),min(PW,x1)):
+            line_y[xp]=y0+(y1-y0)*(xp-x0)/(x1-x0)
+          for i in range(0,max(0,line[0][0])):line_y[i]=line[0][1]
+          for i in range(min(PW,line[-1][0]),PW):line_y[i]=line[-1][1]
+          walk=bytearray(W*H*2);uncovered=0;land=0;passed=0;blocked=0;inside=0
+          for ty in range(H):
+           for tx in range(W):
+            px,py=tx*16+8,ty*16+8
+            u=UORG+(px-XSHIFT)/6;v=(py-YSHIFT)/3
+            wx=round((u-v)/2);wy=round((u+v)/2)
+            sx=wx-XORG;sy=wy-YORG
+            idx=sy*1856+sx
+            covered=0<=sx<1856 and 0<=sy<1536 and bool(coverage[idx])
+            inland=py>=line_y[px]
+            val=385
+            if inland and covered:
+             attr=struct.unpack_from('<H',rawattr,idx*2)[0]
+             val=384 if attr&1==0 else 385
+             land+=1
+             passed+=(val==384);blocked+=(val==385)
+            elif inland and not covered:uncovered+=1
+            struct.pack_into('<H',walk,2*(ty*W+tx),val)
+          assert passed>0 and blocked>0
+          (OUT/'map48-full-walk.bin').write_bytes(walk)
+          report=dict(stats=stats,sourceFiles=790,sourceBlocks=602,sourceMissingBlocks=94,riverPoints=194,viewOnlyOriginalCells=44,generated_images=len(images),ground=288,upper=len(fg),gid=1,layer5_groups=len(ordered),collision_land_covered=land,collision_land_uncovered=uncovered,collision_passable=passed,collision_blocked=blocked,missing_original_tile_ids=sorted({k[1] for k in missing_tiles if k[0]=='file'}),missing_tile_count=len(missing_tiles),missing_tile_examples=missing_tiles.most_common(15),time_sec=round(time.time()-start,1))
+          (OUT/'map48-build-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),'utf8')
+          print('PASS map048',json.dumps(report,ensure_ascii=False),flush=True)
+          V22_MAP48_SOURCE_EOF
+          .venv/bin/python -m py_compile build/v22/build_map048.py
+          .venv/bin/python -u build/v22/build_map048.py
 
-      - name: Expand only Map047 map data and Map029 confirmed entrance
+      - name: Register Map048 original native terrain and MapInfos
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v21/expand-map047.rb <<'V21_SOURCE_EOF'
+          cat > build/v22/apply_map048_map.rb <<'V22_MAP48_MAP_EOF'
           # encoding: UTF-8
-          require 'digest'
           module RPG
-            class Map; end
-            class Event; end
-            class Event::Page; end
-            class Event::Page::Condition; end
-            class Event::Page::Graphic; end
-            class EventCommand; end
-            class MoveCommand; end
-            class MoveRoute; end
-            class AudioFile; end
-          end
-          class Table
-            def self._load(raw)
-              obj = allocate
-              obj.instance_variable_set(:@raw, raw)
-              obj
-            end
-            def _dump(_depth)
-              @raw
-            end
-          end
-          class Tone
-            def self._load(raw)
-              obj = allocate
-              obj.instance_variable_set(:@raw, raw)
-              obj
-            end
-            def _dump(_depth)
-              @raw
-            end
-          end
-          class Color
-            def self._load(raw)
-              obj = allocate
-              obj.instance_variable_set(:@raw, raw)
-              obj
-            end
-            def _dump(_depth)
-              @raw
-            end
-          end
-
-          base=ENV.fetch('MAP47_DATA_ROOT')
-          walk=ENV.fetch('MAP47_WALK_FILE')
-          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          f47=File.join(base, prefix+'Map047.rxdata')
-          f29=File.join(base, prefix+'Map029.rxdata')
-          source47=File.binread(f47)
-          source29=File.binread(f29)
-          map47=Marshal.load(source47)
-          map29=Marshal.load(source29)
-          raise 'Map047 original dimensions mismatch' unless [map47.instance_variable_get(:@width),map47.instance_variable_get(:@height)] == [363,238]
-          raise 'Map047 original event count mismatch' unless map47.instance_variable_get(:@events).size == 7
-          old_table=map47.instance_variable_get(:@data).instance_variable_get(:@raw)
-          raise 'Map047 original Table mismatch' unless old_table.unpack('V5') == [3,363,238,3,3*363*238]
-          old=old_table.byteslice(20,363*238*2).unpack('v*')
-          raise 'Map047 original terrain values mismatch' unless old.all?{|v|v==384 || v==385}
-          raise 'Map047 original upper layers mismatch' unless old_table.byteslice(20+363*238*2,363*238*4).unpack('v*').all?(&:zero?)
-          new_ground=File.binread(walk)
-          raise 'Original full-map collision bytes missing' unless new_ground.bytesize == 768*384*2
-          new_ground=new_ground.unpack('v*')
-          raise 'Unexpected full-map terrain palette' unless new_ground.all?{|v| v==384 || v==385}
-          old_events=map47.instance_variable_get(:@events)
-          old_events.each do |id,event|
-            x=event.instance_variable_get(:@x)
-            y=event.instance_variable_get(:@y)
-            raise "Event #{id} outside old map" unless x.between?(0,362) && y.between?(0,237)
-          end
-          # Preserve all 86,394 tested in-game terrain cells; source supplies only expanded cells.
-          (0...238).each do |y|
-            old_row=y*363
-            new_row=(y+10)*768+175
-            (0...363).each {|x| new_ground[new_row+x]=old[old_row+x] }
-          end
-          new_raw=[3,768,384,3,3*768*384].pack('V5') + new_ground.pack('v*') + ("\0"*(2*768*384*2))
-          map47.instance_variable_set(:@width,768)
-          map47.instance_variable_set(:@height,384)
-          map47.instance_variable_get(:@data).instance_variable_set(:@raw,new_raw)
-          old_event_info=old_events.transform_values{|ev| [ev.instance_variable_get(:@name),ev.instance_variable_get(:@x),ev.instance_variable_get(:@y),Marshal.dump(ev.instance_variable_get(:@pages))]}
-          old_events.each_value do |ev|
-            ev.instance_variable_set(:@x,ev.instance_variable_get(:@x)+175)
-            ev.instance_variable_set(:@y,ev.instance_variable_get(:@y)+10)
-          end
-          transfers=[]
-          map29.instance_variable_get(:@events).each do |event_id,event|
-            event.instance_variable_get(:@pages).each_with_index do |page,pageno|
-              page.instance_variable_get(:@list).each_with_index do |cmd,index|
-                next unless cmd.instance_variable_get(:@code)==201
-                params=cmd.instance_variable_get(:@parameters)
-                next unless params.is_a?(Array) && params[0]==0 && params[1]==47
-                raise 'Map047 unexpected transfer target' unless params[2..3]==[197,128]
-                transfers << [event_id,pageno,index]
-                params[2]=372;params[3]=138
-              end
-            end
-          end
-          raise "Expected one original Map047 entrance, got #{transfers.inspect}" unless transfers==[[11,0,86]]
-          updated47=Marshal.dump(map47)
-          updated29=Marshal.dump(map29)
-          raise 'Original maps unexpectedly unchanged' if updated47==source47 || updated29==source29
-          File.binwrite(f47,updated47)
-          File.binwrite(f29,updated29)
-          # Read back to confirm the full Table and each original event page.
-          verify47=Marshal.load(File.binread(f47))
-          verify29=Marshal.load(File.binread(f29))
-          raise 'Map047 expansion failed' unless [verify47.instance_variable_get(:@width),verify47.instance_variable_get(:@height)] == [768,384]
-          actual=verify47.instance_variable_get(:@data).instance_variable_get(:@raw)
-          raise 'Expanded Table mismatch' unless actual.unpack('V5') == [3,768,384,3,3*768*384]
-          expanded=actual.byteslice(20,768*384*2).unpack('v*')
-          raise 'Table data mismatch' unless expanded==new_ground
-          verify47.instance_variable_get(:@events).each do |id,ev|
-            name,x,y,pages=old_event_info.fetch(id)
-            raise "Event #{id} changed beyond location" unless ev.instance_variable_get(:@name)==name && ev.instance_variable_get(:@x)==x+175 && ev.instance_variable_get(:@y)==y+10 && Marshal.dump(ev.instance_variable_get(:@pages))==pages
-          end
-          cmd=verify29.instance_variable_get(:@events)[11].instance_variable_get(:@pages)[0].instance_variable_get(:@list)[86]
-          raise 'Map029 transfer failed' unless cmd.instance_variable_get(:@parameters)[0,4]==[0,47,372,138]
-          puts "PASS Map047 363x238 -> 768x384"
-          puts "PASS old 86394 collision cells preserved (+175,+10); #{expanded.size-86394} source cells retained"
-          puts 'PASS 7 original events preserved and relocated'
-          puts 'PASS Map029 transfer event 11 (197,128) -> (372,138)'
-          V21_SOURCE_EOF
-          MAP47_DATA_ROOT=site/knight/gameasync/Data MAP47_WALK_FILE=build/v21/map47-full-walk.bin ruby build/v21/expand-map047.rb
-
-      - name: Directly adapt existing V241 renderer and 12-image viewport cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/v21/patch_map047_renderer.rb <<'V21_SOURCE_EOF'
-          # encoding: UTF-8
-          require 'json'
-          require 'zlib'
-          require 'digest'
-          base = 'site/knight/gameasync/Data/'
-          file = base + 'Scripts.rxdata'
-          scripts = Marshal.load(File.binread(file))
-          raise 'Original RGSS script count changed' unless scripts.length == 137
-          find = lambda do |name|
-            rows = scripts.select { |row| row.is_a?(Array) && row[1].to_s.dup.force_encoding('UTF-8') == name }
-            raise "Missing/duplicate original section #{name}: #{rows.length}" unless rows.size == 1
-            rows.first
-          end
-          terrain = find.call('해상도')
-          source = Zlib::Inflate.inflate(terrain[2]).force_encoding('UTF-8')
-          raise 'Original terrain Ruby invalid UTF-8' unless source.valid_encoding?
-          newline = source.include?("\r\n") ? "\r\n" : "\n"
-          t = source.gsub("\r\n", "\n")
-          oldcols = '@slti_floor == 47 ? 12 : 0'
-          oldrows = '@slti_floor == 47 ? 8 : 0'
-          raise 'Map047 terrain dimensions not unique' unless t.scan(oldcols).size == 1 && t.scan(oldrows).size == 1
-          t = t.sub(oldcols,'@slti_floor == 47 ? 24 : 0').sub(oldrows,'@slti_floor == 47 ? 12 : 0')
-          RubyVM::InstructionSequence.compile(t)
-          terrain[2] = Zlib::Deflate.deflate(t.gsub("\n",newline).b)
-
-          layer = find.call('SLNativeLayerV241')
-          layer_source = Zlib::Inflate.inflate(layer[2]).force_encoding('UTF-8')
-          raise 'Original Layer4 source invalid' unless layer_source.valid_encoding?
-          layer_nl = layer_source.include?("\r\n") ? "\r\n" : "\n"
-          s = layer_source.gsub("\r\n", "\n")
-          raise 'V241 renderer origin changed' unless s.include?('WIDTH=363') && s.include?('HEIGHT=238')
-          raise 'Unexpected V241 source changes' unless s.scan('module SLNativeLayerV241').size == 1
-          s = s.sub('WIDTH=363', 'WIDTH=768').sub('HEIGHT=238','HEIGHT=384')
-          hex = File.read('build/v21/map47-group-bounds.hex').strip
-          keys = JSON.parse(File.read('build/v21/map47-foreground-keys.json'))
-          raise 'Invalid original Layer5 bounds' unless hex.match?(/\A[0-9a-f]+\z/) && hex.length % 16 == 0
-          raise 'Invalid original Layer4 image index' unless keys.is_a?(Array) && keys.length > 73 && keys.all? { |xy| xy.length == 2 && xy[0].between?(0,23) && xy[1].between?(0,11) }
-          num = hex.length / 16
-          pattern = /GROUP_BOUNDS='[0-9a-f]+'/m
-          raise 'V241 group table no longer unique' unless s.scan(pattern).size == 1
-          s = s.sub(pattern,"GROUP_BOUNDS='#{hex}'")
-          pattern = /FOREGROUND_KEYS=\[[^\n]*\]/
-          raise 'V241 Layer4 keys no longer unique' unless s.scan(pattern).size == 1
-          s = s.sub(pattern,'FOREGROUND_KEYS='+JSON.generate(keys))
-          raise 'V241 original group size changed' unless s.scan('id>=2949').size == 1
-          s = s.sub('id>=2949',"id>=#{num}")
-
-          replace_method = lambda do |source,name,next_name,new_block|
-            pattern = /^  def #{Regexp.escape(name)}\b[^\n]*\n.*?(?=^  def #{Regexp.escape(next_name)}\b)/m
-            raise "Original method #{name} missing or repeated" unless source.scan(pattern).size == 1
-            source.sub(pattern,new_block.lines.map{|line|line.start_with?("  ") ? line[2..-1] : line}.join.rstrip + "\n\n")
-          end
-
-          prepare = <<'PREPARE'
-              def sl_v241_prepare
-                raise 'V2.1 incompatible original Map047 renderer' unless
-                  @slti_floor==47 && @slti_cols==24 && @slti_rows==12 &&
-                  @slti_chunks.is_a?(Hash)
-                @sl_v241_gid_bitmap=Bitmap.new('Graphics/Panoramas/SLTI_47_GID')
-                @sl_v241_upper={}
-                @sl_v241_upper_lru=[]
-                @sl_v241_fg_lookup={}
-                SLNativeLayerV241::FOREGROUND_KEYS.each{|key|@sl_v241_fg_lookup[key]=true}
-                @sl_v241_pieces=[]
-                40.times do
-                  sp=Sprite.new(@viewport2)
-                  sp.zoom_x=2.0
-                  sp.zoom_y=2.0
-                  sp.visible=false
-                  @sl_v241_pieces << sp
-                end
-                @sl_v241_active={}
-                @sl_v241_last_group=nil
-              end
-          PREPARE
-          s = replace_method.call(s,'sl_v241_prepare','slti_update_terrain',prepare)
-
-          terrain_update = <<'TERRAIN'
-              def slti_update_terrain
-                if $game_map && $game_map.map_id==47
-                  sl_v241_original_slti_update_terrain if @sl_v241_ready
-                else
-                  sl_v241_original_slti_update_terrain
-                end
-              end
-          TERRAIN
-          s = replace_method.call(s,'slti_update_terrain','sl_v241_show_piece',terrain_update)
-
-          refresh = <<'REFRESH'
-              def sl_v241_refresh
-                camx=[$game_map.display_x.to_i/4,0].max
-                camy=[$game_map.display_y.to_i/4,0].max
-                vw=@viewport2.rect.width
-                vh=@viewport2.rect.height
-                return if vw<=0 || vh<=0 || !$game_player
-                player_tile=[$game_player.x,$game_player.y]
-                if @sl_v241_last_player_tile!=player_tile
-                  @sl_v241_last_player_tile=player_tile
-                  @sl_v241_last_group=SLNativeLayerV241.group_at(
-                    @sl_v241_gid_bitmap,$game_player.x,$game_player.y)
-                end
-                gid=@sl_v241_last_group||0
-                box=gid>0 ? SLNativeLayerV241.box_for(gid) : nil
-                left=[camx/1024,0].max
-                top=[camy/1024,0].max
-                right=[(camx+vw-1)/1024,23].min
-                bottom=[(camy+vh-1)/1024,11].min
-                active={}
-                if left<=right && top<=bottom
-                  (top..bottom).each do |y|
-                    (left..right).each{|x|active[[x,y]]=true}
-                  end
-                end
-                @sl_v241_upper.each do |key,sp|
-                  sp.visible=false unless active[key]
-                end
-                # The original slti_update_terrain maintains the 12-decoded-ground limit.
-                # Load at most one additional visible Layer4 bitmap per map update.
-                target=active.keys.find{|key|@sl_v241_fg_lookup[key] && !@sl_v241_upper[key]}
-                if target
-                  x,y=target
-                  name='Graphics/Panoramas/SLTI_47_L4_C'+x.to_s+'_'+y.to_s
-                  sp=Sprite.new(@viewport2)
-                  begin
-                    sp.bitmap=Bitmap.new(name)
-                  rescue StandardError=>error
-                    sp.dispose
-                    raise 'V2.1 original upper image failed: '+name+' '+error.message.to_s
-                  end
-                  sp.zoom_x=2.0
-                  sp.zoom_y=2.0
-                  sp.z=0
-                  sp.visible=false
-                  @sl_v241_upper[target]=sp
-                  @sl_v241_upper_lru << target
-                end
-                piece_index=0
-                active.each_key do |key|
-                  x,y=key
-                  upper=@sl_v241_upper[key]
-                  next unless upper
-                  upper.x=x*1024-camx
-                  upper.y=y*1024-camy
-                  @sl_v241_upper_lru.delete(key)
-                  @sl_v241_upper_lru << key
-                  l=box ? [box[0]-x*512,0].max : 0
-                  t=box ? [box[1]-y*512,0].max : 0
-                  r=box ? [box[2]-x*512,512].min : 0
-                  b=box ? [box[3]-y*512,512].min : 0
-                  if box && r>l && b>t
-                    upper.visible=false
-                    bitmap=upper.bitmap
-                    piece_index=sl_v241_show_piece(bitmap,x,y,[0,0,512,t],0,255,camx,camy,piece_index)
-                    piece_index=sl_v241_show_piece(bitmap,x,y,[0,b,512,512],0,255,camx,camy,piece_index)
-                    piece_index=sl_v241_show_piece(bitmap,x,y,[0,t,l,b],0,255,camx,camy,piece_index)
-                    piece_index=sl_v241_show_piece(bitmap,x,y,[r,t,512,b],0,255,camx,camy,piece_index)
-                    piece_index=sl_v241_show_piece(bitmap,x,y,[l,t,r,b],9999,SLNativeLayerV241::FADE_ALPHA,camx,camy,piece_index)
-                  else
-                    upper.visible=true
-                    upper.opacity=255
-                    upper.z=0
-                  end
-                end
-                while piece_index<@sl_v241_pieces.length
-                  sp=@sl_v241_pieces[piece_index]
-                  sp.visible=false
-                  sp.bitmap=nil
-                  piece_index+=1
-                end
-                while @sl_v241_upper.length>12
-                  victim=@sl_v241_upper_lru.find{|key|!active[key]}
-                  break unless victim
-                  @sl_v241_upper_lru.delete(victim)
-                  sp=@sl_v241_upper.delete(victim)
-                  bmp=sp.bitmap
-                  sp.bitmap=nil
-                  sp.dispose
-                  bmp.dispose if bmp && !bmp.disposed?
-                end
-                @sl_v241_active=active
-              end
-          REFRESH
-          s = replace_method.call(s,'sl_v241_refresh','update',refresh)
-          RubyVM::InstructionSequence.compile(s)
-          layer[2] = Zlib::Deflate.deflate(s.gsub("\n",layer_nl).b)
-          File.binwrite(file,Marshal.dump(scripts))
-          check = Marshal.load(File.binread(file))
-          raise 'RGSS metadata changed' unless check.size==scripts.size && check.map{|r|r[0..1]}==scripts.map{|r|r[0..1]}
-          puts 'PASS original terrain window loader updated to 24x12; max 12 ground PNGs'
-          puts 'PASS original V241 Layer4/Layer5 renderer retains fixed piece pool, max 12 upper PNGs'
-          puts "PASS regenerated native Layer5 #{num-1} groups and #{keys.size} upper chunks"
-          V21_SOURCE_EOF
-          ruby build/v21/patch_map047_renderer.rb
-
-      - name: Repack original Map047 image assets and update only map cache keys
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/v21/pack_map047.py <<'V21_SOURCE_EOF'
-          from pathlib import Path
-          import hashlib, json, re, struct
-          root=Path('site')
-          build=Path('build/v21')
-          pano=root/'knight/gameasync/Graphics/Panoramas'
-          images=json.loads((build/'map47-generated-files.json').read_text('utf-8'))
-          keys=json.loads((build/'map47-foreground-keys.json').read_text('utf-8'))
-          expected={f'SLTI_47_C{x}_{y}.png' for x in range(24) for y in range(12)}
-          expected|={f'SLTI_47_L4_C{x}_{y}.png' for x,y in keys}
-          expected.add('SLTI_47_GID.png')
-          assert len(images)==len(expected) and set(images)==expected,('Incomplete original Map047 source pack',len(images),len(expected))
-          old_pack=root/'knight/assets/map-047-v241.pack'
-          assert old_pack.is_file(), 'Original V241 pack is missing'
-          with old_pack.open('rb') as f:
-              old_len=struct.unpack('<I',f.read(4))[0]
-              old_head=json.loads(f.read(old_len))
-              old_body=f.read()
-          assert (old_head['kind'],old_head['map_id'],len(old_head['files']))==('map',47,194),'Wrong original Map047 pack'
-          old_mapping=root/'knight/gameasync/mapping.js'
-          data=old_mapping.read_text('utf-8')
-          pattern=re.compile(r'^\["graphics/panoramas/slti_47_(?:c\d+_\d+|l4_c\d+_\d+|gid)",\s*"Graphics/Panoramas/SLTI_47_(?:C\d+_\d+|L4_C\d+_\d+|GID)\.png\?h=[0-9a-f]{32}"\],?\n',re.M)
-          old_lines=pattern.findall(data)
-          assert len(old_lines)==193,('Original Map047 mapping entry count changed',len(old_lines))
-          first=pattern.search(data)
-          assert first, 'Original Map047 mapping placement missing'
-          data=pattern.sub('',data)
-          # Update only these previously existing original Map047 resource keys.
-          rows=[]
-          for tag in ('C','L4_C'):
-              for x in range(24):
-                  for y in range(12):
-                      file=f'SLTI_47_{tag}{x}_{y}.png'
-                      p=pano/file
-                      assert p.is_file(),('Missing fully generated image',file)
-                      key=f'graphics/panoramas/{file[:-4].lower()}'
-                      rows.append(f'["{key}", "Graphics/Panoramas/{file}?h={hashlib.md5(p.read_bytes()).hexdigest()}"],\n')
-          gid=pano/'SLTI_47_GID.png'
-          rows.append(f'["graphics/panoramas/slti_47_gid", "Graphics/Panoramas/SLTI_47_GID.png?h={hashlib.md5(gid.read_bytes()).hexdigest()}"],\n')
-          data=data[:first.start()]+''.join(rows)+data[first.start():]
-          for name in ['Scripts.rxdata','MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap047.rxdata','MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata']:
-              path=root/'knight/gameasync/Data'/name
-              marker='Data/'+name+'?h='
-              pattern=re.compile(re.escape(marker)+r'[0-9a-f]{32}')
-              assert len(pattern.findall(data))==1,('Expected one original data mapping',name)
-              data=pattern.sub(marker+hashlib.md5(path.read_bytes()).hexdigest(),data)
-          old_mapping.write_text(data,'utf-8')
-          # Preserve the original pack name: all image downloads still happen before Map047 loads.
-          manifest=[];payload=bytearray()
-          for file in images:
-              raw=(pano/file).read_bytes()
-              assert raw[:8]==b'\x89PNG\r\n\x1a\n'
-              key='graphics/panoramas/'+file[:-4].lower()
-              manifest.append([key,len(payload),len(raw)])
-              payload.extend(raw)
-          extra=[row for row in old_head['files'] if row[0]=='graphics/tilesets/slti_collision_transparent']
-          assert len(extra)==1,('Original Map047 transparent collision tileset missing',extra)
-          key,off,length=extra[0]
-          raw=old_body[off:off+length]
-          assert len(raw)==length and raw[:8]==b'\x89PNG\r\n\x1a\n'
-          manifest.append([key,len(payload),length]);payload.extend(raw)
-          header=json.dumps({'kind':'map','map_id':47,'files':manifest},ensure_ascii=False,separators=(',',':')).encode('utf-8')
-          old_pack.write_bytes(struct.pack('<I',len(header))+header+payload)
-          load=root/'knight/js/sl-assets-v229r115.js'
-          s=load.read_text('utf-8')
-          substitutions={
-              "if(head.files.length!==194)throw new Error('Expected 194 Map047 source images');":"if(head.files.length<290)throw new Error('Incomplete original Map047 map images');",
-              "if(!map47Keys||map47Keys.length!==194)throw new Error('Map047 manifest missing');":"if(!map47Keys||map47Keys.length<290)throw new Error('Map047 manifest missing');",
-              "if(done!==194)throw new Error('Map047 was not fully installed');":"if(done!==map47Keys.length)throw new Error('Map047 was not fully installed');",
-              "label('Map 47 graphics installed 194/194');":"label('Map 47 graphics installed '+done+'/'+map47Keys.length);",
-              "var version='V1.36';":"var version='V2.1';"
-          }
-          for old,new in substitutions.items():
-              assert s.count(old)==1,('Original loader changed',old)
-              s=s.replace(old,new)
-          load.write_text(s,'utf-8')
-          for name in ['index.html','knight/index.html']:
-              p=root/name
-              old=p.read_text('utf-8')
-              assert 'V1.36' in old,('Wrong source HTML version',name)
-              p.write_text(old.replace('V1.36','V2.1').replace('v1.36','v2.1'),'utf-8')
-          (build/'pack-report.json').write_text(json.dumps({'map_images':len(images)+1,'ground':288,'upper':len(keys),'gid':1,'full_mapping':len(rows),'pack_bytes':old_pack.stat().st_size},indent=2),'utf-8')
-          print('PASS Map047 existing pre-entry loader; map image count',len(images)+1,'and existing pack filename preserved')
-          print('PASS all 288 original ground,',len(keys),'native Layer4 image keys, one GID lookup mapped')
-          V21_SOURCE_EOF
-          .venv/bin/python build/v21/pack_map047.py
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
-
-      - name: Verify exact original Map047 events and unchanged scripts
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > build/v21/verify_map047.rb <<'V21_SOURCE_EOF'
-          # encoding: UTF-8
-          require 'zlib'
-          module RPG
-            class Map; end
-            class Event; end
-            class Event::Page; end
-            class Event::Page::Condition; end
-            class Event::Page::Graphic; end
-            class EventCommand; end
-            class MoveRoute; end
-            class MoveCommand; end
-            class AudioFile; end
+            class Map;end
+            class Event;end
+            class Event::Page;end
+            class Event::Page::Condition;end
+            class Event::Page::Graphic;end
+            class EventCommand;end
+            class MoveCommand;end
+            class MoveRoute;end
+            class AudioFile;end
+            class MapInfo;end
           end
           class Table
             def self._load(raw)
@@ -825,189 +392,336 @@ jobs:
             end
             def _dump(_depth);@raw;end
           end
-          class Color
-            def self._load(raw);obj=allocate;obj.instance_variable_set(:@raw,raw);obj;end
-            def _dump(_depth);@raw;end
-          end
           class Tone
             def self._load(raw);obj=allocate;obj.instance_variable_set(:@raw,raw);obj;end
             def _dump(_depth);@raw;end
           end
-          base='site/knight/gameasync/Data/'
-          build='build/v21/'
+          class Color
+            def self._load(raw);obj=allocate;obj.instance_variable_set(:@raw,raw);obj;end
+            def _dump(_depth);@raw;end
+          end
+          base=ENV.fetch('MAP48_DATA_ROOT')
+          walk=ENV.fetch('MAP48_WALK_FILE')
           prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          old=Marshal.load(File.binread(build+'Scripts.v136.original.rxdata'))
-          now=Marshal.load(File.binread(base+'Scripts.rxdata'))
-          raise 'Original 137 section count changed' unless old.size==now.size && now.size==137
-          changes=old.zip(now).filter_map do |a,b|
-            raise 'Script metadata changed' unless a[0]==b[0] && a[1]==b[1]
-            a[1].to_s.dup.force_encoding('UTF-8') if a[2]!=b[2]
-          end
-          raise "Unapproved script changes #{changes.inspect}" unless changes.sort==['SLNativeLayerV241','해상도'].sort
-          now.each do |row|
-            name=row[1].to_s.dup.force_encoding('UTF-8')
-            next unless changes.include?(name)
-            source=Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
-            RubyVM::InstructionSequence.compile(source)
-            if name=='해상도'
-              raise 'Original 12 decoded tile limit removed' unless source.include?('while @slti_chunks.length>12')
-              raise 'Original terrain limited to new extent' unless source.include?('@slti_floor == 47 ? 24 : 0') && source.include?('@slti_floor == 47 ? 12 : 0')
-            else
-              raise 'Original Layer4 fade disabled' unless source.include?('FADE_ALPHA=135')
-              raise 'New native group lookup missing' unless source.include?('WIDTH=768') && source.include?('HEIGHT=384')
-              raise 'New upper 12 decode limit absent' unless source.include?('while @sl_v241_upper.length>12')
-              raise 'Group mask missing' unless source.include?("Bitmap.new('Graphics/Panoramas/SLTI_47_GID')")
-              raise 'Additional engine loop detected' unless source.scan('def sl_v241_refresh').size==1
-            end
-          end
-          old_map=Marshal.load(File.binread(build+'Map047.v136.original.rxdata'))
-          new_map=Marshal.load(File.binread(base+prefix+'Map047.rxdata'))
-          raise 'Wrong Map047 dimensions' unless [new_map.instance_variable_get(:@width),new_map.instance_variable_get(:@height)]==[768,384]
-          old_events=old_map.instance_variable_get(:@events)
-          new_events=new_map.instance_variable_get(:@events)
-          raise 'Original Map047 event count mismatch' unless old_events.size==new_events.size && old_events.size==7
-          old_events.each do |id,ev|
-            ne=new_events.fetch(id)
-            raise "Event #{id} original location/name changed" unless ne.instance_variable_get(:@name)==ev.instance_variable_get(:@name) && ne.instance_variable_get(:@x)==ev.instance_variable_get(:@x)+175 && ne.instance_variable_get(:@y)==ev.instance_variable_get(:@y)+10
-            raise "Event #{id} original pages changed" unless Marshal.dump(ne.instance_variable_get(:@pages))==Marshal.dump(ev.instance_variable_get(:@pages))
-          end
-          ob=old_map.instance_variable_get(:@data).instance_variable_get(:@raw)
-          nb=new_map.instance_variable_get(:@data).instance_variable_get(:@raw)
-          raise 'Wrong original map table' unless ob.byteslice(0,20).unpack('V5')==[3,363,238,3,363*238*3]
-          raise 'Wrong expanded map table' unless nb.byteslice(0,20).unpack('V5')==[3,768,384,3,768*384*3]
-          old_vals=ob.byteslice(20,363*238*2).unpack('v*')
-          new_vals=nb.byteslice(20,768*384*2).unpack('v*')
-          raise 'Original passability values changed' unless old_vals.all?{|x|[384,385].include?(x)} && new_vals.all?{|x|[384,385].include?(x)}
-          (0...238).each do |y|
-           (0...363).each do |x|
-            raise 'Old Map047 collision region changed' unless new_vals[(y+10)*768+x+175]==old_vals[y*363+x]
-           end
-          end
-          old29=Marshal.load(File.binread(build+'Map029.v136.original.rxdata'))
-          new29=Marshal.load(File.binread(base+prefix+'Map029.rxdata'))
-          e=old29.instance_variable_get(:@events)
-          ne=new29.instance_variable_get(:@events)
-          raise 'Map029 original event set changed' unless e.keys==ne.keys
-          changes=[]
-          e.each do |id,event|
-            a=Marshal.load(Marshal.dump(event))
-            a.instance_variable_get(:@pages).each_with_index do |page,pno|
-              page.instance_variable_get(:@list).each_with_index do |cmd,i|
-                next unless cmd.instance_variable_get(:@code)==201
-                params=cmd.instance_variable_get(:@parameters)
-                next unless params[0,2]==[0,47]
-                raise 'Original transfer unexpected position' unless params[2,2]==[197,128]
-                params[2]=372;params[3]=138
-                changes << [id,pno,i]
-              end
-            end
-            raise "Map029 unapproved event edit #{id}" unless Marshal.dump(a)==Marshal.dump(ne.fetch(id))
-          end
-          raise "Wrong transfer count #{changes.inspect}" unless changes==[[11,0,86]]
-          puts 'PASS V2.1 original 135 unchanged RGSS scripts, exactly 2 native terrain sections updated'
-          puts 'PASS original 86,394 Map047 terrain cells and all 7 events relocated'
-          puts 'PASS Map029 exactly one original entrance coordinate changed'
-          V21_SOURCE_EOF
-          ruby build/v21/verify_map047.rb
+          map47_name=File.join(base,prefix+'Map047.rxdata')
+          map48_name=File.join(base,prefix+'Map048.rxdata')
+          mapinfos_name=File.join(base,prefix+'MapInfos.rxdata')
+          raise 'Map048 already exists' if File.exist?(map48_name)
+          map47_bytes=File.binread(map47_name)
+          mapinfos_bytes=File.binread(mapinfos_name)
+          map47=Marshal.load(map47_bytes)
+          infos=Marshal.load(mapinfos_bytes)
+          raise 'Map047 dimensions unexpected' unless [map47.instance_variable_get(:@width),map47.instance_variable_get(:@height)]==[768,384]
+          raise 'Map048 already in mapinfos' if infos.key?(48)
+          raise 'Map047 info missing' unless infos[47]
+          old_info=infos.transform_values{|info|Marshal.dump(info)}
+          walk_bytes=File.binread(walk)
+          raise 'Wrong native Map048 terrain size' unless walk_bytes.bytesize==768*384*2
+          values=walk_bytes.unpack('v*')
+          raise 'Map048 terrain must be 384 or 385' unless values.all?{|v|v==384||v==385}
+          map48=Marshal.load(map47_bytes)
+          map48.instance_variable_set(:@events,{})
+          map48.instance_variable_set(:@width,768)
+          map48.instance_variable_set(:@height,384)
+          map48.instance_variable_get(:@data).instance_variable_set(:@raw,[3,768,384,3,3*768*384].pack('V5')+walk_bytes+("\0"*(768*384*4)))
+          info=RPG::MapInfo.allocate
+          info.instance_variable_set(:@scroll_x,0)
+          info.instance_variable_set(:@name,'글루디오·우드벡·은기사')
+          info.instance_variable_set(:@expanded,true)
+          info.instance_variable_set(:@order,48)
+          info.instance_variable_set(:@scroll_y,0)
+          info.instance_variable_set(:@parent_id,0)
+          infos[48]=info
+          File.binwrite(map48_name,Marshal.dump(map48))
+          File.binwrite(mapinfos_name,Marshal.dump(infos))
+          raise 'Map047 changed' unless File.binread(map47_name)==map47_bytes
+          saved=Marshal.load(File.binread(map48_name))
+          raise 'Map048 dimensions mismatched' unless [saved.instance_variable_get(:@width),saved.instance_variable_get(:@height)]==[768,384]
+          raise 'Map048 event/transit unexpectedly created' unless saved.instance_variable_get(:@events).empty?
+          raise 'Map048 terrain mismatched' unless saved.instance_variable_get(:@data).instance_variable_get(:@raw).byteslice(20,768*384*2)==walk_bytes
+          verified=Marshal.load(File.binread(mapinfos_name))
+          raise 'MapInfos has lost entries' unless verified.size==old_info.size+1 && verified.keys.sort==(old_info.keys+[48]).sort
+          old_info.each{|id, bytes| raise 'Existing MapInfo modified' unless Marshal.dump(verified[id])==bytes}
+          raise 'Wrong Map048 info' unless verified[48].instance_variable_get(:@name)=='글루디오·우드벡·은기사'
+          puts 'PASS native Map048 created from the original map class, events empty, MapInfos preserved'
+          puts 'PASS original Map047 byte-for-byte preserved; no transfer event added'
+          V22_MAP48_MAP_EOF
+          ruby -c build/v22/apply_map048_map.rb
+          MAP48_DATA_ROOT=site/knight/gameasync/Data MAP48_WALK_FILE=build/v22/map48-full-walk.bin ruby build/v22/apply_map048_map.rb
 
-      - name: Verify all original map images, pack and unrelated files
+      - name: Extend only existing two original native renderer scripts for Map048
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v21/verify_map047.py <<'V21_SOURCE_EOF'
+          cat > build/v22/apply_map048_scripts.rb <<'V22_MAP48_SCRIPTS_EOF'
+          # encoding: UTF-8
+          require 'json'
+          require 'zlib'
+          require 'digest'
+          root=ENV.fetch('MAP48_ROOT')
+          file=File.join(root,'knight/gameasync/Data/Scripts.rxdata')
+          built=ENV.fetch('MAP48_BUILD_ROOT')
+          rows=Marshal.load(File.binread(file))
+          raise 'Original RGSS script count changed' unless rows.size==137
+          lookup=lambda do |name|
+            matches=rows.select{|r|r.is_a?(Array)&&r[1].to_s.dup.force_encoding('UTF-8')==name}
+            raise "Missing/duplicate script #{name}" unless matches.size==1
+            matches.first
+          end
+          replace_once=lambda do |s,old,new|
+            raise "Old script expression missing or duplicated: #{old[0,75]}" unless s.scan(old).size==1
+            s.sub(old,new)
+          end
+          old=rows.map{|r|r.dup}
+          # Extend only the existing native terrain map selection; V2.1 Map047 remains unchanged.
+          res=lookup.call('해상도')
+          s=Zlib::Inflate.inflate(res[2]).force_encoding('UTF-8')
+          raise 'Original terrain script invalid UTF-8' unless s.valid_encoding?
+          nl=s.include?("\r\n") ? "\r\n" : "\n"
+          s=s.gsub("\r\n","\n")
+          s=replace_once.call(s,'@slti_floor = ($game_map.map_id == 47) ? 47 : nil','@slti_floor = ($game_map.map_id == 47 || $game_map.map_id == 48) ? $game_map.map_id : nil')
+          s=replace_once.call(s,'@slti_floor == 47 ? 24 : 0','(@slti_floor == 47 || @slti_floor == 48) ? 24 : 0')
+          s=replace_once.call(s,'@slti_floor == 47 ? 12 : 0','(@slti_floor == 47 || @slti_floor == 48) ? 12 : 0')
+          RubyVM::InstructionSequence.compile(s)
+          res[2]=Zlib::Deflate.deflate(s.gsub("\n",nl).b)
+          # Add a second data table to the ORIGINAL renderer and extend its existing paths.
+          res=lookup.call('SLNativeLayerV241')
+          s=Zlib::Inflate.inflate(res[2]).force_encoding('UTF-8')
+          raise 'Original native renderer invalid UTF-8' unless s.valid_encoding?
+          nl=s.include?("\r\n") ? "\r\n" : "\n"
+          s=s.gsub("\r\n","\n")
+          hex=File.read(File.join(built,'map48-group-bounds.hex')).strip
+          keys=JSON.parse(File.read(File.join(built,'map48-foreground-keys.json')))
+          raise 'Invalid Map048 bounds' unless hex.match?(/\A[0-9a-f]+\z/) && hex.length%16==0 && hex.length>16
+          raise 'Invalid Map048 upper keys' unless keys.length>0 && keys.all?{|k|k.is_a?(Array)&&k.size==2&&k[0].between?(0,23)&&k[1].between?(0,11)}
+          s=replace_once.call(s,'  FADE_ALPHA=135',"  GROUP_BOUNDS_48='#{hex}'\n  FOREGROUND_KEYS_48=#{JSON.generate(keys)}\n  FADE_ALPHA=135")
+          s=replace_once.call(s,'''  def self.box_for(id)
+              return nil if id<=0 || id>=4089
+              p=GROUP_BOUNDS[id*16,16]
+              return nil unless p && p.length==16
+              [p[0,4].to_i(16),p[4,4].to_i(16),p[8,4].to_i(16),p[12,4].to_i(16)]
+            end''','''  def self.box_for(id,mapid=47)
+              source=mapid==48 ? GROUP_BOUNDS_48 : GROUP_BOUNDS
+              return nil if id<=0 || id>=source.length/16
+              p=source[id*16,16]
+              return nil unless p && p.length==16
+              [p[0,4].to_i(16),p[4,4].to_i(16),p[8,4].to_i(16),p[12,4].to_i(16)]
+            end''')
+          s=replace_once.call(s,'$game_map.map_id==47 && $game_player','($game_map.map_id==47 || $game_map.map_id==48) && $game_player')
+          s=replace_once.call(s,'return unless $game_map && $game_map.map_id==47','return unless $game_map && ($game_map.map_id==47 || $game_map.map_id==48)')
+          s=replace_once.call(s,'@slti_floor==47 && @slti_cols==24 && @slti_rows==12','(@slti_floor==47 || @slti_floor==48) && @slti_cols==24 && @slti_rows==12')
+          s=replace_once.call(s,"Bitmap.new('Graphics/Panoramas/SLTI_47_GID')","Bitmap.new('Graphics/Panoramas/SLTI_'+@slti_floor.to_s+'_GID')")
+          s=replace_once.call(s,'SLNativeLayerV241::FOREGROUND_KEYS.each','(@slti_floor==48 ? SLNativeLayerV241::FOREGROUND_KEYS_48 : SLNativeLayerV241::FOREGROUND_KEYS).each')
+          s=replace_once.call(s,'if $game_map && $game_map.map_id==47','if $game_map && ($game_map.map_id==47 || $game_map.map_id==48)')
+          s=replace_once.call(s,'SLNativeLayerV241.box_for(gid)','SLNativeLayerV241.box_for(gid,@slti_floor)')
+          s=replace_once.call(s,"name='Graphics/Panoramas/SLTI_47_L4_C'+x.to_s+'_'+y.to_s","name='Graphics/Panoramas/SLTI_'+@slti_floor.to_s+'_L4_C'+x.to_s+'_'+y.to_s")
+          s=replace_once.call(s,'sl_v241_refresh if @sl_v241_ready && $game_map && $game_map.map_id==47','sl_v241_refresh if @sl_v241_ready && $game_map && ($game_map.map_id==47 || $game_map.map_id==48)')
+          RubyVM::InstructionSequence.compile(s)
+          res[2]=Zlib::Deflate.deflate(s.gsub("\n",nl).b)
+          changed=rows.each_index.select{|i|rows[i][2]!=old[i][2]}
+          expected=rows.each_index.select{|i|['해상도','SLNativeLayerV241'].include?(rows[i][1].to_s.dup.force_encoding('UTF-8'))}
+          raise 'Other game script changed' unless changed.sort==expected.sort && changed.size==2
+          File.binwrite(file,Marshal.dump(rows))
+          verify=Marshal.load(File.binread(file))
+          raise 'RGSS script count changed' unless verify.size==137
+          changed.each{|i| raise 'Patched script body differs on load' unless verify[i][2]==rows[i][2]}
+          puts "PASS existing 137 RGSS scripts, only two Map047 native renderer sections extended for Map048"
+          V22_MAP48_SCRIPTS_EOF
+          ruby -c build/v22/apply_map048_scripts.rb
+          MAP48_ROOT=site MAP48_BUILD_ROOT=build/v22 ruby build/v22/apply_map048_scripts.rb
+
+      - name: Pack Map048 images and reuse existing Map047 R115 loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v22/apply_map048_pack.py <<'V22_MAP48_PACK_EOF'
+          from pathlib import Path
+          import hashlib,json,re,struct
+          ROOT=Path('site')
+          OUT=Path('build/v22')
+          PANO=ROOT/'knight/gameasync/Graphics/Panoramas'
+          PREFIX='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          images=json.loads((OUT/'map48-generated-files.json').read_text('utf-8'))
+          keys=json.loads((OUT/'map48-foreground-keys.json').read_text('utf-8'))
+          assert len(images)==288+len(keys)+1 and len(set(images))==len(images)
+          expected={f'SLTI_48_C{x}_{y}.png' for x in range(24) for y in range(12)}
+          expected|={f'SLTI_48_L4_C{x}_{y}.png' for x,y in keys}
+          expected.add('SLTI_48_GID.png')
+          assert set(images)==expected
+          assert all((PANO/name).is_file() for name in images)
+          # Use the original R115 pack format and the unchanged virtual filesystem installation.
+          original_pack=(ROOT/'knight/assets/map-047-v241.pack').read_bytes()
+          length=struct.unpack_from('<I',original_pack,0)[0]
+          old_head=json.loads(original_pack[4:4+length]);old_body=memoryview(original_pack)[4+length:]
+          assert old_head['map_id']==47 and old_head['kind']=='map'
+          extra=[r for r in old_head['files'] if r[0]=='graphics/tilesets/slti_collision_transparent']
+          assert len(extra)==1
+          key,off,size=extra[0];collision=bytes(old_body[off:off+size])
+          assert collision.startswith(b'\x89PNG\r\n\x1a\n')
+          entries=[];payload=bytearray()
+          for name in images:
+           b=(PANO/name).read_bytes();assert b.startswith(b'\x89PNG\r\n\x1a\n')
+           key='graphics/panoramas/'+name[:-4].lower()
+           entries.append([key,len(payload),len(b)]);payload.extend(b)
+          entries.append(['graphics/tilesets/slti_collision_transparent',len(payload),len(collision)])
+          payload.extend(collision)
+          header=json.dumps({'kind':'map','map_id':48,'files':entries},separators=(',',':')).encode('utf-8')
+          pack=struct.pack('<I',len(header))+header+payload
+          packname=ROOT/'knight/assets/map-048-v229r115.pack'
+          assert not packname.exists(),'Map048 pack already in the source build'
+          packname.write_bytes(pack)
+          # Insert only Map048 keys. No Map047 mapping is replaced or reordered.
+          mapper=ROOT/'knight/gameasync/mapping.js'
+          s=mapper.read_text('utf-8')
+          assert 'map048.rxdata' not in s.lower()
+          map47_name=PREFIX+'Map047.rxdata'
+          pattern=r'^\["data/'+PREFIX.lower()+'map047", "Data/'+map47_name+r'\?h=[0-9a-f]{32}"\],?\n'
+          match=re.search(pattern,s,re.M)
+          assert match and len(re.findall(pattern,s,re.M))==1
+          newpath=ROOT/'knight/gameasync/Data'/(PREFIX+'Map048.rxdata')
+          new='["data/'+PREFIX.lower()+'map048", "Data/'+PREFIX+'Map048.rxdata?h='+hashlib.md5(newpath.read_bytes()).hexdigest()+'"],\n'
+          s=s[:match.end()]+new+s[match.end():]
+          anchor='["graphics/panoramas/slti_47_gid", '
+          matches=list(re.finditer(r'^\["graphics/panoramas/slti_47_gid", [^\n]+\n',s,re.M))
+          assert len(matches)==1
+          rows=[]
+          for name in images:
+           p=PANO/name
+           rows.append('["graphics/panoramas/'+name[:-4].lower()+'", "Graphics/Panoramas/'+name+'?h='+hashlib.md5(p.read_bytes()).hexdigest()+'"],\n')
+          s=s[:matches[0].end()]+''.join(rows)+s[matches[0].end():]
+          for name in ('MapInfos.rxdata','Scripts.rxdata'):
+           filename=(PREFIX if name=='MapInfos.rxdata' else '')+name
+           path=ROOT/'knight/gameasync/Data'/filename
+           marker='Data/'+filename+'?h='
+           rgx=re.compile(re.escape(marker)+r'[0-9a-f]{32}')
+           assert len(rgx.findall(s))==1,('Missing one original mapping',filename)
+           s=rgx.sub(marker+hashlib.md5(path.read_bytes()).hexdigest(),s)
+          mapper.write_text(s,'utf-8')
+          # Extend the single original R115 image-preinstallation path to Map048.
+          loader=ROOT/'knight/js/sl-assets-v229r115.js'
+          s=loader.read_text('utf-8')
+          def rep(old,new):
+           global s
+           assert s.count(old)==1,('Expected unique original Map047 preloader code',old)
+           s=s.replace(old,new)
+          rep('var map47Keys=null, map47FilesReady=false;','var map47Keys=null, map47FilesReady=false, map48Keys=null, map48FilesReady=false;')
+          rep("if(kind==='map'&&mid===47){\n      if(head.files.length<290)throw new Error('Incomplete original Map047 map images');\n      map47Keys=head.files.map(function(row){return row[0];});\n    }","if(kind==='map'&&(mid===47||mid===48)){\n      if(head.files.length<290)throw new Error('Incomplete original Map'+mid+' images');\n      if(mid===47)map47Keys=head.files.map(function(row){return row[0];});\n      else map48Keys=head.files.map(function(row){return row[0];});\n    }")
+          rep('function installMap47Files(){','function installMap47Files(mid){')
+          rep('if(map47FilesReady)return Promise.resolve();','if((mid===47&&map47FilesReady)||(mid===48&&map48FilesReady))return Promise.resolve();')
+          rep("if(!map47Keys||map47Keys.length<290)throw new Error('Map047 manifest missing');","var mapKeys=mid===48?map48Keys:map47Keys;\n    if(!mapKeys||mapKeys.length<290)throw new Error('Map'+mid+' manifest missing');")
+          rep('var keys=map47Keys.slice(), next=0, done=0;','var keys=mapKeys.slice(), next=0, done=0;')
+          rep("'Missing Map047 mapping '+key","'Missing Map'+mid+' mapping '+key")
+          rep("'Missing Map047 resource directory '+key","'Missing Map'+mid+' resource directory '+key")
+          rep("'Missing staged Map047 bytes '+key","'Missing staged Map'+mid+' bytes '+key")
+          rep("'Map047 image installation '+key+': '+err","'Map'+mid+' image installation '+key+': '+err")
+          rep("label('Map 47 graphics installed '+done+'/'+keys.length);","label('Map '+mid+' graphics installed '+done+'/'+keys.length);")
+          rep("display('Preparing all Map 47 graphics before movement\\n'+done+'/'+keys.length);","display('Preparing all Map '+mid+' graphics before movement\\n'+done+'/'+keys.length);")
+          rep("if(done!==map47Keys.length)throw new Error('Map047 was not fully installed');","if(done!==mapKeys.length)throw new Error('Map'+mid+' was not fully installed');")
+          rep('map47FilesReady=true;','if(mid===47)map47FilesReady=true;\n      else map48FilesReady=true;')
+          rep("label('Map 47 graphics installed '+done+'/'+map47Keys.length);","label('Map '+mid+' graphics installed '+done+'/'+mapKeys.length);")
+          rep('return mid===47 ? installMap47Files().then(function(){return result;}) : result;','return (mid===47||mid===48) ? installMap47Files(mid).then(function(){return result;}) : result;')
+          rep('if(mid<1||mid>47)return nativeMapLoad.apply(self,args);','if(mid<1||mid>48)return nativeMapLoad.apply(self,args);')
+          rep("var version='V2.1';","var version='V2.2';")
+          loader.write_text(s,'utf-8')
+          for name in ('index.html','knight/index.html'):
+           p=ROOT/name
+           old=p.read_text('utf-8')
+           assert 'V2.1' in old
+           p.write_text(old.replace('V2.1','V2.2').replace('v2.1','v2.2'),'utf-8')
+          print('PASS Map048 native image pack',len(entries),'entries and',packname.stat().st_size,'bytes')
+          print('PASS original Map047 preloader reused for 48, no new runtime loader')
+          V22_MAP48_PACK_EOF
+          .venv/bin/python -m py_compile build/v22/apply_map048_pack.py
+          .venv/bin/python build/v22/apply_map048_pack.py
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
+
+      - name: Verify all Map048 resources and V2.1 file preservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v22/verify_map048.py <<'V22_MAP48_VERIFY_EOF'
           from pathlib import Path
           from PIL import Image
-          import hashlib,json,re,struct
-          root=Path('site');built=Path('build/v21')
-          before=json.loads((built/'before.json').read_text('utf-8'))
+          from io import BytesIO
+          import collections,hashlib,json,re,struct
+          root=Path('site')
+          work=Path('build/v22')
+          before=json.loads((work/'v21-original-filehash.json').read_text('utf8'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          mapfiles=[f'SLTI_47_{tag}{x}_{y}.png' for tag in ('C','L4_C') for x in range(24) for y in range(12)]
-          img_names=set(mapfiles+['SLTI_47_GID.png'])
-          images={'knight/gameasync/Graphics/Panoramas/'+name for name in img_names}
-          base='knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          core={base+'Map047.rxdata',base+'Map029.rxdata', 'knight/gameasync/Data/Scripts.rxdata',
-                'knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js',
-                'index.html','knight/index.html','knight/assets/map-047-v241.pack'}
-          assert set(before)-set(after)==set(),'Original game files removed'
-          added=set(after)-set(before)
-          assert added==images-set(before),('Unapproved generated files or missing images',sorted(added^(images-set(before)))[:15])
-          changed={p for p in before if before[p]!=after[p]}
-          assert core<=changed,('Required Map047 change not written',sorted(core-changed))
-          assert not changed-(core|images),('Non-map game file modified',sorted(changed-(core|images)))
-          assert len(before)==5619,('Wrong source inventory',len(before))
-          assert len(after)==5619+len(added),('Wrong result inventory',len(after),len(added))
-          assert len(added)==384,('Wrong full map expansion image count',len(added))
-          assert len(images)==577
-          for x in range(24):
-              for y in range(12):
-                  for tag,mode in (('C','RGB'),('L4_C','RGBA')):
-                      p=root/'knight/gameasync/Graphics/Panoramas'/f'SLTI_47_{tag}{x}_{y}.png'
-                      with Image.open(p) as im:
-                          assert im.size==(512,512) and im.mode==mode,('Original source image invalid',p,im.size,im.mode)
-          with Image.open(root/'knight/gameasync/Graphics/Panoramas/SLTI_47_GID.png') as im:
-              assert im.size==(768,384) and im.mode=='RGB'
-          assert (built/'attr1_512x512_le.bin').stat().st_size==512*512*2
-          assert (built/'map47-full-walk.bin').stat().st_size==768*384*2
-          report=json.loads((built/'source-metrics.json').read_text('utf-8'))
-          assert report['raw_block_count']==64 and report['original_ground_compared']==96 and report['max_ground_mae']<25
-          pack=root/'knight/assets/map-047-v241.pack'
-          orig=built/'map-047-v241.original.pack'
-          with orig.open('rb') as f:
-              l=struct.unpack('<I',f.read(4))[0];old=json.loads(f.read(l)); oldbody=f.read()
-          with pack.open('rb') as f:
-              l=struct.unpack('<I',f.read(4))[0];head=json.loads(f.read(l));body=f.read()
-          assert old['map_id']==head['map_id']==47 and old['kind']==head['kind']=='map'
-          assert len(old['files'])==194
-          extra=[row for row in old['files'] if row[0]=='graphics/tilesets/slti_collision_transparent']
-          assert len(extra)==1
-          key,off,size=extra[0]
-          original=oldbody[off:off+size]
-          current=[row for row in head['files'] if row[0]==key]
-          assert len(current)==1
-          assert original==body[current[0][1]:current[0][1]+current[0][2]],'Native collision transparent tileset modified'
-          expected=set(json.loads((built/'map47-generated-files.json').read_text('utf-8')))
-          pack_images=set()
+          imgs=json.loads((work/'map48-generated-files.json').read_text('utf8'))
+          imgpath={'knight/gameasync/Graphics/Panoramas/'+name for name in imgs}
+          added=imgpath|{'knight/assets/map-048-v229r115.pack','knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap048.rxdata'}
+          changed={'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMapInfos.rxdata',
+                   'knight/gameasync/Data/Scripts.rxdata','knight/gameasync/mapping.js',
+                   'knight/js/sl-assets-v229r115.js','index.html','knight/index.html'}
+          assert set(after)-set(before)==added,('Missing/additional files',sorted((set(after)-set(before))^added)[:100])
+          assert set(before)-set(after)==set(),('Original files deleted',sorted(set(before)-set(after)))
+          actual_change={p for p in before if before[p]!=after[p]}
+          assert actual_change==changed,('Unapproved original changes',sorted(actual_change^changed))
+          assert len(after)==len(before)+len(added)
+          assert len(before)==6003
+          pack47=root/'knight/assets/map-047-v241.pack'
+          assert hashlib.sha256(pack47.read_bytes()).hexdigest()==before['knight/assets/map-047-v241.pack']
+          map47=root/'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap047.rxdata'
+          assert hashlib.sha256(map47.read_bytes()).hexdigest()==before['knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap047.rxdata']
+          map48=root/'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap048.rxdata'
+          assert map48.is_file()
+          keys=json.loads((work/'map48-foreground-keys.json').read_text('utf8'))
+          assert len(imgs)==288+len(keys)+1 and imgs[-1]=='SLTI_48_GID.png'
+          for file in imgs:
+           p=root/'knight/gameasync/Graphics/Panoramas'/file
+           with Image.open(p) as img:
+            assert img.size == ((768,384) if file.endswith('_GID.png') else (512,512))
+            assert img.mode == ('RGB' if '_C' in file and '_L4_C' not in file else ('RGB' if file.endswith('_GID.png') else 'RGBA')),(file,img.mode)
+          extra=(root/'knight/assets/map-048-v229r115.pack').read_bytes();l=struct.unpack_from('<I',extra)[0]
+          head=json.loads(extra[4:4+l]);data=memoryview(extra)[4+l:]
+          assert head['kind']=='map' and head['map_id']==48 and len(head['files'])==len(imgs)+1
+          packs=set()
           for key,offset,length in head['files']:
-              assert 0<=offset and length>8 and offset+length<=len(body)
-              chunk=body[offset:offset+length]
-              assert chunk[:8]==b'\x89PNG\r\n\x1a\n'
-              if key.startswith('graphics/panoramas/slti_47_'):
-                  name='SLTI_47_'+key.split('slti_47_',1)[1]+'.png'
-                  # The source names are case sensitive only for the local disk.
-                  matches=[f for f in expected if f.lower()==name.lower()]
-                  assert len(matches)==1,('Manifest key does not point to an original image',key)
-                  assert chunk==(root/'knight/gameasync/Graphics/Panoramas'/matches[0]).read_bytes(),('Image bytes mismatch',key)
-                  pack_images.add(matches[0])
-          assert pack_images==expected,('Incomplete full original image pack',len(pack_images),len(expected))
-          assert len(head['files'])==len(expected)+1
-          mapping=(root/'knight/gameasync/mapping.js').read_text('utf-8')
-          for filename in img_names:
-              data=(root/'knight/gameasync/Graphics/Panoramas'/filename).read_bytes()
-              entry='Graphics/Panoramas/'+filename+'?h='+hashlib.md5(data).hexdigest()
-              assert mapping.count(entry)==1,('Incorrect mapping checksum',filename)
-          for filename in ['Scripts.rxdata','MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap047.rxdata','MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata']:
-              data=(root/'knight/gameasync/Data'/filename).read_bytes()
-              assert ('Data/'+filename+'?h='+hashlib.md5(data).hexdigest()) in mapping
-          loader=(root/'knight/js/sl-assets-v229r115.js').read_text('utf-8')
-          assert loader.count("var version='V2.1';")==1
-          assert 'done!==map47Keys.length' in loader and 'map-047-v241.pack' in loader
-          for name in ('index.html','knight/index.html'):
-              assert 'V2.1' in (root/name).read_text('utf-8')
-          print('PASS V2.1 768x384, 24x12 original native images and Layer5 source')
-          print('PASS 86,394 original collision cells and seven NPC/event positions are preserved (Ruby test)')
-          print('PASS Map029 single transfer and 1,072 common events preserved (Ruby test)')
-          print('PASS no original non-map script/data/game feature changed')
-          print('PASS original transparent collision tileset retained byte-for-byte')
-          print('PASS original Map047 pack name and every PNG checksum updated')
-          print('PASS',len(after),'game files,',len(added),'new map image files')
-          V21_SOURCE_EOF
-          .venv/bin/python build/v21/verify_map047.py
+           assert key not in packs and 0<=offset<len(data) and length>=8 and offset+length<=len(data)
+           packs.add(key)
+           if key.startswith('graphics/panoramas/slti_48_'):
+            name='SLTI_48_'+key.split('slti_48_',1)[1]+'.png'
+            matched=[f for f in imgs if f.lower()==name.lower()]
+            assert len(matched)==1
+            assert data[offset:offset+length]==(root/'knight/gameasync/Graphics/Panoramas'/matched[0]).read_bytes()
+          assert len(packs)==len(imgs)+1
+          original47=pack47.read_bytes();q=struct.unpack_from('<I',original47)[0]
+          map47head=json.loads(original47[4:4+q]);map47body=memoryview(original47)[4+q:]
+          source=[row for row in map47head['files'] if row[0]=='graphics/tilesets/slti_collision_transparent']
+          current=[row for row in head['files'] if row[0]=='graphics/tilesets/slti_collision_transparent']
+          assert len(source)==len(current)==1
+          assert data[current[0][1]:current[0][1]+current[0][2]]==map47body[source[0][1]:source[0][1]+source[0][2]]
+          mapping=(root/'knight/gameasync/mapping.js').read_text('utf8')
+          assert mapping.lower().count('map048.rxdata')==1
+          for f in imgs:
+           p=root/'knight/gameasync/Graphics/Panoramas'/f
+           expected='Graphics/Panoramas/'+f+'?h='+hashlib.md5(p.read_bytes()).hexdigest()
+           assert mapping.count(expected)==1,('Missing MD5 Map048 mapping',f)
+          for f in ('MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMapInfos.rxdata','Scripts.rxdata','MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap048.rxdata'):
+           p=root/'knight/gameasync/Data'/f
+           expected='Data/'+f+'?h='+hashlib.md5(p.read_bytes()).hexdigest()
+           assert mapping.count(expected)==1,('Missing data Map048 mapping',f)
+          js=(root/'knight/js/sl-assets-v229r115.js').read_text('utf8')
+          assert js.count("var version='V2.2';")==1 and "mid<1||mid>48" in js
+          assert "map-047-v241.pack" in js and "map-048-v229r115.pack" not in js  # Default mid48 name is calculated.
+          assert js.count('installMap47Files(mid)')==2
+          for file in ('index.html','knight/index.html'):
+           assert 'V2.2' in (root/file).read_text('utf8')
+          print('PASS V2.2 original',len(before),'files unchanged except',len(changed),'approved metadata/load changes')
+          print('PASS original Map047 data and pack byte-for-byte, no original game assets lost')
+          print('PASS Map048 added',len(imgs),'PNG source images and',len(head['files']),'pack entries')
+          print('PASS all mapping MD5 and Map048 native pack payloads')
+          V22_MAP48_VERIFY_EOF
+          .venv/bin/python -m py_compile build/v22/verify_map048.py
+          .venv/bin/python build/v22/verify_map048.py
 
-      - name: Verify complete Map047 pre-entry image installation
+      - name: Verify Map047 and Map048 graphics installed before gameplay
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/v21/verify_browser_loader.js <<'V21_SOURCE_EOF'
+          cat > build/v22/verify_browser_map048.js <<'V22_MAP48_BROWSER_EOF'
           const fs=require('node:fs');
           const vm=require('node:vm');
           const path=require('node:path');
@@ -1018,61 +732,74 @@ jobs:
           const stat={created:0,unlinked:0};
           const overlayObjects=[];
           const context={
-            console,TextDecoder,DataView,Uint8Array,ArrayBuffer,AbortController,
-            setTimeout,clearTimeout,Promise,Error,Number,String,Object,
-            document:{body:{appendChild(x){overlayObjects.push(x)}},
-              createElement(tag){return {tag,style:{},append(x){},remove(){},onclick:null,textContent:''}},
-              getElementById(id){return null}},
-            window:{fileAsyncCache:{},loadFileAsync(fullPath,bitmap,callback){
-              nativeMapCallbacks++;
-              if(installs.size<300)throw new Error('Map047 native game opened before graphics installation');
-              if(typeof callback==='function')callback();
-            }, getLazyAsset(){originalDownloadCalled++}},
-            FS:{createPreloadedFile(folder,name,bytes,canRead,canWrite,ok,fail,dontCreate,canOwn,preFinish){
-               if(!(bytes instanceof Uint8Array) || bytes.length<8)throw new Error('Invalid asset installation');
-               stat.created++;
-               installs.add(folder+'/'+name);
-               if(typeof preFinish==='function')preFinish();
-               ok();
-            },unlink(name){stat.unlinked++}},
-            fetch(url){
-              const rel=String(url);
-              const f=path.join(root,rel);
-              if(!fs.existsSync(f))return Promise.resolve({ok:false,status:404,headers:new Map(),body:null});
-              return Promise.resolve({ok:true,status:200,body:null,headers:new Map(),arrayBuffer(){
-                const b=fs.readFileSync(f);
-                return Promise.resolve(b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength));
-              }});
-            }
+           console,TextDecoder,DataView,Uint8Array,ArrayBuffer,AbortController,
+           setTimeout,clearTimeout,Promise,Error,Number,String,Object,
+           document:{body:{appendChild(x){overlayObjects.push(x)}},
+            createElement(tag){return {tag,style:{},append(x){},remove(){},onclick:null,textContent:''}},
+            getElementById(id){return null}},
+           window:{fileAsyncCache:{},loadFileAsync(fullPath,bitmap,callback){
+             nativeMapCallbacks++;
+             let mapid=Number((fullPath.match(/Map(\d{3})\.rxdata/i)||[])[1]);
+             if(mapid==47 && installs.size<300)throw new Error('Map047 opened before graphics install');
+             if(mapid==48 && installs.size<690)throw new Error('Map048 opened before graphics install');
+             if(typeof callback==='function')callback();
+           },getLazyAsset(){originalDownloadCalled++}},
+           FS:{createPreloadedFile(folder,name,bytes,canRead,canWrite,ok,fail,dontCreate,canOwn,preFinish){
+             if(!(bytes instanceof Uint8Array)||bytes.length<8)throw new Error('Invalid map asset');
+             stat.created++;
+             installs.add(folder+'/'+name);
+             if(typeof preFinish==='function')preFinish();
+             ok();
+           },unlink(){stat.unlinked++}},
+           fetch(url){
+            const f=path.join(root,String(url));
+            if(!fs.existsSync(f))return Promise.resolve({ok:false,status:404,headers:new Map(),body:null});
+            return Promise.resolve({ok:true,status:200,body:null,headers:new Map(),arrayBuffer(){
+             const b=fs.readFileSync(f);return Promise.resolve(b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength));
+            }});
+           }
           };
           vm.createContext(context);
           vm.runInContext(fs.readFileSync(path.join(root,'gameasync/mapping.js'),'utf8'),context,{filename:'mapping.js'});
           vm.runInContext(fs.readFileSync(path.join(root,'js/sl-assets-v229r115.js'),'utf8'),context,{filename:'sl-assets-v229r115.js'});
-          let timeoutId;
-          const timeout=new Promise((_,reject)=>{timeoutId=setTimeout(()=>reject(new Error('Map047 install did not finish')),30000)});
-          Promise.race([new Promise((resolve,reject)=>{
-              try{context.window.loadFileAsync('gameasync/Data/Map047.rxdata',false,resolve)}catch(e){reject(e)}
-            }),timeout]).then(()=>{
-              clearTimeout(timeoutId);
-              const headPath=path.join(root,'assets/map-047-v241.pack');
-              const data=fs.readFileSync(headPath);
-              const len=data.readUInt32LE(0);
-              const head=JSON.parse(data.subarray(4,4+len));
-              if(nativeMapCallbacks!==1)throw new Error('Map callback invoked wrong number of times');
-              if(head.files.length<290)throw new Error('Full Map047 images missing');
-              const missing=head.files.filter(x=>!context.window.fileAsyncCache[x[0]]);
-              if(missing.length)throw new Error('Native loader skipped '+missing.length+' Map047 files');
-              if(stat.created<head.files.length)throw new Error('Map047 assets not fully installed');
-              if(!installs.has('/game/Graphics/Tilesets/SLTI_Collision_Transparent.png')) {
-                throw new Error('Original transparent collision tileset not installed');
-              }
-              console.log('PASS browser source pack staged, '+head.files.length+' graphics preinstalled, exactly one Map047 callback');
-              console.log('PASS original collision tileset and all map files ready before gameplay');
-            }).catch(err=>{clearTimeout(timeoutId);console.error(err);process.exitCode=1});
-          V21_SOURCE_EOF
-          node build/v21/verify_browser_loader.js
+          function load(mid){
+           return new Promise((resolve,reject)=>{
+            let timer=setTimeout(()=>reject(new Error('Map'+mid+' install timed out')),30000);
+            try{context.window.loadFileAsync('gameasync/Data/Map'+String(mid).padStart(3,'0')+'.rxdata',false,()=>{clearTimeout(timer);resolve()});}catch(e){clearTimeout(timer);reject(e)}
+           });
+          }
+          function getHead(mid){
+           const f=path.join(root,'assets',mid===47?'map-047-v241.pack':'map-048-v229r115.pack');
+           const data=fs.readFileSync(f);const l=data.readUInt32LE(0);
+           return JSON.parse(data.subarray(4,4+l));
+          }
+          async function main(){
+           await load(47);
+           if(nativeMapCallbacks!==1)throw new Error('Map047 native callback count');
+           const h47=getHead(47);
+           const missing47=h47.files.filter(x=>!context.window.fileAsyncCache[x[0]]);
+           if(missing47.length)throw new Error('Map047 preinstall skipped '+missing47.length+' entries');
+           const originals=new Set(installs);
+           await load(48);
+           if(nativeMapCallbacks!==2)throw new Error('Map048 native callback count');
+           const h48=getHead(48);
+           if(h48.files.length!==399)throw new Error('Map048 pack entries not 399');
+           const missing48=h48.files.filter(x=>!context.window.fileAsyncCache[x[0]]);
+           if(missing48.length)throw new Error('Map048 preinstall skipped '+missing48.length+' entries');
+           if(!installs.has('/game/Graphics/Panoramas/SLTI_48_GID.png'))throw new Error('Map048 GID not installed');
+           if(!installs.has('/game/Graphics/Tilesets/SLTI_Collision_Transparent.png'))throw new Error('Original collision tileset not installed');
+           for(const key of originals)if(!installs.has(key))throw new Error('Map048 removed original loaded Map047 asset '+key);
+           if(stat.created!==h47.files.length+h48.files.length-1)throw new Error('wrong unique installed image count '+stat.created);
+           console.log('PASS both Map047 and Map048 use original pre-entry loader with one native map callback each');
+           console.log('PASS',h47.files.length,'Map047 assets and',h48.files.length,'Map048 assets; shared collision tileset installed once');
+           console.log('PASS Map047 assets retained during Map048 entry, no image download during movement');
+          }
+          main().catch(err=>{console.error(err);process.exitCode=1});
+          V22_MAP48_BROWSER_EOF
+          node --check build/v22/verify_browser_map048.js
+          node build/v22/verify_browser_map048.js
 
-      - name: Publish V2.1 candidate
+      - name: Publish V2.2 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
