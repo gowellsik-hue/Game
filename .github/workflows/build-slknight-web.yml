@@ -100,21 +100,12 @@ jobs:
            (32960,32512,33280,33024)
           ]
 
-          zone_mask=Image.new('L',(PW,PH),0)
-          for x0,y0,x1,y1 in zones49:
-           points=[
-            (fx(x0,y0),fy(x0,y0)),
-            (fx(x1,y0),fy(x1,y0)),
-            (fx(x1,y1),fy(x1,y1)),
-            (fx(x0,y1),fy(x0,y1))
-           ]
-           ImageDraw.Draw(zone_mask).polygon(points,fill=255)
-
           north_sight=Image.new('L',(PW,PH),0)
           sight_points=[
            (0,0),(PW,0)
           ]+[
-           (x,y+264) for x,y in reversed(line)
+           (x,y+(44+max(0,44-abs(x-(434*16+8))//16))*6)
+           for x,y in reversed(line)
           ]+[
            (0,line[0][1]+264)
           ]
@@ -128,9 +119,9 @@ jobs:
           ]
           ImageDraw.Draw(north_land).polygon(land_points,fill=255)
 
-          mask=ImageChops.multiply(zone_mask,north_sight)
-          landmask=ImageChops.multiply(zone_mask,north_land)
-          mask_small=landmask.resize((W,H),Image.Resampling.NEAREST)
+          mask=north_sight
+          landmask=north_land
+          mask_small=mask.resize((W,H),Image.Resampling.NEAREST)
 
           """
           source=source[:first]+mask_code+source[last:]
@@ -158,11 +149,6 @@ jobs:
            'inland=py>=line_y[px]',
            'inland=bool(landmask.getpixel((px,py)))'
           )
-          change(
-           'if bmp is not None and not (110<=tile<=168 and index==34):',
-           'if bmp is not None:'
-          )
-
           source=source.replace('SLTI_48_','SLTI_49_')
           source=source.replace('map48-','map49-')
           source=source.replace("print('PASS map048'","print('PASS map049'")
@@ -180,7 +166,7 @@ jobs:
           .venv/bin/python -m py_compile build/v28/build_map049.py
           .venv/bin/python -u build/v28/build_map049.py
 
-      - name: Register Map049 and preserve Map029 teleport NPC
+      - name: Register Map049 and connect bridge and teleport NPC
         shell: bash
         run: |
           set -euo pipefail
@@ -286,10 +272,14 @@ jobs:
             table.instance_variable_set(:@raw,raw)
           end
 
-          # Original Gludio–Orc Forest bridge, two adjacent boundary cells.
+          # Original Gludio–Orc Forest bridge, river-aligned crossing cells.
           crossings=[
+            [242,294,432,633],
+            [243,293,433,632],
             [244,293,434,632],
-            [245,293,435,632]
+            [245,293,435,632],
+            [246,292,436,631],
+            [247,292,437,631]
           ]
 
           crossings.each do |x48,y48,x49,y49|
@@ -353,8 +343,109 @@ jobs:
               bridge_event(npc,i+1,x49,y49,48,x48,y48+1,2)
           end
 
+          # Find a valid landing tile near the original Orc Forest location.
+          wx,wy=32715,32448
+          x0=((12*(wx+wy-64600))/16.0).round
+          y0=((6*(wy-wx)+10798)/16.0).round
+          landing=nil
+
+          (0..48).each do |radius|
+            break if landing
+            (-radius..radius).each do |dy|
+              break if landing
+              (-radius..radius).each do |dx|
+                next unless dx.abs+dy.abs==radius
+                x=x0+dx
+                y=y0+dy
+                if passable(map49,x,y)
+                  landing=[x,y]
+                  break
+                end
+              end
+            end
+          end
+          raise 'No original Orc Forest landing tile' unless landing
+          puts "Map049 Orc Forest landing #{landing.inspect}"
+
+          # Reuse all existing teleport routes; remove Next/Cancel items.
+          old_list=npc.instance_variable_get(:@pages)[0].instance_variable_get(:@list)
+          raise 'Wrong original teleport count' unless
+            old_list.count{|c|c.instance_variable_get(:@code)==201}==11
+          raise 'Wrong original menu' unless
+            old_list[3].instance_variable_get(:@code)==102
+
+          root_indent=old_list[3].instance_variable_get(:@indent)
+          original_routes=[]
+
+          old_list.each_with_index do |cmd,i|
+            next unless cmd.instance_variable_get(:@code)==402
+            parameters=cmd.instance_variable_get(:@parameters)
+            next unless parameters.is_a?(Array)&&parameters.size==2
+            name=parameters[1]
+            next unless name.is_a?(String)
+            next if name.include?('다음')||name.include?('취소')
+
+            branch_indent=cmd.instance_variable_get(:@indent)
+            j=i+1
+            j+=1 while j<old_list.size &&
+                       old_list[j].instance_variable_get(:@indent)>branch_indent
+            body=old_list[(i+1)...j].map{|c|Marshal.load(Marshal.dump(c))}
+            next unless body.any?{|c|c.instance_variable_get(:@code)==201}
+            body.each do |c|
+              depth=c.instance_variable_get(:@indent)
+              c.instance_variable_set(:@indent,depth+root_indent-branch_indent)
+            end
+            original_routes << [name,body]
+          end
+
+          raise 'Original 11 teleport routes not found' unless
+            original_routes.size==11 &&
+            original_routes.map(&:first).uniq.size==11 &&
+            original_routes.sum{|name,body|
+              body.count{|c|c.instance_variable_get(:@code)==201}
+            }==11
+
+          names=original_routes.map(&:first)+['오크숲']
+          root_end=(4...old_list.size).find do |i|
+            c=old_list[i]
+            c.instance_variable_get(:@code)==404 &&
+              c.instance_variable_get(:@indent)==root_indent
+          end
+          raise 'Original teleport menu end missing' unless root_end
+
+          new_list=old_list[0...3].map{|c|Marshal.load(Marshal.dump(c))}
+          new_list << make_command(102,root_indent,[names,13])
+
+          original_routes.each_with_index do |(name,body),index|
+            new_list << make_command(402,root_indent,[index,name])
+            new_list.concat(body)
+          end
+
+          new_list << make_command(402,root_indent,[11,'오크숲'])
+          new_list << make_command(201,root_indent+1,
+                                   [0,49,landing[0],landing[1],0,1])
+          new_list << make_command(0,root_indent+1,[])
+          new_list << make_command(402,root_indent,[12,'취소'])
+          new_list << make_command(0,root_indent+1,[])
+          new_list << make_command(404,root_indent,[])
+          new_list.concat(
+            old_list[(root_end+1)..-1].map{|c|Marshal.load(Marshal.dump(c))}
+          )
+
+          raise 'Wrong destination count' unless
+            new_list.count{|c|c.instance_variable_get(:@code)==201}==12
+          raise 'Wrong choice count' unless
+            new_list.count{|c|c.instance_variable_get(:@code)==102}==1 &&
+            new_list.count{|c|c.instance_variable_get(:@code)==402}==13
+          raise 'Next/Cancel item remains' if names.any?{|n|
+            n.include?('다음')||n.include?('취소')
+          }
+
+          npc.instance_variable_get(:@pages)[0].instance_variable_set(:@list,new_list)
+
           File.binwrite(f48,Marshal.dump(map48))
           File.binwrite(f49,Marshal.dump(map49))
+          File.binwrite(f29,Marshal.dump(map29))
           File.binwrite(fi,Marshal.dump(infos))
 
           raise 'Map047 modified' unless File.binread(f47)==before47
@@ -367,18 +458,33 @@ jobs:
               Marshal.dump(verified_infos[id])==bytes
           end
 
+          original_events=Marshal.load(before29).instance_variable_get(:@events)
+          updated_events=Marshal.load(File.binread(f29)).instance_variable_get(:@events)
+          original_events.each do |id,e|
+            next if id==11
+            raise 'Other teleport-map event modified' unless
+              Marshal.dump(e)==Marshal.dump(updated_events[id])
+          end
+
           [map48,map49].each do |map|
             raise 'Bridge event count wrong' unless
-              map.instance_variable_get(:@events).keys.sort==[1,2]
+              map.instance_variable_get(:@events).keys.sort==(1..crossings.size).to_a
+            map.instance_variable_get(:@events).each_value do |event|
+              page=event.instance_variable_get(:@pages)[0]
+              raise 'Bridge touch event inactive' unless page.instance_variable_get(:@trigger)==1 &&
+                page.instance_variable_get(:@through)==true &&
+                page.instance_variable_get(:@list).any?{|cmd|cmd.instance_variable_get(:@code)==201}
+            end
           end
 
           puts 'PASS Map049 original terrain registered'
           puts 'PASS Map048 and Map049 two-way bridge transfers'
+          puts 'PASS space teleporter 12 destinations; no Next/Cancel items'
           RUBY
           ruby -c build/v28/connect_map049.rb
           ruby build/v28/connect_map049.rb
 
-      - name: Extend native renderer for Map049 without message changes
+      - name: Extend native renderer and teleport window for Map049
         shell: bash
         run: |
           set -euo pipefail
@@ -488,19 +594,52 @@ jobs:
           RubyVM::InstructionSequence.compile(s)
           res[2]=Zlib::Deflate.deflate(s.gsub("\n",nl).b)
 
+          res=lookup.call('Window_Message')
+          s=Zlib::Inflate.inflate(res[2]).force_encoding('UTF-8')
+          raise 'Invalid original message script' unless s.valid_encoding?
+          nl=s.include?("\r\n") ? "\r\n" : "\n"
+          s=s.gsub("\r\n","\n")
+
+          s=replace_once.call(
+            s,
+            "  def terminate_message\n    self.active = false",
+            "  def terminate_message\n    self.oy=0 if $game_map && $game_map.map_id==29 && $game_temp.choice_max==12\n    self.active = false"
+          )
+          s=replace_once.call(
+            s,
+            "  def refresh\n    self.contents.clear",
+            "  def refresh\n    if $game_map && $game_map.map_id==29 && $game_temp.choice_max==12\n      if self.contents.height<384\n        old=self.contents\n        self.contents=Bitmap.new(self.width-32,384)\n        old.dispose if old && !old.disposed?\n      end\n      self.oy=0\n    end\n    self.contents.clear"
+          )
+          cursor=<<'CURSOR_12'
+                if $game_map && $game_map.map_id==29 && $game_temp.choice_max==12
+                  super
+                  self.cursor_rect.set(8,n*32-self.oy,@cursor_width,32)
+                else
+                  self.cursor_rect.set(8,n*32,@cursor_width,32)
+                end
+          CURSOR_12
+          s=replace_once.call(
+            s,
+            '      self.cursor_rect.set(8, n * 32, @cursor_width, 32)',
+            cursor.chomp
+          )
+
+          RubyVM::InstructionSequence.compile(s)
+          res[2]=Zlib::Deflate.deflate(s.gsub("\n",nl).b)
+
           changed=rows.each_index.select{|i|rows[i][2]!=before[i][2]}
           expected=rows.each_index.select{|i|
-            ['해상도','SLNativeLayerV241'].include?(
+            ['해상도','SLNativeLayerV241','Window_Message'].include?(
               rows[i][1].to_s.dup.force_encoding('UTF-8'))
           }
           raise 'Unexpected game script modification' unless
-            changed.sort==expected.sort && changed.size==2
+            changed.sort==expected.sort && changed.size==3
 
           File.binwrite(file,Marshal.dump(rows))
           raise 'Scripts verification failed' unless
             Marshal.load(File.binread(file)).size==137
 
-          puts 'PASS Map049 renderer; native V2.7 message and input handling preserved'
+          puts 'PASS Map049 renderer; original input preserved, Map029-only 12-choice scrolling'
           RUBY
           ruby -c build/v28/patch_map049_scripts.rb
           ruby build/v28/patch_map049_scripts.rb
@@ -599,6 +738,7 @@ jobs:
           s=s[:i]+''.join(rows)+s[i:]
 
           modified=[
+           prefix+'Map029.rxdata',
            prefix+'Map048.rxdata',
            prefix+'MapInfos.rxdata',
            'Scripts.rxdata'
@@ -666,7 +806,7 @@ jobs:
            )
 
           print('PASS Map049 native pack',len(entries),'files')
-          print('PASS Map048, Map049 and Scripts mapping; original Map029 unchanged')
+          print('PASS Map029, Map048, Map049 and Scripts mapping')
           PY
           .venv/bin/python -m py_compile build/v28/pack_map049.py
           .venv/bin/python build/v28/pack_map049.py
@@ -707,6 +847,7 @@ jobs:
           })
 
           changed={
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata',
            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap048.rxdata',
            'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMapInfos.rxdata',
            'knight/gameasync/Data/Scripts.rxdata',
@@ -865,7 +1006,7 @@ jobs:
                   const b=fs.readFileSync(f);
                   return Promise.resolve(
                     b.buffer.slice(
-                      b.byteOffset,b.byteOffset+b.byteLength
+                      b.byteOffset,b.byteLength+b.byteOffset
                     )
                   );
                 }
