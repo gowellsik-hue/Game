@@ -24,7 +24,6 @@ jobs:
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}
-
     steps:
       - name: Download original Sanctuary Map4 source data
         uses: actions/download-artifact@v4
@@ -35,120 +34,165 @@ jobs:
           github-token: ${{ github.token }}
           path: source-map4
 
-      - name: Prepare corrected V2.10 from exact original workflow
+      - name: Prepare original V2.10 steps and direct targeted corrections
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build/v210/steps
-
           gh api \
             'repos/gowellsik-hue/Game/contents/.github/workflows/build-slknight-web.yml?ref=50a353ee08769cb8c8bfc8b5b4dd3254f46c0a9d' \
             --jq .content | base64 -d > build/v210/original-v210.yml
-
-          python3 - <<'V210_PATCH_EOF'
+          test -s build/v210/original-v210.yml
+          cat > build/v210/patch_steps.py <<'V210_PATCH_STEPS_EOF'
           from pathlib import Path
 
-          source = Path('build/v210/original-v210.yml')
-          s = source.read_text('utf8')
+          src = Path('build/v210/original-v210.yml').read_text('utf8')
+          out = Path('build/v210/steps')
+          out.mkdir(parents=True,exist_ok=True)
+          names = [
+           'Restore exact V2.9 deployed game and snapshot every original file',
+           'Retrieve last confirmed Map048 renderer and original V2.9 preloader verification',
+           'Restore exact visual-extent masks from three re-extracted HTMLs',
+           'Re-use the original renderer and retain only needed terrain chunks',
+           'Replace 48 49 collision and register Map050 plus Oren destination',
+           'Extend existing native renderer and scroll count for Map050',
+           'Pack all three maps and remove duplicate individual full-size PNGs',
+           'Verify every changed file and report actual map pack MB',
+           'Reuse original native browser smoke test for Map050',
+           'Reject any broken Map048 to Map049 bridge transition'
+          ]
+          for i,name in enumerate(names):
+           marker='      - name: '+name+'\n'
+           assert src.count(marker)==1,(name,'step missing')
+           section=src.split(marker,1)[1].split('\n      - name: ',1)[0]
+           tag='        run: |\n'
+           assert section.count(tag)==1,(name,'no run block')
+           lines=section.split(tag,1)[1].splitlines()
+           assert all(not x or x.startswith('          ') for x in lines),(name,'bad indent')
+           (out/f'{i:02d}.sh').write_text('\n'.join(x[10:] if x else '' for x in lines).rstrip()+'\n','utf8')
 
-          def change(old, new, count=1):
-              global s
-              actual = s.count(old)
-              if actual != count:
-                  raise RuntimeError(
-                      f'V2.10 source mismatch: {old[:100]!r}, '
-                      f'expected {count}, found {actual}'
-                  )
-              s = s.replace(old, new)
+          def change(step,old,new,n=1):
+           p=out/f'{step:02d}.sh'
+           s=p.read_text('utf8')
+           count=s.count(old)
+           if count!=n:
+            raise RuntimeError(f'step{step:02d} expected {n} substitutions, got {count}, expr={old[:120]!r}')
+           p.write_text(s.replace(old,new),'utf8')
 
-          change(
-              '49:346,50:208',
-              '49:345,50:207',
-              3
-          )
-
-          change(
-              """          blank=Image.new('RGBA',(512,512),(0,0,0,0))
+          # Original masks are restored unchanged by step 02; do not decode or redraw them.
+          change(3,'49:346,50:208','49:345,50:207')
+          change(3,"""blank=Image.new('RGBA',(512,512),(0,0,0,0))
           blank_buf=BytesIO()
           blank.save(blank_buf,format='PNG',optimize=True)
           blank_png=blank_buf.getvalue()
-          """,
-              ''
-          )
-
-          change(
-              r'''"if (gx,gy) in keep:\n   crop=ground.crop((x,y,x+512,y+512)).convert('RGBA')\n   crop.save(panos/name,optimize=True)\n  else:\n   (panos/name).write_bytes(blank_png)\n  images.append(name)"''',
-              r'''"if (gx,gy) in keep:\n   crop=ground.crop((x,y,x+512,y+512)).convert('RGBA')\n   crop.save(panos/name,optimize=True)\n   images.append(name)"'''
-          )
-
-          change(
-              "rep('ground=1152,upper',f'ground={W//32*H//32},upper')",
-              "rep('ground=1152,upper','ground=len(keep),upper')"
-          )
-
-          needle = "rep('ground=1152,upper','ground=len(keep),upper')"
-          addition = r"""
-           gid=f"images.append('SLTI_{mid}_GID.png')"
-           assert s.count(gid)==1
+          """,'')
+          change(3,
+           r'''"if (gx,gy) in keep:\n   crop=ground.crop((x,y,x+512,y+512)).convert('RGBA')\n   crop.save(panos/name,optimize=True)\n  else:\n   (panos/name).write_bytes(blank_png)\n  images.append(name)"''',
+           r'''"if (gx,gy) in keep:\n   crop=ground.crop((x,y,x+512,y+512)).convert('RGBA')\n   crop.save(panos/name,optimize=True)\n   images.append(name)"''')
+          change(3,
+           "rep('ground=1152,upper',f'ground={W//32*H//32},upper')",
+           """rep('ground=1152,upper','ground=len(keep),upper')
+           marker=f"images.append('SLTI_{mid}_GID.png')"
+           assert s.count(marker)==1
            inventory=(
-            "(Path('build/v210')/'map%d-chunk-inventory.json').write_text(" % mid
+            f"(Path('build/v210')/'map{mid}-chunk-inventory.json').write_text("
             +"json.dumps({'keep':[list(p) for p in sorted(keep)],"
             +"'omit':[[gx,gy] for gx in range(W//32) for gy in range(H//32)"
             +" if (gx,gy) not in keep]},separators=(',',':')),'utf8')"
            )
-           s=s.replace(gid,gid+'\n'+inventory)"""
-          change(needle, needle + addition)
+           s=s.replace(marker,marker+'\\n'+inventory)""")
 
-          change(
-              "expected={f'SLTI_{mid}_C{x}_{y}.png' for x in range(w) for y in range(h)}",
-              """inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
+          # Use the current branch's map-data semantics for the unverified bridges.
+          change(4,
+           "maps[50].instance_variable_set(:@events,{})",
+           "[48,49,50].each{|mid|maps[mid].instance_variable_set(:@events,{})}")
+          change(4,
+           'puts "PASS V2.9 Map048/Map049 event objects retained; Map050 added"',
+           "puts 'PASS Map048/049/050 data; unverified bridge transfers excluded'")
+
+          # Keep the original RGSS method. Filter its existing required-cell set only.
+          change(5,
+           "  s\nend\n\npatch_named(rows,'SLNativeLayerV241') do |s|",
+           """  sparse_ground=<<-'V210_GROUND_FILTER_EOF'
+              if @slti_floor && [48,49,50].include?(@slti_floor)
+                bits=SLNativeLayerV241::SPARSE_GROUND_BITS[@slti_floor]
+                raise 'Sparse terrain inventory missing' unless bits
+                required.delete_if do |key,_|
+                  x,y=key
+                  idx=y*@slti_cols+x
+                  ((bits[idx/8] || 0) & (1 << (idx%8)))==0
+                end
+              end
+            V210_GROUND_FILTER_EOF
+            s=replace_once(s,'    @slti_r111_active_chunks=required',
+              sparse_ground+'    @slti_r111_active_chunks=required')
+            s
+          end
+
+          patch_named(rows,'SLNativeLayerV241') do |s|""")
+          change(5,
+           "  bounds=File.read('build/v22/map50-group-bounds.hex').strip",
+           """  dimensions={48=>[48,24],49=>[50,24],50=>[24,13]}
+            masks={}
+            dimensions.each do |mid,(w,h)|
+              inv=JSON.parse(File.read("build/v210/map#{mid}-chunk-inventory.json"))
+              points=inv.fetch('keep')
+              bytes=Array.new((w*h+7)/8,0)
+              points.each do |x,y|
+                raise "Bad sparse terrain coordinate #{mid} #{x},#{y}" unless
+                  x.between?(0,w-1) && y.between?(0,h-1)
+                idx=y*w+x
+                bytes[idx/8]|=1<<(idx%8)
+              end
+              raise "Bad sparse terrain count #{mid}" unless
+                points.length=={48=>450,49=>345,50=>207}[mid]
+              masks[mid]=bytes.pack('C*').unpack1('H*')
+            end
+            sparse_literal=masks.map{|mid,hex| "#{mid}=>['#{hex}'].pack('H*')"}.join(',')
+            bounds=File.read('build/v22/map50-group-bounds.hex').strip""")
+          change(5,
+           r'''"  GROUP_BOUNDS_50=#{parts}\n  FOREGROUND_KEYS_50=#{JSON.generate(keys)}\n  FADE_ALPHA=135"''',
+           r'''"  GROUP_BOUNDS_50=#{parts}\n  FOREGROUND_KEYS_50=#{JSON.generate(keys)}\n  SPARSE_GROUND_BITS={#{sparse_literal}}\n  FADE_ALPHA=135"''')
+
+          # Register sparse real PNGs only, never transparent placeholders.
+          change(6,
+           " expected={f'SLTI_{mid}_C{x}_{y}.png' for x in range(w) for y in range(h)}",
+           """ inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
            keep={tuple(p) for p in inv['keep']}
            omit={tuple(p) for p in inv['omit']}
            assert len(keep)=={48:450,49:345,50:207}[mid]
            assert not keep&omit and len(keep)+len(omit)==w*h
-           expected={f'SLTI_{mid}_C{x}_{y}.png' for x,y in keep}"""
-          )
-
-          change(
-              """           inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
-           assert len(inv['keep'])=={48:450,49:345,50:207}[mid]
+           expected={f'SLTI_{mid}_C{x}_{y}.png' for x,y in keep}""")
+          change(6,
+           """ inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
+           assert len(inv['keep'])=={48:450,49:346,50:208}[mid]
            blank={(x,y) for x,y in inv['omit']}
            assert len(blank)+len(inv['keep'])==w*h
-          """,
-              ''
-          )
-
-          change('           blank_hash=None\n', '')
-
-          change(
-              """             if xy in blank:
+          """,'')
+          change(6,' blank_hash=None\n','')
+          change(6,
+           """   if xy in blank:
               value=hashlib.sha256(content).hexdigest()
               if blank_hash is None:blank_hash=value
               assert blank_hash==value,(mid,xy,'non-blank omitted region')
           """,
-              """             assert xy in keep,(mid,xy,'unapproved discarded ground chunk')
-          """
-          )
+           """   assert xy in keep,(mid,xy,'omitted region in pack')
+          """)
+          change(6,
+           "'required_ground=',len(inv['keep']),'empty_ground=',len(inv['omit']),",
+           "'required_ground=',len(keep),'omitted_ground=',len(omit),")
+          change(6,
+           '''rep("var version='V2.9';","var version='V2.10';")''',
+           '''rep("if(head.files.length<290)throw new Error('Incomplete original Map'+mid+' images');",
+              "if(head.files.length<(mid===50?209:290))throw new Error('Incomplete original Map'+mid+' images');")
+          rep("var version='V2.9';","var version='V2.10';")''')
 
-          change(
-              "'required_ground=',len(inv['keep']),'empty_ground=',len(inv['omit']),",
-              "'required_ground=',len(keep),'omitted_ground=',len(omit),"
-          )
-
-          loader_version = '''rep("var version='V2.9';","var version='V2.10';")'''
-          loader_check = '''rep(
-            "if(head.files.length<290)throw new Error('Incomplete original Map'+mid+' images');",
-            "if(head.files.length<(mid===50?209:290))throw new Error('Incomplete original Map'+mid+' images');")
-          '''
-          change(loader_version, loader_check + loader_version)
-
-          change(
-              "assert len(ground)==basechunks,(mid,len(ground))",
-              "assert len(ground)==keep,(mid,len(ground))"
-          )
-
-          change(
-              """           # Missing original terrain is tiny transparent assets, not duplicated full maps.
+          # Verify that every included ground key belongs to the saved source mask.
+          change(7,'49:346,50:208','49:345,50:207')
+          change(7,'assert len(ground)==basechunks,(mid,len(ground))',
+                   'assert len(ground)==keep,(mid,len(ground))')
+          change(7,
+           """ # Missing original terrain is tiny transparent assets, not duplicated full maps.
            inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
            blanks=set(inv['omit'])
            for key,off,size in ground:
@@ -156,179 +200,43 @@ jobs:
             if (int(part[0]),int(part[1])) in blanks:
              assert size<5000,(mid,key,'large unused tile')
           """,
-              """           inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
-           retained={tuple(row) for row in inv['keep']}
-           assert len(retained)==keep
+           """ inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
+           retained={tuple(p) for p in inv['keep']}
+           omitted={tuple(p) for p in inv['omit']}
+           assert len(retained)==keep and not retained&omitted
+           assert len(retained)+len(omitted)==basechunks
            for key,off,size in ground:
             part=key.rsplit('_c',1)[1].split('_')
-            assert (int(part[0]),int(part[1])) in retained,(mid,key,'discarded tile in pack')
-          """
-          )
+            assert (int(part[0]),int(part[1])) in retained,(mid,key,'omitted tile in pack')
+          """)
+          change(7,"'emptyPlaceholderTiles':basechunks-keep,",
+                   "'omittedGroundTiles':basechunks-keep,")
+          change(7,
+           "print('PASS no unapproved modifications; native source image duplicates excluded')",
+           "print('PASS no unapproved modifications; omitted ground has no PNG or pack entry')")
 
-          change(
-              "'emptyPlaceholderTiles':basechunks-keep,",
-              "'omittedGroundTiles':basechunks-keep,"
-          )
+          # Bridge events remain explicitly excluded until the real bridge landing points are verified.
+          change(9,
+           'raise "Map#{id} bridge inventory changed" unless events.keys.sort==[1,2,3,4]',
+           'raise "Unverified Map#{id} bridge event remains" unless events.empty?')
+          change(9,
+           'puts "BRIDGE PASS=#{results.count(true)} FAIL=#{results.count(false)} of #{results.size}"',
+           "puts 'PASS no unverified bridge transfer events'")
+          change(9,
+           "raise 'V2.10 REJECTED: original bridge cells do not connect to re-extracted Map049. Do not deploy unusable crossings.' unless results.all?",
+           "raise 'Unexpected bridge transfer' unless results.empty?")
 
-          change(
-              "print('PASS no unapproved modifications; native source image duplicates excluded')",
-              "print('PASS no unapproved modifications; omitted ground has no PNG or pack entry')"
-          )
+          print('PASS ten original V2.10 steps extracted and targeted patch applied')
+          V210_PATCH_STEPS_EOF
+          python3 -m py_compile build/v210/patch_steps.py
+          python3 build/v210/patch_steps.py
+          for STEP in build/v210/steps/*.sh; do bash -n "$STEP"; done
+          test -s build/v210/steps/02.sh
 
-          change(
-              "maps[50].instance_variable_set(:@events,{})",
-              "[48,49,50].each{|mid|maps[mid].instance_variable_set(:@events,{})}"
-          )
-
-          change(
-              'puts "PASS V2.9 Map048/Map049 event objects retained; Map050 added"',
-              "puts 'PASS Map048/049/050 data; unverified bridge transfers excluded'"
-          )
-
-          change(
-              'raise "Map#{id} bridge inventory changed" unless events.keys.sort==[1,2,3,4]',
-              'raise "Unverified Map#{id} bridge event remains" unless events.empty?'
-          )
-
-          change(
-              'puts "BRIDGE PASS=#{results.count(true)} FAIL=#{results.count(false)} of #{results.size}"',
-              "puts 'PASS no unverified bridge transfer events'"
-          )
-
-          change(
-              "raise 'V2.10 REJECTED: original bridge cells do not connect to re-extracted Map049. Do not deploy unusable crossings.' unless results.all?",
-              "raise 'Unexpected bridge transfer' unless results.empty?"
-          )
-
-          names = [
-              'Restore exact V2.9 deployed game and snapshot every original file',
-              'Retrieve last confirmed Map048 renderer and original V2.9 preloader verification',
-              'Re-use the original renderer and retain only needed terrain chunks',
-              'Replace 48 49 collision and register Map050 plus Oren destination',
-              'Extend existing native renderer and scroll count for Map050',
-              'Pack all three maps and remove duplicate individual full-size PNGs',
-              'Verify every changed file and report actual map pack MB',
-              'Reuse original native browser smoke test for Map050',
-              'Reject any broken Map048 to Map049 bridge transition'
-          ]
-
-          for index, name in enumerate(names):
-              marker = '      - name: ' + name + '\n'
-              if s.count(marker) != 1:
-                  raise RuntimeError('Missing/duplicate source step: ' + name)
-
-              remainder = s.split(marker, 1)[1]
-              section = remainder.split('\n      - name: ', 1)[0]
-              body_marker = '        run: |\n'
-              if section.count(body_marker) != 1:
-                  raise RuntimeError('Invalid source step body: ' + name)
-
-              body = section.split(body_marker, 1)[1]
-              lines = []
-              for line in body.splitlines():
-                  if line:
-                      if not line.startswith('          '):
-                          raise RuntimeError(
-                              'Unexpected YAML block indentation: ' + name
-                          )
-                      lines.append(line[10:])
-                  else:
-                      lines.append('')
-
-              target = Path(f'build/v210/steps/{index:02d}.sh')
-              target.write_text(
-                  '\n'.join(lines).rstrip() + '\n',
-                  'utf8'
-              )
-
-          print('PASS V2.10 source patch and ordered step extraction')
-          V210_PATCH_EOF
-
-      - name: Preserve sparse ground loading in the original RGSS renderer
+      - name: Build and verify maps 048 049 050
         shell: bash
         run: |
           set -euo pipefail
-
-          python3 - <<'V210_GROUND_GUARD_EOF'
-          from pathlib import Path
-
-          file = Path('build/v210/steps/04.sh')
-          s = file.read_text('utf8')
-
-          old = """  s
-          end
-
-          patch_named(rows,'SLNativeLayerV241') do |s|"""
-
-          new = r"""  start=s.index('def slti_update_terrain')
-          finish=s.index("\n  def ",start+4) rescue s.length
-          body=s[start...finish]
-          matches=body.lines.select{|line|
-            line.include?('SLTI_') && line.include?('_C') &&
-            line.match?(/^\s*[A-Za-z_]\w*\s*=/)
-          }
-          raise "Unable to locate original terrain filename assignment: #{matches.inspect}" unless matches.size==1
-          line=matches.first
-          variable=line[/^\s*([A-Za-z_]\w*)\s*=/,1]
-          indent=line[/^\s*/]
-          guard=(
-            "#{indent}if @slti_floor && [48,49,50].include?(@slti_floor)\n" +
-            "#{indent}  slti_match=#{variable}.match(/SLTI_(\\d+)_C(\\d+)_(\\d+)/)\n" +
-            "#{indent}  if slti_match && slti_match[1].to_i==@slti_floor\n" +
-            "#{indent}    slti_bits=SLNativeLayerV241::SPARSE_GROUND_BITS.fetch(@slti_floor)\n" +
-            "#{indent}    slti_index=slti_match[3].to_i*@slti_cols+slti_match[2].to_i\n" +
-            "#{indent}    next if (((slti_bits[slti_index/8] || 0) >> (slti_index%8)) & 1)==0\n" +
-            "#{indent}  end\n" +
-            "#{indent}end\n"
-          )
-          s=replace_once(s,line,line+guard)
-          s
-          end
-
-          patch_named(rows,'SLNativeLayerV241') do |s|"""
-
-          if s.count(old) != 1:
-              raise RuntimeError('Original RGSS terrain patch location changed')
-          s = s.replace(old, new)
-
-          marker = "  bounds=File.read('build/v22/map50-group-bounds.hex').strip"
-
-          addition = """  dimensions={48=>[48,24],49=>[50,24],50=>[24,13]}
-          masks={}
-          dimensions.each do |mid,(w,h)|
-            inventory=JSON.parse(File.read("build/v210/map#{mid}-chunk-inventory.json"))
-            rows=inventory.fetch('keep')
-            bytes=Array.new((w*h+7)/8,0)
-            rows.each do |x,y|
-              raise "Ground chunk out of range #{mid}" unless x.between?(0,w-1)&&y.between?(0,h-1)
-              index=y*w+x
-              bytes[index/8]|=(1<<(index%8))
-            end
-            masks[mid]=bytes.pack('C*').unpack1('H*')
-          end
-          sparse_literal=masks.map{|mid,hex| "#{mid}=>['#{hex}'].pack('H*')"}.join(',')
-          """
-
-          if s.count(marker) != 1:
-              raise RuntimeError('Original Layer4 patch location changed')
-          s = s.replace(marker, addition + marker)
-
-          old_const = r'''"  GROUP_BOUNDS_50=#{parts}\n  FOREGROUND_KEYS_50=#{JSON.generate(keys)}\n  FADE_ALPHA=135"'''
-          new_const = r'''"  GROUP_BOUNDS_50=#{parts}\n  FOREGROUND_KEYS_50=#{JSON.generate(keys)}\n  SPARSE_GROUND_BITS={#{sparse_literal}}\n  FADE_ALPHA=135"'''
-
-          if s.count(old_const) != 1:
-              raise RuntimeError('Original RGSS Layer4 constant changed')
-          s = s.replace(old_const, new_const)
-
-          file.write_text(s, 'utf8')
-          print('PASS original RGSS terrain receives sparse-ground guard')
-          V210_GROUND_GUARD_EOF
-
-      - name: Build and verify corrected V2.10
-        shell: bash
-        run: |
-          set -euo pipefail
-
           for STEP in \
             build/v210/steps/00.sh \
             build/v210/steps/01.sh \
@@ -338,20 +246,19 @@ jobs:
             build/v210/steps/05.sh \
             build/v210/steps/06.sh \
             build/v210/steps/07.sh \
-            build/v210/steps/08.sh
+            build/v210/steps/08.sh \
+            build/v210/steps/09.sh
           do
             echo "RUN $STEP"
             bash -e "$STEP"
           done
-
           test -s build/v210/size-report.json
           test -s site/knight/assets/map-048-v229r115.pack
           test -s site/knight/assets/map-049-v229r115.pack
           test -s site/knight/assets/map-050-v229r115.pack
+          echo 'PASS V2.10 map build and static verification'
 
-          echo 'PASS V2.10 corrected map build and static verification'
-
-      - name: Publish verified V2.10 candidate
+      - name: Publish V2.10 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
