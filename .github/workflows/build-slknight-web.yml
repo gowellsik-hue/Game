@@ -1,3 +1,930 @@
+name: build-slknight-web.yml | V3.1 | Map048 Map049 Map050 Sparse Original Native Terrain
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-slknight-web.yml
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: slknight-github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Restore exact V2.9 deployed game and snapshot every original file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site baseline build/v210 build/v22 build/v211
+          RUN_ID="$(gh api 'repos/gowellsik-hue/Game/actions/workflows/build-slknight-web.yml/runs?status=success&per_page=100' --jq '.workflow_runs[] | select(.head_sha=="dd5303061eae982f978bb62bd8e813d014826826") | .id' | head -n 1)"
+          test -n "$RUN_ID"
+          gh run download "$RUN_ID" --repo gowellsik-hue/Game --name github-pages --dir baseline
+          test -s baseline/artifact.tar
+          tar -xf baseline/artifact.tar -C site
+          rm -rf baseline
+          test -s site/knight/gameasync/Data/Scripts.rxdata
+          test -s site/knight/assets/map-048-v229r115.pack
+          test -s site/knight/assets/map-049-v229r115.pack
+          grep -q "var version='V2.9';" site/knight/js/sl-assets-v229r115.js
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --disable-pip-version-check 'Pillow>=11,<13'
+          python3 - <<'V210_INITIAL_SNAPSHOT'
+          from pathlib import Path
+          import hashlib,json
+          root=Path('site')
+          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.rglob('*') if p.is_file()}
+          assert len(before)>8500
+          Path('build/v210/before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
+          print('PASS exact last deployed V2.9 baseline',len(before))
+          V210_INITIAL_SNAPSHOT
+
+      - name: Download original Sanctuary Map4 source data
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 43157706909
+          name: Sanctuary-Original-Map-4-Full
+          github-token: ${{ github.token }}
+          path: source-map4
+
+      - name: Retrieve last confirmed Map048 renderer and original V2.9 preloader verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api 'repos/gowellsik-hue/Game/contents/.github/workflows/build-slknight-web.yml?ref=3c82c3b4ed77baab032e23cb6f4a1385755b377b' --jq .content | base64 -d > build/v210/v27-source.yml
+          gh api 'repos/gowellsik-hue/Game/contents/.github/workflows/build-slknight-web.yml?ref=dd5303061eae982f978bb62bd8e813d014826826' --jq .content | base64 -d > build/v210/v29-source.yml
+          test -s build/v210/v27-source.yml
+          test -s build/v210/v29-source.yml
+
+      - name: Restore exact visual-extent masks from three re-extracted HTMLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api 'repos/gowellsik-hue/Game/contents/.github/workflows/build-slknight-web.yml?ref=0cfbf99d6c16cdc599661cdd5b81c6e8fc9a864e' --jq .content | base64 -d > build/v210/v210-source.yml
+          .venv/bin/python - <<'V211_RESTORE_MASKS'
+          from pathlib import Path
+          import base64,zlib
+          src=Path('build/v210/v210-source.yml').read_text('utf8')
+          head="          cat > build/v210/masks.txt <<'V210_REGION_BITS_EOF'\n"
+          tail='\n          V210_REGION_BITS_EOF'
+          assert src.count(head)==1 and src.count(tail)==1
+          bits=src.split(head,1)[1].split(tail,1)[0]
+          rows=[line.strip() for line in bits.splitlines() if line.strip()]
+          assert len(rows)==3
+          assert [int(line.split(' ',1)[0]) for line in rows]==[48,49,50]
+          for row in rows:
+              mid,coded=row.split(' ',1)
+              packed=base64.b85decode(coded)
+              raw=zlib.decompress(packed)
+              w,h={48:(1536,768),49:(1600,768),50:(768,416)}[int(mid)]
+              assert len(raw)==w*h//8,(mid,len(raw))
+          Path('build/v210/masks.txt').write_text(
+              ''.join(line+'\n' for line in rows),'ascii')
+          print('PASS exact V2.10 Map048/049/050 masks',len(rows))
+          V211_RESTORE_MASKS
+
+      - name: Re-use the original renderer and retain only needed terrain chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/prepare_native_maps.py <<'V210_PREPARE_NATIVE_MAPS_EOF'
+          from pathlib import Path
+          import base64,json,textwrap,zlib
+
+          work=Path('build/v210')
+          site=Path('site')
+          src=(work/'v27-source.yml').read_text('utf8')
+          head="          cat > build/v22/build_map048.py <<'V22_MAP48_SOURCE_EOF'\n"
+          tail='\n          V22_MAP48_SOURCE_EOF'
+          assert src.count(head)==1
+          script=textwrap.dedent(src.split(head,1)[1].split(tail,1)[0])
+          assert script.startswith('from pathlib import Path')
+          conf={48:(1536,768,64854,8,5358),49:(1600,768,64600,0,10798),50:(768,416,66027,4,13058)}
+
+          bits={}
+          for line in (work/'masks.txt').read_text('ascii').splitlines():
+           mid,coded=line.split(' ',1)
+           bits[int(mid)]=base64.b85decode(coded)
+          assert sorted(bits)==[48,49,50]
+          pano=site/'knight/gameasync/Graphics/Panoramas'
+          for mid,expected in ((48,1530),(49,1885)):
+           old=list(pano.glob(f'SLTI_{mid}_*.png'))
+           assert len(old)==expected,(mid,'V2.9 images changed',len(old))
+           for p in old:p.unlink()
+          assert not list(pano.glob('SLTI_50_*.png'))
+
+          for mid,(W,H,U,X,Y) in conf.items():
+           s=script
+           def rep(old,new):
+            global s
+            assert s.count(old)==1,(mid,'expected unique renderer expression',old[:90],s.count(old))
+            s=s.replace(old,new,1)
+           rep('W,H=1536,768',f'W,H={W},{H}')
+           rep('UORG=64854',f'UORG={U}')
+           rep('XSHIFT,YSHIFT=8,5358',f'XSHIFT,YSHIFT={X},{Y}')
+           if mid!=48:
+            rep("assert cities=={'글루디오':(366,382),'우드벡':(742,546),'은기사':(1210,450)}",'assert len(cities)==3')
+           a=s.index('bridge_x=(fx(')
+           b=s.index("idx=(ROOT/'Tile.idx').read_bytes()",a)
+           block=(
+            'import zlib\n'
+            'from base64 import b85decode\n'
+            f"region_bits=zlib.decompress(b85decode({base64.b85encode(bits[mid]).decode('ascii')!r}))\n"
+            'assert len(region_bits)==W*H//8\n'
+            'region_bytes=bytes(255 if (region_bits[i//8]>>(i%8))&1 else 0 for i in range(W*H))\n'
+            "mask_small=Image.frombytes('L',(W,H),region_bytes)\n"
+            'mask=mask_small.resize((PW,PH),Image.Resampling.NEAREST)\n'
+            'keep={(gx,gy) for gy in range(H//32) for gx in range(W//32) '
+            'if mask_small.crop((gx*32,gy*32,(gx+1)*32,(gy+1)*32)).getbbox()}\n'
+            f"assert len(keep)=={ {48:450,49:345,50:207}[mid] }\n"
+           )
+           s=s[:a]+block+'\n'+s[b:]
+           rep('ground.paste((0,0,0,255),mask=ImageChops.invert(mask))',
+               'ground.paste((0,0,0,0),mask=ImageChops.invert(mask))')
+           start=s.index('line_y=[0]*PW')
+           end=s.index('walk=bytearray(W*H*2)',start)
+           s=s[:start]+s[end:]
+           rep('inland=py>=line_y[px]','inland=bool(mask_small.getpixel((tx,ty)))')
+           rep('for gx in range(48):','for gx in range(W//32):')
+           rep('for gy in range(24):','for gy in range(H//32):')
+           rep("crop=ground.crop((x,y,x+512,y+512)).convert('RGB');crop.save(panos/name,optimize=True);images.append(name)",
+               "if (gx,gy) in keep:\n   crop=ground.crop((x,y,x+512,y+512)).convert('RGBA')\n   crop.save(panos/name,optimize=True)\n   images.append(name)")
+           if mid!=48:
+            rep('if bmp is not None and not (110<=tile<=168 and index==34):', 'if bmp is not None:')
+           if mid!=48:
+            s=s.replace('SLTI_48_',f'SLTI_{mid}_')
+            s=s.replace('map48-',f'map{mid}-')
+            s=s.replace("print('PASS map048'",f"print('PASS map{mid:03}'")
+           rep('ground=1152,upper','ground=len(keep),upper')
+           target=f"images.append('SLTI_{mid}_GID.png')"
+           assert s.count(target)==1
+           contents=(
+             f"Path('build/v210/map{mid}-chunk-inventory.json').write_text("
+             +"json.dumps({'keep':[list(xy) for xy in sorted(keep)],"
+             +"'omit':[[x,y] for x in range(W//32) for y in range(H//32) "
+             +"if (x,y) not in keep]},separators=(',',':')),'utf8')"
+           )
+           s=s.replace(target,target+'\n'+contents)
+           assert f'SLTI_{mid}_GID.png' in s and f'map{mid}-full-walk.bin' in s
+           out=work/f'render_map{mid}.py'
+           out.write_text(s,'utf8')
+           compile(s,str(out),'exec')
+           print('READY',mid,'source lines',len(s.splitlines()),'native base chunks',W//32*H//32)
+          V210_PREPARE_NATIVE_MAPS_EOF
+          .venv/bin/python -m py_compile build/v210/prepare_native_maps.py
+
+          .venv/bin/python build/v210/prepare_native_maps.py
+          for MID in 48 49 50; do
+            .venv/bin/python -m py_compile "build/v210/render_map${MID}.py"
+            PYTHONUNBUFFERED=1 .venv/bin/python "build/v210/render_map${MID}.py"
+          done
+
+      - name: Replace 48 49 collision and register Map050 plus Oren destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/apply_native_map_data.rb <<'V210_APPLY_NATIVE_MAP_DATA_EOF'
+          # encoding: UTF-8
+          module RPG
+            class Map;end
+            class Event;end
+            class Event::Page;end
+            class Event::Page::Condition;end
+            class Event::Page::Graphic;end
+            class EventCommand;end
+            class MoveCommand;end
+            class MoveRoute;end
+            class AudioFile;end
+            class MapInfo;end
+          end
+          class Table
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth);@raw;end
+          end
+          class Tone
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth);@raw;end
+          end
+          class Color
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth);@raw;end
+          end
+
+          data='site/knight/gameasync/Data'
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          path=lambda{|name|File.join(data,prefix+name+'.rxdata')}
+          files={48=>path.call('Map048'),49=>path.call('Map049'),50=>path.call('Map050')}
+          infos_path=path.call('MapInfos')
+          npc_path=path.call('Map029')
+          raise 'Map050 exists in V2.9' if File.exist?(files[50])
+          original={}
+          [48,49].each{|mid|original[mid]=File.binread(files[mid])}
+          old_infos=File.binread(infos_path)
+          old_npc=File.binread(npc_path)
+          infos=Marshal.load(old_infos)
+          raise 'Original MapInfo keys missing' unless infos.key?(48)&&infos.key?(49)&&!infos.key?(50)
+
+          maps={}
+          [48,49].each do |mid|
+            map=Marshal.load(original[mid])
+            w,h={48=>[1536,768],49=>[1600,768]}[mid]
+            raise "Unexpected Map#{mid} size" unless
+              [map.instance_variable_get(:@width),map.instance_variable_get(:@height)]==[w,h]
+            raise "Map#{mid} original bridges changed" unless
+              map.instance_variable_get(:@events).keys.sort==[1,2,3,4]
+            maps[mid]=map
+          end
+          maps[50]=Marshal.load(original[49])
+          [48,49,50].each{|mid|maps[mid].instance_variable_set(:@events,{})}
+
+          {48=>[1536,768],49=>[1600,768],50=>[768,416]}.each do |mid,(w,h)|
+            walk=File.binread("build/v22/map#{mid}-full-walk.bin")
+            raise "Unexpected Map#{mid} collision length" unless walk.bytesize==w*h*2
+            raise "Unexpected Map#{mid} collision values" unless walk.unpack('v*').all?{|v|v==384||v==385}
+            map=maps[mid]
+            map.instance_variable_set(:@width,w)
+            map.instance_variable_set(:@height,h)
+            map.instance_variable_get(:@data).instance_variable_set(
+              :@raw,[3,w,h,3,3*w*h].pack('V5')+walk+("\0"*(4*w*h)))
+            File.binwrite(files[mid],Marshal.dump(map))
+            raise "Map#{mid} differs after saving" unless
+              Marshal.load(File.binread(files[mid])).instance_variable_get(:@width)==w
+          end
+
+          info=Marshal.load(Marshal.dump(infos.fetch(49)))
+          info.instance_variable_set(:@name,'오렌')
+          info.instance_variable_set(:@order,50)
+          infos[50]=info
+          File.binwrite(infos_path,Marshal.dump(infos))
+          raise 'MapInfos mismatch' unless Marshal.load(File.binread(infos_path)).keys.sort==infos.keys.sort
+
+          npc=Marshal.load(old_npc)
+          events=npc.instance_variable_get(:@events)
+          raise 'Teleport NPC missing' unless events.key?(11)
+          event=events[11]
+          raise 'Teleport NPC position changed' unless
+            [event.instance_variable_get(:@x),event.instance_variable_get(:@y)]==[70,48]
+          page=event.instance_variable_get(:@pages).first
+          list=page.instance_variable_get(:@list)
+          choice=list.select{|c|c.instance_variable_get(:@code)==102}
+          raise 'Unexpected teleport menu count' unless choice.size==1
+          root=choice.first.instance_variable_get(:@indent)
+          opts=choice.first.instance_variable_get(:@parameters)
+          raise 'V2.9 teleport options changed' unless
+            opts.is_a?(Array)&&opts[0].size==12 &&
+            opts[0].last=='오크숲' && opts[1]==13 &&
+            list.count{|c|c.instance_variable_get(:@code)==201}==12
+
+          walk50=File.binread('build/v22/map50-full-walk.bin')
+          w50,h50=768,416
+          land=nil
+          (0...w50*h50).each do |idx|
+            next unless walk50.byteslice(idx*2,2).unpack1('v')==384
+            x,y=idx%w50,idx/w50
+            candidate=[(x-w50/2).abs+(y-h50/2).abs,y,x]
+            land=[candidate,x,y] if !land || (candidate<=>land[0])==-1
+          end
+          raise 'No original Oren passable tile' unless land
+          orenx,oreny=land[1],land[2]
+
+          def make_command(code,indent,parameters)
+            c=RPG::EventCommand.allocate
+            c.instance_variable_set(:@code,code)
+            c.instance_variable_set(:@indent,indent)
+            c.instance_variable_set(:@parameters,parameters)
+            c
+          end
+          cancel_idx=list.index{|c|c.instance_variable_get(:@code)==403 &&
+            c.instance_variable_get(:@indent)==root}
+          raise 'V2.9 teleport cancel branch missing' unless cancel_idx
+          opts[0] << '오렌'
+          list.insert(cancel_idx,
+            make_command(402,root,[12,'오렌']),
+            make_command(201,root+1,[0,50,orenx,oreny,0,1]),
+            make_command(0,root+1,[]))
+          raise 'Teleport choice count not 13' unless
+            opts[0].size==13 &&
+            list.count{|c|c.instance_variable_get(:@code)==201}==13 &&
+            list.count{|c|c.instance_variable_get(:@code)==402}==13
+          File.binwrite(npc_path,Marshal.dump(npc))
+          raise 'Other NPC event mutated' unless
+            Marshal.load(old_npc).instance_variable_get(:@events).all?{|id,e|
+              id==11 || Marshal.dump(e)==Marshal.dump(Marshal.load(File.binread(npc_path)).instance_variable_get(:@events)[id])}
+          puts 'PASS original Map048/049 bridges excluded pending verified coordinates; Map050 added'
+          puts "PASS thirteen teleport destinations; Oren landing #{orenx},#{oreny}"
+          V210_APPLY_NATIVE_MAP_DATA_EOF
+          ruby -c build/v210/apply_native_map_data.rb
+          ruby build/v210/apply_native_map_data.rb
+
+      - name: Extend existing native renderer and scroll count for Map050
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/patch_native_scripts.rb <<'V210_PATCH_NATIVE_SCRIPTS_EOF'
+          # encoding: UTF-8
+          require 'json'
+          require 'zlib'
+          file='site/knight/gameasync/Data/Scripts.rxdata'
+          rows=Marshal.load(File.binread(file))
+          raise 'Unexpected RGSS count' unless rows.size==137
+          original=rows.map{|r|r.dup}
+
+          def replace_once(s,old,new)
+            raise "Missing/duplicate RGSS expression: #{old[0,110]}" unless s.scan(old).size==1
+            s.sub(old,new)
+          end
+
+          def patch_named(rows,name)
+            matches=rows.select{|r|r.is_a?(Array)&&r[1].to_s.dup.force_encoding('UTF-8')==name}
+            raise "Missing or duplicate RGSS script #{name}" unless matches.size==1
+            row=matches.first
+            src=Zlib::Inflate.inflate(row[2]).force_encoding('UTF-8')
+            raise "Invalid UTF-8 #{name}" unless src.valid_encoding?
+            nl=src.include?("\r\n") ? "\r\n" : "\n"
+            src=src.gsub("\r\n","\n")
+            dst=yield src
+            RubyVM::InstructionSequence.compile(dst)
+            row[2]=Zlib::Deflate.deflate(dst.gsub("\n",nl).b)
+          end
+
+          patch_named(rows,'해상도') do |s|
+            s=replace_once(s,
+              '@slti_floor = ([47,48,49].include?($game_map.map_id)) ? $game_map.map_id : nil',
+              '@slti_floor = ([47,48,49,50].include?($game_map.map_id)) ? $game_map.map_id : nil')
+            s=replace_once(s,
+              '@slti_floor == 49 ? 50 : (@slti_floor == 48 ? 48 : (@slti_floor == 47 ? 24 : 0))',
+              '@slti_floor == 50 ? 24 : (@slti_floor == 49 ? 50 : (@slti_floor == 48 ? 48 : (@slti_floor == 47 ? 24 : 0)))')
+            s=replace_once(s,
+              '(@slti_floor == 48 || @slti_floor == 49) ? 24 : (@slti_floor == 47 ? 12 : 0)',
+              '@slti_floor == 50 ? 13 : ((@slti_floor == 48 || @slti_floor == 49) ? 24 : (@slti_floor == 47 ? 12 : 0))')
+            s=replace_once(s,
+              '([48,49].include?(@map_id)) ? width : $WINDOW_WIDTH',
+              '([48,49,50].include?(@map_id)) ? width : $WINDOW_WIDTH')
+            s=replace_once(s,
+              '([48,49].include?(@map_id)) ? height : $WINDOW_HEIGHT',
+              '([48,49,50].include?(@map_id)) ? height : $WINDOW_HEIGHT')
+            sparse_filter=<<-'V210_SPARSE_GROUND_FILTER'
+              if @slti_floor==48 || @slti_floor==49 || @slti_floor==50
+                slti_bits=SLNativeLayerV241::SPARSE_GROUND_BITS.fetch(@slti_floor)
+                required.delete_if do |key,_|
+                  cell=key[1]*@slti_cols+key[0]
+                  (slti_bits[cell/8,1].unpack('C')[0] & (1 << (cell%8)))==0
+                end
+              end
+            V210_SPARSE_GROUND_FILTER
+            s=replace_once(s,'    @slti_r111_active_chunks=required',
+              sparse_filter+'    @slti_r111_active_chunks=required')
+            s
+          end
+
+          patch_named(rows,'SLNativeLayerV241') do |s|
+            dimensions={48=>[48,24],49=>[50,24],50=>[24,13]}
+            sparse={}
+            dimensions.each do |mid,(w,h)|
+              inventory=JSON.parse(File.read("build/v210/map#{mid}-chunk-inventory.json"))
+              keep=inventory.fetch('keep')
+              expected={48=>450,49=>345,50=>207}[mid]
+              raise "Map#{mid} ground count mismatch" unless keep.length==expected
+              bits=Array.new((w*h+7)/8,0)
+              keep.each do |x,y|
+                raise "Map#{mid} ground coordinate outside bounds" unless x.between?(0,w-1) && y.between?(0,h-1)
+                cell=y*w+x
+                bits[cell/8] |= (1 << (cell%8))
+              end
+              sparse[mid]=bits.pack('C*').unpack1('H*')
+            end
+            sparse_code=sparse.map{|mid,hex|"#{mid}=>['#{hex}'].pack('H*')"}.join(',')
+            bounds=File.read('build/v22/map50-group-bounds.hex').strip
+            keys=JSON.parse(File.read('build/v22/map50-foreground-keys.json'))
+            raise 'Map050 bounds invalid' unless bounds.match?(/\A[0-9a-f]+\z/) && bounds.length%16==0 && bounds.length>16
+            raise 'Map050 foreground invalid' unless keys.any? && keys.all?{|k|k.is_a?(Array)&&k.size==2&&k[0].between?(0,23)&&k[1].between?(0,12)}
+            parts=bounds.scan(/.{1,30000}/).map{|p|"'#{p}'"}.join(" \\\n    ")
+            s=replace_once(s,'  FADE_ALPHA=135',
+               "  GROUP_BOUNDS_50=#{parts}\n  FOREGROUND_KEYS_50=#{JSON.generate(keys)}\n  SPARSE_GROUND_BITS={#{sparse_code}}\n  FADE_ALPHA=135")
+            s=replace_once(s,
+               'source=mapid==49 ? GROUP_BOUNDS_49 : (mapid==48 ? GROUP_BOUNDS_48 : GROUP_BOUNDS)',
+               'source=mapid==50 ? GROUP_BOUNDS_50 : (mapid==49 ? GROUP_BOUNDS_49 : (mapid==48 ? GROUP_BOUNDS_48 : GROUP_BOUNDS))')
+            old='$game_map.map_id==47 || $game_map.map_id==48 || $game_map.map_id==49'
+            raise 'Map049 native branches missing' unless s.include?(old)
+            s=s.gsub(old,'$game_map.map_id==47 || $game_map.map_id==48 || $game_map.map_id==49 || $game_map.map_id==50')
+            s=replace_once(s,
+               '(@slti_floor==49 && @slti_cols==50 && @slti_rows==24)',
+               '(@slti_floor==49 && @slti_cols==50 && @slti_rows==24) || (@slti_floor==50 && @slti_cols==24 && @slti_rows==13)')
+            s=replace_once(s,
+              '@slti_floor==49 ? SLNativeLayerV241::FOREGROUND_KEYS_49 : (@slti_floor==48 ? SLNativeLayerV241::FOREGROUND_KEYS_48 : SLNativeLayerV241::FOREGROUND_KEYS)',
+              '@slti_floor==50 ? SLNativeLayerV241::FOREGROUND_KEYS_50 : (@slti_floor==49 ? SLNativeLayerV241::FOREGROUND_KEYS_49 : (@slti_floor==48 ? SLNativeLayerV241::FOREGROUND_KEYS_48 : SLNativeLayerV241::FOREGROUND_KEYS))')
+            s
+          end
+
+          patch_named(rows,'Window_Message') do |s|
+            s=replace_once(s,'$game_temp.choice_max==12','$game_temp.choice_max==13')
+            s=replace_once(s,'($game_temp.choice_start+12)*32','($game_temp.choice_start+13)*32')
+            s=replace_once(s,'@item_max=12','@item_max=13')
+            s
+          end
+          changed=rows.each_index.select{|i|rows[i][2]!=original[i][2]}
+          expected=rows.each_index.select{|i|['해상도','SLNativeLayerV241','Window_Message'].include?(rows[i][1].to_s.dup.force_encoding('UTF-8'))}
+          raise 'Unapproved RGSS script mutation' unless changed.sort==expected.sort && changed.size==3
+          File.binwrite(file,Marshal.dump(rows))
+          raise 'Serialized RGSS count changed' unless Marshal.load(File.binread(file)).size==137
+          puts 'PASS existing native renderer extended for Map050; no new update/input loop'
+          V210_PATCH_NATIVE_SCRIPTS_EOF
+          ruby -c build/v210/patch_native_scripts.rb
+          ruby build/v210/patch_native_scripts.rb
+
+      - name: Pack all three maps and remove duplicate individual full-size PNGs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/pack_and_register.py <<'V210_PACK_AND_REGISTER_EOF'
+          from pathlib import Path
+          import hashlib,json,re,struct
+
+          root=Path('site')
+          pano=root/'knight/gameasync/Graphics/Panoramas'
+          data=root/'knight/gameasync/Data'
+          asset=root/'knight/assets'
+          work=Path('build/v22')
+          prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          original=(asset/'map-047-v241.pack').read_bytes()
+          n=struct.unpack_from('<I',original)[0]
+          head=json.loads(original[4:4+n])
+          body=memoryview(original)[4+n:]
+          assert head['kind']=='map' and head['map_id']==47
+          collision=[r for r in head['files'] if r[0]=='graphics/tilesets/slti_collision_transparent']
+          assert len(collision)==1
+          _,off,size=collision[0]
+          extra=bytes(body[off:off+size])
+          assert extra.startswith(b'\x89PNG\r\n\x1a\n')
+
+          images={}
+          old_pack_bytes={}
+          for mid in (48,49,50):
+           names=json.loads((work/f'map{mid}-generated-files.json').read_text('utf8'))
+           keys=json.loads((work/f'map{mid}-foreground-keys.json').read_text('utf8'))
+           w,h={48:(48,24),49:(50,24),50:(24,13)}[mid]
+           inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
+           keep={tuple(point) for point in inv['keep']}
+           omit={tuple(point) for point in inv['omit']}
+           assert len(keep)=={48:450,49:345,50:207}[mid]
+           assert len(keep)+len(omit)==w*h and not keep&omit
+           expected={f'SLTI_{mid}_C{x}_{y}.png' for x,y in keep}
+           expected|={f'SLTI_{mid}_L4_C{x}_{y}.png' for x,y in keys}
+           expected.add(f'SLTI_{mid}_GID.png')
+           assert set(names)==expected,(mid,'missing or extra images',len(names),len(expected))
+           assert len(names)==len(set(names))
+           oldpack=asset/f'map-{mid:03}-v229r115.pack'
+           old_pack_bytes[mid]=oldpack.stat().st_size if oldpack.exists() else None
+           payload=bytearray();entries=[]
+           for name in names:
+            p=pano/name
+            content=p.read_bytes()
+            assert content.startswith(b'\x89PNG\r\n\x1a\n')
+            key='graphics/panoramas/'+name[:-4].lower()
+            if name.startswith(f'SLTI_{mid}_C') and not name.startswith(f'SLTI_{mid}_L4_C'):
+             coords=name.split('_C',1)[1][:-4].split('_')
+             xy=(int(coords[0]),int(coords[1]))
+             assert xy in keep,(mid,xy,'discarded ground must not enter pack')
+            entries.append([key,len(payload),len(content)])
+            payload.extend(content)
+           entries.append(['graphics/tilesets/slti_collision_transparent',len(payload),len(extra)])
+           payload.extend(extra)
+           nh=json.dumps({'kind':'map','map_id':mid,'files':entries},separators=(',',':')).encode('utf8')
+           oldpack.write_bytes(struct.pack('<I',len(nh))+nh+payload)
+           print('PACK_SIZE',mid,'old=',old_pack_bytes[mid],'new=',oldpack.stat().st_size,
+                 'required_ground=',len(keep),'omitted_ground=',len(omit),
+                 'upper=',len(keys),'pack_entries=',len(entries))
+           images[mid]=names
+
+          mapper=root/'knight/gameasync/mapping.js'
+          s=mapper.read_text('utf8')
+          lines=s.splitlines(keepends=True)
+          filtered=[]
+          removed={48:0,49:0}
+          for l in lines:
+           hit=re.match(r'^\s*\["graphics/panoramas/slti_(48|49)_',l)
+           if hit:
+            removed[int(hit.group(1))]+=1
+           else:filtered.append(l)
+          assert removed=={48:1530,49:1885},('Original V2.9 image mappings unexpected',removed)
+          s=''.join(filtered)
+          marker='"graphics/panoramas/slti_47_gid"'
+          assert s.count(marker)==1
+          insert=s.index('\n',s.index(marker))+1
+          rows=[]
+          for mid in (48,49,50):
+           for name in images[mid]:
+            p=pano/name
+            rows.append('["graphics/panoramas/'+name[:-4].lower()+'", "Graphics/Panoramas/'+name+
+             '?h='+hashlib.md5(p.read_bytes()).hexdigest()+'"],\n')
+          s=s[:insert]+''.join(rows)+s[insert:]
+
+          map50=data/(prefix+'Map050.rxdata')
+          assert map50.is_file()
+          old49='"data/'+prefix.lower()+'map049"'
+          assert s.count(old49)==1
+          insert=s.index('\n',s.index(old49))+1
+          new='["data/'+prefix.lower()+'map050", "Data/'+prefix+'Map050.rxdata?h='+hashlib.md5(map50.read_bytes()).hexdigest()+'"],\n'
+          s=s[:insert]+new+s[insert:]
+          for name in [prefix+'Map029.rxdata',prefix+'Map048.rxdata',prefix+'Map049.rxdata',
+                       prefix+'MapInfos.rxdata','Scripts.rxdata']:
+           p=data/name
+           marker='Data/'+name+'?h='
+           pattern=re.escape(marker)+r'[0-9a-f]{32}'
+           assert len(re.findall(pattern,s))==1,(name,'original mapping missing or duplicate')
+           s=re.sub(pattern,lambda match:marker+hashlib.md5(p.read_bytes()).hexdigest(),s)
+          mapper.write_text(s,'utf8')
+
+          loader=root/'knight/js/sl-assets-v229r115.js'
+          s=loader.read_text('utf8')
+          def rep(old,new):
+           global s
+           assert s.count(old)==1,('Missing original native asset loader expression',old[:110],s.count(old))
+           s=s.replace(old,new)
+          rep('var map47Keys=null, map47FilesReady=false, map48Keys=null, map48FilesReady=false, map49Keys=null, map49FilesReady=false;',
+           'var map47Keys=null, map47FilesReady=false, map48Keys=null, map48FilesReady=false, map49Keys=null, map49FilesReady=false, map50Keys=null, map50FilesReady=false;')
+          rep("if(kind==='map'&&(mid===47||mid===48||mid===49)){",
+           "if(kind==='map'&&(mid===47||mid===48||mid===49||mid===50)){")
+          rep('if(mid===47)map47Keys=head.files.map(function(row){return row[0];});\n      else if(mid===48)map48Keys=head.files.map(function(row){return row[0];});\n      else map49Keys=head.files.map(function(row){return row[0];});',
+           'if(mid===47)map47Keys=head.files.map(function(row){return row[0];});\n      else if(mid===48)map48Keys=head.files.map(function(row){return row[0];});\n      else if(mid===49)map49Keys=head.files.map(function(row){return row[0];});\n      else map50Keys=head.files.map(function(row){return row[0];});')
+          rep('if((mid===47&&map47FilesReady)||(mid===48&&map48FilesReady)||(mid===49&&map49FilesReady))return Promise.resolve();',
+           'if((mid===47&&map47FilesReady)||(mid===48&&map48FilesReady)||(mid===49&&map49FilesReady)||(mid===50&&map50FilesReady))return Promise.resolve();')
+          rep('var mapKeys=mid===49?map49Keys:(mid===48?map48Keys:map47Keys);',
+           'var mapKeys=mid===50?map50Keys:(mid===49?map49Keys:(mid===48?map48Keys:map47Keys));')
+          rep('if(mid===47)map47FilesReady=true;\n      else if(mid===48)map48FilesReady=true;\n      else map49FilesReady=true;',
+           'if(mid===47)map47FilesReady=true;\n      else if(mid===48)map48FilesReady=true;\n      else if(mid===49)map49FilesReady=true;\n      else map50FilesReady=true;')
+          rep('return (mid===47||mid===48||mid===49) ? installMap47Files(mid).then(function(){return result;}) : result;',
+           'return (mid===47||mid===48||mid===49||mid===50) ? installMap47Files(mid).then(function(){return result;}) : result;')
+          rep('if(mid<1||mid>49)return nativeMapLoad.apply(self,args);',
+           'if(mid<1||mid>50)return nativeMapLoad.apply(self,args);')
+          rep("if(head.files.length<290)throw new Error('Incomplete original Map'+mid+' images');",
+              "if(head.files.length<(mid===47?290:(mid===48?452:(mid===49?347:209))))throw new Error('Incomplete original Map'+mid+' images');")
+          rep("var timeout=setTimeout(function(){controller.abort();},90000);",
+              "var timeout=setTimeout(function(){controller.abort();},filename==='map-050-v229r115.pack'?300000:90000);")
+          rep("return fetch('assets/'+filename,{cache:'force-cache',signal:controller.signal})",
+              "return fetch('assets/'+filename,{cache:filename==='map-050-v229r115.pack'?'reload':'force-cache',signal:controller.signal})")
+          rep("var version='V2.9';","var version='V2.14';")
+          loader.write_text(s,'utf8')
+
+          for name in ('index.html','knight/index.html'):
+           p=root/name
+           text=p.read_text('utf8')
+           assert 'V2.9' in text
+           p.write_text(text.replace('V2.9','V2.14').replace('v2.9','v2.14')
+            .replace('mapping.js?v=v229r111','mapping.js?v=v2.14')
+            .replace('sl-assets-v229r115.js?v=v229r115','sl-assets-v229r115.js?v=v2.14'),'utf8')
+
+          for mid in (48,49,50):
+           ps=list(pano.glob(f'SLTI_{mid}_*.png'))
+           assert len(ps)==len(images[mid]),(mid,'PNG files before dedupe',len(ps),len(images[mid]))
+           for p in ps:p.unlink()
+           assert not list(pano.glob(f'SLTI_{mid}_*.png'))
+
+          print('PASS original map loader extended only from 49 to 50')
+          print('PASS Map048, Map049, Map050 are packed once, no duplicate physical PNGs')
+          V210_PACK_AND_REGISTER_EOF
+          .venv/bin/python -m py_compile build/v210/pack_and_register.py
+          .venv/bin/python build/v210/pack_and_register.py
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
+
+      - name: Verify every changed file and report actual map pack MB
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/verify_and_report.py <<'V210_VERIFY_AND_REPORT_EOF'
+          from pathlib import Path
+          import hashlib,json,struct
+
+          root=Path('site')
+          base=Path('build/v210/before.json')
+          old=json.loads(base.read_text('utf8'))
+          now={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+
+          allowed={
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap029.rxdata',
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap048.rxdata',
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap049.rxdata',
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMapInfos.rxdata',
+           'knight/gameasync/Data/Scripts.rxdata',
+           'knight/gameasync/mapping.js',
+           'knight/js/sl-assets-v229r115.js',
+           'knight/assets/map-048-v229r115.pack',
+           'knight/assets/map-049-v229r115.pack',
+           'index.html','knight/index.html'}
+          added={
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap050.rxdata',
+           'knight/assets/map-050-v229r115.pack'}
+          removed={p for p in old if p.startswith('knight/gameasync/Graphics/Panoramas/SLTI_48_') or
+                   p.startswith('knight/gameasync/Graphics/Panoramas/SLTI_49_')}
+          assert len(removed)==1530+1885,(len(removed),'V2.9 original PNG count')
+          assert set(now)-set(old)==added,('unexpected additions',(set(now)-set(old))^added)
+          assert set(old)-set(now)==removed,('unexpected deletions',(set(old)-set(now))^removed)
+          changed={p for p in set(old)&set(now) if old[p]!=now[p]}
+          assert changed==allowed,('unapproved original file mutation',changed^allowed)
+          assert 'knight/js/dpad.js' not in changed
+          assert old['knight/assets/map-047-v241.pack']==now['knight/assets/map-047-v241.pack']
+          assert old['knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap047.rxdata']==now[
+           'knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMap047.rxdata']
+
+          manifest={}
+          for mid in (48,49,50):
+           p=root/f'knight/assets/map-{mid:03}-v229r115.pack'
+           b=p.read_bytes();n=struct.unpack_from('<I',b)[0];h=json.loads(b[4:4+n]);data=memoryview(b)[4+n:]
+           assert h['kind']=='map' and h['map_id']==mid
+           assert len({entry[0] for entry in h['files']})==len(h['files'])
+           assert all(0<=o<len(data) and z>7 and o+z<=len(data) for _,o,z in h['files'])
+           ground=[entry for entry in h['files'] if entry[0].startswith('graphics/panoramas/slti_'+str(mid)+'_c')]
+           keep={48:450,49:345,50:207}[mid]
+           basechunks={48:1152,49:1200,50:312}[mid]
+           assert len(ground)==keep,(mid,len(ground))
+           inv=json.loads(Path(f'build/v210/map{mid}-chunk-inventory.json').read_text('utf8'))
+           retained={tuple(p) for p in inv['keep']}
+           omitted={tuple(p) for p in inv['omit']}
+           assert len(retained)==keep and len(retained)+len(omitted)==basechunks
+           assert not retained&omitted
+           for key,off,size in ground:
+            part=key.rsplit('_c',1)[1].split('_')
+            assert (int(part[0]),int(part[1])) in retained,(mid,key,'omitted ground still packed')
+           total_content=sum(f.stat().st_size for f in root.rglob('*') if f.is_file())
+           manifest[mid]={'packBytes':len(b),'packMB':round(len(b)/1e6,3),'realGroundTiles':keep,
+                          'omittedGroundTiles':basechunks-keep,'packFiles':len(h['files'])}
+           print('MAP_PACK',json.dumps({'map':mid,**manifest[mid]},ensure_ascii=False))
+
+          report={'v':'2.14','mapPacks':manifest,'bytes':total_content,'MB':round(total_content/1e6,3),
+           'originalBaselineFiles':len(old),'postBuildFiles':len(now),'originalUntouchedFiles':len(old)-len(changed)-len(removed),
+           'removedRedundantPNGs':len(removed)}
+          Path('build/v210/size-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),'utf8')
+          print('TOTAL_BYTES',total_content,'TOTAL_MB',round(total_content/1e6,3))
+          print('PASS no unapproved modifications; removed ground has no pack entries')
+          V210_VERIFY_AND_REPORT_EOF
+          .venv/bin/python -m py_compile build/v210/verify_and_report.py
+          .venv/bin/python build/v210/verify_and_report.py
+
+      - name: Reuse original native browser smoke test for Map050
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/prepare_browser_test.py <<'V210_PREPARE_BROWSER_TEST_EOF'
+          from pathlib import Path
+          import textwrap
+          s=Path('build/v210/v29-source.yml').read_text('utf8')
+          begin="          cat > build/v28/verify_browser_map049.js <<'JS'\n"
+          end='\n          JS'
+          assert s.count(begin)==1
+          js=textwrap.dedent(s.split(begin,1)[1].split(end,1)[0])
+          def rep(old,new):
+           global js
+           assert js.count(old)==1,(old,js.count(old))
+           js=js.replace(old,new)
+          rep('for(const mid of [47,48,49])','for(const mid of [47,48,49,50])')
+          rep('callbacks===3','callbacks===4')
+          rep('callbacks!==3','callbacks!==4')
+          js=js.replace('SLTI_49_GID.png','SLTI_50_GID.png')
+          js=js.replace('Map049 graphics not installed','Map050 graphics not installed')
+          js=js.replace('Map049 GID missing','Map050 GID missing')
+          js=js.replace('Map047, Map048 and Map049','Map047, Map048, Map049 and Map050')
+          js=js.replace('Map049 graphics available','Map050 graphics available')
+          Path('build/v210/verify_browser.js').write_text(js,'utf8')
+          print('Browser test prepared',len(js.splitlines()))
+          V210_PREPARE_BROWSER_TEST_EOF
+          .venv/bin/python -m py_compile build/v210/prepare_browser_test.py
+          .venv/bin/python build/v210/prepare_browser_test.py
+          node --check build/v210/verify_browser.js
+          node build/v210/verify_browser.js
+
+      - name: Reject any broken Map048 to Map049 bridge transition
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/v210/verify_bridges.rb <<'V210_VERIFY_BRIDGES_EOF'
+          # encoding: UTF-8
+          module RPG
+            class Map;end
+            class Event;end
+            class Event::Page;end
+            class Event::Page::Condition;end
+            class Event::Page::Graphic;end
+            class EventCommand;end
+            class MoveCommand;end
+            class MoveRoute;end
+            class AudioFile;end
+            class MapInfo;end
+          end
+          class Table
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth);@raw;end
+          end
+          class Color
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth);@raw;end
+          end
+          class Tone
+            def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
+            def _dump(depth);@raw;end
+          end
+
+          prefix='site/knight/gameasync/Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          maps={48=>Marshal.load(File.binread(prefix+'Map048.rxdata')),
+                49=>Marshal.load(File.binread(prefix+'Map049.rxdata'))}
+          def walkable(map,x,y)
+            w=map.instance_variable_get(:@width)
+            h=map.instance_variable_get(:@height)
+            return false unless x.between?(0,w-1) && y.between?(0,h-1)
+            raw=map.instance_variable_get(:@data).instance_variable_get(:@raw)
+            raw.byteslice(20+2*(y*w+x),2).unpack1('v')==384
+          end
+
+          results=[]
+          maps.each do |id,map|
+            events=map.instance_variable_get(:@events)
+            raise "Unverified Map#{id} bridge transfer remains" unless events.empty?
+            events.sort.each do |eventid,event|
+              x=event.instance_variable_get(:@x)
+              y=event.instance_variable_get(:@y)
+              pages=event.instance_variable_get(:@pages)
+              raise "Map#{id} bridge page changed" unless pages.size==1
+              commands=pages[0].instance_variable_get(:@list).select{|cmd|cmd.instance_variable_get(:@code)==201}
+              raise "Map#{id} bridge transfer missing" unless commands.size==1
+              _,destination,tx,ty,*rest=commands[0].instance_variable_get(:@parameters)
+              raise 'Destination Map ID changed' unless destination==({48=>49,49=>48}[id])
+              departure=walkable(map,x,y)
+              arrival=walkable(maps[destination],tx,ty)
+              ok=departure && arrival
+              results << ok
+              puts "BRIDGE Map#{id} EVENT#{eventid}: #{x},#{y} -> Map#{destination} #{tx},#{ty} | departure=#{departure} arrival=#{arrival}"
+            end
+          end
+          puts 'PASS unverified Map048/049 bridge events not installed'
+          raise 'Unexpected bridge test results' unless results.empty?
+          V210_VERIFY_BRIDGES_EOF
+          ruby -c build/v210/verify_bridges.rb
+          ruby build/v210/verify_bridges.rb
+
+      - name: V2.14 verify legacy Map047 packs and externalize Map047 and newer packs
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          cat > build/v211/migrate_maps.py <<'V211_MIGRATE_MAPS_EOF'
+          from pathlib import Path
+          import hashlib,json,os,subprocess,urllib.request
+          from urllib.parse import urlsplit
+
+          root=Path('site')
+          assets=root/'knight/assets'
+          live=('map-047-v241.pack','map-048-v229r115.pack',
+                'map-049-v229r115.pack','map-050-v229r115.pack')
+          legacy=('map-047-v229r151.pack','map-047-v234.pack')
+          for name in live+legacy:
+              assert (assets/name).is_file(),('Missing V2.10 pack',name)
+
+          for name in legacy:
+              needle=name.encode('ascii')
+              refs=[]
+              for p in root.rglob('*'):
+                  if not p.is_file() or p==assets/name:
+                      continue
+                  with p.open('rb') as stream:
+                      tail=b''
+                      while True:
+                          block=stream.read(1048576)
+                          if not block:
+                              break
+                          if needle in tail+block:
+                              refs.append(str(p.relative_to(root)))
+                              break
+                          tail=block[-(len(needle)-1):]
+              if refs:
+                  print('KEEP REFERENCED',name,refs)
+              else:
+                  count=(assets/name).stat().st_size
+                  (assets/name).unlink()
+                  print('REMOVE UNUSED Map047',name,count)
+
+          live+=tuple(p.name for p in sorted(assets.glob('map-*.pack'))
+                      if p.name[4:7].isdigit() and int(p.name[4:7])>=51)
+          assert len(live)==len(set(live)),('Duplicate active PACK names',live)
+
+          fields=('R2_ACCOUNT_ID','R2_ACCESS_KEY_ID','R2_SECRET_ACCESS_KEY',
+                  'R2_BUCKET','R2_PUBLIC_BASE_URL')
+          settings={name:os.environ.get(name,'').strip() for name in fields}
+          if any(settings.values()) and not all(settings.values()):
+              raise RuntimeError('Incomplete R2 configuration; deployment stopped')
+          if not any(settings.values()):
+              print('::warning::R2 not configured: PACKs remain on GitHub Pages; R2 transfer skipped')
+          else:
+              import boto3
+              public_base=settings['R2_PUBLIC_BASE_URL'].rstrip('/')
+              parsed=urlsplit(public_base)
+              assert parsed.scheme=='https' and parsed.netloc and not parsed.query and not parsed.fragment
+              origin='https://gowellsik-hue.github.io'
+              key_prefix='slknight/v214/'
+              client=boto3.client(
+                  's3',
+                  endpoint_url='https://'+settings['R2_ACCOUNT_ID']+'.r2.cloudflarestorage.com',
+                  aws_access_key_id=settings['R2_ACCESS_KEY_ID'],
+                  aws_secret_access_key=settings['R2_SECRET_ACCESS_KEY'],
+                  region_name='auto')
+              bucket=settings['R2_BUCKET']
+              for name in live:
+                  p=assets/name
+                  with p.open('rb') as stream:
+                      digest=hashlib.file_digest(stream,'sha256').hexdigest()
+                  key=key_prefix+name
+                  client.upload_file(str(p),bucket,key,ExtraArgs={
+                      'ContentType':'application/octet-stream',
+                      'CacheControl':'public,max-age=31536000,immutable',
+                      'Metadata':{'sha256':digest}})
+                  obj=client.head_object(Bucket=bucket,Key=key)
+                  assert obj['ContentLength']==p.stat().st_size,(name,'R2 length')
+                  assert obj.get('Metadata',{}).get('sha256')==digest,(name,'R2 digest')
+                  url=public_base+'/'+key
+                  req=urllib.request.Request(url,method='HEAD',headers={'Origin':origin})
+                  with urllib.request.urlopen(req,timeout=60) as response:
+                      assert response.status==200,(name,'public HEAD')
+                      assert int(response.headers['Content-Length'])==p.stat().st_size,(name,'public length')
+                      assert response.headers.get('Access-Control-Allow-Origin') in ('*',origin),(name,'CORS HEAD')
+                  req=urllib.request.Request(url,method='GET',headers={
+                      'Origin':origin,'Range':'bytes=0-15'})
+                  with urllib.request.urlopen(req,timeout=60) as response:
+                      assert response.status in (200,206),(name,'public GET')
+                      assert response.headers.get('Access-Control-Allow-Origin') in ('*',origin),(name,'CORS GET')
+                      sample=response.read(16)
+                  with p.open('rb') as stream:
+                      assert sample==stream.read(16),(name,'public bytes')
+                  print('R2 VERIFIED',name,p.stat().st_size,digest)
+
+              loader=root/'knight/js/sl-assets-v229r115.js'
+              current=loader.read_text('utf8')
+              old="fetch('assets/'+filename,{cache:filename==='map-050-v229r115.pack'?'reload':'force-cache',signal:controller.signal})"
+              assert current.count(old)==1,'Original V2.10 fetchPack expression changed'
+              condition='||'.join("filename==="+json.dumps(n) for n in live)
+              urlbase=json.dumps(public_base+'/'+key_prefix)
+              new="fetch(("+condition+'?'+urlbase+"+filename:'assets/'+filename),{cache:filename==='map-050-v229r115.pack'?'reload':'force-cache',signal:controller.signal})"
+              loader.write_text(current.replace(old,new),'utf8')
+              subprocess.run(['node','--check',str(loader)],check=True)
+
+              smoke=Path('build/v210/verify_browser.js').read_text('utf8')
+              old_test='const f=path.join(root,String(url));'
+              new_test="const f=path.join(root,/^https:\\/\\//.test(String(url))?'assets/'+String(url).split('/').pop():String(url));"
+              assert smoke.count(old_test)==1,'Original native browser test changed'
+              test_file=Path('build/v211/verify_browser_r2.js')
+              test_file.write_text(smoke.replace(old_test,new_test),'utf8')
+              subprocess.run(['node','--check',str(test_file)],check=True)
+              subprocess.run(['node',str(test_file)],check=True)
+
+              for name in live:
+                  needle=name.encode('ascii')
+                  unexpected=[]
+                  for p in root.rglob('*'):
+                      if not p.is_file() or p==assets/name or p==loader:
+                          continue
+                      with p.open('rb') as stream:
+                          tail=b''
+                          while True:
+                              chunk=stream.read(1048576)
+                              if not chunk:
+                                  break
+                              if needle in tail+chunk:
+                                  unexpected.append(str(p.relative_to(root)))
+                                  break
+                          tail=chunk[-(len(needle)-1):]
+                  assert not unexpected,(name,'Other code refers to local pack',unexpected)
+              for name in live:
+                  (assets/name).unlink()
+              assert all(not (assets/name).exists() for name in live)
+              print('R2 ACTIVE:',len(live),'Map047 and newer packs external; local packs removed after checks')
+
+          size=sum(p.stat().st_size for p in root.rglob('*') if p.is_file())
+          print('V2.14_SITE_BYTES',size,'MB',round(size/1e6,3))
+          V211_MIGRATE_MAPS_EOF
+          .venv/bin/python -m py_compile build/v211/migrate_maps.py
+          if [ -n "$R2_ACCOUNT_ID" ] && [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_BUCKET" ] && [ -n "$R2_PUBLIC_BASE_URL" ]; then
+            .venv/bin/python -m pip install --quiet --disable-pip-version-check 'boto3>=1.35,<2'
+          fi
+          .venv/bin/python build/v211/migrate_maps.py
 
       - name: V3.1 add 6 separately summoned Fairy companions using native healer follow routes
         shell: bash
@@ -83,6 +1010,11 @@
               obj=allocate
               obj.instance_variable_set(:@raw,raw)
               obj
+            end
+            Object.const_get(n).class_eval do
+              def _dump(_depth)
+                @raw
+              end
             end
           end
 
@@ -380,3 +1312,19 @@
           print('PASS V3.1 companions registered and map follower events compiled',len(maps))
           print('PASS V3.1 only approved data, images and versions changed',len(changed),len(added))
           V31_VERSION_AND_VERIFY
+
+      - name: Publish verified V2.14 candidate
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+          retention-days: 30
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v5
+        id: deployment
