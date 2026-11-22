@@ -471,6 +471,7 @@ jobs:
           assert len(collision)==1
           _,off,size=collision[0]
           extra=bytes(body[off:off+size])
+          assert extra.startswith(b'\x89PNG\r\n\x1a\n')
           images={}
           old_pack_bytes={}
           for mid in (48,49,50):
@@ -904,10 +905,10 @@ jobs:
                               chunk=stream.read(1048576)
                               if not chunk:
                                   break
-                              if needle in tail+chunk:
-                                  unexpected.append(str(p.relative_to(root)))
-                                  break
-                              tail=chunk[-(len(needle)-1):]
+                          if needle in tail+chunk:
+                              unexpected.append(str(p.relative_to(root)))
+                              break
+                          tail=chunk[-(len(needle)-1):]
                   assert not unexpected,(name,'Other code refers to local pack',unexpected)
               for name in live:
                   (assets/name).unlink()
@@ -922,7 +923,16 @@ jobs:
             .venv/bin/python -m pip install --quiet --disable-pip-version-check 'boto3>=1.35,<2'
           fi
           .venv/bin/python build/v211/migrate_maps.py
-      - name: V3.1 add 6 separately summoned Fairy companions using native healer follow routes
+      - name: V3.2 retrieve original Sanctuary wizard walking frames
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 42136715406
+          name: sanctuary-original-all-part-01
+          github-token: ${{ github.token }}
+          path: build/v32
+
+      - name: V3.2 restore 6 Fairy companions and native 1x walking
         shell: bash
         run: |
           set -euo pipefail
@@ -986,6 +996,30 @@ jobs:
           print('FAIRY_RGSSAD_EXTRACT_OK',count)
           V31_RGSSAD_SOURCE
           .venv/bin/python build/v31/rgssad_extract.py build/v31/raw/Game.rgssad build/v31/elf/gameasync
+          .venv/bin/python - <<'V32_WIZARD'
+          from pathlib import Path
+          from PIL import Image
+          import io,zipfile,hashlib
+          source=Path('build/v32/part-01.zip')
+          assert source.is_file(),'Sanctuary original artifact missing'
+          assert hashlib.sha256(source.read_bytes()).hexdigest()=='77897bd1fabf1a0fa34e2bc41cc604b6c2d85eb1a3530e0d712919a18ab18eea'
+          result=Image.new('RGBA',(192,384),(0,0,0,0))
+          with zipfile.ZipFile(source) as z:
+              for row,sub in enumerate((1,3,7,5)):
+                  name=f'gifs/caster-characters/Sprite/734/734-{sub}.gif'
+                  with Image.open(io.BytesIO(z.read(name))) as gif:
+                      assert gif.n_frames==4,(name,gif.n_frames)
+                      for col in range(4):
+                          gif.seek(col)
+                          frame=gif.convert('RGBA')
+                          assert frame.width<=48 and frame.height<=96,(name,frame.size)
+                          result.alpha_composite(frame,(col*48+(48-frame.width)//2,row*96+96-frame.height))
+                          assert result.crop((col*48,row*96,(col+1)*48,(row+1)*96)).getchannel('A').getbbox()
+          path=Path('site/knight/gameasync/Graphics/Characters/법사.png')
+          assert not path.exists(),'Native wizard image already exists'
+          result.save(path,optimize=True)
+          print('PASS Sanctuary SPR734 walking 4 directions x 4 original frames')
+          V32_WIZARD
           cat > build/v31/companions.rb <<'V31_COMPANIONS_RUBY'
           require 'json'
           require 'digest'
@@ -1078,6 +1112,7 @@ jobs:
           check(actors.size==9 && items.size==1000 && common.size>=1061,"incorrect baseline actor/item/CE counts: #{actors.size}/#{items.size}/#{common.size}")
           CE_IDS=(common.size...(common.size+ORDER.size)).to_a.freeze
           check(utf(actors[3].instance_variable_get(:@name))=='힐러 마법사','actor3 must be healer')
+          actors[3].instance_variable_set(:@character_name,'법사')
           check(utf(items[117].instance_variable_get(:@name)).include?('힐러 명령 주문서'),'item117 healer anchor differs')
           exp_scripts_before=scripts.filter_map do |row|
             next unless row.is_a?(Array) && row[2].is_a?(String)
@@ -1148,6 +1183,16 @@ jobs:
             common << ce
           end
 
+          edit_script(scripts,'Game_Character 2') do |s|
+            s=rep(s,
+              "if (self.is_a?(Game_Player) || (self.is_a?(Game_Event) && @event && @event.name == '[ID힐러 마법사]')) && @sl_move_rate.to_f >= 1.0",
+              "if (self.is_a?(Game_Player) || (self.is_a?(Game_Event) && @event && (@event.name == '[ID힐러 마법사]' || @event.name.to_s.start_with?('동료 ')))) && @sl_move_rate.to_f >= 1.0",
+              'existing 1x walking animation branch')
+            rep(s,"  def update_move\n",
+              "  def update_move\n    @sl_move_rate = SLV229::Speed.move_rate if self.is_a?(Game_Event) && @event && (@event.name == '[ID힐러 마법사]' || @event.name.to_s.start_with?('동료 '))\n",
+              'native follower movement rate')
+          end
+
           edit_script(scripts,'Game_Party') do |s|
             s=rep(s,'if @actors.size < 4 and not @actors.include?(actor)',
                      'if @actors.size < 8 and not @actors.include?(actor)','party capacity')
@@ -1191,6 +1236,28 @@ jobs:
             end
             healer=events.values.select{|event|utf(event.instance_variable_get(:@name))=='[ID힐러 마법사]'}
             check(healer.size<=1,"#{map_id}: ambiguous healer")
+            healer.each do |h|
+              h.instance_variable_set(:@sl_move_rate,1.0)
+              h.instance_variable_get(:@pages).each do |pg|
+                graphic=pg.instance_variable_get(:@graphic)
+                unless utf(graphic.instance_variable_get(:@character_name)).empty?
+                  graphic.instance_variable_set(:@character_name,'법사')
+                end
+                pg.instance_variable_get(:@list).each do |command|
+                  next unless command.instance_variable_get(:@code)==209
+                  params=command.instance_variable_get(:@parameters)
+                  next unless params.is_a?(Array)
+                  route=params.find{|x|x.is_a?(RPG::MoveRoute)}
+                  next unless route
+                  route.instance_variable_get(:@list).each do |step|
+                    next unless step.instance_variable_get(:@code)==41
+                    p=step.instance_variable_get(:@parameters)
+                    next unless p.is_a?(Array)
+                    p[0]='법사' if ['힐러','바포메트','흑장로','흑장로마법'].include?(utf(p[0]))
+                  end
+                end
+              end
+            end
             template=healer[0] || base_healer
             highest=events.keys.max || 0
             anchor=events.values.first || template
@@ -1199,6 +1266,7 @@ jobs:
               event=clone(template)
               event.instance_variable_set(:@id,highest+i+1)
               event.instance_variable_set(:@name,'동료 '+name)
+              event.instance_variable_set(:@sl_move_rate,1.0)
               event.instance_variable_set(:@x,healer.empty? ? anchor.instance_variable_get(:@x) : template.instance_variable_get(:@x))
               event.instance_variable_set(:@y,healer.empty? ? anchor.instance_variable_get(:@y) : template.instance_variable_get(:@y))
               pages=template.instance_variable_get(:@pages)
@@ -1223,11 +1291,10 @@ jobs:
               check(!events.key?(highest+i+1),"#{map_id}: map event collision")
               events[highest+i+1]=event
             end
-            check(original_ids.all?{|id|events.key?(id) && Digest::SHA256.hexdigest(Marshal.dump(events[id]))==original_hashes[id]},"#{map_id}: original map event changed")
+            check(original_ids.all?{|id|events.key?(id) && (healer.any?{|h|h.instance_variable_get(:@id)==id} || Digest::SHA256.hexdigest(Marshal.dump(events[id]))==original_hashes[id])},"#{map_id}: unrelated map event changed")
             File.binwrite(path,Marshal.dump(map))
             map_stats << [map_id,events.size,healer.size==1]
           end
-
           exp_scripts_after=scripts.filter_map do |row|
             next unless row.is_a?(Array) && row[2].is_a?(String)
             source=Zlib::Inflate.inflate(row[2])
@@ -1249,7 +1316,7 @@ jobs:
             check(matches.size==1,"mapping #{rel} count #{matches.size}")
             js=js.sub(pattern,rel+'?h='+Digest::MD5.file(path).hexdigest)
           end
-          ORDER.each do |name|
+          (ORDER+['법사']).each do |name|
             rel='Graphics/Characters/'+name+'.png'
             key='graphics/characters/'+name.downcase
             digest=Digest::MD5.file(File.join(main,rel)).hexdigest
@@ -1281,12 +1348,12 @@ jobs:
           loader=root/'knight/js/sl-assets-v229r115.js'
           js=loader.read_text('utf8')
           assert js.count("var version='V2.14';")==1
-          loader.write_text(js.replace("var version='V2.14';","var version='V3.1';"),'utf8')
+          loader.write_text(js.replace("var version='V2.14';","var version='V3.2';"),'utf8')
           for name in ('index.html','knight/index.html'):
               p=root/name
               src=p.read_text('utf8')
               assert 'V2.14' in src,('missing V2.14 identity',name)
-              p.write_text(src.replace('V2.14','V3.1').replace('v2.14','v3.1'),'utf8')
+              p.write_text(src.replace('V2.14','V3.2').replace('v2.14','v3.2'),'utf8')
           before=json.loads(Path('build/v31/before.json').read_text('utf8'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file()}
@@ -1301,248 +1368,17 @@ jobs:
           expected|={'knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js',
                      'index.html','knight/index.html'}
           approved_add={'knight/gameasync/Graphics/Characters/'+n+'.png'
-                        for n in ('여요정','다크엘프','다크레인저','실버레인저','애로우 마스터','아크스카우터')}
+                        for n in ('여요정','다크엘프','다크레인저','실버레인저','애로우 마스터','아크스카우터','법사')}
           assert changed==expected,('changed mismatch',sorted(changed-expected),sorted(expected-changed))
-          assert added<=approved_add,('unexpected additions',sorted(added-approved_add))
+          assert added<=approved_add and 'knight/gameasync/Graphics/Characters/법사.png' in added,('unexpected additions',sorted(added-approved_add))
           assert not removed,('unexpected removals',sorted(removed))
-          print('PASS V3.1 companions registered and map follower events compiled',len(maps))
-          print('PASS V3.1 only approved data, images and versions changed',len(changed),len(added))
+          print('PASS V3.2 companions registered and native 1x walking branches compiled',len(maps))
+          print('PASS V3.2 only approved data, images and versions changed',len(changed),len(added))
           V31_VERSION_AND_VERIFY
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: V3.2 retrieve original Sanctuary wizard walking frames
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 42136715406
-          name: sanctuary-original-all-part-01
-          github-token: ${{ github.token }}
-          path: build/v32
-
-      - name: V3.2 preserve native 1x walking branch and replace healer sprite
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'V32_SNAPSHOT'
-          from pathlib import Path
-          import hashlib,json
-          root=Path('site')
-          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          Path('build/v32/before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
-          V32_SNAPSHOT
-          .venv/bin/python - <<'V32_SPR_WALK'
-          from pathlib import Path
-          from PIL import Image
-          import io,zipfile,hashlib
-          source=Path('build/v32/part-01.zip')
-          assert source.is_file(), 'Verified Sanctuary animation artifact missing'
-          assert hashlib.sha256(source.read_bytes()).hexdigest()=='77897bd1fabf1a0fa34e2bc41cc604b6c2d85eb1a3530e0d712919a18ab18eea'
-          with zipfile.ZipFile(source) as z:
-              result=Image.new('RGBA',(192,384),(0,0,0,0))
-              for row,sub in enumerate((1,3,7,5)):
-                  name=f'gifs/caster-characters/Sprite/734/734-{sub}.gif'
-                  with Image.open(io.BytesIO(z.read(name))) as gif:
-                      assert gif.n_frames==4,(name,gif.n_frames)
-                      for col in range(4):
-                          gif.seek(col)
-                          fr=gif.convert('RGBA')
-                          assert fr.width<=48 and fr.height<=96,(name,fr.size)
-                          result.alpha_composite(fr,(col*48+(48-fr.width)//2,row*96+96-fr.height))
-                          assert result.crop((col*48,row*96,(col+1)*48,(row+1)*96)).getchannel('A').getbbox()
-          path=Path('site/knight/gameasync/Graphics/Characters/법사.png')
-          assert not path.exists(), 'Never overwrite an existing character asset'
-          result.save(path,optimize=True)
-          print('PASS original Sanctuary wizard M 734 action0.walk 4 directions x 4 native frames')
-          V32_SPR_WALK
-          cat > build/v32/native_1x_patch.rb <<'V32_NATIVE_PATCH'
-          # encoding: UTF-8
-          require 'json'
-          require 'zlib'
-          require 'digest'
-          module RPG
-            %w[Actor Item AudioFile CommonEvent EventCommand Event MoveRoute MoveCommand Map].each do |n|
-              const_set(n,Class.new) unless const_defined?(n,false)
-            end
-            Event.const_set(:Page,Class.new) unless Event.const_defined?(:Page,false)
-            Event::Page.const_set(:Condition,Class.new) unless Event::Page.const_defined?(:Condition,false)
-            Event::Page.const_set(:Graphic,Class.new) unless Event::Page.const_defined?(:Graphic,false)
-          end
-          %w[Table Tone Color].each do |n|
-            Object.const_set(n,Class.new) unless Object.const_defined?(n)
-            Object.const_get(n).define_singleton_method(:_load) do |raw|
-              o=allocate;o.instance_variable_set(:@raw,raw);o
-            end
-            Object.const_get(n).class_eval do
-              def _dump(_depth);@raw;end
-            end
-          end
-
-          def check(a,msg);raise msg unless a;end
-
-          def utf(a);a.to_s.dup.force_encoding('UTF-8').scrub;end
-
-          def lone(directory,tail)
-            a=Dir.glob(File.join(directory,'*'+tail+'.rxdata')).select{|p|File.size?(p)}
-            check(a.size==1,"#{tail}: expected one source, found #{a.size}")
-            a.fetch(0)
-          end
-
-          knight=ARGV.fetch(0)
-          main=File.join(knight,'gameasync')
-          data=File.join(main,'Data')
-          script_path=lone(data,'Scripts')
-          actor_path=lone(data,'Actors')
-          scripts=Marshal.load(File.binread(script_path))
-          actors=Marshal.load(File.binread(actor_path))
-          # Extend the proven V1.25 1x cadence branch; keep the original 8/7/6/5/4F table.
-          row=scripts.select{|r|r.is_a?(Array) && utf(r[1])=='Game_Character 2'}
-          check(row.size==1,'Game_Character 2 must be unique')
-          source=Zlib::Inflate.inflate(row.first[2]).dup.force_encoding('UTF-8')
-          check(source.valid_encoding?,'Game_Character 2 is not UTF8')
-          crlf=source.include?("\r\n")
-          text=source.gsub("\r\n","\n")
-          original_branch="if (self.is_a?(Game_Player) || (self.is_a?(Game_Event) && @event && @event.name == '[ID힐러 마법사]')) && @sl_move_rate.to_f >= 1.0"
-          new_branch="if (self.is_a?(Game_Player) || (self.is_a?(Game_Event) && @event && (@event.name == '[ID힐러 마법사]' || @event.name.to_s.start_with?('동료 ')))) && @sl_move_rate.to_f >= 1.0"
-          check(text.scan(original_branch).size==1,'last confirmed V1.25 walking branch not found once')
-          text=text.sub(original_branch,new_branch)
-          # No new rate calculation. Read the already-computed knight rate for healer/fairy
-          # in the EXISTING update_move path immediately before the existing rate assignment.
-          original_rate='rate = @sl_move_rate || V113_NATIVE_RATES[@move_speed.to_i] || 1.0'
-          check(text.scan(original_rate).size==1,'original unified movement-rate assignment changed')
-          reuse="@sl_move_rate = ($game_player.instance_variable_get(:@sl_move_rate) || @sl_move_rate) if self.is_a?(Game_Event) && @event && $game_player && (@event.name == '[ID힐러 마법사]' || @event.name.to_s.start_with?('동료 '))\n    " + original_rate
-          text=text.sub(original_rate,reuse)
-          check(text.include?('elsif rate >= 2.6') && text.include?('elsif rate >= 2.0') && text.include?('elsif rate >= 1.3'),'existing player cadence table changed')
-          RubyVM::InstructionSequence.compile(text)
-          row.first[2]=Zlib::Deflate.deflate((crlf ? text.gsub("\n","\r\n") : text).b)
-
-          # Change only healer actor image; do not alter the six original Fairy images.
-          check(utf(actors.fetch(3).instance_variable_get(:@name))=='힐러 마법사','actor 3 not healer')
-          actor_before=utf(actors[3].instance_variable_get(:@character_name))
-          actors[3].instance_variable_set(:@character_name,'법사')
-
-          companions=['여요정','다크엘프','다크레인저','실버레인저','애로우 마스터','아크스카우터']
-          maps=Dir.glob(File.join(data,'*Map???.rxdata')).select{|p|File.size?(p)}.sort
-          check(maps.size==46,"expected 46 maps, saw #{maps.size}")
-          healer_count=0
-          companion_count=0
-          healer_graphics=0
-          healer_cast_graphics=0
-          # Verify that a patch does not touch any unrelated map event at all.
-          maps.each do |path|
-            map=Marshal.load(File.binread(path))
-            events=map.instance_variable_get(:@events)
-            old_events=events.transform_values{|event|Digest::SHA256.hexdigest(Marshal.dump(event))}
-            allowed=[]
-            healers=events.values.select{|e|utf(e.instance_variable_get(:@name))=='[ID힐러 마법사]'}
-            check(healers.size<=1,"#{path}: duplicate healers")
-            healers.each do |event|
-              allowed << event.instance_variable_get(:@id)
-              event.instance_variable_set(:@sl_move_rate,1.0)
-              event.instance_variable_get(:@pages).each do |page|
-                graphic=page.instance_variable_get(:@graphic)
-                old_image=utf(graphic.instance_variable_get(:@character_name))
-                unless old_image.empty?
-                  check(['힐러','바포메트','흑장로','법사'].include?(old_image),"unexpected healer graphic #{old_image}")
-                  graphic.instance_variable_set(:@character_name,'법사')
-                  healer_graphics+=1
-                end
-                # Retain every original casting command and timing; replace only its costume.
-                page.instance_variable_get(:@list).each do |command|
-                  next unless command.instance_variable_get(:@code)==209
-                  params=command.instance_variable_get(:@parameters)
-                  next unless params.is_a?(Array)
-                  route=params.find{|x|x.is_a?(RPG::MoveRoute)}
-                  next unless route
-                  route.instance_variable_get(:@list).each do |step|
-                    next unless step.instance_variable_get(:@code)==41
-                    p=step.instance_variable_get(:@parameters)
-                    next unless p.is_a?(Array) && !utf(p[0]).empty?
-                    if ['바포메트','흑장로','흑장로마법','힐러'].include?(utf(p[0]))
-                      p[0]='법사'
-                      healer_cast_graphics+=1
-                    end
-                  end
-                end
-              end
-              healer_count+=1
-            end
-            companions.each_with_index do |name,i|
-              matching=events.values.select{|e|utf(e.instance_variable_get(:@name))=='동료 '+name}
-              check(matching.size==1,"#{path}: missing/duplicate #{name}")
-              event=matching.fetch(0)
-              allowed << event.instance_variable_get(:@id)
-              pages=event.instance_variable_get(:@pages)
-              check(pages.size==1,"#{path}: extra page on #{name}")
-              graphic=pages[0].instance_variable_get(:@graphic)
-              check(utf(graphic.instance_variable_get(:@character_name))==name,"#{path}: wrong Fairy sprite #{name}")
-              condition=pages[0].instance_variable_get(:@condition)
-              check(condition.instance_variable_get(:@switch1_valid) && condition.instance_variable_get(:@switch1_id)==2001+i,"#{path}: Fairy summon condition mutated")
-              event.instance_variable_set(:@sl_move_rate,1.0)
-              companion_count+=1
-            end
-            check(events.all?{|id,event|allowed.include?(id) || old_events[id]==Digest::SHA256.hexdigest(Marshal.dump(event))},"#{path}: unrelated event changed")
-            File.binwrite(path,Marshal.dump(map))
-          end
-          check(healer_count==39,"healer count #{healer_count}/39")
-          check(companion_count==276,"Fairy count #{companion_count}/276")
-          check(healer_graphics>0,'no healer page graphic changed')
-          File.binwrite(script_path,Marshal.dump(scripts))
-          File.binwrite(actor_path,Marshal.dump(actors))
-          puts JSON.generate({maps:maps.size,healers:healer_count,companions:companion_count,healerPageGraphics:healer_graphics,healerCastGraphics:healer_cast_graphics,actor3Before:actor_before,baseRate:1.0,rateSource:'existing SLV229 calculated player rate',animation:'existing Game_Character 2 8/7/6/5/4F branch extended',modifiedScripts:['Game_Character 2']})
-          V32_NATIVE_PATCH
-          ruby -c build/v32/native_1x_patch.rb
-          ruby build/v32/native_1x_patch.rb site/knight
-          .venv/bin/python - <<'V32_VERIFY'
-          from pathlib import Path
-          import hashlib,json,re
-          root=Path('site')
-          main=root/'knight/gameasync'
-          data=main/'Data'
-          maps=sorted(p for p in data.glob('*Map???.rxdata') if p.is_file() and p.stat().st_size>10)
-          assert len(maps)==46
-          actors=next(p for p in data.glob('*Actors.rxdata') if p.stat().st_size>10)
-          scripts=next(p for p in data.glob('*Scripts.rxdata') if p.stat().st_size>10)
-          mapfile=main/'mapping.js'
-          s=mapfile.read_text('utf8')
-          for p in [*maps,actors,scripts]:
-              key=p.relative_to(main).as_posix()+'?h='
-              match=re.escape(key)+r'[a-f0-9]{32}'
-              assert len(re.findall(match,s))==1,('mapping anchor mismatch',key)
-              s=re.sub(match,lambda m:key+hashlib.md5(p.read_bytes()).hexdigest(),s)
-          key='graphics/characters/법사'
-          rel='Graphics/Characters/법사.png'
-          assert key not in s,'duplicate Mage graphic mapping'
-          anchor='["graphics/characters/여요정", '
-          assert s.count(anchor)==1, 'V3.1 Fairy mapping anchor changed'
-          at=s.index('\n',s.index(anchor))
-          s=s[:at+1]+'["'+key+'", "'+rel+'?h='+hashlib.md5((main/rel).read_bytes()).hexdigest()+'"],\n'+s[at+1:]
-          mapfile.write_text(s,'utf8')
-          loader=root/'knight/js/sl-assets-v229r115.js'
-          s=loader.read_text('utf8')
-          assert s.count("var version='V3.1';")==1
-          loader.write_text(s.replace("var version='V3.1';","var version='V3.2';"),'utf8')
-          for rel in ('index.html','knight/index.html'):
-              p=root/rel
-              s=p.read_text('utf8')
-              assert 'V3.1' in s,rel
-              p.write_text(s.replace('V3.1','V3.2').replace('v3.1','v3.2'),'utf8')
-          before=json.loads(Path('build/v32/before.json').read_text('utf8'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          changed={k for k in before.keys()&after.keys() if before[k]!=after[k]}
-          added=set(after)-set(before)
-          removed=set(before)-set(after)
-          expected={'knight/gameasync/Data/'+p.name for p in maps+[actors,scripts]}
-          expected|={'knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js','index.html','knight/index.html'}
-          assert changed==expected,('unapproved changed files',sorted(changed^expected))
-          assert added=={'knight/gameasync/Graphics/Characters/법사.png'},('unexpected added files',added)
-          assert not removed,('unexpected deleted files',removed)
-          print('PASS V3.2 approved files only, '+str(len(changed))+' modified and 1 original wizard walking sprite added')
-          V32_VERIFY
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
-
-      - name: Publish verified V3.2 candidate
+      - name: Publish V3.2 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
