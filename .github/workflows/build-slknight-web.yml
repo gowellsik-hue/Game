@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V3.9 | Input Response
+name: build-slknight-web.yml | V3.10 | Input Response
 
 "on":
   workflow_dispatch:
@@ -22,16 +22,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - name: Restore the exact successful V3.8 game
+      - name: Restore the exact successful V3.9 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45333575740
+          run-id: 45356394406
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Patch existing input response and verify all original files
+      - name: Remove initial character selection
         shell: bash
         run: |
           set -euo pipefail
@@ -40,13 +40,17 @@ jobs:
           mkdir -p site
           tar -xf baseline/artifact.tar -C site
 
+          test -s site/index.html
+          test -s site/knight/index.html
           test -s site/knight/gameasync/Data/Scripts.rxdata
           test -s site/knight/js/dpad.js
           test -s site/knight/js/sl-assets-v229r115.js
 
-          python3 - <<'PY1'
+          python3 - <<'PY'
           from pathlib import Path
-          import hashlib,json
+          import hashlib
+          import re
+          import subprocess
 
           root=Path('site')
 
@@ -56,606 +60,139 @@ jobs:
           }
 
           assert len(before)==6013,(
-              'Original V3.8 artifact file count mismatch',
+              'Original V3.9 artifact file count mismatch',
               len(before)
           )
 
           loader=root/'knight/js/sl-assets-v229r115.js'
-
-          assert loader.read_text('utf8').count(
-              "var version='V3.8';"
-          )==1,'Original V3.8 version mismatch'
-
-          Path('before.json').write_text(
-              json.dumps(before,sort_keys=True),
-              'utf8'
-          )
-          PY1
-
-          cat > /tmp/slv39.py <<'PY2'
-          from pathlib import Path
-          import re
-
-          p=Path('site/knight/js/dpad.js')
-          s=p.read_bytes().decode('utf8')
-          original=s
-
-          def function(src,name):
-              pat=(
-                  r'(?ms)^function[ \t]+'
-                  +re.escape(name)
-                  +r'\([^\r\n]*\)[ \t]*\{[^\r\n]*\r?\n'
-                  +r'.*?^\}[ \t]*(?=\r?$)'
-              )
-
-              hits=list(re.finditer(pat,src))
-
-              assert len(hits)==1,(
-                  name,'definition',len(hits)
-              )
-
-              return hits[0].group()
-
-          def one(src,old,new,label):
-              assert src.count(old)==1,(
-                  label,src.count(old)
-              )
-
-              return src.replace(old,new,1)
-
-          names=(
-              'sendKey',
-              'pulseKey',
-              'releaseAll',
-              'bindHold',
-              'dirButton',
-              'attackButton'
-          )
-
-          old={name:function(s,name) for name in names}
-          new=dict(old)
-
-          assert "held.add(key);simulateKeyEvent('keydown',key);" in old['sendKey']
-
-          assert "held.delete(key);simulateKeyEvent('keyup',key);" in old['sendKey']
-
-          assert 'pulseTimers.clear()' in old['releaseAll']
-
-          f=old['pulseKey']
-
-          f=one(
-              f,
-              'function pulseKey(key,ms=120){',
-              'function pulseKey(key,ms=120,b=null){',
-              'Original pulse header'
-          )
-
-          f=one(
-              f,
-              'setTimeout(()=>{sendKey(key,false);pulseTimers.delete(key);},ms)',
-              "setTimeout(()=>{if(!b||!b.classList.contains('pressed'))sendKey(key,false);pulseTimers.delete(key);},ms)",
-              'Original pulse timer'
-          )
-
-          new['pulseKey']=f
-
-          for name in ('bindHold','dirButton'):
-              f=old[name]
-
-              f=one(
-                  f,
-                  "b.classList.add('pressed');sendKey(key,true);",
-                  "b.classList.add('pressed');pulseKey(key,50,b);",
-                  name+' immediate keydown'
-              )
-
-              f=one(
-                  f,
-                  "b.classList.remove('pressed');sendKey(key,false);",
-                  "if(!pulseTimers.has(key)||((!e||e.type!=='pointerup')&&b.classList.contains('pressed')))sendKey(key,false);b.classList.remove('pressed');",
-                  name+' short tap release'
-              )
-
-              for event in (
-                  'pointerdown',
-                  'pointerup',
-                  'pointercancel',
-                  'lostpointercapture'
-              ):
-                  assert event in f,(name,event)
-
-              new[name]=f
-
-          f=old['attackButton']
-
-          f=one(
-              f,
-              'sendKey(67,true);',
-              'pulseKey(67,50,b);',
-              'Manual attack immediate keydown'
-          )
-
-          starts=list(re.finditer(
-              r"b\.addEventListener\(\s*['\"]pointerup['\"]\s*,",
-              f
-          ))
-
-          ends=list(re.finditer(
-              r'\bconst\s+abort\s*=',
-              f
-          ))
-
-          assert len(starts)==len(ends)==1
-
-          a=starts[0].start()
-          z=ends[0].start()
-
-          assert a<z,'Original attack release boundary'
-
-          up=one(
-              f[a:z],
-              'clearAttackPulse();',
-              'if(!pulseTimers.has(67))clearAttackPulse();',
-              'Manual attack short tap release'
-          )
-
-          f=f[:a]+up+f[z:]
-
-          new['attackButton']=f
-
-          for name in names:
-              if old[name]!=new[name]:
-                  s=one(
-                      s,
-                      old[name],
-                      new[name],
-                      name
-                  )
-
-                  print('PATCH',name)
-
-          changed=[
-              name for name in names
-              if old[name]!=new[name]
-          ]
-
-          assert changed==[
-              'pulseKey',
-              'bindHold',
-              'dirButton',
-              'attackButton'
-          ],changed
-
-          for token in (
-              'setTimeout',
-              'clearTimeout',
-              'setInterval',
-              'clearInterval',
-              'addEventListener',
-              'removeEventListener',
-              'simulateKeyEvent',
-              'requestAnimationFrame'
-          ):
-              assert s.count(token)==original.count(token),(
-                  token,'Unexpected implementation change'
-              )
-
-          restored=s
-
-          for name in names:
-              if old[name]!=new[name]:
-                  restored=one(
-                      restored,
-                      new[name],
-                      old[name],
-                      name+' reverse verification'
-                  )
-
-          assert restored==original,(
-              'Unapproved input source changes'
-          )
-
-          for name in names:
-              assert function(s,name)==new[name],name
-
-          assert 'pulseKey(k,120)' in s
-          assert 'pulseKey(key,120)' in s
-          assert 'pulseKey(slSkillKeys[index],165)' in s
-          assert 'pulseKey(67,AUTO_ATTACK_DOWN_MS)' in s
-
-          assert 'slReleaseTimer' not in s
-
-          p.write_bytes(s.encode('utf8'))
-
-          assert p.read_bytes().decode('utf8')==s
-
-          for name in names:
-              print('VERIFIED',name)
-
-          parts=[]
-
-          for name in names:
-              if name=='dirButton':
-                  parts.append(
-                      'const dirKeys=[37,38,39,40];'
-                  )
-
-              parts.append(function(s,name))
-
-          Path('/tmp/slv39-input.js').write_text(
-              '\n'.join(parts),
-              'utf8'
-          )
-
-          print('PASS existing keydown remains immediate')
-          print('PASS short touch minimum duration: 50ms')
-          print('PASS existing item and skill pulse durations unchanged')
-          print('PASS existing automatic attack timing unchanged')
-          print('PASS no additional timer implementation')
-          print('PASS no additional input event handler')
-          PY2
-
-          python3 -m py_compile /tmp/slv39.py
-          python3 /tmp/slv39.py
-
-          node --check site/knight/js/dpad.js
-
-          cat > /tmp/slv39-test.cjs <<'JS'
-          const fs=require('fs');
-          const vm=require('vm');
-          const assert=require('assert/strict');
-
-          const input=fs.readFileSync(
-            '/tmp/slv39-input.js','utf8'
-          );
-
-          const pre=`
-          const held=new Set(),pulseTimers=new Map();
-
-          let now=0,next=0;
-
-          const pending=new Map(),events=[];
-
-          function setTimeout(fn,ms){
-            const id=++next;
-            pending.set(id,{fn,at:now+ms});
-            return id;
-          }
-
-          function clearTimeout(id){
-            pending.delete(id);
-          }
-
-          function setInterval(){
-            throw Error('Unexpected auto interval in manual test');
-          }
-
-          function clearInterval(id){
-            pending.delete(id);
-          }
-
-          function advance(ms){
-            const end=now+ms;
-
-            while(true){
-              const q=[...pending]
-                .filter(([id,x])=>x.at<=end)
-                .sort((a,b)=>a[1].at-b[1].at)[0];
-
-              if(!q)break;
-
-              now=q[1].at;
-              pending.delete(q[0]);
-              q[1].fn();
-            }
-
-            now=end;
-          }
-
-          function simulateKeyEvent(type,key){
-            events.push([type,key,now]);
-          }
-
-          function element(){
-            const classes=new Set(),handlers={};
-
-            return {
-              children:[],
-
-              classList:{
-                add:c=>classes.add(c),
-                remove:c=>classes.delete(c),
-                contains:c=>classes.has(c),
-                toggle:(c,on)=>on?classes.add(c):classes.delete(c)
-              },
-
-              addEventListener:(type,fn)=>{
-                (handlers[type]||=[]).push(fn);
-              },
-
-              fire(type){
-                for(const fn of handlers[type]||[]){
-                  fn({
-                    type,
-                    pointerId:1,
-                    preventDefault(){},
-                    stopPropagation(){}
-                  });
-                }
-              },
-
-              setPointerCapture(){},
-
-              appendChild(x){
-                this.children.push(x);
-              },
-
-              querySelectorAll(){
-                return this.children;
-              },
-
-              getBoundingClientRect(){
-                return {
-                  left:0,top:0,
-                  right:100,bottom:100
-                };
-              }
-            };
-          }
-
-          const document={
-            createElement:()=>element()
-          };
-
-          const window={};
-
-          let slScene='Scene_Map';
-          `;
-
-          const test=`
-          function check(b,k){
-            let n=events.length,t=now;
-
-            b.fire('pointerdown');
-
-            assert.deepEqual(
-              events[n],
-              ['keydown',k,t]
-            );
-
-            advance(5);
-
-            b.fire('pointerup');
-            b.fire('lostpointercapture');
-
-            assert.equal(events.length,n+1);
-
-            advance(44);
-
-            assert(held.has(k));
-
-            advance(1);
-
-            assert.deepEqual(
-              events[n+1],
-              ['keyup',k,t+50]
-            );
-
-            assert(!held.has(k));
-            assert(!pulseTimers.has(k));
-
-            n=events.length;
-            t=now;
-
-            b.fire('pointerdown');
-
-            advance(75);
-
-            assert(held.has(k));
-            assert.equal(events.length,n+1);
-
-            b.fire('pointerup');
-
-            assert.deepEqual(
-              events[n+1],
-              ['keyup',k,t+75]
-            );
-
-            assert(!held.has(k));
-
-            n=events.length;
-
-            b.fire('pointerdown');
-
-            advance(5);
-
-            b.fire('pointercancel');
-
-            assert(!held.has(k));
-            assert.equal(events.length,n+2);
-
-            advance(50);
-
-            assert.equal(events.length,n+2);
-          }
-
-          const x=element();
-
-          bindHold(x,88);
-
-          check(x,88);
-
-          const parent=element();
-
-          const dirs=[37,38,39,40].map(
-            k=>dirButton(parent,'d'+k,'d',k)
-          );
-
-          for(let i=0;i<dirs.length;i++){
-            check(dirs[i],37+i);
-          }
-
-          let n=events.length;
-
-          dirs[0].fire('pointerdown');
-
-          advance(5);
-
-          dirs[1].fire('pointerdown');
-
-          assert.deepEqual(
-            events.slice(n).map(e=>e.slice(0,2)),
-            [
-              ['keydown',37],
-              ['keyup',37],
-              ['keydown',38]
-            ]
-          );
-
-          dirs[1].fire('pointerup');
-
-          advance(50);
-
-          assert(!held.has(37));
-          assert(!held.has(38));
-
-          const atk=attackButton(element());
-
-          check(atk,67);
-
-          let t=now,n2=events.length;
-
-          pulseKey(65,120);
-
-          advance(119);
-
-          assert(held.has(65));
-
-          advance(1);
-
-          assert.deepEqual(
-            events.slice(n2),
-            [
-              ['keydown',65,t],
-              ['keyup',65,t+120]
-            ]
-          );
-
-          x.fire('pointerdown');
-
-          releaseAll();
-
-          assert.equal(held.size,0);
-          assert.equal(pulseTimers.size,0);
-
-          advance(100);
-
-          assert.equal(held.size,0);
-
-          console.log(
-            'PASS four direction keys, X, manual attack'
-          );
-
-          console.log(
-            'PASS short press, long press, cancellation'
-          );
-
-          console.log(
-            'PASS immediate direction changes'
-          );
-
-          console.log(
-            'PASS original 120ms item pulse'
-          );
-
-          console.log(
-            'PASS original releaseAll cleanup'
-          );
-          `;
-
-          vm.runInNewContext(
-            pre+'\n'+input+'\n'+test,
-            {assert,console}
-          );
-          JS
-
-          node --check /tmp/slv39-test.cjs
-          node /tmp/slv39-test.cjs
-
-          python3 - <<'PY3'
-          from pathlib import Path
-          import hashlib,json,re
-
-          root=Path('site')
-
-          loader=root/'knight/js/sl-assets-v229r115.js'
           source=loader.read_text('utf8')
 
-          assert source.count("var version='V3.8';")==1
+          assert source.count("var version='V3.9';")==1,(
+              'Original V3.9 version mismatch'
+          )
 
-          loader.write_text(
+          launcher=root/'index.html'
+          original=launcher.read_text('utf8')
+
+          assert 'V3.9' in original
+
+          source=original.replace(
+              'V3.9','V3.10'
+          ).replace(
+              'v3.9','v3.10'
+          )
+
+          body_pattern=re.compile(
+              r'(<body\b[^>]*>)(.*?)(</body\s*>)',
+              re.I|re.S
+          )
+
+          bodies=list(body_pattern.finditer(source))
+
+          assert len(bodies)==1,(
+              'Original launcher body count',
+              len(bodies)
+          )
+
+          match=bodies[0]
+          body=match.group(2)
+
+          assert len(re.findall(
+              r'<button\b',body,re.I
+          ))==2,(
+              'Original character selection button count'
+          )
+
+          for side in ('knight','elf'):
+              pattern=(
+                  r'''location\.href\s*=\s*['"]'''
+                  +side
+                  +r'''/\?v=['"]\s*\+\s*Date\.now\(\)'''
+              )
+
+              assert len(re.findall(pattern,body))==1,(
+                  'Original character entry missing',
+                  side
+              )
+
+          assert '캐릭터 선택' in body
+
+          assert not re.search(
+              r'<script\b',body,re.I
+          ),'Unexpected script in original character selection'
+
+          new_body=(
+              "<script>"
+              "location.replace('knight/?v='+Date.now());"
+              "</script>"
+          )
+
+          result=(
+              source[:match.start(2)]
+              +new_body
+              +source[match.end(2):]
+          )
+
+          assert not re.search(
+              r'<button\b',result,re.I
+          )
+
+          assert '캐릭터 선택' not in result
+
+          assert result.count(
+              "location.replace('knight/?v='+Date.now());"
+          )==1
+
+          assert "location.href='elf/" not in result
+
+          script=re.search(
+              r'<script>(.*?)</script>',
+              new_body,
+              re.S
+          ).group(1)
+
+          test=(
+              "const assert=require('assert');"
+              "let target;"
+              "const location={replace:v=>target=v};"
+              "Date.now=()=>123;"
+              +script+
+              "assert.strictEqual(target,'knight/?v=123');"
+          )
+
+          subprocess.run(
+              ['node','-e',test],
+              check=True
+          )
+
+          launcher.write_text(result,'utf8')
+
+          knight=root/'knight/index.html'
+          source=knight.read_text('utf8')
+
+          assert 'V3.9' in source
+
+          knight.write_text(
               source.replace(
-                  "var version='V3.8';",
-                  "var version='V3.9';"
+                  'V3.9','V3.10'
+              ).replace(
+                  'v3.9','v3.10'
               ),
               'utf8'
           )
 
-          for name in ('index.html','knight/index.html'):
-              path=root/name
-              source=path.read_text('utf8')
+          source=loader.read_text('utf8')
 
-              assert 'V3.8' in source,(
-                  'Missing original version',
-                  name
-              )
+          assert source.count(
+              "var version='V3.9';"
+          )==1
 
-              source=source.replace(
-                  'V3.8','V3.9'
-              ).replace(
-                  'v3.8','v3.9'
-              )
-
-              if name=='knight/index.html':
-                  pattern=re.compile(
-                      r"""(\bsrc\s*=\s*["'](?:\./)?js/dpad\.js)(\?[^"'\r\n]*)?(["'])"""
-                  )
-
-                  matches=list(pattern.finditer(source))
-
-                  assert len(matches)==1,(
-                      'Original dpad script reference',
-                      len(matches)
-                  )
-
-                  match=matches[0]
-                  query=match.group(2) or ''
-
-                  assert not query or re.fullmatch(
-                      r'\?v=[^&]*',
-                      query
-                  ),query
-
-                  replacement=(
-                      match.group(1)
-                      +'?v=v3.9-input2'
-                      +match.group(3)
-                  )
-
-                  source=(
-                      source[:match.start()]
-                      +replacement
-                      +source[match.end():]
-                  )
-
-                  assert source.count(
-                      'js/dpad.js?v=v3.9-input2'
-                  )==1
-
-              path.write_text(source,'utf8')
-
-          before=json.loads(
-              Path('before.json').read_text('utf8')
+          loader.write_text(
+              source.replace(
+                  "var version='V3.9';",
+                  "var version='V3.10';"
+              ),
+              'utf8'
           )
 
           after={
@@ -673,10 +210,9 @@ jobs:
           }
 
           expected={
-              'knight/js/dpad.js',
-              'knight/js/sl-assets-v229r115.js',
               'index.html',
-              'knight/index.html'
+              'knight/index.html',
+              'knight/js/sl-assets-v229r115.js'
           }
 
           assert changed==expected,(
@@ -688,29 +224,33 @@ jobs:
               'knight/gameasync/Data/Scripts.rxdata'
           ]==after[
               'knight/gameasync/Data/Scripts.rxdata'
-          ],'Original game scripts changed'
+          ]
+
+          assert before[
+              'knight/js/dpad.js'
+          ]==after[
+              'knight/js/dpad.js'
+          ]
 
           assert before[
               'knight/gameasync/mapping.js'
           ]==after[
               'knight/gameasync/mapping.js'
-          ],'Original resource mapping changed'
+          ]
 
-          print('PASS V3.9 input response patch')
-          print('PASS dpad.js cache reference refreshed')
-          print('PASS original movement speed unchanged')
-          print('PASS original attack speed unchanged')
+          print('PASS V3.10 direct knight entry')
+          print('PASS initial character selection removed')
+          print('PASS V3.9 input response unchanged')
           print('PASS original companion behavior unchanged')
-          print('PASS original item and skill timings unchanged')
-          print('PASS original engine and game data unchanged')
+          print('PASS original save and game data unchanged')
           print('PASS approved changed files:',len(changed))
           print('PASS untouched original files:',len(before)-len(changed))
-          PY3
+          PY
 
           node --check site/knight/js/dpad.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Upload V3.9 candidate
+      - name: Upload V3.10 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
