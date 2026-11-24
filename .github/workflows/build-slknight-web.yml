@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V3.7 | Knight and Wizard Render Scale
+name: build-slknight-web.yml | V3.8 | Knight and Wizard Render Scale
 
 "on":
   workflow_dispatch:
@@ -59,6 +59,7 @@ jobs:
           from pathlib import Path
           from PIL import Image
           from statistics import median
+          import json,re
 
           path=Path('site/knight/gameasync/Graphics/Characters/법사.png')
           with Image.open(path) as im:
@@ -126,14 +127,100 @@ jobs:
                   anchor(saved.crop((c*cw,r*ch,(c+1)*cw,(r+1)*ch)).convert('RGBA'))==(x,y)
                   for r in range(4) for c in range(4))
 
-          print('PASS 16/16 frames: identical head anchor, original pixels and 48x96 cells retained')
+          print('PASS 16/16 wizard frames: identical head anchor, original pixels and 48x96 cells retained')
+
+          root=Path('site/knight/gameasync')
+          mapping=(root/'mapping.js').read_text('utf8')
+
+          def graphic(name):
+              key='graphics/characters/'+name.lower()
+              pattern=r'\["'+re.escape(key)+r'",\s*"([^"]+)\?h=[0-9a-f]{32}"\]'
+              found=re.findall(pattern,mapping)
+              assert len(found)==1,(name,'Graphic mapping count',len(found))
+              p=root/found[0]
+              assert p.is_file(),p
+              return p
+
+          def ground_offsets(name):
+              p=graphic(name)
+
+              with Image.open(p) as image:
+                  sheet=image.convert('RGBA')
+
+              assert sheet.width%4==0 and sheet.height%4==0,(name,sheet.size)
+
+              w=sheet.width//4
+              h=sheet.height//4
+              samples=[]
+
+              for row in range(4):
+                  for col in range(4):
+                      cell=sheet.crop((col*w,row*h,(col+1)*w,(row+1)*h))
+                      b=cell.getchannel('A').getbbox()
+                      assert b,(name,row,col)
+
+                      ax,ay=anchor(cell)
+                      half=max(3,min(8,(b[2]-b[0])//5))
+                      left=max(b[0],ax-half)
+                      right=min(b[2],ax+half+1)
+                      lower=b[1]+(b[3]-b[1])//2
+
+                      feet=[
+                          yy
+                          for yy in range(lower,b[3])
+                          for xx in range(left,right)
+                          if cell.getpixel((xx,yy))[3]>32
+                          and max(cell.getpixel((xx,yy))[:3])>=48
+                      ]
+
+                      assert feet,(name,row,col,'Ground anchor not found')
+                      fy=max(feet)+1
+
+                      samples.append((ax-w//2,fy-h))
+                      print('GROUND',name,row,col,
+                            'cell',w,h,
+                            'anchor',ax,fy,
+                            'offset',samples[-1])
+
+              assert len(samples)==16
+
+              return (
+                  median([p[0] for p in samples]),
+                  median([p[1] for p in samples])
+              )
+
+          knight=ground_offsets('knight_men')
+          fairy=ground_offsets('여요정')
+
+          target_x=knight[0]*0.90
+          target_y=knight[1]*0.90
+
+          ox=round(fairy[0]-target_x)
+          oy=round(fairy[1]-target_y)
+
+          assert abs(fairy[0]-ox-target_x)<=0.5
+          assert abs(fairy[1]-oy-target_y)<=0.5
+
+          Path('/tmp/slv38-anchor.json').write_text(
+              json.dumps({'ox':ox,'oy':oy}),
+              'utf8'
+          )
+
+          print('PASS knight and fairy: 32/32 source frames inspected')
+          print('FAIRY_ORIGIN',ox,oy,
+                'knight',knight,
+                'fairy',fairy,
+                'target',target_x,target_y)
           PY3
+
           /tmp/slv37-venv/bin/python -m py_compile /tmp/slv37.py
           /tmp/slv37-venv/bin/python /tmp/slv37.py
 
           cat > /tmp/slknight-v34.rb <<'RUBY'
           require 'zlib'
           require 'digest'
+          require 'json'
+
           module RPG
             %w[Actor Item AudioFile].each do |n|
               const_set(n,Class.new) unless const_defined?(n,false)
@@ -171,15 +258,31 @@ jobs:
           root='site/knight/gameasync'
           data=root+'/Data/Scripts.rxdata'
           rows=Marshal.load(File.binread(data))
+
           raise 'V3.3 Scripts count changed' unless rows.size==137
+
           original_rows=rows.map{|r|r.is_a?(Array) ? r.dup : r}
+
           actor_files=Dir.glob(root+'/Data/*Actors.rxdata').select{|p|File.size(p)>10}
           item_files=Dir.glob(root+'/Data/*Items.rxdata').select{|p|File.size(p)>10}
+
           raise 'Actor or item data not unique' unless actor_files.size==1 && item_files.size==1
+
           actors=Marshal.load(File.binread(actor_files.first))
           items=Marshal.load(File.binread(item_files.first))
+
           raise 'Original Fairy actor differs' unless actors[4].instance_variable_get(:@name).to_s.dup.force_encoding('UTF-8')=='여요정'
-          raise 'Original Fairy summon item differs' unless items[1000].instance_variable_get(:@name).to_s.dup.force_encoding('UTF-8').strip=='여요정'
+
+          raise 'Original healer command item differs' unless items[117].instance_variable_get(:@name).to_s.dup.force_encoding('UTF-8').include?('힐러 명령 주문서')
+
+          names=['여요정','다크엘프','다크레인저','실버레인저','애로우 마스터','아크스카우터']
+
+          names.each_with_index do |name,i|
+            item=items[1000+i]
+            raise "Missing original item #{1000+i}" unless item
+            actual=item.instance_variable_get(:@name).to_s.dup.force_encoding('UTF-8').strip
+            raise "Original item #{1000+i} differs: #{actual}" unless actual==name
+          end
 
           edit_script(rows,'Game_Character 2') do |s|
             old="    @sl_move_rate = SLV229::Speed.move_rate if self.is_a?(Game_Event) && @event && (@event.name == '[ID힐러 마법사]' || @event.name.to_s.start_with?('동료 '))"
@@ -187,80 +290,239 @@ jobs:
             rep(s,old,newer,'Original speed expression')
           end
 
+          edit_script(rows,'Game_Character 3') do |s|
+            first=s.index('  def move_toward_player')
+            raise 'Original follower movement method missing' unless first
+
+            last=s.index('  def move_away_from_player',first)
+            raise 'Original follower method boundary missing' unless last
+
+            method=s[first...last]
+
+            point=method.index('return if @sl_healer_teleport')
+            raise 'Original healer teleport guard missing' unless point
+
+            guards=method[0...point].lines.select do |line|
+              line.match?(/^[ \t]*if[ \t]+.*@event\.name[ \t]*==[ \t]*'\[ID힐러 마법사\]'/)
+            end
+
+            raise 'Original healer follower condition not unique' unless guards.size==1
+
+            guard=guards.first
+            m=guard.match(/\A([ \t]*)if[ \t]+([^\n]+)\n\z/)
+
+            raise 'Original healer condition format differs' unless m
+
+            newguard="#{m[1]}if (#{m[2]}) || (self.is_a?(Game_Event) && @event && @event.name == '동료 여요정')\n"
+
+            method=rep(method,guard,newguard,'Native healer and fairy follower condition')
+
+            raise 'Original teleport destination assignment missing' unless method.scan('@sl_healer_teleport = [tx, ty, Graphics.frame_count]').size==1
+
+            raise 'Unexpected old healer aggro reset in follower branch' if method.include?('$game_map.events.each_value do |event|')
+
+            old='if d <= 1 || outside'
+
+            newer="if d <= 1 || outside || (@event.name == '동료 여요정' && $game_map.events.values.any? { |e| e != self && e.character_name != '' && e.x == @x && e.y == @y && e.instance_variable_get(:@event) && (e.instance_variable_get(:@event).name == '[ID힐러 마법사]' || e.instance_variable_get(:@event).name.to_s.start_with?('동료 ')) })"
+
+            method=rep(method,old,newer,'Existing follower overlap and offscreen condition')
+
+            old="e != self && e.x == tx && e.y == ty && e.character_name != ''"
+
+            newer="e != self && e.character_name != '' && ((e.x == tx && e.y == ty) || (e.instance_variable_get(:@sl_healer_teleport) && e.instance_variable_get(:@sl_healer_teleport)[0,2] == [tx,ty]))"
+
+            method=rep(method,old,newer,'Existing destination occupancy and reservation')
+
+            raise 'Original follower separation missing' unless method.include?('if d <= 2')
+            raise 'Original follower distance missing' unless method.include?('return if d <= 5')
+
+            rep(s,s[first...last],method,'Native follower movement')
+          end
+
           edit_script(rows,'Sprite_Character') do |s|
+            raise 'Existing teleport effect path missing' unless s.scan('effect = @character.instance_variable_get(:@sl_healer_teleport)').size==1
+
+            raise 'Existing teleport completion missing' unless s.include?('@character.moveto(effect[0],effect[1])')
+
+            origin=JSON.parse(File.read('/tmp/slv38-anchor.json'))
+            ox=Integer(origin.fetch('ox'))
+            oy=Integer(origin.fetch('oy'))
+
+            old="        self.ox = @cw / 2\n"
+
+            newer="        self.ox = @cw / 2 + (@character_name == '여요정' ? #{ox} : 0)\n"
+
+            s=rep(s,old,newer,'Fairy horizontal origin')
+
             anchor="        self.oy = @ch\n      end\n    end\n"
-            replacement="        self.oy = @ch\n      end\n      self.zoom_x = (@tile_id == 0 && @character.is_a?(Game_Player) && ['knight_men', 'knight_men_death', 'knight_men좌표', '기사이동모션', 'knight_damage', 'knight_drop'].include?(@character_name) ? 0.90 : (@tile_id == 0 && @character.is_a?(Game_Event) && @character.instance_variable_get(:@event) && @character.instance_variable_get(:@event).name == '[ID힐러 마법사]' ? 1.01 : 1.0))\n      self.zoom_y = self.zoom_x\n    end\n"
+
+            replacement="        self.oy = @ch + (@character_name == '여요정' ? #{oy} : 0)\n      end\n      self.zoom_x = (@tile_id == 0 && @character.is_a?(Game_Player) && ['knight_men', 'knight_men_death', 'knight_men좌표', '기사이동모션', 'knight_damage', 'knight_drop'].include?(@character_name) ? 0.90 : (@tile_id == 0 && @character.is_a?(Game_Event) && @character.instance_variable_get(:@event) && @character.instance_variable_get(:@event).name == '[ID힐러 마법사]' ? 1.01 : 1.0))\n      self.zoom_y = self.zoom_x\n    end\n"
+
             rep(s,anchor,replacement,'Original sprite graphic-change branch')
           end
 
           edit_script(rows,'Game_Party') do |s|
             raise 'Original lose_item method missing' unless s.match?(/^\s*def lose_item\b/)
+
             old="    for i in $data_system.party_members\n      @actors.push($game_actors[i])\n    end\n    for id in 1000..1005\n      gain_item(id,1)\n    end\n  end"
-            newer="    for i in ($data_system.party_members | [4])\n      @actors.push($game_actors[i])\n    end\n    $game_switches[2001] = @actors.include?($game_actors[4])\n    for id in 1001..1005\n      gain_item(id,1)\n    end\n  end"
-            s=rep(s,old,newer,'Original starting members and inventory')
+
+            newer="    for i in ($data_system.party_members | [4])\n      @actors.push($game_actors[i])\n    end\n    $game_switches[2001] = @actors.include?($game_actors[4])\n    for id in [117,1000,1001,1002,1003,1004,1005]\n      lose_item(id,item_number(id))\n    end\n  end"
+
+            s=rep(s,old,newer,'Starting members and obsolete command items')
+
             old="    @actors = new_actors\n    for id in 1000..1005\n      gain_item(id,1) if item_number(id)==0\n    end\n    for id in 4..9\n      $game_switches[2001+id-4] = @actors.include?($game_actors[id])\n    end\n  end"
-            newer="    @actors = new_actors | [$game_actors[4]]\n    lose_item(1000,item_number(1000))\n    for id in 1001..1005\n      gain_item(id,1) if item_number(id)==0\n    end\n    for id in 4..9\n      $game_switches[2001+id-4] = @actors.include?($game_actors[id])\n    end\n  end"
-            rep(s,old,newer,'Original load inventory and party visibility')
+
+            newer="    @actors = new_actors | [$game_actors[4]]\n    for id in [117,1000,1001,1002,1003,1004,1005]\n      lose_item(id,item_number(id))\n    end\n    for id in 4..9\n      $game_switches[2001+id-4] = @actors.include?($game_actors[id])\n    end\n  end"
+
+            s=rep(s,old,newer,'Load inventory and party visibility')
+
+            gain=s.match(/^  def gain_item\(item_id,[ \t]*n\)[ \t]*\n/)
+
+            raise 'Original gain_item method header missing' unless gain
+
+            finish=s.index("\n  def ",gain.end(0))
+
+            raise 'Original gain_item method boundary missing' unless finish
+
+            method=s[gain.begin(0)...finish]
+
+            old="    if item_id > 0\n"
+
+            newer="    if item_id > 0 && (n <= 0 || (item_id != 117 && !(1000..1005).include?(item_id)))\n"
+
+            updated=rep(method,old,newer,'Original item acquisition condition')
+
+            rep(s,method,updated,'Native item acquisition')
           end
 
           ['Window_Item','★Window_Item2'].each do |name|
             edit_script(rows,name) do |s|
-              old="      if i == 117\n        for id in 1000..1005\n          @data.push($data_items[id]) if $game_party.item_number(id)>0\n        end\n      end"
-              newer="      if i == 117\n        for id in 1001..1005\n          @data.push($data_items[id]) if $game_party.item_number(id)>0\n        end\n      end"
+              old="    for i in 1...$data_items.size\n      next if i >= 1000 && i <= 1005\n      if $game_party.item_number(i) > 0\n        @data.push($data_items[i])\n      end\n      if i == 117\n        for id in 1000..1005\n          @data.push($data_items[id]) if $game_party.item_number(id)>0\n        end\n      end\n    end"
+
+              newer="    for i in 1...$data_items.size\n      next if i == 117 || (1000..1005).include?(i)\n      if $game_party.item_number(i) > 0\n        @data.push($data_items[i])\n      end\n    end"
+
               rep(s,old,newer,name+' original companion item display')
             end
           end
 
           changed=rows.each_index.select{|i|rows[i]!=original_rows[i]}.map{|i|rows[i][1].to_s.dup.force_encoding('UTF-8')}.sort
-          expected=['Game_Character 2','Sprite_Character','Game_Party','Window_Item','★Window_Item2'].sort
+
+          expected=[
+            'Game_Character 2',
+            'Game_Character 3',
+            'Sprite_Character',
+            'Game_Party',
+            'Window_Item',
+            '★Window_Item2'
+          ].sort
+
           raise "Unexpected script changes: #{changed.inspect}" unless changed==expected
+
           File.binwrite(data,Marshal.dump(rows))
+
           raise 'Script serialization mismatch' unless Marshal.load(File.binread(data))==rows
+
+          gain_owners=rows.select do |r|
+            r.is_a?(Array) &&
+            r[2].is_a?(String) &&
+            Zlib::Inflate.inflate(r[2]).force_encoding('UTF-8').match?(/^[ \t]*def gain_item\(item_id,[ \t]*n\)/)
+          end.map{|r|r[1].to_s.dup.force_encoding('UTF-8')}
+
+          raise "Unexpected gain_item implementations: #{gain_owners.inspect}" unless gain_owners==['Game_Party']
+
+          teleport_refs=rows.select do |r|
+            r.is_a?(Array) &&
+            r[2].is_a?(String) &&
+            Zlib::Inflate.inflate(r[2]).force_encoding('UTF-8').include?('@sl_healer_teleport')
+          end.map{|r|r[1].to_s.dup.force_encoding('UTF-8')}
+
+          puts 'Existing teleport references: '+teleport_refs.join(', ')
+
           mapper=root+'/mapping.js'
+
           js=File.binread(mapper).force_encoding('UTF-8')
+
           raise 'Invalid resource map' unless js.valid_encoding?
+
           rel='Graphics/Characters/법사.png'
+
           [['Data/Scripts.rxdata',data],[rel,root+'/'+rel]].each do |name,path|
             pattern=Regexp.new(Regexp.escape(name)+'\\?h=[0-9a-f]{32}')
+
             raise "Resource reference missing or duplicated: #{name}" unless js.scan(pattern).size==1
+
             js=js.sub(pattern,name+'?h='+Digest::MD5.file(path).hexdigest)
           end
+
           File.binwrite(mapper,js)
+
           puts 'PASS exact approved script changes: '+changed.join(', ')
+          puts 'PASS existing healer teleport effect reused'
+          puts 'PASS Fairy remains starting companion'
+          puts 'PASS obsolete items 117 and 1000 through 1005 removed from acquisition and inventory'
           RUBY
+
           ruby -c /tmp/slknight-v34.rb
           ruby /tmp/slknight-v34.rb
 
           python3 - <<'PY4'
           from pathlib import Path
           import hashlib,json
+
           root=Path('site')
           loader=root/'knight/js/sl-assets-v229r115.js'
+
           src=loader.read_text('utf8')
+
           assert src.count("var version='V3.3';")==1
-          loader.write_text(src.replace("var version='V3.3';","var version='V3.7';"),'utf8')
+
+          loader.write_text(
+              src.replace("var version='V3.3';","var version='V3.8';"),
+              'utf8'
+          )
+
           for name in ('index.html','knight/index.html'):
               p=root/name
               src=p.read_text('utf8')
+
               assert 'V3.3' in src,('Missing current version',name)
-              p.write_text(src.replace('V3.3','V3.7').replace('v3.3','v3.7'),'utf8')
+
+              p.write_text(
+                  src.replace('V3.3','V3.8').replace('v3.3','v3.8'),
+                  'utf8'
+              )
+
           before=json.loads(Path('before.json').read_text('utf8'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-                 for p in root.rglob('*') if p.is_file()}
+
+          after={
+              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in root.rglob('*') if p.is_file()
+          }
+
           changed={p for p in before.keys()&after.keys() if before[p]!=after[p]}
-          expected={'knight/gameasync/Data/Scripts.rxdata',
-                    'knight/gameasync/Graphics/Characters/법사.png',
-                    'knight/gameasync/mapping.js',
-                    'knight/js/sl-assets-v229r115.js',
-                    'index.html','knight/index.html'}
+
+          expected={
+              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/Graphics/Characters/법사.png',
+              'knight/gameasync/mapping.js',
+              'knight/js/sl-assets-v229r115.js',
+              'index.html',
+              'knight/index.html'
+          }
+
           assert changed==expected,('Unapproved changed files',sorted(changed^expected))
           assert before.keys()==after.keys(),'Unexpected added or deleted game files'
-          print('PASS V3.7: 6 approved changed files; all other files unchanged')
+
+          print('PASS V3.8: 6 approved changed files')
+          print('PASS remaining 6007 original files unchanged')
+          print('PASS knight scale 0.90, wizard scale 1.01, follower speed 1.0 retained')
+          print('PASS original map, item database, common events and engine unchanged')
           PY4
+
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Upload V3.7 candidate
+      - name: Upload V3.8 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
