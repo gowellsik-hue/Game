@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.7 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.8 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -10,8 +10,6 @@ name: build-slknight-web.yml | V4.7 | Companion Separation and Ground Alignment
 permissions:
   contents: read
   actions: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: slknight-github-pages
@@ -20,371 +18,238 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
-      - name: Restore V4.6 game
+      - name: Restore V4.7 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45791739313
+          run-id: 45799624062
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify V4.6 baseline
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s baseline/artifact.tar
-          mkdir -p site
-          tar -xf baseline/artifact.tar -C site
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import hashlib,json
-          root=Path('site')
-          game=root/'knight/gameasync'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert len(before)==6019,len(before)
-          assert (root/'knight/js/sl-assets-v229r115.js').read_bytes().count(b"var version='V4.6';")==1
-          assert len(list((game/'Data').glob(pre+'Map[0-9][0-9][0-9].rxdata')))==46
-          names=[pre+n+'.rxdata' for n in ('System','Map029','Map047')]
-          Path('/tmp/sl47-before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
-          Path('/tmp/sl47-md5.json').write_text(json.dumps({n:hashlib.md5((game/'Data'/n).read_bytes()).hexdigest() for n in names}),'utf8')
-          print('PASS V4.6 baseline',len(before))
-          PYTHON
-
-      - name: Move new character start and recruiter to Talking Island
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/sl47-patch.rb <<'RUBY'
-          # encoding: UTF-8
-          require 'zlib'
-          require 'json'
-          module RPG
-            %w[Map MapInfo Tileset Event EventCommand MoveRoute MoveCommand AudioFile CommonEvent System Item].each{|n|const_set(n,Class.new)}
-            Event.const_set(:Page,Class.new)
-            Event::Page.const_set(:Condition,Class.new)
-            Event::Page.const_set(:Graphic,Class.new)
-            System.const_set(:Words,Class.new)
-            System.const_set(:TestBattler,Class.new)
-          end
-          %w[Table Tone Color].each do |n|
-            Object.const_set(n,Class.new do
-              def self._load(raw);o=allocate;o.instance_variable_set(:@raw,raw);o;end
-              def _dump(depth);@raw;end
-            end)
-          end
-          def iv(o,k);o.instance_variable_get(k);end
-          def utf(s);s.to_s.dup.force_encoding('UTF-8').scrub;end
-          def check(ok,msg);raise msg unless ok;end
-          def table(o)
-            r=iv(o,:@raw);check(r.is_a?(String)&&r.bytesize>=20,'Invalid Table')
-            _,w,h,z,n=r.unpack('V5');check(n==w*h*z&&r.bytesize==20+n*2,'Invalid Table length')
-            [w,h,z,r.byteslice(20,n*2).unpack('v*')]
-          end
-          def lists(e);iv(e,:@pages).map{|p|iv(p,:@list)};end
-          def code(c);iv(c,:@code);end
-          def params(c);iv(c,:@parameters);end
-          def targets(c)
-            p=params(c)
-            case code(c)
-            when 111; p[0]==6 ? [1] : []
-            when 122; p[3]==6 ? [4] : []
-            when 202; p[1]==2 ? [0,2] : [0]
-            when 207,209; [0]
-            else; []
-            end
-          end
-          def strings(obj,&block)
-            case obj
-            when String;block.call(utf(obj))
-            when Array;obj.each{|x|strings(x,&block)}
-            when Hash;obj.each_value{|x|strings(x,&block)}
-            when RPG::MoveRoute,RPG::MoveCommand
-              obj.instance_variables.each{|k|strings(iv(obj,k),&block)}
-            end
-          end
-          def fields(o,except=[])
-            (o.instance_variables-except).to_h{|k|[k,Marshal.dump(iv(o,k))]}
-          end
-          def local_ref?(s,id)
-            s.match?(/\b(?:events\s*\[\s*#{id}\s*\]|get_character\s*\(\s*#{id}\s*\))/)
-          end
-          root='site/knight/gameasync/Data'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          path=lambda{|n|File.join(root,pre+n+'.rxdata')}
-          load_data=lambda{|n|Marshal.load(File.binread(path.call(n)))}
-          maps=Dir.glob(path.call('Map[0-9][0-9][0-9]')).sort.to_h{|f|[f[/Map(\d{3})\.rxdata$/,1].to_i,Marshal.load(File.binread(f))]}
-          check(maps.size==46,'Map count')
-          infos=load_data.call('MapInfos')
-          source=maps.fetch(29);dest=maps.fetch(47)
-          check(utf(iv(infos.fetch(47),:@name)).match?(/말\s*하는\s*섬|말섬/),'Map047 name')
-          src_events=iv(source,:@events);dst_events=iv(dest,:@events)
-          recruit=src_events.fetch(49)
-          check(utf(iv(recruit,:@name))=='[ID고용사]'&&[iv(recruit,:@x),iv(recruit,:@y)]==[72,48],'Original recruiter identity')
-          check(iv(recruit,:@pages).size==2,'Original recruiter pages')
-          found=maps.flat_map{|mid,m|iv(m,:@events).filter_map{|eid,e|[mid,eid] if utf(iv(e,:@name))=='[ID고용사]'}}
-          check(found==[[29,49]],"Recruiter locations #{found.inspect}")
-          common=load_data.call('CommonEvents').compact.to_h{|e|[iv(e,:@id),e]}
-          commands=[];slots=0;event_count=0
-          maps.each do |mid,m|
-            ids=[]
-            iv(m,:@events).each do |eid,e|
-              event_count+=1
-              check(iv(e,:@id)==eid,"Map #{mid} event ID #{eid}")
-              lists(e).each{|l|commands<<[mid,eid,l]}
-              if utf(iv(e,:@name)).start_with?('동료 ')
-                pg=iv(e,:@pages)
-                check(pg.size==1,"Map #{mid} companion page")
-                c=iv(pg[0],:@condition)
-                check(iv(c,:@switch1_valid),"Map #{mid} companion condition")
-                ids<<iv(c,:@switch1_id)
-              end
-            end
-            check(ids.sort==(2001..2006).to_a,"Map #{mid} companion slots")
-            slots+=ids.count{|id|(2001..2003).include?(id)}
-          end
-          check(slots==138,'Active companion count')
-          common.each{|id,e|commands<<[nil,id,iv(e,:@list)]}
-          entrance=lists(src_events.fetch(11)).flatten.select{|c|code(c)==201&&params(c)[0,2]==[0,47]}
-          check(entrance.size==1,'Map029 EV11 Talking Island entrance')
-          ax,ay=params(entrance[0])[2,2]
-          check(ax.is_a?(Integer)&&ay.is_a?(Integer),'Entrance coordinates')
-          scripts=Marshal.load(File.binread(File.join(root,'Scripts.rxdata'))).filter_map do |r|
-            [utf(r[1]),utf(Zlib::Inflate.inflate(r[2]))] if r&&r[2].is_a?(String)
-          end
-          startup=scripts.select{|_,s|s.match?(/\$game_map\.setup\s*\(\s*\$data_system\.start_map_id\s*\)/)&&s.match?(/\$game_player\.moveto\s*\(\s*\$data_system\.start_x\s*,\s*\$data_system\.start_y\s*\)/)}
-          check(!startup.empty?,'Native new-game start route not verified')
-          sys=load_data.call('System')
-          start_keys=[:@start_map_id,:@start_x,:@start_y]
-          start_old=start_keys.map{|k|iv(sys,k)}
-          check(start_old.all?{|v|v.is_a?(Integer)}&&maps.key?(start_old[0]),'Original System start fields')
-          if start_old[0]!=47
-            old_start_events=iv(maps.fetch(start_old[0]),:@events)
-            old_start_events.each do |eid,e|
-              iv(e,:@pages).each_with_index do |pg,pi|
-                next unless iv(pg,:@trigger)==3
-                c=iv(pg,:@condition)
-                conditional=[:@switch1_valid,:@switch2_valid,:@variable_valid,:@self_switch_valid].any?{|k|iv(c,k)}
-                puts "OLD START AUTORUN EV#{eid} page=#{pi} conditional=#{conditional} name=#{utf(iv(e,:@name))}"
-                check(conditional,'Unconditional old-start autorun must be preserved')
-              end
-            end
-          end
-          puts "START route=#{startup.map(&:first).inspect} old=#{start_old.inspect} entrance=#{[47,ax,ay].inspect}"
-          new_id=dst_events.keys.max+1
-          check(!dst_events.key?(new_id),'Destination event ID collision')
-          commands.each do |mid,eid,list|
-            next if mid==29&&eid==49
-            next unless mid==29||mid==47
-            target_id=mid==29 ? 49 : new_id
-            list.each do |c|
-              check(targets(c).none?{|i|params(c)[i]==target_id},"Map #{mid} EV#{eid} local target #{target_id}")
-              strings(params(c)){|s|check(!local_ref?(s,target_id),"Map #{mid} EV#{eid} script target #{target_id}")}
-            end
-          end
-          scripts.each do |name,s|
-            check(!s.match?(/\[\s*29\s*,\s*49\s*,\s*['"][A-D]['"]\s*\]/),"Recruiter self-switch reference #{name}")
-            check(!s.lines.any?{|l|l.match?(/map_id\s*==\s*29\b/)&&local_ref?(l,49)},"Recruiter map-bound script #{name}")
-          end
-          check(iv(recruit,:@pages).none?{|pg|iv(iv(pg,:@condition),:@self_switch_valid)},'Recruiter self-switch condition')
-          rcommands=lists(recruit).flatten
-          queue=rcommands.select{|c|code(c)==117}.map{|c|params(c)[0]}
-          seen={}
-          until queue.empty?
-            id=queue.shift
-            next if seen[id]
-            seen[id]=true
-            l=iv(common.fetch(id),:@list)
-            l.each do |c|
-              check(targets(c).none?{|i|params(c)[i].is_a?(Integer)&&params(c)[i]>0},"Recruiter CE#{id} local target")
-              check(code(c)!=123,"Recruiter CE#{id} self-switch")
-              strings(params(c)){|s|check(!local_ref?(s,49),"Recruiter CE#{id} script target")}
-              queue<<params(c)[0] if code(c)==117
-            end
-          end
-          rcommands.each do |c|
-            check(code(c)!=123,'Recruiter self-switch command')
-            check(targets(c).none?{|i|params(c)[i].is_a?(Integer)&&params(c)[i]>0},'Recruiter map-local event target')
-            strings(params(c)){|s|check(!local_ref?(s,49),'Recruiter map-local script target')}
-          end
-          tileset=load_data.call('Tilesets').fetch(iv(dest,:@tileset_id))
-          w,h,layers,cells=table(iv(dest,:@data))
-          check([w,h,layers]==[iv(dest,:@width),iv(dest,:@height),3],'Map047 tile dimensions')
-          _,_,_,passages=table(iv(tileset,:@passages))
-          _,_,_,priorities=table(iv(tileset,:@priorities))
-          check(cells.all?{|id|id<passages.size&&id<priorities.size},'Map047 tile references')
-          occupied=dst_events.values.to_h{|e|[[iv(e,:@x),iv(e,:@y)],true]}
-          landings={};transfers=[]
-          commands.each do |mid,eid,list|
-            list.each do |c|
-              next unless code(c)==201
-              p=params(c)
-              transfers<<[mid,eid,p]
-              landings[p[2,2]]=true if p[0,2]==[0,47]
-            end
-          end
-          steps=[[0,1,1,8],[-1,0,2,4],[1,0,4,2],[0,-1,8,1]]
-          pass=lambda do |x,y,bit|
-            next false unless x>=0&&y>=0&&x<w&&y<h
-            result=true
-            (layers-1).downto(0) do |z|
-              id=cells[x+w*(y+h*z)]
-              flags=passages[id]
-              if (flags&bit)!=0||(flags&15)==15
-                result=false
-                break
-              end
-              break if priorities[id]==0
-            end
-            result
-          end
-          free=lambda{|x,y|x>=0&&y>=0&&x<w&&y<h&&!occupied[[x,y]]}
-          check(free.call(ax,ay)&&steps.any?{|dx,dy,b,back|free.call(ax+dx,ay+dy)&&pass.call(ax,ay,b)&&pass.call(ax+dx,ay+dy,back)},'Existing Map047 entrance is not traversable')
-          reached={[ax,ay]=>true}
-          queue=[[ax,ay]]
-          until queue.empty?
-            x,y=queue.shift
-            steps.each do |dx,dy,b,back|
-              nx,ny=x+dx,y+dy
-              xy=[nx,ny]
-              next unless (nx-ax).abs+(ny-ay).abs<=6&&free.call(nx,ny)&&!reached[xy]&&pass.call(x,y,b)&&pass.call(nx,ny,back)
-              reached[xy]=true
-              queue<<xy
-            end
-          end
-          candidates=reached.keys.filter_map do |x,y|
-            d=(x-ax).abs+(y-ay).abs
-            next unless d.between?(2,5)&&!landings[[x,y]]
-            next unless occupied.keys.all?{|ex,ey|(ex-x).abs+(ey-y).abs>=2}
-            next unless steps.all?{|_,_,b,_|pass.call(x,y,b)}
-            access=steps.count{|dx,dy,b,back|free.call(x+dx,y+dy)&&reached[[x+dx,y+dy]]&&pass.call(x,y,b)&&pass.call(x+dx,y+dy,back)}
-            next unless access>=3
-            [d,-access,(y-ay).abs,y,x]
-          end
-          check(!candidates.empty?,'No accessible recruiter tile near existing Map047 entrance')
-          _,_,_,y,x=candidates.min
-          return_re=/귀환|return[_ ]?scroll|return[_ ]?map|recall/i
-          items=load_data.call('Items').compact
-          ids=common.filter_map{|id,e|id if utf(iv(e,:@name)).match?(return_re)}
-          items.each do |item|
-            next unless utf(iv(item,:@name)).match?(return_re)
-            id=iv(item,:@common_event_id)
-            ids<<id if id.is_a?(Integer)&&id>0
-            puts "RETURN ITEM #{iv(item,:@id)} #{utf(iv(item,:@name))} CE=#{id}"
-          end
-          audited={}
-          until ids.empty?
-            id=ids.shift
-            next if audited[id]
-            audited[id]=true
-            e=common.fetch(id)
-            puts "RETURN CE#{id} #{utf(iv(e,:@name))}"
-            iv(e,:@list).each do |c|
-              p=params(c)
-              puts "RETURN COMMAND #{id} code=#{code(c)} indent=#{iv(c,:@indent)} params=#{p.inspect}" if [111,112,113,115,117,118,119,121,122,125,126,201,411,412,355,655].include?(code(c))
-              ids<<p[0] if code(c)==117
-            end
-          end
-          scripts.each{|name,s|s.each_line.with_index(1){|l,i|puts "RETURN SCRIPT #{name}:#{i} #{l.strip}" if l.match?(return_re)}}
-          maps.each_key{|mid|puts "RETURN MAP #{mid} #{utf(iv(infos.fetch(mid),:@name))}"}
-          transfers.uniq.each{|mid,eid,p|puts "TRANSFER #{mid||'CE'}:#{eid} #{p.inspect}"}
-          puts "RETURN AUDIT maps=#{maps.size} common_events=#{common.size} transfers=#{transfers.size} return_common_events=#{audited.size}"
-          before_src=src_events.transform_values{|e|Marshal.dump(e)}
-          before_dst=dst_events.transform_values{|e|Marshal.dump(e)}
-          src_fields=fields(source,[:@events])
-          dst_fields=fields(dest,[:@events])
-          recruit_fields=fields(recruit,[:@id,:@x,:@y])
-          sys_fields=fields(sys,start_keys)
-          recruit.instance_variable_set(:@id,new_id)
-          recruit.instance_variable_set(:@x,x)
-          recruit.instance_variable_set(:@y,y)
-          src_events.delete(49)
-          dst_events[new_id]=recruit
-          check(fields(recruit,[:@id,:@x,:@y])==recruit_fields,'Recruiter behavior changed')
-          check(src_events.keys.sort==(before_src.keys-[49]).sort&&(dst_events.keys-before_dst.keys)==[new_id],'Event set mismatch')
-          check(src_events.all?{|id,e|Marshal.dump(e)==before_src.fetch(id)},'Other Map029 event changed')
-          check(dst_events.all?{|id,e|id==new_id||Marshal.dump(e)==before_dst.fetch(id)},'Other Map047 event changed')
-          check(fields(source,[:@events])==src_fields&&fields(dest,[:@events])==dst_fields,'Other map fields changed')
-          start_new=[47,ax,ay]
-          start_keys.zip(start_new).each{|k,v|sys.instance_variable_set(k,v)}
-          check(fields(sys,start_keys)==sys_fields,'Unrelated System fields changed')
-          updates={path.call('Map029')=>source,path.call('Map047')=>dest}
-          updates[path.call('System')]=sys if start_old!=start_new
-          updates.each do |f,o|
-            raw=Marshal.dump(o)
-            File.binwrite(f,raw)
-            check(Marshal.dump(Marshal.load(File.binread(f)))==raw,"Roundtrip #{f}")
-          end
-          File.write('/tmp/sl47-changed-data.json',JSON.generate(updates.keys.map{|f|File.basename(f)}.sort))
-          puts "PASS maps=#{maps.size} events=#{event_count} companions=#{slots}"
-          puts "PASS start #{start_old.inspect} -> #{start_new.inspect}"
-          puts "PASS recruiter Map029 EV49 -> Map047 EV#{new_id} (#{x},#{y})"
-          puts "PASS original recruiter pages and other map fields preserved"
-          RUBY
-          ruby -c /tmp/sl47-patch.rb
-          ruby /tmp/sl47-patch.rb
-
-      - name: Update mappings and verify exact changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import hashlib,json,re
-          root=Path('site')
-          game=root/'knight/gameasync'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          names=json.loads(Path('/tmp/sl47-changed-data.json').read_text('utf8'))
-          before=json.loads(Path('/tmp/sl47-before.json').read_text('utf8'))
-          old=json.loads(Path('/tmp/sl47-md5.json').read_text('utf8'))
-          required={pre+'Map029.rxdata',pre+'Map047.rxdata'}
-          assert len(names)==len(set(names)) and required<=set(names)<=set(old),names
-          mapper=game/'mapping.js'
-          s=mapper.read_bytes()
-          for n in names:
-              marker=('Data/'+n+'?h=').encode('ascii')
-              pattern=re.escape(marker)+rb'[0-9a-f]{32}'
-              assert re.findall(pattern,s)==[marker+old[n].encode('ascii')],n
-              digest=hashlib.md5((game/'Data'/n).read_bytes()).hexdigest().encode('ascii')
-              assert digest!=old[n].encode('ascii'),n
-              s=re.sub(pattern,lambda _:marker+digest,s)
-          mapper.write_bytes(s)
-          loader=root/'knight/js/sl-assets-v229r115.js'
-          s=loader.read_bytes()
-          assert s.count(b"var version='V4.6';")==1
-          loader.write_bytes(s.replace(b"var version='V4.6';",b"var version='V4.7';"))
-          for name in ('index.html','knight/index.html'):
-              p=root/name
-              s=p.read_bytes()
-              assert b'V4.6' in s
-              p.write_bytes(s.replace(b'V4.6',b'V4.7').replace(b'v4.6',b'v4.7'))
-          after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
-          assert set(before)==set(after) and len(after)==6019
-          allowed={'knight/gameasync/Data/'+n for n in names}|{'knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js','index.html','knight/index.html'}
-          changed={p for p in before if before[p]!=after[p]}
-          assert changed==allowed,sorted(changed^allowed)
-          print('PASS approved files',len(changed))
-          print('PASS unchanged files',len(before)-len(changed))
-          print('PASS V4.7')
-          PYTHON
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
-
-      - name: Upload V4.7 candidate
-        uses: actions/upload-pages-artifact@v5
+      - name: Restore original Sanctuary TBT icons
+        uses: actions/download-artifact@v4
         with:
-          path: site
-          retention-days: 30
+          repository: gowellsik-hue/Game
+          run-id: 43244856128
+          name: sanctuary-all-tbt-icons-html
+          github-token: ${{ github.token }}
+          path: tbt
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/deploy-pages@v5
-        id: deployment
+      - name: Extract complete equipment implementation source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import hashlib
+          import json
+          import re
+          import base64
+
+          root=Path('source')
+          root.mkdir()
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          prefix='knight/gameasync/Data/'
+          manifest={}
+
+          with tarfile.open('baseline/artifact.tar','r:') as tar:
+              members={
+                  m.name.removeprefix('./'):m
+                  for m in tar.getmembers() if m.isfile()
+              }
+
+              assert len(members)==6019,len(members)
+
+              loader='knight/js/sl-assets-v229r115.js'
+              original=tar.extractfile(members[loader]).read()
+              assert original.count(b"var version='V4.7';")==1
+
+              data_files=sorted(
+                  n for n in members
+                  if n.startswith(prefix) and n.endswith('.rxdata')
+              )
+
+              required=['Scripts.rxdata']+[
+                  pre+n+'.rxdata'
+                  for n in [
+                      'Actors','Classes','Weapons','Armors',
+                      'Items','System','CommonEvents','MapInfos'
+                  ]
+              ]
+
+              for name in required:
+                  assert prefix+name in members,name
+
+              maps=[
+                  n for n in data_files
+                  if re.fullmatch(
+                      re.escape(pre)+r'Map[0-9]{3}\.rxdata',
+                      Path(n).name
+                  )
+              ]
+              assert len(maps)==46,len(maps)
+
+              web_files=[
+                  n for n in members
+                  if n.startswith('knight/js/') and n.endswith('.js')
+              ]
+
+              web_files+= [
+                  n for n in members
+                  if n in (
+                      'knight/gameasync/mapping.js',
+                      'knight/gameasync/bitmap-map.js'
+                  )
+              ]
+
+              selected=sorted(set(data_files+web_files))
+              for n in selected:
+                  data=tar.extractfile(members[n]).read()
+                  target=root/n
+                  target.parent.mkdir(parents=True,exist_ok=True)
+                  target.write_bytes(data)
+                  manifest[n]={
+                      'bytes':len(data),
+                      'sha256':hashlib.sha256(data).hexdigest()
+                  }
+
+              packs=[]
+              for n in sorted(members):
+                  if '/assets/' in n and n.endswith('.pack'):
+                      packs.append({
+                          'path':n,
+                          'bytes':members[n].size
+                      })
+
+              (root/'pack-index.json').write_text(
+                  json.dumps(packs,indent=2),
+                  encoding='utf8'
+              )
+
+          gallery=list(Path('tbt').rglob('All-TBT-Icons.html'))
+          assert len(gallery)==1
+
+          html=gallery[0].read_text('utf8')
+          match=re.search(
+              r'<script id="icons" type="application/json">(.*?)</script>',
+              html,re.S
+          )
+          assert match
+          icons=json.loads(match.group(1))
+          assert icons['total']==5154
+          assert len(icons['items'])==5154
+          assert not icons['errors']
+
+          ids=[2,20,83,1072,445,110,299,710,447,450,69,1029,2017,7]
+          target=root/'ivory-icons'
+          target.mkdir()
+
+          for gid in ids:
+              found=[
+                  x for x in icons['items']
+                  if x['id']==gid and x['pak']=='Sprite'
+              ]
+              assert len(found)==1,(gid,len(found))
+              png=base64.b64decode(found[0]['png'].split(',',1)[1])
+              assert png.startswith(b'\x89PNG\r\n\x1a\n')
+              p=target/f'{gid}.png'
+              p.write_bytes(png)
+              manifest[str(p.relative_to(root))]={
+                  'bytes':len(png),
+                  'sha256':hashlib.sha256(png).hexdigest()
+              }
+
+          (root/'manifest.json').write_text(
+              json.dumps(manifest,ensure_ascii=False,indent=2),
+              encoding='utf8'
+          )
+
+          print('PASS V4.7 original files:',len(members))
+          print('PASS native data files:',len(data_files))
+          print('PASS maps:',len(maps))
+          print('PASS original TBT icons:',len(ids))
+          PY
+
+      - name: Extract every native Ruby script
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -rzlib -rjson <<'RUBY'
+          rows=Marshal.load(
+            File.binread(
+              'source/knight/gameasync/Data/Scripts.rxdata'
+            )
+          )
+
+          Dir.mkdir('source/ruby')
+          index=[]
+
+          rows.each_with_index do |row,i|
+            next unless row && row[2].is_a?(String)
+            name=row[1].to_s.force_encoding('UTF-8').scrub
+            src=Zlib::Inflate.inflate(row[2])
+            file=format('%03d.rb',i)
+            File.binwrite("source/ruby/#{file}",src)
+            index<<{
+              index:i,
+              name:name,
+              file:file,
+              bytes:src.bytesize
+            }
+          end
+
+          File.write(
+            'source/ruby-index.json',
+            JSON.pretty_generate(index)
+          )
+
+          puts "PASS all native scripts: #{index.size}"
+          RUBY
+
+      - name: Verify extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import hashlib
+
+          root=Path('source')
+          manifest=json.loads(
+              (root/'manifest.json').read_text('utf8')
+          )
+
+          for name,info in manifest.items():
+              p=root/name
+              assert p.is_file(),name
+              assert p.stat().st_size==info['bytes'],name
+              assert hashlib.sha256(p.read_bytes()).hexdigest()==info['sha256'],name
+
+          index=json.loads(
+              (root/'ruby-index.json').read_text('utf8')
+          )
+
+          for row in index:
+              assert (root/'ruby'/row['file']).stat().st_size==row['bytes']
+
+          total=sum(p.stat().st_size for p in root.rglob('*') if p.is_file())
+          assert total<450*1024*1024,total
+
+          print('PASS source integrity')
+          print('PASS source bytes:',total)
+          print('PASS game files unchanged')
+          PY
+
+      - name: Upload complete source
+        uses: actions/upload-artifact@v4
+        with:
+          name: SLKnight-V4.8-Equipment-Source
+          path: source/
+          compression-level: 6
+          retention-days: 30
+          if-no-files-found: error
