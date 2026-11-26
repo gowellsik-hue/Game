@@ -48,7 +48,9 @@ jobs:
           assert len(before)==6019,len(before)
           assert (root/'knight/js/sl-assets-v229r115.js').read_bytes().count(b"var version='V4.4';")==1
           assert (game/'Data'/(pre+'MonsterStats.rxdata')).is_file()
-          names=['Scripts.rxdata',pre+'CommonEvents.rxdata',pre+'Map029.rxdata']
+          maps=sorted(p.name for p in (game/'Data').glob(pre+'Map[0-9][0-9][0-9].rxdata'))
+          assert len(maps)==46,len(maps)
+          names=['Scripts.rxdata',pre+'CommonEvents.rxdata']+maps
           Path('/tmp/sl45-before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
           Path('/tmp/sl45-md5.json').write_text(json.dumps({n:hashlib.md5((game/'Data'/n).read_bytes()).hexdigest() for n in names}),'utf8')
           print('PASS V4.4 baseline',len(before))
@@ -188,9 +190,16 @@ jobs:
           maps=Dir.glob(path.call('Map[0-9][0-9][0-9]')).sort
           check(maps.size==46,'Map count')
           slots=0;legacy=0;old_pages=0;m29=nil
+          map_updates={}
+          new_gates=0
+          map_audit=[]
           maps.each do |f|
             m=Marshal.load(File.binread(f));mid=f[/Map(\d{3})\.rxdata$/,1].to_i
             events=iv(m,:@events)
+            original_events=events.transform_values{|e|Marshal.dump(e)}
+            original_fields=m.instance_variables.reject{|k|k==:@events}.to_h{|k|[k,Marshal.dump(iv(m,k))]}
+            retired_ids=[]
+            changed_ids=[]
             followers=events.values.select{|e|utf(iv(e,:@name)).start_with?('동료 ')}
             switches=followers.map do |e|
               pgs=iv(e,:@pages);check(pgs.size==1,"Map #{mid} companion page count")
@@ -202,12 +211,39 @@ jobs:
             events.each_value do |e|
               next unless utf(iv(e,:@name))=='[ID힐러 마법사]'
               legacy+=1
-              iv(e,:@pages).each do |pg|
+              eid=iv(e,:@id)
+              check(events[eid].equal?(e),"Map #{mid} legacy event ID")
+              retired_ids<<eid
+              iv(e,:@pages).each_with_index do |pg,pi|
                 c=iv(pg,:@condition)
-                check((iv(c,:@switch1_valid)&&[185,781].include?(iv(c,:@switch1_id))) || (iv(c,:@switch2_valid)&&[185,781].include?(iv(c,:@switch2_id))),"Map #{mid} ungated retired healer")
                 old_pages+=1
+                gated=(iv(c,:@switch1_valid)&&[185,781].include?(iv(c,:@switch1_id))) || (iv(c,:@switch2_valid)&&[185,781].include?(iv(c,:@switch2_id)))
+                next if gated
+                old_page=Marshal.load(Marshal.dump(pg))
+                old_c=iv(old_page,:@condition)
+                if !iv(c,:@switch1_valid) || iv(c,:@switch2_valid)
+                  c.instance_variable_set(:@switch1_valid,true)
+                  c.instance_variable_set(:@switch1_id,185)
+                  old_c.instance_variable_set(:@switch1_valid,true)
+                  old_c.instance_variable_set(:@switch1_id,185)
+                else
+                  c.instance_variable_set(:@switch2_valid,true)
+                  c.instance_variable_set(:@switch2_id,185)
+                  old_c.instance_variable_set(:@switch2_valid,true)
+                  old_c.instance_variable_set(:@switch2_id,185)
+                end
+                check(Marshal.dump(old_page)==Marshal.dump(pg),"Map #{mid} EV#{eid} page #{pi}: unrelated field changed")
+                changed_ids<<eid
+                new_gates+=1
+                map_audit<<[mid,eid,pi]
               end
+              check(iv(e,:@pages).all?{|pg|c=iv(pg,:@condition);(iv(c,:@switch1_valid)&&[185,781].include?(iv(c,:@switch1_id))) || (iv(c,:@switch2_valid)&&[185,781].include?(iv(c,:@switch2_id)))},"Map #{mid} retirement incomplete")
             end
+            changed_ids.uniq!
+            actual=events.keys.select{|id|Marshal.dump(events[id])!=original_events.fetch(id)}.sort
+            check(actual==changed_ids.sort && (actual-retired_ids).empty?,"Map #{mid} unrelated event change")
+            check(m.instance_variables.reject{|k|k==:@events}.to_h{|k|[k,Marshal.dump(iv(m,k))]}==original_fields,"Map #{mid} unrelated map data")
+            map_updates[f]=m unless changed_ids.empty?
             m29=m if mid==29
           end
           check(slots==138 && legacy>0,'Map slot audit')
@@ -265,11 +301,16 @@ jobs:
           end
           check(ce.each_index.select{|i|Marshal.dump(ce[i])!=ce_before[i]}==legacy_ids,'Unexpected common event changes')
 
-          [[sp,rows],[path.call('CommonEvents'),ce],[path.call('Map029'),m29]].each do |f,data|
+          map_updates[path.call('Map029')]=m29
+          updates={sp=>rows,path.call('CommonEvents')=>ce}.merge(map_updates)
+          check(map_updates.keys.all?{|f|maps.include?(f)},'Unexpected map update')
+          updates.each do |f,data|
             raw=Marshal.dump(data);File.binwrite(f,raw)
             check(Marshal.dump(Marshal.load(File.binread(f)))==raw,"Roundtrip #{f}")
           end
-          puts "PASS maps=#{maps.size} new_slots=#{slots} disabled_old_healer_events=#{legacy} pages=#{old_pages}"
+          File.write('/tmp/sl45-changed-data.json',JSON.generate(updates.keys.map{|f|File.basename(f)}.sort))
+          puts "PASS maps=#{maps.size} new_slots=#{slots} disabled_old_healer_events=#{legacy} pages=#{old_pages} repaired_conditions=#{new_gates}"
+          puts "PASS newly gated pages #{map_audit.inspect}"
           puts "PASS scripts=#{changed.inspect}; dedicated common events=#{legacy_ids.inspect}"
           RUBY
           ruby -c /tmp/sl45-patch.rb
@@ -285,9 +326,13 @@ jobs:
           root=Path('site')
           game=root/'knight/gameasync'
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          names=['Scripts.rxdata',pre+'CommonEvents.rxdata',pre+'Map029.rxdata']
+          names=json.loads(Path('/tmp/sl45-changed-data.json').read_text('utf8'))
+          assert len(names)==len(set(names))
+          assert {'Scripts.rxdata',pre+'CommonEvents.rxdata',pre+'Map029.rxdata'}<=set(names)
+          assert all(n in ('Scripts.rxdata',pre+'CommonEvents.rxdata') or re.fullmatch(re.escape(pre)+r'Map[0-9]{3}\.rxdata',n) for n in names),names
           before=json.loads(Path('/tmp/sl45-before.json').read_text('utf8'))
           old=json.loads(Path('/tmp/sl45-md5.json').read_text('utf8'))
+          assert set(names)<=set(old)
           mapper=game/'mapping.js'
           s=mapper.read_bytes()
           for n in names:
