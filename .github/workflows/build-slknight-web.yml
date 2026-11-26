@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.5 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.6 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -22,16 +22,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - name: Restore V4.4 game
+      - name: Restore V4.5 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45778773928
+          run-id: 45784031614
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify V4.4 baseline
+      - name: Verify V4.5 baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -46,31 +46,26 @@ jobs:
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
           before={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
           assert len(before)==6019,len(before)
-          assert (root/'knight/js/sl-assets-v229r115.js').read_bytes().count(b"var version='V4.4';")==1
+          assert (root/'knight/js/sl-assets-v229r115.js').read_bytes().count(b"var version='V4.5';")==1
           assert (game/'Data'/(pre+'MonsterStats.rxdata')).is_file()
-          maps=sorted(p.name for p in (game/'Data').glob(pre+'Map[0-9][0-9][0-9].rxdata'))
-          assert len(maps)==46,len(maps)
-          names=['Scripts.rxdata',pre+'CommonEvents.rxdata']+maps
-          Path('/tmp/sl45-before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
-          Path('/tmp/sl45-md5.json').write_text(json.dumps({n:hashlib.md5((game/'Data'/n).read_bytes()).hexdigest() for n in names}),'utf8')
-          print('PASS V4.4 baseline',len(before))
+          names=['Scripts.rxdata']
+          Path('/tmp/sl46-before.json').write_text(json.dumps(before,sort_keys=True),'utf8')
+          Path('/tmp/sl46-md5.json').write_text(json.dumps({n:hashlib.md5((game/'Data'/n).read_bytes()).hexdigest() for n in names}),'utf8')
+          print('PASS V4.5 baseline',len(before))
           PYTHON
 
-      - name: Retire legacy healer and connect three native companion HUDs
+      - name: Fix companion defense and movement collision
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/sl45-patch.rb <<'RUBY'
+          cat > /tmp/sl46-patch.rb <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
-          require 'json'
           module RPG
-            %w[Map MapInfo Event EventCommand MoveRoute MoveCommand AudioFile CommonEvent Actor System].each{|n|const_set(n,::Class.new)}
-            Event.const_set(:Page,::Class.new)
-            Event::Page.const_set(:Condition,::Class.new)
-            Event::Page.const_set(:Graphic,::Class.new)
-            System.const_set(:Words,::Class.new)
-            System.const_set(:TestBattler,::Class.new)
+            %w[Map Event EventCommand MoveRoute MoveCommand AudioFile].each{|n|const_set(n,Class.new)}
+            Event.const_set(:Page,Class.new)
+            Event::Page.const_set(:Condition,Class.new)
+            Event::Page.const_set(:Graphic,Class.new)
           end
           %w[Table Tone Color].each do |n|
             Object.const_set(n,Class.new do
@@ -79,242 +74,268 @@ jobs:
             end)
           end
           def iv(o,k);o.instance_variable_get(k);end
-          def utf(s);s.to_s.dup.force_encoding('UTF-8').scrub;end
+          def utf(s);s.to_s.dup.force_encoding('UTF-8');end
           def check(ok,msg);raise msg unless ok;end
           def once(s,a,b,label)
             check(s.scan(a).size==1,"#{label}: #{s.scan(a).size} anchors")
             s.sub(a){b}
           end
+          def method_edit(s,name)
+            heads=s.to_enum(:scan,/^([ \t]*)def #{Regexp.escape(name)}(?:\(|\s*$)/).map{Regexp.last_match}
+            check(heads.size==1,"Method #{name}: #{heads.size}")
+            h=heads.first; start=h.begin(0)
+            tail=s.index(/^#{Regexp.escape(h[1])}end[ \t]*$/,h.end(0))
+            check(tail,"Method end #{name}")
+            finish=s.index("\n",tail)||s.size
+            original=s[start...finish]
+            updated=yield(original)
+            check(original!=updated,"No change #{name}")
+            s[0...start]+updated+s[finish..-1]
+          end
           def edit(rows,name)
-            matches=rows.select{|r|r && utf(r[1])==name}
-            check(matches.size==1,name)
-            r=matches.first
-            src=Zlib::Inflate.inflate(r[2]).force_encoding('UTF-8')
-            check(src.valid_encoding?,name)
-            crlf=src.include?("\r\n")
-            out=yield(src.gsub("\r\n","\n"))
-            RubyVM::InstructionSequence.compile(out)
-            out=out.gsub("\n","\r\n") if crlf
-            check(src!=out,name)
-            r[2]=Zlib::Deflate.deflate(out)
+            a=rows.select{|r|r && utf(r[1])==name};check(a.size==1,name)
+            r=a[0];src=utf(Zlib::Inflate.inflate(r[2]));check(src.valid_encoding?,name)
+            t=yield(src.gsub("\r\n","\n"))
+            RubyVM::InstructionSequence.compile(t)
+            t=t.gsub("\n","\r\n") if src.include?("\r\n")
+            check(src!=t,name);r[2]=Zlib::Deflate.deflate(t)
           end
-          def event_code(c);iv(c,:@code);end
-          def params(c);iv(c,:@parameters);end
-          def blank_command(c)
-            x=Marshal.load(Marshal.dump(c))
-            x.instance_variable_set(:@code,0)
-            x.instance_variable_set(:@indent,0)
-            x.instance_variable_set(:@parameters,[])
-            x
-          end
-          root=ENV.fetch('SL45_DATA','site/knight/gameasync/Data')
+          root=ENV.fetch('SL46_DATA','site/knight/gameasync/Data')
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          path=lambda{|n|File.join(root,pre+n+'.rxdata')}
           sp=File.join(root,'Scripts.rxdata')
-          rows=Marshal.load(File.binread(sp))
-          old_rows=rows.map{|r|Marshal.dump(r)}
-          edit(rows,'MOG - S HUD') do |s|
-            a='@actor = (@sl_actor_id == 3 ? $game_actors[3] : $game_party.actors[0])'
-            b='@actor = (@sl_actor_id == 1 ? $game_party.actors[0] : $game_actors[@sl_actor_id])'
-            check(s.scan(a).size==3,'Native HUD actor routes')
-            s=s.gsub(a,b)
-            a=s.index('    if @sl_actor_id == 3 && $game_switches[185]')
-            b=a && s.index('    #HP Border',a)
-            check(a && b,'Old healer HUD migration block')
-            old=s[a...b]
-            check(old.include?('@sl_healer_v117_table_fixed') && !old.include?('def '),'Old migration scope')
-            s[a...b]=''
-            old='(@sl_actor_id == 3 && (!$game_switches[185] || @sl_healer_event == nil || @sl_healer_event.transparent))'
-            new='(@sl_actor_id != 1 && (!$game_switches[1997+@sl_actor_id] || @sl_healer_event == nil || @sl_healer_event.transparent || @sl_healer_event.character_name == ""))'
-            s=once(s,old,new,'HUD visibility')
-            a=s.index("  def hud_pos_update\n")
-            b=a && s.index('    @hp_sprite.x = ',a)
-            check(a && b,'Native HUD position')
-            old=s[a...b]
-            check(old.include?("obj.name == '[ID힐러 마법사]'") && old.include?('@sl_healer_map_id'),'Old event lookup')
-            s[a...b]=<<'SRC'
-            def hud_pos_update
-              target = $game_player
-              if @sl_actor_id != 1
-                if !@sl_healer_events.equal?($game_map.events)
-                  @sl_healer_events = $game_map.events
-                  @sl_healer_event = @sl_healer_events.values.find do |e|
-                    obj=e.instance_variable_get(:@event)
-                    page=obj && obj.pages[0]
-                    page && obj.name.to_s.start_with?('동료 ') && page.condition.switch1_valid && page.condition.switch1_id==1997+@sl_actor_id
+          rows=Marshal.load(File.binread(sp));before=rows.map{|r|Marshal.dump(r)}
+          # Independent base statistics, retaining equipment summation in original methods.
+          edit(rows,'Game_Actor') do |s|
+            {2=>['base_str',0],3=>['base_dex',1],5=>['base_int',2]}.each do |col,(name,i)|
+              s=method_edit(s,name) do |m|
+                a="n = $data_actors[@actor_id].parameters[#{col}, @level]"
+                once(m,a,"n = @sl46_stats_ready ? @sl43_stats[#{i}] : $data_actors[@actor_id].parameters[#{col}, @level]",name)
+              end
+            end
+            s=once(s,'    return unless @sl43_stats && @sl43_form',<<'SRC'.chomp,'Existing hire/load stat initialization')
+              return unless @sl43_stats && @sl43_form
+              unless @sl46_stats_ready
+                @str_plus = @dex_plus = @int_plus = 0
+                @sl46_stats_ready = true
+              end
+          SRC
+            s=method_edit(s,'base_pdef') do |m|
+              a=m.index('    if $game_variables[469] >= 18');check(a,'Original player AC formula')
+              m[0...a]+<<'SRC'+m[a..-1]
+              if @sl46_stats_ready
+                dex=@sl43_stats[1]+@dex_plus
+                od=@sl43_stats[1]
+                div=dex>=18 ? 4 : (dex>=16 ? 5 : (dex>=13 ? 6 : (dex>=10 ? 7 : 8)))
+                bonus=if @sl43_form.end_with?('기사'); od>=15 ? 3 : (od>=13 ? 1 : 0)
+                elsif @sl43_form.end_with?('요정'); od>=18 ? 2 : (od>=15 ? 1 : 0)
+                elsif @sl43_form.end_with?('법사'); od>=10 ? 2 : (od>=8 ? 1 : 0)
+                elsif @sl43_form.end_with?('다엘'); od>=17 ? 1 : 0
+                else; raise 'Unknown recruited class'; end
+                return pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus
+              end
+          SRC
+            end
+            method_edit(s,'base_mdef') do |m|
+              a=m.index('    $MDEF =');check(a,'Original player MR formula')
+              m[0...a]+<<'SRC'+m[a..-1]
+              if @sl46_stats_ready
+                w=@sl43_stats[4]
+                b=if w<=14; 0
+                elsif w<=23; [3,3,6,10,15,21,28,37,47][w-15]
+                elsif w<=29; 50
+                elsif w<=34; 52
+                elsif w<=39; 55
+                elsif w<=43; 59
+                elsif w<=46; 62
+                elsif w<=49; 64
+                else; 65; end
+                mr=if @sl43_form.end_with?('기사'); w>=12 ? 2 : (w>=10 ? 1 : 0)
+                elsif @sl43_form.end_with?('요정'); 25+(w>=16 ? 2 : (w>=13 ? 1 : 0))
+                elsif @sl43_form.end_with?('법사'); 15+(w>=15 ? 1 : 0)
+                elsif @sl43_form.end_with?('다엘'); 10+(w>=16 ? 4 : (w==15 ? 3 : (w==14 ? 2 : (w>=11 ? 1 : 0))))
+                else; raise 'Unknown recruited class'; end
+                return mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b
+              end
+          SRC
+            end
+          end
+          edit(rows,'Game_Battler 1') do |s|
+            once(s,'n = base_pdef + $game_variables[169] + $game_variables[170] + $game_variables[171]','n = base_pdef + (@sl46_stats_ready ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])','Independent defense')
+          end
+          edit(rows,'Multi-slot script : Actor') do |s|
+            method_edit(s,'base_mdef') do |m|
+              check(m.scan('$n').size==4 && m.include?('g7_ms_game_actor_base_mdef'),'Multi-slot MR accumulator')
+              m.gsub('$n','n').sub('return n',"$n = n unless @sl46_stats_ready\n  return n")
+            end
+          end
+          %w[Window_Base Window_Base2].each do |name|
+            edit(rows,name) do |s|
+              method_edit(s,'draw_actor_parameter') do |m|
+                a=m.lines.select{|l|l.match?(/^\s*\$agi = actor\.pdef(?: \* 0\.8)?\s*$/)}
+                check(a.size==1,"#{name} AC side effect")
+                m=once(m,a[0],a[0].rstrip+' unless actor.instance_variable_get(:@sl46_stats_ready)' + "\n",name)
+                m=once(m,'totalDex = $game_variables[469] + $game_variables[961]','totalDex = actor.instance_variable_get(:@sl46_stats_ready) ? actor.dex : $game_variables[469] + $game_variables[961]',name+' DEX')
+                if name=='Window_Base2'
+                  {962=>3,966=>4,968=>5}.each do |v,i|
+                    m=once(m,"$game_variables[#{v}].to_s","(actor.instance_variable_get(:@sl46_stats_ready) ? actor.instance_variable_get(:@sl43_stats)[#{i}] : $game_variables[#{v}]).to_s",name+v.to_s)
                   end
                 end
-                return unless @sl_healer_event
-                target = @sl_healer_event
+                m
               end
-          SRC
-            old='(@sl_actor_id == 3 ? target.screen_y : target.screen_z)'
-            check(s.scan(old).size==4,'Native HUD vertical position count')
-            s=s.gsub(old,'(@sl_actor_id != 1 ? target.screen_y : target.screen_z)')
-            old='      @healer_shud = S_Hud.new(@s_viewport,3)'
-            s=once(s,old,'      @companion_shuds = {}','HUD creation')
-            s=once(s,"      @healer_shud.dispose\n      @healer_shud = nil", "      @companion_shuds.each_value{|hud|hud.dispose}\n      @companion_shuds.clear",'HUD disposal')
-            s=once(s,'    @healer_shud.update',<<'SRC'.chomp,'HUD update')
-              for id in 4..6
-                actor=$game_actors[id]
-                if actor.instance_variable_get(:@sl43_hired) && $game_party.actors.include?(actor)
-                  @companion_shuds[id] ||= S_Hud.new(@s_viewport,id)
-                  @companion_shuds[id].update
-                elsif @companion_shuds[id]
-                  @companion_shuds.delete(id).dispose
-                end
-              end
-          SRC
-            # S_Hud already guards gameover with actor_id == 1. Preserve all drawing routines.
-            check(s.include?('if @sl_actor_id == 1 && @actor.hp == 0'),'Player-only gameover guard')
-            check(!s.include?('@healer_shud') && !s.include?('$game_actors[3]') && !s.include?("'[ID힐러 마법사]'"),'Old healer HUD references')
-            s
+            end
           end
-          edit(rows,'Game_Party') do |s|
-            s=once(s,'    for i in $data_system.party_members',"    for i in $data_system.party_members\n      next if i == 3",'Initial party')
-            old='    @actors = new_actors.reject{|a| (4..9).include?(a.id) && !(a.id <= 6 && a.instance_variable_get(:@sl43_hired))}'
-            new='    @actors = new_actors.reject{|a| a.id == 3 || ((4..9).include?(a.id) && !(a.id <= 6 && a.instance_variable_get(:@sl43_hired)))}'
-            cleanup="    if new_actors.any?{|a|a.id==3}\n      [94,95,185,188,382,386,778,781,811].each{|id|$game_switches[id]=false}\n    end\n"
-            s=once(s,old,cleanup+new+"\n    @items.delete(117)\n    $game_switches[185]=false\n    $game_switches[781]=false",'Saved party')
-            s=once(s,'  def add_actor(actor_id)',"  def add_actor(actor_id)\n    return if actor_id == 3",'Retired actor recruitment')
-            s=once(s,'  def item_number(item_id)',"  def item_number(item_id)\n    return 0 if item_id == 117",'Retired command item')
-            once(s,'  def gain_item(item_id, n)',"  def gain_item(item_id, n)\n    return if item_id == 117",'Retired command item gain')
+          edit(rows,'Scene_Equip') do |s|
+            once(s,'$MDEF = new_mdef','$MDEF = new_mdef unless @actor.instance_variable_get(:@sl46_stats_ready)','Equipment preview MR ownership')
           end
-          edit(rows,'Game_Switches') do |s|
-            s=once(s,'  def [](switch_id)',"  def [](switch_id)\n    return false if switch_id == 185 || switch_id == 781",'Retired healer activation')
-            once(s,'  def []=(switch_id, value)',"  def []=(switch_id, value)\n    value = false if switch_id == 185 || switch_id == 781",'Retired healer activation writes')
-          end
-          changed=rows.each_index.select{|i|Marshal.dump(rows[i])!=old_rows[i]}.map{|i|utf(rows[i][1])}.sort
-          check(changed==['Game_Party','Game_Switches','MOG - S HUD'].sort,"Unexpected scripts #{changed.inspect}")
+          # Collision remains a pure query; yielding occurs only on actual movement.
+          helpers=<<'SRC'
+            def sl46_slot
+              return nil unless self.is_a?(Game_Event) && @event && @event.name.to_s.start_with?('동료 ') && @character_name != ''
+              c=@event.pages[0].condition
+              sw=c.switch1_id
+              return c.switch1_valid && (2001..2003).include?(sw) && $game_switches[sw] ? sw-1997 : nil
+            end
 
-          maps=Dir.glob(path.call('Map[0-9][0-9][0-9]')).sort
+            def sl46_step_coords(d)
+              return [@x+(d==6 ? 1 : d==4 ? -1 : 0),@y+(d==2 ? 1 : d==8 ? -1 : 0)]
+            end
+
+            def sl46_occupied?(nx,ny)
+              return true if self!=$game_player && $game_player.x==nx && $game_player.y==ny
+              $game_map.events.values.any? do |e|
+                next false if e==self || e.character_name==''
+                pending=e.instance_variable_get(:@sl_healer_teleport)
+                (e.x==nx && e.y==ny && (!e.through || e.sl46_slot)) || (pending && pending[0,2]==[nx,ny])
+              end
+            end
+
+            def sl46_yield_at(nx,ny,d,priority=nil,seen=[])
+              priority ||= (self==$game_player ? 0 : sl46_slot)
+              return true unless priority
+              events=$game_map.events.values
+              b=events.find{|e|e!=self && e.sl46_slot && e.x==nx && e.y==ny}
+              unless b
+                return !events.any?{|e| e!=self && e.sl46_slot && e.moving? && (e.real_x-nx*128).abs<64 && (e.real_y-ny*128).abs<64}
+              end
+              return false unless [2,4,6,8].include?(d)
+              return false if seen.include?(b) || (priority!=0 && priority>=b.sl46_slot)
+              return false if b.moving? || b.jumping? || b.move_route_forcing || b.lock? || b.instance_variable_get(:@sl_healer_teleport)
+              dirs=([4,6].include?(d) ? [2,8] : [4,6])+[d,10-d]
+              dirs.each do |side|
+                tx,ty=b.sl46_step_coords(side)
+                next if tx==@x && ty==@y
+                next unless $game_map.valid?(tx,ty) && $game_map.passable?(b.x,b.y,side,b) && $game_map.passable?(tx,ty,10-side)
+                if b.sl46_occupied?(tx,ty)
+                  if priority==0 && side==d && seen.size<2
+                    other=events.find{|e|e!=b && e.sl46_slot && e.x==tx && e.y==ty}
+                    if other && !seen.include?(other)
+                      b.sl46_yield_at(tx,ty,side,priority,seen+[b])
+                      return false
+                    end
+                  end
+                  next
+                end
+                next unless b.passable?(b.x,b.y,side)
+                old=[b.x,b.y]
+                case side
+                when 2; b.move_down
+                when 4; b.move_left
+                when 6; b.move_right
+                when 8; b.move_up
+                end
+                return false if [b.x,b.y]!=old
+              end
+              false
+            end
+
+            def sl46_before_step(d)
+              return true unless self==$game_player || sl46_slot
+              nx,ny=sl46_step_coords(d)
+              return true unless $game_map.valid?(nx,ny)
+              if $game_map.events.values.any?{|e|e!=self && e.sl46_slot && e.x==nx && e.y==ny}
+                return true unless $game_map.passable?(@x,@y,d,self) && $game_map.passable?(nx,ny,10-d)
+              end
+              sl46_yield_at(nx,ny,d)
+            end
+
+          SRC
+          edit(rows,'Game_Character 1') do |s|
+            s=method_edit(s,'passable?') do |m|
+              a=m.lines.select{|l|l.include?('return false if self.is_a?(Game_Event)') && l.include?('e.x-new_x') && l.include?('@sl_healer_teleport')}
+              check(a.size==1,'V3.14 adjacency collision guard')
+              m=once(m,a[0],"    return false if (self==$game_player || sl46_slot) && $game_map.events.values.any?{|e|e!=self && e.sl46_slot && ((e.x==new_x && e.y==new_y) || (e.instance_variable_get(:@sl_healer_teleport) && e.instance_variable_get(:@sl_healer_teleport)[0,2]==[new_x,new_y]))}\n",'Exact-tile collision')
+              through=m.lines.select{|l|l.match?(/^[ \t]*(?:if|return true if)[ \t]+@through(?:[ \t]*==[ \t]*true)?[ \t]*(?:#.*)?\n?$/)}
+              check(through.size==1,'Original through guard')
+              once(m,through[0],through[0].sub(/@through(?:[ \t]*==[ \t]*true)?/,'@through && !sl46_slot'),'Companion terrain and ordinary collision')
+            end
+            once(s,'  def passable?(x, y, d)',helpers+'  def passable?(x, y, d)','Actual movement yield helpers')
+          end
+          edit(rows,'Game_Character 3') do |s|
+            {2=>'move_down',4=>'move_left',6=>'move_right',8=>'move_up'}.each do |d,n|
+              s=method_edit(s,n){|m|once(m,"if passable?(@x, @y, #{d})","return unless sl46_before_step(#{d})\n    if passable?(@x, @y, #{d})",n)}
+            end
+            method_edit(s,'move_toward_player') do |m|
+              a=m.lines.select{|l|l.include?('if d <= 1 || outside') && l.include?('동료 ') && l.include?('e.x-@x')}
+              check(a.size==1,'V3.14 near teleport condition')
+              m=once(m,a[0],a[0][/^[ \t]*/]+'if d >= 12'+"\n",'Distance-only teleport')
+              screen=m[/^[ \t]*sx = screen_x\n[ \t]*sy = screen_y\n[ \t]*outside = sx < -45 \|\| sx >= 640 \+ 45 \|\|\n[ \t]*sy <= 0 \|\| sy >= 480 \+ 85\n/]
+              m=once(m,screen,'','Unused off-screen test') if screen
+              a=m.lines.select{|l|l.include?('e != self') && l.include?('e.x-tx') && l.include?('@sl_healer_teleport')}
+              check(a.size==1,'Teleport reservation')
+              m=once(m,a[0],a[0][/^[ \t]*/]+"(e != self && e.character_name != '' && ((e.x == tx && e.y == ty) || (e.instance_variable_get(:@sl_healer_teleport) && e.instance_variable_get(:@sl_healer_teleport)[0,2] == [tx,ty])))\n",'Exact destination reservation')
+              first=m.index('      if d <= 2');last=first && m.index('      return if d <= 5',first)
+              check(first && last && m[first...last].include?('move_away_from_player'),'Original close separation')
+              m[first...last]=<<'SRC'
+                if d == 0 || $game_map.events.values.any?{|e|e!=self && e.sl46_slot && sl46_slot && e.sl46_slot<sl46_slot && e.x==@x && e.y==@y}
+                  dirs=[10-$game_player.direction,2,4,6,8].uniq
+                  dirs.each do |side|
+                    nx,ny=sl46_step_coords(side)
+                    next if sl46_occupied?(nx,ny) || !passable?(@x,@y,side)
+                    case side
+                    when 2; move_down
+                    when 4; move_left
+                    when 6; move_right
+                    when 8; move_up
+                    end
+                    break if moving?
+                  end
+                  return
+                end
+          SRC
+              check(m.scan('@sl_healer_teleport = [tx, ty, Graphics.frame_count]').size==1,'Original teleport effect route')
+              m
+            end
+          end
+          # Native terrain has a separate actual movement entry; preserve its graph and only add yielding.
+          native=rows.select{|r|r && utf(Zlib::Inflate.inflate(r[2])).include?('def slti_native66_move(')}
+          check(native.size==1,'Native movement owner')
+          native_name=utf(native.first[1])
+          edit(rows,native_name) do |s|
+            method_edit(s,'slti_native66_move') do |m|
+              once(m,'return false unless $game_map.valid?(nx,ny)',"return false unless $game_map.valid?(nx,ny)\n    return false unless sl46_yield_at(nx,ny,dir)",'Native terrain movement yield')
+            end
+          end
+          expected=['Game_Actor','Game_Battler 1','Multi-slot script : Actor','Window_Base','Window_Base2','Scene_Equip','Game_Character 1','Game_Character 3',native_name].sort
+          changed=rows.each_index.select{|i|Marshal.dump(rows[i])!=before[i]}.map{|i|utf(rows[i][1])}.sort
+          check(changed==expected,"Unexpected script changes #{changed.inspect}")
+          # Inspect every map and active companion slot before writing scripts.
+          maps=Dir.glob(File.join(root,pre+'Map[0-9][0-9][0-9].rxdata')).sort
           check(maps.size==46,'Map count')
-          slots=0;legacy=0;old_pages=0;m29=nil
-          map_updates={}
-          new_gates=0
-          map_audit=[]
-          maps.each do |f|
-            m=Marshal.load(File.binread(f));mid=f[/Map(\d{3})\.rxdata$/,1].to_i
-            events=iv(m,:@events)
-            original_events=events.transform_values{|e|Marshal.dump(e)}
-            original_fields=m.instance_variables.reject{|k|k==:@events}.to_h{|k|[k,Marshal.dump(iv(m,k))]}
-            retired_ids=[]
-            changed_ids=[]
-            followers=events.values.select{|e|utf(iv(e,:@name)).start_with?('동료 ')}
-            switches=followers.map do |e|
-              pgs=iv(e,:@pages);check(pgs.size==1,"Map #{mid} companion page count")
-              c=iv(pgs[0],:@condition);check(iv(c,:@switch1_valid),"Map #{mid} companion switch")
-              iv(c,:@switch1_id)
+          slots=0
+          maps.each do |p|
+            m=Marshal.load(File.binread(p));events=iv(m,:@events)
+            ids=events.values.filter_map do |e|
+              next unless utf(iv(e,:@name)).start_with?('동료 ')
+              pg=iv(e,:@pages);check(pg.size==1,p);c=iv(pg[0],:@condition);check(iv(c,:@switch1_valid),p);iv(c,:@switch1_id)
             end
-            check(switches.sort==(2001..2006).to_a,"Map #{mid} slot mapping")
-            slots+=switches.count{|i|(2001..2003).include?(i)}
-            events.each_value do |e|
-              next unless utf(iv(e,:@name))=='[ID힐러 마법사]'
-              legacy+=1
-              eid=iv(e,:@id)
-              check(events[eid].equal?(e),"Map #{mid} legacy event ID")
-              retired_ids<<eid
-              iv(e,:@pages).each_with_index do |pg,pi|
-                c=iv(pg,:@condition)
-                old_pages+=1
-                gated=(iv(c,:@switch1_valid)&&[185,781].include?(iv(c,:@switch1_id))) || (iv(c,:@switch2_valid)&&[185,781].include?(iv(c,:@switch2_id)))
-                next if gated
-                old_page=Marshal.load(Marshal.dump(pg))
-                old_c=iv(old_page,:@condition)
-                if !iv(c,:@switch1_valid) || iv(c,:@switch2_valid)
-                  c.instance_variable_set(:@switch1_valid,true)
-                  c.instance_variable_set(:@switch1_id,185)
-                  old_c.instance_variable_set(:@switch1_valid,true)
-                  old_c.instance_variable_set(:@switch1_id,185)
-                else
-                  c.instance_variable_set(:@switch2_valid,true)
-                  c.instance_variable_set(:@switch2_id,185)
-                  old_c.instance_variable_set(:@switch2_valid,true)
-                  old_c.instance_variable_set(:@switch2_id,185)
-                end
-                check(Marshal.dump(old_page)==Marshal.dump(pg),"Map #{mid} EV#{eid} page #{pi}: unrelated field changed")
-                changed_ids<<eid
-                new_gates+=1
-                map_audit<<[mid,eid,pi]
-              end
-              check(iv(e,:@pages).all?{|pg|c=iv(pg,:@condition);(iv(c,:@switch1_valid)&&[185,781].include?(iv(c,:@switch1_id))) || (iv(c,:@switch2_valid)&&[185,781].include?(iv(c,:@switch2_id)))},"Map #{mid} retirement incomplete")
-            end
-            changed_ids.uniq!
-            actual=events.keys.select{|id|Marshal.dump(events[id])!=original_events.fetch(id)}.sort
-            check(actual==changed_ids.sort && (actual-retired_ids).empty?,"Map #{mid} unrelated event change")
-            check(m.instance_variables.reject{|k|k==:@events}.to_h{|k|[k,Marshal.dump(iv(m,k))]}==original_fields,"Map #{mid} unrelated map data")
-            map_updates[f]=m unless changed_ids.empty?
-            m29=m if mid==29
+            check(ids.sort==(2001..2006).to_a,p);slots+=ids.count{|i|(2001..2003).include?(i)}
           end
-          check(slots==138 && legacy>0,'Map slot audit')
-          check(m29,'Recruiter map missing')
-          events=iv(m29,:@events);recruit=events.fetch(49)
-          check(utf(iv(recruit,:@name))=='[ID고용사]' && [iv(recruit,:@x),iv(recruit,:@y)]==[72,48],'Recruiter identity')
-          map_before=events.transform_values{|e|Marshal.dump(e)}
-          pgs=iv(recruit,:@pages);check(pgs.size==2,'Recruiter pages')
-          pgs.each do |pg|
-            list=iv(pg,:@list)
-            old=' + ($game_party.actors.include?($game_actors[3]) ? 1 : 0)'
-            hits=0;manage=0
-            list.each do |c|
-              next unless [111,355].include?(event_code(c))
-              p=params(c)
-              ix=event_code(c)==111 ? 1 : 0
-              next unless p[ix].is_a?(String)
-              s=utf(p[ix])
-              if s.include?(old)
-                check(s.scan(old).size==1,'Legacy limit reference')
-                s=s.sub(old,'');hits+=1
-                RubyVM::InstructionSequence.compile(s);p[ix]=s
-              end
-              if s.include?('[3,4,5,6].select{|id|')
-                a='[3,4,5,6].select{|id| a=$game_actors[id]; $game_party.actors.include?(a) && a.hp>0 && (id==3 || a.instance_variable_get(:@sl43_hired))}'
-                b='[4,5,6].select{|id| a=$game_actors[id]; $game_party.actors.include?(a) && a.hp>0 && a.instance_variable_get(:@sl43_hired)}'
-                s=once(s,a,b,'Dismissal list')
-                RubyVM::InstructionSequence.compile(s);p[ix]=s;manage+=1
-              end
-            end
-            check(hits==16 && manage==1,"Legacy recruiter conditions #{hits}/#{manage}")
-            starts=list.each_index.select{|i|event_code(list[i])==111 && params(list[i])==[12,'@sl43_slot == 3']}
-            check(starts.size==1,'Legacy dismissal branch')
-            a=starts[0];d=iv(list[a],:@indent)
-            b=(a+1...list.size).find{|i|event_code(list[i])==412 && iv(list[i],:@indent)==d}
-            check(b && list[a..b].any?{|c|event_code(c)==129 && params(c)[0]==3},'Legacy dismissal branch body')
-            list.slice!(a..b)
-            check(list.none?{|c|event_code(c)==129 && params(c)[0]==3},'Legacy actor event command')
-          end
-          check(events.all?{|id,e|id==49 || Marshal.dump(e)==map_before[id]},'Unrelated Map029 event')
-
-          ce=Marshal.load(File.binread(path.call('CommonEvents')))
-          ce_before=ce.map{|e|Marshal.dump(e)}
-          legacy_ids=[9,603,604,605,625,800]
-          legacy_ids.each do |id|
-            e=ce.fetch(id)
-            check(utf(iv(e,:@name)).include?('힐러'),"CE#{id}: non-healer")
-            if [605,800].include?(id)
-              e.instance_variable_set(:@list,[blank_command(iv(e,:@list).last)])
-            else
-              check(iv(e,:@trigger)==2,"CE#{id}: unexpected trigger")
-              # Retire only the dedicated parallel process, keep its reusable source commands.
-              e.instance_variable_set(:@trigger,0)
-            end
-          end
-          check(ce.each_index.select{|i|Marshal.dump(ce[i])!=ce_before[i]}==legacy_ids,'Unexpected common event changes')
-
-          map_updates[path.call('Map029')]=m29
-          updates={sp=>rows,path.call('CommonEvents')=>ce}.merge(map_updates)
-          check(map_updates.keys.all?{|f|maps.include?(f)},'Unexpected map update')
-          updates.each do |f,data|
-            raw=Marshal.dump(data);File.binwrite(f,raw)
-            check(Marshal.dump(Marshal.load(File.binread(f)))==raw,"Roundtrip #{f}")
-          end
-          File.write('/tmp/sl45-changed-data.json',JSON.generate(updates.keys.map{|f|File.basename(f)}.sort))
-          puts "PASS maps=#{maps.size} new_slots=#{slots} disabled_old_healer_events=#{legacy} pages=#{old_pages} repaired_conditions=#{new_gates}"
-          puts "PASS newly gated pages #{map_audit.inspect}"
-          puts "PASS scripts=#{changed.inspect}; dedicated common events=#{legacy_ids.inspect}"
+          check(slots==138,'Companion coverage')
+          raw=Marshal.dump(rows);File.binwrite(sp,raw);check(Marshal.dump(Marshal.load(File.binread(sp)))==raw,'Script roundtrip')
+          puts "PASS #{maps.size} maps, #{slots} active slots; scripts #{changed.inspect}"
           RUBY
-          ruby -c /tmp/sl45-patch.rb
-          ruby /tmp/sl45-patch.rb
+          ruby -c /tmp/sl46-patch.rb
+          ruby /tmp/sl46-patch.rb
 
       - name: Update mappings and verify exact changes
         shell: bash
@@ -326,13 +347,9 @@ jobs:
           root=Path('site')
           game=root/'knight/gameasync'
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          names=json.loads(Path('/tmp/sl45-changed-data.json').read_text('utf8'))
-          assert len(names)==len(set(names))
-          assert {'Scripts.rxdata',pre+'CommonEvents.rxdata',pre+'Map029.rxdata'}<=set(names)
-          assert all(n in ('Scripts.rxdata',pre+'CommonEvents.rxdata') or re.fullmatch(re.escape(pre)+r'Map[0-9]{3}\.rxdata',n) for n in names),names
-          before=json.loads(Path('/tmp/sl45-before.json').read_text('utf8'))
-          old=json.loads(Path('/tmp/sl45-md5.json').read_text('utf8'))
-          assert set(names)<=set(old)
+          names=['Scripts.rxdata']
+          before=json.loads(Path('/tmp/sl46-before.json').read_text('utf8'))
+          old=json.loads(Path('/tmp/sl46-md5.json').read_text('utf8'))
           mapper=game/'mapping.js'
           s=mapper.read_bytes()
           for n in names:
@@ -344,13 +361,13 @@ jobs:
           mapper.write_bytes(s)
           loader=root/'knight/js/sl-assets-v229r115.js'
           s=loader.read_bytes()
-          assert s.count(b"var version='V4.4';")==1
-          loader.write_bytes(s.replace(b"var version='V4.4';",b"var version='V4.5';"))
+          assert s.count(b"var version='V4.5';")==1
+          loader.write_bytes(s.replace(b"var version='V4.5';",b"var version='V4.6';"))
           for name in ('index.html','knight/index.html'):
               p=root/name
               s=p.read_bytes()
-              assert b'V4.4' in s
-              p.write_bytes(s.replace(b'V4.4',b'V4.5').replace(b'v4.4',b'v4.5'))
+              assert b'V4.5' in s
+              p.write_bytes(s.replace(b'V4.5',b'V4.6').replace(b'v4.5',b'v4.6'))
           after={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
           assert set(before)==set(after)
           allowed={'knight/gameasync/Data/'+n for n in names}|{'knight/gameasync/mapping.js','knight/js/sl-assets-v229r115.js','index.html','knight/index.html'}
@@ -359,12 +376,12 @@ jobs:
           assert len(after)==6019
           print('PASS approved files',len(changed))
           print('PASS unchanged files',len(before)-len(changed))
-          print('PASS V4.5')
+          print('PASS V4.6')
           PYTHON
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Upload V4.5 candidate
+      - name: Upload V4.6 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
