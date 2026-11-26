@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.2 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.3 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -21,34 +21,31 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-
     steps:
-      - name: Restore exact V4.1 game
+      - name: Restore V4.2 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45585032295
+          run-id: 45761191336
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify V4.1 baseline
+      - name: Verify baseline and preserve original hashes
         shell: bash
         run: |
           set -euo pipefail
-
           test -s baseline/artifact.tar
           mkdir -p site
           tar -xf baseline/artifact.tar -C site
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib,json
 
           root=Path('site')
+          game=root/'knight/gameasync'
           prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          data=root/'knight/gameasync/Data'
 
           before={
               str(p.relative_to(root)):hashlib.sha256(
@@ -63,72 +60,66 @@ jobs:
           assert (
               root/'knight/js/sl-assets-v229r115.js'
           ).read_bytes().count(
-              b"var version='V4.1';"
+              b"var version='V4.2';"
           )==1
 
           assert (
-              data/(prefix+'MonsterStats.rxdata')
+              game/'Data'/(prefix+'MonsterStats.rxdata')
           ).is_file()
 
           files=[
-              prefix+'Map018.rxdata',
+              'Scripts.rxdata',
               prefix+'Map029.rxdata'
           ]
 
-          Path('/tmp/sl42-before.json').write_text(
+          Path('/tmp/sl43-before.json').write_text(
               json.dumps(before,sort_keys=True),
               'utf8'
           )
 
-          Path('/tmp/sl42-md5.json').write_text(
+          Path('/tmp/sl43-md5.json').write_text(
               json.dumps({
                   n:hashlib.md5(
-                      (data/n).read_bytes()
+                      (game/'Data'/n).read_bytes()
                   ).hexdigest()
                   for n in files
               }),
               'utf8'
           )
 
-          print('PASS V4.1 artifact',len(before))
+          print('PASS original V4.2 files',len(before))
           PY
 
-      - name: Move original recruiter to Silver Knight Town
+      - name: Configure native companion recruitment
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl-v42-move.rb <<'RUBY'
+          cat > /tmp/sl43-patch.rb <<'RUBY'
           # encoding: UTF-8
-          require 'digest'
           require 'zlib'
+          require 'json'
+          require 'digest'
 
           module RPG
             %w[
-              Map MapInfo Tileset Event
-              EventCommand MoveRoute MoveCommand
-              AudioFile CommonEvent
-            ].each do |name|
-              const_set(name, Class.new)
+              Actor Map MapInfo Event EventCommand
+              MoveRoute MoveCommand AudioFile CommonEvent
+            ].each do |n|
+              const_set(n, ::Class.new)
             end
 
-            Event.const_set(:Page, Class.new)
-
-            Event::Page.const_set(
-              :Condition, Class.new
-            )
-
-            Event::Page.const_set(
-              :Graphic, Class.new
-            )
+            Event.const_set(:Page, ::Class.new)
+            Event::Page.const_set(:Condition, ::Class.new)
+            Event::Page.const_set(:Graphic, ::Class.new)
           end
 
-          %w[Table Tone Color].each do |name|
-            Object.const_set(name, Class.new do
+          %w[Table Tone Color].each do |n|
+            Object.const_set(n, Class.new do
               def self._load(raw)
-                obj=allocate
-                obj.instance_variable_set(:@raw,raw)
-                obj
+                o=allocate
+                o.instance_variable_set(:@raw,raw)
+                o
               end
 
               def _dump(_depth)
@@ -137,648 +128,910 @@ jobs:
             end)
           end
 
-          def iv(obj,name)
-            obj.instance_variable_get(name)
+          def iv(o,k)
+            o.instance_variable_get(k)
           end
 
           def utf(s)
             s.to_s.dup.force_encoding('UTF-8').scrub
           end
 
-          def check(ok,message)
-            raise message unless ok
+          def check(ok,msg)
+            raise msg unless ok
           end
 
-          def table(obj)
-            raw=iv(obj,:@raw)
-
-            check(
-              raw.is_a?(String)&&raw.bytesize>=20,
-              'Invalid native Table'
+          def replace_once(src,old,new,label)
+            pattern=Regexp.new(
+              Regexp.escape(old).gsub('\n','\r?\n')
             )
 
-            dims,w,h,z,n=raw.unpack('V5')
+            matches=src.scan(pattern)
 
             check(
-              n==w*h*z && raw.bytesize==20+n*2,
-              'Invalid native Table size'
+              matches.size==1,
+              "#{label}: #{matches.size} anchors"
             )
 
-            [w,h,z,raw.byteslice(20,n*2).unpack('v*')]
-          end
-
-          def lists(event)
-            iv(event,:@pages).map{|p|iv(p,:@list)}
-          end
-
-          def targets(command)
-            p=iv(command,:@parameters)
-
-            case iv(command,:@code)
-            when 111
-              p[0]==6 ? [1] : []
-            when 122
-              p[3]==6 ? [4] : []
-            when 202
-              p[1]==2 ? [0,2] : [0]
-            when 207,209
-              [0]
-            else
-              []
+            src.sub(pattern) do |m|
+              m.include?("\r\n") ?
+                new.gsub("\n","\r\n") : new
             end
           end
 
-          def strings(obj,&block)
-            case obj
-            when String
-              block.call(obj)
-            when Array
-              obj.each{|item|strings(item,&block)}
-            when Hash
-              obj.each_value{|item|strings(item,&block)}
-            when RPG::MoveRoute,RPG::MoveCommand
-              obj.instance_variables.each do |k|
-                strings(iv(obj,k),&block)
-              end
+          def edit(rows,name)
+            found=rows.select{|r|r && utf(r[1])==name}
+
+            check(
+              found.size==1,
+              "Script #{name}: #{found.size}"
+            )
+
+            row=found.first
+
+            src=Zlib::Inflate.inflate(
+              row[2]
+            ).force_encoding('UTF-8')
+
+            check(
+              src.valid_encoding?,
+              "Invalid script encoding #{name}"
+            )
+
+            out=yield(src)
+
+            check(src!=out,"No change in #{name}")
+
+            RubyVM::InstructionSequence.compile(out)
+
+            row[2]=Zlib::Deflate.deflate(out)
+          end
+
+          def emit(list,code,indent,params=[])
+            c=RPG::EventCommand.new
+            c.instance_variable_set(:@code,code)
+            c.instance_variable_set(:@indent,indent)
+            c.instance_variable_set(:@parameters,params)
+            list << c
+          end
+
+          def script(list,d,src)
+            src=src.strip+'; true'
+
+            RubyVM::InstructionSequence.compile(src)
+
+            emit(list,355,d,[src])
+          end
+
+          def msg(list,d,text)
+            emit(list,101,d,[text])
+          end
+
+          def stop(list,d)
+            emit(list,115,d)
+          end
+
+          def cond(list,d,expr)
+            RubyVM::InstructionSequence.compile(expr)
+
+            emit(list,111,d,[12,expr])
+
+            yield(d+1)
+
+            emit(list,0,d+1)
+            emit(list,412,d)
+          end
+
+          def choices(list,d,labels)
+            emit(list,102,d,[labels.dup,labels.size])
+
+            labels.each_with_index do |label,i|
+              emit(list,402,d,[i,label])
+              yield(i,d+1)
+              emit(list,0,d+1)
+            end
+
+            emit(list,404,d)
+          end
+
+          def select_slots(list,d,expr,count)
+            script(
+              list,d,
+              "@sl43_ids = #{expr}; @sl43_slot = nil"
+            )
+
+            cond(list,d,'@sl43_ids.empty?') do |n|
+              msg(list,n,'선택할 동료가 없습니다.')
+              stop(list,n)
+            end
+
+            script(
+              list,d,
+              '@list[@index+1].parameters[0] = @sl43_ids.map{|id| $game_actors[id].name} + ["취소"]; @list[@index+1].parameters[1] = @sl43_ids.size+1'
+            )
+
+            choices(
+              list,d,
+              Array.new(count,'동료')+['취소']
+            ) do |i,n|
+
+              script(
+                list,n,
+                "@sl43_slot = @sl43_ids[#{i}]"
+              )
+            end
+
+            cond(list,d,'@sl43_slot == nil') do |n|
+              stop(list,n)
             end
           end
 
           root=ENV.fetch(
-            'SL42_DATA',
+            'SL43_DATA',
             'site/knight/gameasync/Data'
           )
 
           prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          path=lambda do |name|
-            File.join(root,prefix+name+'.rxdata')
+          path=lambda do |n|
+            File.join(root,prefix+n+'.rxdata')
           end
 
-          old_name=/\A\[ID힐러\s*고용사\]\z/
-          old_label=/힐러\s*고용사/
-
-          files=Dir.glob(
+          map_paths=Dir.glob(
             path.call('Map[0-9][0-9][0-9]')
           ).sort
 
           check(
-            !files.empty?,
-            'Original map files missing'
+            map_paths.size==46,
+            "Map count #{map_paths.size}"
           )
 
-          maps=files.to_h do |p|
+          maps=map_paths.to_h do |p|
             [
-              p[/Map(\d{3})\.rxdata\z/,1].to_i,
+              p[/Map(\d{3})\.rxdata$/,1].to_i,
               Marshal.load(File.binread(p))
             ]
           end
 
-          source=maps.fetch(18)
-          dest=maps.fetch(29)
-
-          infos=Marshal.load(
-            File.binread(path.call('MapInfos'))
-          )
-
-          check(
-            utf(iv(infos.fetch(29),:@name)).match?(
-              /은기사\s*마을/
-            ),
-            'Map029 is not Silver Knight Town'
-          )
-
-          source_events=iv(source,:@events)
-          dest_events=iv(dest,:@events)
-
-          recruit=source_events.fetch(6)
-
-          check(
-            iv(recruit,:@id)==6 &&
-            utf(iv(recruit,:@name)).match?(old_name),
-            'Map018 EV6 recruiter identity mismatch'
-          )
-
-          found=maps.flat_map do |mid,m|
-            iv(m,:@events).filter_map do |eid,e|
-              [mid,eid] if utf(
-                iv(e,:@name)
-              ).match?(old_name)
-            end
-          end
-
-          check(
-            found==[[18,6]],
-            "Recruiter count/location mismatch: #{found.inspect}"
-          )
-
-          anchor=dest_events.fetch(11)
-
-          ax,ay=iv(anchor,:@x),iv(anchor,:@y)
-
-          check(
-            [ax,ay]==[70,48],
-            'Map029 EV11 position changed'
-          )
-
-          check(
-            lists(anchor).flatten.any?{
-              |c|iv(c,:@code)==201
-            },
-            'Map029 EV11 is not original teleporter'
-          )
-
-          new_id=dest_events.keys.max+1
-
-          check(
-            !dest_events.key?(new_id),
-            'Destination ID collision'
-          )
-
-          ce_file=path.call('CommonEvents')
-
-          common=Marshal.load(
-            File.binread(ce_file)
-          ).compact
-
-          common_by_id=common.to_h do |e|
-            [iv(e,:@id),e]
-          end
-
-          all_commands=[]
-          map18_commands=[]
-          all_events=0
+          companions=0
 
           maps.each do |mid,map|
-            iv(map,:@events).each do |eid,e|
+            evs=iv(map,:@events)
 
-              all_events+=1
+            slots=evs.values.select do |e|
+              utf(iv(e,:@name)).start_with?('동료 ')
+            end
+
+            check(
+              slots.size==6,
+              "Map#{mid}: #{slots.size} follower slots"
+            )
+
+            sw=slots.map do |e|
+              pg=iv(e,:@pages)
 
               check(
-                iv(e,:@id)==eid,
-                "Map#{mid} event ID mismatch #{eid}"
+                pg.size==1,
+                "Map#{mid}: follower page count"
               )
 
-              lists(e).each do |list|
-                all_commands << [mid,eid,list]
+              c=iv(pg.first,:@condition)
 
-                if mid==18 && eid!=6
-                  map18_commands << list
+              check(
+                iv(c,:@switch1_valid),
+                "Map#{mid}: follower condition"
+              )
+
+              iv(c,:@switch1_id)
+            end
+
+            check(
+              sw.sort==(2001..2006).to_a,
+              "Map#{mid}: follower switches"
+            )
+
+            companions+=slots.size
+          end
+
+          check(companions==276,'Follower slot total')
+
+          map=maps.fetch(29)
+          events=iv(map,:@events)
+          recruit=events.fetch(49)
+
+          check(
+            utf(iv(recruit,:@name))=='[ID고용사]' &&
+            [iv(recruit,:@x),iv(recruit,:@y)]==[72,48],
+            'V4.2 recruiter mismatch'
+          )
+
+          check(
+            !iv(maps.fetch(18),:@events).key?(6),
+            'Original recruiter still present'
+          )
+
+          pages=iv(recruit,:@pages)
+
+          check(pages.size==2,'Recruiter page count')
+
+          old_lists=pages.map{|p|iv(p,:@list)}
+
+          check(
+            old_lists.flatten.any?{
+              |c|iv(c,:@code)==129 &&
+              iv(c,:@parameters)[0]==3
+            },
+            'Original healer command missing'
+          )
+
+          legacy=old_lists[1]
+
+          a=legacy.index do |c|
+            iv(c,:@code)==402 &&
+            iv(c,:@indent)==0 &&
+            iv(c,:@parameters)[0]==0
+          end
+
+          b=legacy.index do |c|
+            iv(c,:@code)==402 &&
+            iv(c,:@indent)==0 &&
+            iv(c,:@parameters)[0]==1
+          end
+
+          check(
+            a && b && b>a,
+            'Original dismissal branch missing'
+          )
+
+          legacy=legacy[a+1...b]
+
+          check(
+            legacy.any?{
+              |c|iv(c,:@code)==129 &&
+              iv(c,:@parameters)[0]==3
+            },
+            'Legacy dismissal missing actor command'
+          )
+
+          actors=Marshal.load(
+            File.binread(path.call('Actors'))
+          )
+
+          check(
+            actors.size==10 &&
+            (1..9).all?{
+              |i|actors[i] && iv(actors[i],:@id)==i
+            },
+            'Actor slots differ'
+          )
+
+          knight=[
+            ['힘기사',[20,12,14,8,9,12]],
+            ['콘기사',[16,12,18,8,9,12]]
+          ]
+
+          elf=[
+            ['덱요정',[11,18,13,12,12,9]],
+            ['콘요정',[11,13,18,12,12,9]],
+            ['인트요정',[11,14,12,17,12,9]]
+          ]
+
+          mage=[
+            ['인트위즈',[8,7,16,18,18,8]],
+            ['콘위즈',[8,7,18,16,18,8]],
+            ['콘인트',[8,7,18,18,16,8]]
+          ]
+
+          dark=[
+            ['힘덱',[18,18,9,11,10,9]],
+            ['힘콘',[18,15,12,11,10,9]],
+            ['위즈',[12,15,10,11,18,9]]
+          ]
+
+          forms=[
+            ['남기사','knight_men',1,knight],
+            ['여기사','SL13_여기사',5,knight],
+            ['남요정','SL13_남요정',6,elf],
+            ['여요정','여요정',4,elf],
+            ['남법사','법사',3,mage],
+            ['여법사','SL13_여법사',7,mage],
+            ['남다엘','SL13_남다엘',8,dark],
+            ['여다엘','SL13_여다엘',9,dark]
+          ]
+
+          check(
+            forms.sum{|f|f[3].size}==22 &&
+            forms.all?{
+              |f|f[3].all?{|t|t[1].sum==75}
+            },
+            'Preset count/total'
+          )
+
+          forms.each do |_,g,id,_|
+            next if id==1
+
+            check(
+              utf(iv(actors[id],:@character_name))==g,
+              "Actor #{id} graphic mismatch"
+            )
+          end
+
+          cost=[
+            10000,10500,11000,11500,12500,
+            13500,15000,17000,19000,21000,
+            24000,27000,30000,33000,37000,
+            41000,45000,50000,54000,59000,
+            65000,70000,76000,82000,89000,
+            95000,102000,109000,117000,125000,
+            130000,140000,150000,160000,165000,
+            175000,185000,195000,205000,215000,
+            225000,235000,250000,260000,270000,
+            285000,305000,335000,390000,500000,
+            800000,1100000,1400000,1700000,2000000,
+            2300000,2550000,2850000,3150000,3450000,
+            3750000,4050000,4350000,4650000,4950000,
+            5250000,5550000,5850000,6100000,6400000,
+            6700000,7000000,7300000,7600000,7900000,
+            8200000,8500000,8800000,9100000,9400000,
+            9650000,9950000,10250000,10550000,10850000,
+            11150000,11450000,11750000,12050000,12350000,
+            12650000,12950000,13200000,13500000,13800000,
+            14100000,14400000,14700000,15000000
+          ]
+
+          check(
+            cost.size==99 &&
+            cost[0]==10000 &&
+            cost[49]==500000 &&
+            cost[-1]==15000000 &&
+            cost.each_cons(2).all?{|x,y|y>x},
+            'Approved cost table mismatch'
+          )
+
+          hired='[4,5,6].select{|id| $game_actors[id].instance_variable_get(:@sl43_hired)}'
+
+          free='[4,5,6].find{|id| !$game_actors[id].instance_variable_get(:@sl43_hired) && !$game_party.actors.include?($game_actors[id])}'
+
+          full="(#{hired}).size + ($game_party.actors.include?($game_actors[3]) ? 1 : 0) >= 3 || $game_party.actors.size >= 4"
+
+          active='$game_party.actors.include?($game_actors[@sl43_slot])'
+
+          ready='$game_actors[@sl43_slot].instance_variable_get(:@sl43_hired) && $game_actors[@sl43_slot].hp == 0 && !'+active
+
+          list=[]
+
+          labels=forms.map(&:first)+['고용 관리','취소']
+
+          choices(list,0,labels) do |i,d|
+
+            if i<forms.size
+
+              form,graphic,template,presets=forms[i]
+
+              cond(list,d,full) do |n|
+                msg(list,n,'최대 3명까지 고용할 수 있습니다.')
+                stop(list,n)
+              end
+
+              script(
+                list,d,
+                "@sl43_slot = #{free}; @sl43_stats = nil; @sl43_type = nil"
+              )
+
+              cond(list,d,'@sl43_slot == nil') do |n|
+                msg(list,n,'빈 고용 슬롯이 없습니다.')
+                stop(list,n)
+              end
+
+              choices(
+                list,d,
+                presets.map(&:first)+['취소']
+              ) do |j,n|
+
+                if j<presets.size
+
+                  kind,stats=presets[j]
+
+                  script(
+                    list,n,
+                    "@sl43_type = #{kind.inspect}; @sl43_stats = #{stats.inspect}"
+                  )
+
+                else
+
+                  stop(list,n)
+
+                end
+              end
+
+              cond(list,d,'@sl43_stats == nil') do |n|
+                stop(list,n)
+              end
+
+              script(
+                list,d,
+                "@sl43_actor = Game_Actor.new(@sl43_slot); $game_actors.instance_variable_get(:@data)[@sl43_slot] = @sl43_actor; @sl43_actor.instance_variable_set(:@class_id,$data_actors[#{form.end_with?("법사") ? 3 : (form.end_with?("기사") ? 1 : template)}].class_id); @sl43_actor.level = 1; @sl43_actor.set_graphic(#{graphic.inspect},0,@sl43_actor.battler_name,@sl43_actor.battler_hue); @sl43_actor.name = ''; @sl43_actor.instance_variable_set(:@sl43_form,#{form.inspect}); @sl43_actor.instance_variable_set(:@sl43_type,@sl43_type); @sl43_actor.instance_variable_set(:@sl43_stats,@sl43_stats.dup); @sl43_actor.str = @sl43_stats[0]; @sl43_actor.dex = @sl43_stats[1]; @sl43_actor.int = @sl43_stats[2]; @sl43_actor.recover_all"
+              )
+
+              (4..6).each do |slot|
+                cond(
+                  list,d,
+                  "@sl43_slot == #{slot}"
+                ) do |n|
+                  emit(list,303,n,[slot,12])
+                end
+              end
+
+              cond(
+                list,d,
+                '$game_actors[@sl43_slot].name.to_s.strip.empty?'
+              ) do |n|
+                stop(list,n)
+              end
+
+              cond(
+                list,d,
+                '$game_actors[@sl43_slot].name.split(//).inject(0){|n,ch| n+(ch =~ /\A[\x20-\x7e]\z/ ? 1 : 2)} > 12'
+              ) do |n|
+
+                msg(
+                  list,n,
+                  '이름은 한글 6자, 영문 12자 이내입니다.'
+                )
+
+                stop(list,n)
+              end
+
+              cond(
+                list,d,
+                "($game_party.actors + (#{hired}).map{|id|$game_actors[id]}).any?{|a| a.id != @sl43_slot && a.name == $game_actors[@sl43_slot].name}"
+              ) do |n|
+
+                msg(list,n,'이미 사용 중인 이름입니다.')
+                stop(list,n)
+              end
+
+              script(
+                list,d,
+                'a=$game_actors[@sl43_slot]; @list[@index+1].parameters[0] = a.name + " / " + @sl43_type + " / Lv.1 / 10,000 아데나"'
+              )
+
+              msg(list,d,'10,000 아데나')
+
+              choices(list,d,['고용','취소']) do |j,n|
+
+                next if j!=0
+
+                cond(
+                  list,n,
+                  "#{full} || $game_actors[@sl43_slot].instance_variable_get(:@sl43_hired)"
+                ) do |k|
+
+                  msg(list,k,'고용 인원 제한입니다.')
+                  stop(list,k)
+                end
+
+                cond(
+                  list,n,
+                  '$game_party.gold < 10000'
+                ) do |k|
+
+                  msg(list,k,'아데나가 부족합니다.')
+                  stop(list,k)
+                end
+
+                script(
+                  list,n,
+                  '$game_party.add_actor(@sl43_slot)'
+                )
+
+                cond(list,n,active) do |k|
+
+                  script(
+                    list,k,
+                    'a=$game_actors[@sl43_slot]; a.instance_variable_set(:@sl43_hired,true); $game_party.lose_gold(10000); $game_switches[1997+@sl43_slot]=true; $game_map.need_refresh=true'
+                  )
+                end
+              end
+
+              stop(list,d)
+
+            elsif i==forms.size
+
+              choices(
+                list,d,
+                ['재고용','해고','취소']
+              ) do |j,n|
+
+                if j==0
+
+                  select_slots(
+                    list,n,
+                    "(#{hired}).select{|id| a=$game_actors[id]; a.hp==0 && !$game_party.actors.include?(a)}",
+                    3
+                  )
+
+                  cond(
+                    list,n,
+                    '$game_party.actors.size >= 4'
+                  ) do |k|
+
+                    msg(
+                      list,k,
+                      '최대 3명까지 고용할 수 있습니다.'
+                    )
+
+                    stop(list,k)
+                  end
+
+                  script(
+                    list,n,
+                    "a=$game_actors[@sl43_slot]; @sl43_price = #{cost.inspect}[a.level-1]"
+                  )
+
+                  cond(
+                    list,n,
+                    '@sl43_price == nil'
+                  ) do |k|
+
+                    stop(list,k)
+                  end
+
+                  script(
+                    list,n,
+                    'a=$game_actors[@sl43_slot]; @list[@index+1].parameters[0] = a.name + " / Lv." + a.level.to_s + " / " + @sl43_price.to_s.reverse.scan(/.{1,3}/).join(",").reverse + " 아데나"'
+                  )
+
+                  msg(list,n,'재고용 비용')
+
+                  choices(
+                    list,n,
+                    ['재고용','취소']
+                  ) do |k,z|
+
+                    next if k!=0
+
+                    cond(
+                      list,z,
+                      '!('+ready+') || $game_party.actors.size >= 4'
+                    ) do |t|
+
+                      stop(list,t)
+                    end
+
+                    cond(
+                      list,z,
+                      '$game_party.gold < @sl43_price'
+                    ) do |t|
+
+                      msg(list,t,'아데나가 부족합니다.')
+                      stop(list,t)
+                    end
+
+                    script(
+                      list,z,
+                      '$game_party.add_actor(@sl43_slot)'
+                    )
+
+                    cond(list,z,active) do |t|
+
+                      script(
+                        list,t,
+                        'a=$game_actors[@sl43_slot]; [:@weapon_id,:@armor1_id,:@armor2_id,:@armor3_id,:@armor4_id].each{|k|a.instance_variable_set(k,0)}; a.instance_variable_set(:@weapon_ids,Array.new(a.weapon_slots.size,0)); a.instance_variable_set(:@armor_ids,Array.new(a.armor_slots.size,0)); a.recover_all; $game_party.lose_gold(@sl43_price); $game_switches[1997+@sl43_slot]=true; $game_map.need_refresh=true'
+                      )
+                    end
+                  end
+
+                elsif j==1
+
+                  select_slots(
+                    list,n,
+                    '[3,4,5,6].select{|id| a=$game_actors[id]; $game_party.actors.include?(a) && a.hp>0 && (id==3 || a.instance_variable_get(:@sl43_hired))}',
+                    4
+                  )
+
+                  choices(
+                    list,n,
+                    ['해고','취소']
+                  ) do |k,z|
+
+                    next if k!=0
+
+                    cond(
+                      list,z,
+                      '@sl43_slot == 3'
+                    ) do |t|
+
+                      legacy.each do |original|
+
+                        c=Marshal.load(
+                          Marshal.dump(original)
+                        )
+
+                        c.instance_variable_set(
+                          :@indent,
+                          iv(c,:@indent)+t-1
+                        )
+
+                        list<<c
+                      end
+
+                      stop(list,t)
+                    end
+
+                    cond(
+                      list,z,
+                      active+' && $game_actors[@sl43_slot].hp > 0'
+                    ) do |t|
+
+                      script(
+                        list,t,
+                        'a=$game_actors[@sl43_slot]; a.equip_from_menu=false; a.equip_type_force=nil; a.weapon_ids=nil; a.armor_ids=nil; $game_party.remove_actor(@sl43_slot); a.instance_variable_set(:@sl43_hired,false); $game_switches[1997+@sl43_slot]=false; $game_map.need_refresh=true'
+                      )
+                    end
+                  end
                 end
               end
             end
           end
 
-          common.each do |e|
-            all_commands << [
-              nil,
-              iv(e,:@id),
-              iv(e,:@list)
-            ]
-          end
-
-          map18_commands.flatten.each do |c|
-            p=iv(c,:@parameters)
-
-            check(
-              targets(c).none?{|i|p[i]==6},
-              'Map018 has a separate reference to EV6'
-            )
-          end
-
-          recruit_lists=lists(recruit)
-
-          queue=recruit_lists.flatten.select do |c|
-            iv(c,:@code)==117
-          end.map do |c|
-            iv(c,:@parameters)[0]
-          end
-
-          visited={}
-
-          until queue.empty?
-            id=queue.shift
-
-            next if visited[id]
-
-            visited[id]=true
-
-            commands=iv(
-              common_by_id.fetch(id),
-              :@list
-            )
-
-            commands.each do |c|
-              p=iv(c,:@parameters)
-
-              check(
-                targets(c).none?{
-                  |i|p[i].is_a?(Integer)&&p[i]>0
-                },
-                "Recruiter CE#{id} has a map-local target"
-              )
-
-              queue<<p[0] if iv(c,:@code)==117
-            end
-          end
+          emit(list,0,0)
 
           check(
-            iv(recruit,:@pages).none?{
-              |pg|iv(
-                iv(pg,:@condition),
-                :@self_switch_valid
-              )
+            list.first.instance_variable_get(
+              :@parameters
+            )[0]==labels,
+            'Character choice order'
+          )
+
+          check(
+            list.count{
+              |c|iv(c,:@code)==303
+            }==24,
+            'Name input routes'
+          )
+
+          check(
+            list.none?{
+              |c|iv(c,:@code)==111 &&
+              iv(c,:@parameters)==[1,1,0,50,1]
             },
-            'Recruiter has map-local self-switch conditions'
+            'Old level restriction'
           )
 
           check(
-            recruit_lists.flatten.none?{
-              |c|iv(c,:@code)==123
-            },
-            'Recruiter uses map-local self-switch commands'
+            list.last.instance_variable_get(:@code)==0,
+            'Event end'
           )
 
-          all_commands.each do |mid,eid,list|
-            next if mid==18 && eid==6
-
-            list.each do |c|
-              strings(iv(c,:@parameters)) do |value|
-                s=utf(value)
-
-                check(
-                  !s.match?(old_label),
-                  "External recruiter name reference: #{mid || 'CE'}:#{eid}"
-                )
-              end
-            end
+          original_events=events.transform_values do |e|
+            Marshal.dump(e)
           end
 
-          scripts=Marshal.load(
-            File.binread(
-              File.join(root,'Scripts.rxdata')
-            )
-          )
-
-          scripts.each do |row|
-            next if !row || !row[2].is_a?(String)
-
-            s=utf(Zlib::Inflate.inflate(row[2]))
-
-            check(
-              !s.match?(old_label),
-              "External recruiter script name reference: #{row[1]}"
-            )
-
-            check(
-              !s.match?(
-                /\[\s*18\s*,\s*6\s*,\s*['"][A-D]['"]\s*\]/
-              ),
-              "Recruiter self-switch reference: #{row[1]}"
-            )
+          original_fields=recruit.instance_variables.reject do |n|
+            n==:@pages
+          end.to_h do |n|
+            [n,Marshal.dump(iv(recruit,n))]
           end
 
-          tilesets=Marshal.load(
-            File.binread(path.call('Tilesets'))
-          )
-
-          tileset=tilesets.fetch(
-            iv(dest,:@tileset_id)
-          )
-
-          w,h,layers,cells=table(
-            iv(dest,:@data)
-          )
-
-          check(
-            [w,h,layers]==[
-              iv(dest,:@width),
-              iv(dest,:@height),
-              3
-            ],
-            'Unexpected Map029 tile dimensions'
-          )
-
-          _,_,_,passages=table(
-            iv(tileset,:@passages)
-          )
-
-          _,_,_,priorities=table(
-            iv(tileset,:@priorities)
-          )
-
-          check(
-            cells.all?{
-              |id|id<passages.size &&
-              id<priorities.size
-            },
-            'Map029 invalid tile references'
-          )
-
-          occupied=dest_events.values.map do |e|
-            [iv(e,:@x),iv(e,:@y)]
-          end.to_h do |xy|
-            [xy,true]
-          end
-
-          landings={}
-
-          all_commands.each do |_,_,list|
-            list.each do |c|
-              p=iv(c,:@parameters)
-
-              if iv(c,:@code)==201 &&
-                 p[0]==0 &&
-                 p[1]==29
-
-                landings[[p[2],p[3]]]=true
-              end
-            end
-          end
-
-          steps=[
-            [0,1,1,8],
-            [-1,0,2,4],
-            [1,0,4,2],
-            [0,-1,8,1]
-          ]
-
-          pass=lambda do |x,y,bit|
-            next false unless (
-              x>=0 && y>=0 && x<w && y<h
-            )
-
-            result=true
-
-            (layers-1).downto(0) do |z|
-              id=cells[x+w*(y+h*z)]
-              flags=passages[id]
-
-              if (flags&bit)!=0 ||
-                 (flags&15)==15
-
-                result=false
-                break
-              end
-
-              break if priorities[id]==0
-            end
-
-            result
-          end
-
-          free=lambda do |x,y|
-            x>=0 &&
-            y>=0 &&
-            x<w &&
-            y<h &&
-            !occupied[[x,y]]
-          end
-
-          near=lambda do |x,y|
-            (x-ax).abs+(y-ay).abs<=6
-          end
-
-          reachable={}
-
-          queue=steps.filter_map do |dx,dy,_,_|
-            nx,ny=ax+dx,ay+dy
-
-            [nx,ny] if (
-              free.call(nx,ny) &&
-              steps.any?{
-                |_,_,b,_|pass.call(nx,ny,b)
-              }
-            )
-          end
-
-          queue.each{|xy|reachable[xy]=true}
-
-          until queue.empty?
-
-            x,y=queue.shift
-
-            steps.each do |dx,dy,bit,back|
-              nx,ny=x+dx,y+dy
-              xy=[nx,ny]
-
-              next unless (
-                near.call(nx,ny) &&
-                free.call(nx,ny) &&
-                !reachable[xy]
-              )
-
-              next unless (
-                pass.call(x,y,bit) &&
-                pass.call(nx,ny,back)
-              )
-
-              reachable[xy]=true
-              queue<<xy
-            end
-          end
-
-          candidates=reachable.keys.filter_map do |x,y|
-            distance=(x-ax).abs+(y-ay).abs
-
-            next unless (
-              distance.between?(2,5) &&
-              !landings[[x,y]]
-            )
-
-            next unless dest_events.values.all?{
-              |e|(iv(e,:@x)-x).abs+
-              (iv(e,:@y)-y).abs>=2
-            }
-
-            next unless steps.all?{
-              |_,_,bit,_|pass.call(x,y,bit)
-            }
-
-            access=steps.count do |dx,dy,bit,back|
-              free.call(x+dx,y+dy) &&
-              reachable[[x+dx,y+dy]] &&
-              pass.call(x,y,bit) &&
-              pass.call(x+dx,y+dy,back)
-            end
-
-            next unless access>=3
-
-            [distance,-access,(y-ay).abs,y,x]
-          end
-
-          check(
-            !candidates.empty?,
-            'No clear passable recruiter tile near Map029 EV11'
-          )
-
-          _,_,_,y,x=candidates.min
-
-          before18=source_events.to_h do |eid,e|
-            [eid,Marshal.dump(e)]
-          end
-
-          before29=dest_events.to_h do |eid,e|
-            [eid,Marshal.dump(e)]
-          end
-
-          map_fields=lambda do |m|
-            m.instance_variables.reject do |n|
-              n==:@events
+          original_pages=pages.map do |pg|
+            pg.instance_variables.reject do |n|
+              n==:@list
             end.to_h do |n|
-              [n,Marshal.dump(iv(m,n))]
+              [n,Marshal.dump(iv(pg,n))]
             end
           end
 
-          fields18=map_fields.call(source)
-          fields29=map_fields.call(dest)
-
-          name=iv(recruit,:@name)
-
-          recruit.instance_variable_set(
-            :@name,
-            '[ID고용사]'.encode(
-              name.encoding==Encoding::ASCII_8BIT ?
-              'UTF-8' : name.encoding
-            ).force_encoding(name.encoding)
-          )
-
-          recruit_lists.flatten.each do |c|
-            p=iv(c,:@parameters)
-
-            targets(c).each do |i|
-              next unless (
-                p[i].is_a?(Integer)&&p[i]>0
-              )
-
-              check(
-                p[i]==6,
-                'Recruiter references another source-map event'
-              )
-
-              p[i]=new_id
-            end
-
-            strings(p) do |value|
-              s=utf(value)
-
-              next unless s.match?(old_label)
-
-              check(
-                [101,401,102,402].include?(
-                  iv(c,:@code)
-                ),
-                'Recruiter has a non-display name reference'
-              )
-
-              value.replace(
-                s.gsub(
-                  old_label,'고용사'
-                ).force_encoding(value.encoding)
-              )
-            end
+          pages.each do |pg|
+            pg.instance_variable_set(
+              :@list,
+              Marshal.load(Marshal.dump(list))
+            )
           end
 
-          recruit.instance_variable_set(:@id,new_id)
-          recruit.instance_variable_set(:@x,x)
-          recruit.instance_variable_set(:@y,y)
-
-          source_events.delete(6)
-          dest_events[new_id]=recruit
-
-          expected=Marshal.dump(recruit)
-
           check(
-            source_events.keys.sort==
-            (before18.keys-[6]).sort,
-            'Source event count mismatch'
-          )
-
-          check(
-            dest_events.keys.sort==
-            (before29.keys+[new_id]).sort,
-            'Destination event count mismatch'
-          )
-
-          check(
-            source_events.all?{
-              |eid,e|Marshal.dump(e)==before18.fetch(eid)
-            },
-            'Unrelated Map018 event changed'
-          )
-
-          check(
-            dest_events.all?{
-              |eid,e|eid==new_id ||
-              Marshal.dump(e)==before29.fetch(eid)
+            events.all?{
+              |id,e|id==49 ||
+              Marshal.dump(e)==original_events[id]
             },
             'Unrelated Map029 event changed'
           )
 
           check(
-            map_fields.call(source)==fields18 &&
-            map_fields.call(dest)==fields29,
-            'Unrelated map field changed'
-          )
-
-          [[18,source],[29,dest]].each do |mid,m|
-
-            p=path.call(format('Map%03d',mid))
-
-            File.binwrite(p,Marshal.dump(m))
-
-            reloaded=Marshal.load(
-              File.binread(p)
-            )
-
-            check(
-              Marshal.dump(reloaded)==Marshal.dump(m),
-              "Map#{mid} roundtrip mismatch"
-            )
-          end
-
-          m18=Marshal.load(
-            File.binread(path.call('Map018'))
-          )
-
-          m29=Marshal.load(
-            File.binread(path.call('Map029'))
+            original_fields==
+            recruit.instance_variables.reject{
+              |n|n==:@pages
+            }.to_h{
+              |n|[n,Marshal.dump(iv(recruit,n))]
+            },
+            'Recruiter identity changed'
           )
 
           check(
-            !iv(m18,:@events).key?(6),
-            'Source recruiter still exists'
+            original_pages==
+            pages.map{
+              |pg|pg.instance_variables.reject{
+                |n|n==:@list
+              }.to_h{
+                |n|[n,Marshal.dump(iv(pg,n))]
+              }
+            },
+            'Recruiter page fields changed'
+          )
+
+          scripts_path=File.join(root,'Scripts.rxdata')
+
+          rows=Marshal.load(
+            File.binread(scripts_path)
+          )
+
+          original_rows=rows.map{|r|Marshal.dump(r)}
+
+          edit(rows,'Game_Party') do |s|
+
+            s=replace_once(
+              s,
+              '    for i in ($data_system.party_members | (4..9).to_a)',
+              '    for i in $data_system.party_members',
+              'Automatic starting companions'
+            )
+
+            s=replace_once(
+              s,
+              '    @actors = new_actors | (4..9).map { |id| $game_actors[id] }',
+              <<~'SRC'.lines.map{|l|'    '+l}.join.chomp,
+              'Automatic load companions'
+            )
+          @actors = new_actors.reject{|a| (4..9).include?(a.id) && !(a.id <= 6 && a.instance_variable_get(:@sl43_hired))}
+          for id in 4..9
+            $game_switches[1997+id] = @actors.include?($game_actors[id])
+          end
+          $game_map.need_refresh = true if $game_map
+          SRC
+
+            replace_once(
+              s,
+              '    @actors.delete($game_actors[actor_id])',
+              <<~'SRC'.lines.map{|l|'    '+l}.join.chomp,
+              'Native actor removal'
+            )
+          @actors.delete($game_actors[actor_id])
+          if (4..6).include?(actor_id)
+            $game_switches[1997+actor_id] = false
+            $game_map.need_refresh = true if $game_map
+          end
+          SRC
+          end
+
+          edit(rows,'Game_Event') do |s|
+
+            replace_once(
+              s,
+              '    @character_name = @page.graphic.character_name',
+              <<~'SRC'.lines.map{|l|'    '+l}.join.chomp,
+              'Existing companion graphic'
+            )
+          @character_name = @page.graphic.character_name
+          if @event.name.to_s.start_with?('동료 ') && @page.condition.switch1_valid
+            id = @page.condition.switch1_id - 1997
+            if (4..6).include?(id)
+              actor = $game_actors[id]
+              if actor.instance_variable_get(:@sl43_hired)
+                @character_name = actor.character_name
+                @sprite_id = actor.name
+              end
+            end
+          end
+          SRC
+          end
+
+          edit(rows,'Window_Message') do |s|
+
+            replace_once(
+              s,
+              "    self.back_opacity = 255\n  end",
+              <<~'SRC'.lines.map{|l|'    '+l}.join.chomp.sub(/\n    end\z/,"\n  end"),
+              'Recruiter choice height'
+            )
+          self.back_opacity = 255
+          large = $game_temp.choice_start == 0 && $game_temp.choice_max == 10 && $game_temp.message_text.to_s.start_with?("남기사\n여기사\n남요정\n")
+          if large || @sl43_original_height
+            if large
+              @sl43_original_height ||= self.height
+              h = 352
+              self.y = 16
+            else
+              h = @sl43_original_height
+              @sl43_original_height = nil
+            end
+            if self.height != h
+              self.height = h
+              self.contents.dispose
+              self.contents = Bitmap.new(width-32,height-32)
+              self.oy = 0
+            end
+          end
+          end
+          SRC
+          end
+
+          edit(rows,'Scene_Name') do |s|
+
+            replace_once(
+              s,
+              "      if @edit_window.index == 0\n        return\n      end",
+              <<~'SRC'.lines.map{|l|'      '+l}.join.chomp,
+              'Existing name cancellation'
+            )
+          if @edit_window.index == 0
+            if (4..6).include?(@actor.id) && @actor.instance_variable_get(:@sl43_type) && !@actor.instance_variable_get(:@sl43_hired)
+              @actor.name = ''
+              $scene = Scene_Map.new
+            end
+            return
+          end
+          SRC
+          end
+
+          changed=rows.each_index.select do |i|
+            Marshal.dump(rows[i])!=original_rows[i]
+          end.map do |i|
+            utf(rows[i][1])
+          end.sort
+
+          check(
+            changed==[
+              'Game_Party',
+              'Game_Event',
+              'Window_Message',
+              'Scene_Name'
+            ].sort,
+            "Unexpected scripts #{changed.inspect}"
+          )
+
+          File.binwrite(
+            scripts_path,
+            Marshal.dump(rows)
+          )
+
+          File.binwrite(
+            path.call('Map029'),
+            Marshal.dump(map)
+          )
+
+          check(
+            Marshal.load(
+              File.binread(scripts_path)
+            )==rows,
+            'Script roundtrip'
           )
 
           check(
             Marshal.dump(
-              iv(m29,:@events).fetch(new_id)
-            )==expected,
-            'Moved recruiter differs'
+              Marshal.load(
+                File.binread(path.call('Map029'))
+              )
+            )==Marshal.dump(map),
+            'Map roundtrip'
           )
 
-          puts "PASS maps=#{maps.size}"
-          puts "PASS original events=#{all_events}"
-          puts "PASS Map018 EV6 -> Map029 EV#{new_id}"
-          puts "PASS recruiter position #{x},#{y}"
-          puts 'PASS recruiter renamed'
-          puts 'PASS one recruiter moved'
-          puts 'PASS all unrelated events unchanged'
-          puts 'PASS all unrelated map fields unchanged'
+          puts "PASS maps=#{maps.size} companion_slots=#{companions}"
+          puts 'PASS 8 appearances 22 presets 3 independent actor slots'
+          puts 'PASS 99 exact approved fees'
+          puts "PASS recruiter commands=#{list.size}"
+          puts "PASS only scripts #{changed.join(', ')}"
           RUBY
 
-          ruby -c /tmp/sl-v42-move.rb
-          ruby /tmp/sl-v42-move.rb
+          ruby -c /tmp/sl43-patch.rb
+          ruby /tmp/sl43-patch.rb
 
-      - name: Update mappings and verify all changes
+      - name: Update checksums and verify exact approved changes
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
-          import json
-          import re
+          import hashlib,json,re
 
           root=Path('site')
           game=root/'knight/gameasync'
@@ -786,16 +1039,16 @@ jobs:
           prefix='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           files=[
-              prefix+'Map018.rxdata',
+              'Scripts.rxdata',
               prefix+'Map029.rxdata'
           ]
 
           before=json.loads(
-              Path('/tmp/sl42-before.json').read_text('utf8')
+              Path('/tmp/sl43-before.json').read_text('utf8')
           )
 
           old_md5=json.loads(
-              Path('/tmp/sl42-md5.json').read_text('utf8')
+              Path('/tmp/sl43-md5.json').read_text('utf8')
           )
 
           mapper=game/'mapping.js'
@@ -814,7 +1067,7 @@ jobs:
 
               matches=re.findall(pattern,s)
 
-              assert len(matches)==1,name
+              assert len(matches)==1,(name,len(matches))
 
               assert matches[0]==(
                   marker+old_md5[name].encode('ascii')
@@ -837,28 +1090,29 @@ jobs:
           s=loader.read_bytes()
 
           assert s.count(
-              b"var version='V4.1';"
+              b"var version='V4.2';"
           )==1
 
           loader.write_bytes(
               s.replace(
-                  b"var version='V4.1';",
-                  b"var version='V4.2';"
+                  b"var version='V4.2';",
+                  b"var version='V4.3';"
               )
           )
 
           for name in ('index.html','knight/index.html'):
 
               p=root/name
+
               s=p.read_bytes()
 
-              assert b'V4.1' in s
+              assert b'V4.2' in s
 
               p.write_bytes(
                   s.replace(
-                      b'V4.1',b'V4.2'
+                      b'V4.2',b'V4.3'
                   ).replace(
-                      b'v4.1',b'v4.2'
+                      b'v4.2',b'v4.3'
                   )
               )
 
@@ -891,29 +1145,16 @@ jobs:
 
           assert len(after)==6019
 
-          monster_file=(
-              'knight/gameasync/Data/'+prefix+
-              'MonsterStats.rxdata'
-          )
-
-          assert before[monster_file]==after[monster_file]
-
-          print('PASS approved file changes',len(changed))
+          print('PASS changed files',len(changed))
           print('PASS unchanged files',len(before)-len(changed))
-          print('PASS V4.1 monster data retained')
-          print('PASS original scripts unchanged')
-          print('PASS original actor data unchanged')
-          print('PASS original companion functions unchanged')
-          print('PASS original graphics unchanged')
-          print('PASS no added files')
-          print('PASS no removed files')
-          print('PASS V4.2')
+          print('PASS no added or removed files')
+          print('PASS V4.3')
           PY
 
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Upload V4.2 candidate
+      - name: Upload V4.3 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -922,11 +1163,9 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-24.04
-
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - uses: actions/deploy-pages@v5
         id: deployment
