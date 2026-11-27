@@ -32,16 +32,7 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Restore original runtime sources
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 46002274527
-          name: sl414-original-runtime-audit
-          github-token: ${{ github.token }}
-          path: audit
-
-      - name: Verify V4.14 baseline
+      - name: Verify original game
         shell: bash
         run: |
           set -euo pipefail
@@ -53,7 +44,8 @@ jobs:
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib, json
+          import hashlib
+          import json
 
           root=Path('site')
 
@@ -70,12 +62,6 @@ jobs:
               'knight/gameasync/Data/Scripts.rxdata'
           ]=='e651e2d63092dd3eebf1a185f2482cf80eb478008dc0b540735972e97bfaa8b9'
 
-          image=root/'knight/gameasync/Graphics/Pictures/게이지(저사양)-상.png'
-
-          assert hashlib.md5(
-              image.read_bytes()
-          ).hexdigest()=='ed37440f448cd7ff710b00aeefd4915e'
-
           assert before[
               'knight/assets/shared-v229r115.pack'
           ].startswith('848a3d863d953bdc')
@@ -84,357 +70,399 @@ jobs:
               'knight/gameasync/bitmap-map.js'
           ].startswith('30b5b4a619a81d4c')
 
+          skin=root/'knight/gameasync/Graphics/Windowskins/스킨.png'
+
+          assert skin.stat().st_size==9929
+
+          assert hashlib.md5(
+              skin.read_bytes()
+          ).hexdigest()=='b944521800f1066434045a21ae8ff72d'
+
           Path('/tmp/sl415-before.json').write_text(
               json.dumps(before),
               'utf8'
           )
 
-          print('PASS exact V4.14 game')
+          print('PASS exact V4.14 baseline')
+          print('PASS original windowskin')
           PYTHON
 
-      - name: Restore original gauge drawing path
+      - name: Apply inventory windowskin
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl415-native-gauge.rb <<'RUBY'
+          cat > /tmp/sl415-inventory.rb <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
           require 'digest'
 
-          base,original,previous,out=ARGV
+          path=ARGV.fetch(0)
 
-          raise 'Arguments' unless out
+          raw=File.binread(path)
 
-          raw=File.binread(base)
-          old=File.binread(original)
-          item_raw=File.binread(previous)
-
-          raise 'Baseline mismatch' unless
+          raise 'V4.14 baseline' unless
             Digest::SHA256.hexdigest(raw)==
             'e651e2d63092dd3eebf1a185f2482cf80eb478008dc0b540735972e97bfaa8b9'
 
-          raise 'Original gauge mismatch' unless
-            Digest::SHA256.hexdigest(old)==
-            'aee568a7fe7f1930048b8baa163dd5995d28947dcb66866691cc08522dca56d1'
-
-          raise 'Item source mismatch' unless
-            Digest::SHA256.hexdigest(item_raw)==
-            'a51670a58ab4d35567a5a40a955b83c7552f6163c93f9223874192922a68272d'
-
           rows=Marshal.load(raw)
-          original_rows=Marshal.load(old)
-          item_rows=Marshal.load(item_raw)
 
-          raise 'Script count' unless
-            [rows,original_rows,item_rows].all?{
-              |r|r.size==137
-            }
+          raise 'Script count' unless rows.size==137
 
           before=rows.map{|r|Marshal.dump(r)}
 
-          source=->(a,i){
-            Zlib::Inflate.inflate(
-              a[i][2]
+          [80,81].each do |i|
+
+            src=Zlib::Inflate.inflate(
+              rows[i][2]
             ).force_encoding('UTF-8')
-          }
 
-          edit=->(i,s){
-            RubyVM::InstructionSequence.compile(s)
-            rows[i][2]=Zlib::Deflate.deflate(s.b)
-          }
+            s=src.gsub("\r\n","\n")
 
-          replace=lambda do |s,a,b|
+            if i==80
 
-            raise "Anchor #{a.inspect[0,120]}" unless
-              s.scan(a).size==1
+              a="    @item_window = Window_Item.new\n"
 
-            s.sub(a){b}
+              b=a+
+                "    @help_window.windowskin = RPG::Cache.windowskin(\"SLInventory\")\n"+
+                "    @item_window.windowskin = RPG::Cache.windowskin(\"SLInventory\")\n"
 
-          end
+            else
 
-          [26,42,43,71,80,81,93].each do |i|
+              a="    @item_window.x = 620\n"
 
-            raise "Identity #{i}" unless
-              rows[i][0,2]==item_rows[i][0,2]
-
-            RubyVM::InstructionSequence.compile(
-              source.call(item_rows,i)
-            )
-
-            rows[i][2]=item_rows[i][2]
-
-          end
-
-          s=source.call(item_rows,130)
-
-          a=s.index("  def self.draw(w)\n")
-
-          b=s.index("  class Menu\n",a)
-
-          raise 'Failed renderer bounds' unless
-            a && b && b>a
-
-          s=s[0...a]+s[b..-1]
-
-          s=replace.call(
-            s,
-            "    (store[id]||={})[item] ||=\n      [0,HEAL.key?(item)]\n",
-            "    return false if !entry(id,item) && (store[id]||{}).size>=4\n\n    (store[id]||={})[item] ||=\n      [0,HEAL.key?(item)]\n"
-          )
-
-          raise 'Failed renderer retained' if
-            s.include?('SL414.draw') ||
-            s.include?('clear_rect') ||
-            s.include?('def self.draw(w)')
-
-          edit.call(130,s)
-
-          s=source.call(rows,127)
-
-          orig=source.call(original_rows,127)
-
-          raise 'Gauge class' unless
-            s.include?('class Guage < Window_Base2') &&
-            s.include?('super(0, 120, 800, 600)')
-
-          raise 'Native level' unless
-            orig.include?(
-              'draw_actor_level($game_party.actors[0], 2, 354)'
-            )
-
-          raise 'Native AC' unless
-            orig.include?(
-              'draw_actor_parameter($game_party.actors[0], 8, 395, 1)'
-            )
-
-          raise 'Native MR' unless
-            orig.include?(
-              'draw_actor_parameter($game_party.actors[0], 70, 395, 2)'
-            )
-
-          raise 'Native inventory' unless
-            source.call(original_rows,115).include?(
-              'bitmap = RPG::Cache.icon(item.icon_name)'
-            )
-
-          raise 'Native experience' unless
-            source.call(original_rows,105).include?(
-              'actor.exp_rate * 100'
-            )
-
-          raise 'Native DPS' unless
-            orig.lines.count{
-              |line|
-              line.include?('"DPS "+dps1.to_s+" / "+dps2.to_s') &&
-              line.include?('draw_text')
-            }==5
-
-          raise 'DPS still present' if
-            s.include?('"DPS "+dps1.to_s+" / "+dps2.to_s')
-
-          raise 'Native DPS values absent' unless
-            s.include?('dps1 = sprintf("%.1f",$DPS1.to_f)') &&
-            s.include?('dps2 = sprintf("%.1f",$DPS2.to_f)')
-
-          block=<<'HUD'
-              self.contents.font.name = "NanumGothic"
-              self.contents.font.size = 12
-              self.contents.font.bold = false
-
-              [$game_actors[1], SL414.member(4), SL414.member(5), SL414.member(6)].each_with_index do |actor, i|
-
-                next unless actor
-
-                x = i * 192
-
-                [
-                  [x+4, 328, 130, actor.name, 0, Color.new(192, 224, 255)],
-                  [x+134, 328, 54, "Lv."+actor.level.to_s, 2, Color.new(255, 255, 255)],
-                  [x+4, 349, 94, "HP "+actor.hp.to_s+"/"+actor.maxhp.to_s, 0, Color.new(255, 128, 128)],
-                  [x+98, 349, 90, "MP "+actor.sp.to_s+"/"+actor.maxsp.to_s, 2, Color.new(128, 128, 255)],
-                  [x+4, 369, 184, "EXP "+sprintf("%.4f%%",actor.exp_rate*100), 0, Color.new(255, 255, 128)],
-                  [x+4, 389, 94, "AC "+(10-actor.pdef).to_s, 0, Color.new(255, 255, 255)],
-                  [x+98, 389, 90, "MR "+actor.mdef.to_s+"%", 2, Color.new(255, 255, 255)]
-                ].each do |tx,ty,tw,value,align,color|
-
-                  self.contents.font.color = Color.new(0, 0, 0)
-
-                  self.contents.draw_text(tx-1, ty, tw, 32, value, align)
-                  self.contents.draw_text(tx, ty-1, tw, 32, value, align)
-                  self.contents.draw_text(tx+1, ty, tw, 32, value, align)
-                  self.contents.draw_text(tx, ty+1, tw, 32, value, align)
-
-                  self.contents.font.color = color
-
-                  self.contents.draw_text(tx, ty, tw, 32, value, align)
-
-                end
-
-                if i == 0
-
-                  self.contents.font.color = Color.new(0, 0, 0)
-
-                  self.contents.draw_text(x+3, 421, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
-                  self.contents.draw_text(x+4, 420, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
-                  self.contents.draw_text(x+5, 421, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
-                  self.contents.draw_text(x+4, 422, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
-
-                  self.contents.font.color = Color.new(255, 0, 150)
-
-                  self.contents.draw_text(x+4, 421, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
-
-                else
-
-                  SL414::IDS.select{
-                    |id|SL414.entry(actor.id,id)
-                  }[0,4].each_with_index do |id,j|
-
-                    item = $data_items[id]
-
-                    next unless item
-
-                    ix = x+4+j*46
-
-                    bitmap = RPG::Cache.icon(item.icon_name)
-
-                    self.contents.blt(
-                      ix,
-                      421,
-                      bitmap,
-                      Rect.new(0, 0, 32, 32)
-                    )
-
-                    number = SL414.count(actor.id,id)
-
-                    self.contents.font.color = Color.new(0, 0, 0)
-
-                    self.contents.draw_text(
-                      ix+1, 429, 43, 32,
-                      number.to_s, 2
-                    )
-
-                    self.contents.font.color = Color.new(255, 255, 0)
-
-                    self.contents.draw_text(
-                      ix, 428, 43, 32,
-                      number.to_s, 2
-                    )
-
-                  end
-
-                end
-
-              end
-          HUD
-
-          methods=[]
-
-          walk=lambda do |n|
-
-            if n.is_a?(RubyVM::AbstractSyntaxTree::Node)
-
-              methods<<n if
-                n.type==:DEFN &&
-                n.children[0]==:refresh
-
-              n.children.each{
-                |c|walk.call(c)
-              }
+              b=a+
+                "    @item_window.width = 180\n"+
+                "    @item_window.windowskin = RPG::Cache.windowskin(\"SLInventory\")\n"+
+                "    @item_window.opacity = 255\n"+
+                "    @item_window.back_opacity = 200\n"+
+                "    $아이템창.opacity = 0\n"
 
             end
 
-          end
+            raise "Anchor #{i}" unless
+              s.scan(a).size==1
 
-          walk.call(
-            RubyVM::AbstractSyntaxTree.parse(s)
-          )
+            t=s.sub(a){b}
 
-          raise 'Refresh method count' unless
-            methods.size==1
+            raise 'Non-target edits' unless
+              t.sub(b){a}==s
 
-          lines=s.lines
+            RubyVM::InstructionSequence.compile(t)
 
-          at=methods[0].last_lineno-1
+            t=t.gsub("\n","\r\n") if
+              src.include?("\r\n")
 
-          raise 'Refresh end' unless
-            lines[at].strip=='end'
-
-          block=block.gsub("\n","\r\n") if
-            s.include?("\r\n")
-
-          lines.insert(at,block)
-
-          t=lines.join
-
-          raise 'Non-HUD change' unless
-            t.sub(block,'')==s
-
-          edit.call(127,t)
-
-          changed=rows.each_index.select{
-            |i|Marshal.dump(rows[i])!=before[i]
-          }
-
-          raise "Scope #{changed}" unless
-            changed==[26,42,43,71,80,81,93,127,130]
-
-          raise 'Original experience window changed' unless
-            Marshal.dump(rows[105])==before[105]
-
-          rows.each_index do |i|
-
-            raise "Identity #{i}" unless
-              rows[i][0,2]==original_rows[i][0,2]
-
-            raise "Encoding #{i}" unless
-              source.call(rows,i).valid_encoding?
+            rows[i][2]=Zlib::Deflate.deflate(t.b)
 
           end
+
+          raise 'Script scope' unless
+            rows.each_index.select{
+              |i|Marshal.dump(rows[i])!=before[i]
+            }==[80,81]
 
           File.binwrite(
-            out,
+            path,
             Marshal.dump(rows)
           )
 
           raise 'Round trip' unless
-            Marshal.load(File.binread(out))==rows
+            Marshal.load(
+              File.binread(path)
+            )==rows
 
-          puts 'PASS original Guage.refresh reused'
-          puts 'PASS all previous gauge lines preserved'
-          puts 'PASS original Scene_Map unchanged'
-          puts 'PASS original experience window unchanged'
-          puts 'PASS original gauge window bounds unchanged'
-          puts 'PASS original gauge show and hide unchanged'
-          puts 'PASS original DPS drawing restored'
-          puts 'PASS original inventory icons reused'
-          puts 'PASS 9 modified scripts'
-          puts 'PASS 128 unchanged scripts'
-          puts "MD5 #{Digest::MD5.file(out).hexdigest}"
+          puts 'PASS Scene_Item'
+          puts 'PASS Scene_Item2'
+          puts 'PASS original inventory functions preserved'
+          puts 'PASS 135 other scripts unchanged'
+          puts "MD5 #{Digest::MD5.file(path).hexdigest}"
           RUBY
 
-          ruby -c /tmp/sl415-native-gauge.rb
+          ruby -c /tmp/sl415-inventory.rb
 
-          ruby /tmp/sl415-native-gauge.rb \
-            site/knight/gameasync/Data/Scripts.rxdata \
-            audit/V4.13/knight/gameasync/Data/Scripts.rxdata \
-            audit/V4.14/knight/gameasync/Data/Scripts.rxdata \
-            /tmp/sl415.rxdata
-
-          cp /tmp/sl415.rxdata \
+          ruby /tmp/sl415-inventory.rb \
             site/knight/gameasync/Data/Scripts.rxdata
 
-      - name: Update V4.15 cache references
+      - name: Create inventory skin from original
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PYTHON'
+          python3 -m venv \
+            --system-site-packages /tmp/sl415-venv
+
+          /tmp/sl415-venv/bin/python -c "import PIL" || \
+            /tmp/sl415-venv/bin/python -m pip install \
+              --quiet --disable-pip-version-check \
+              'Pillow>=11,<13'
+
+          /tmp/sl415-venv/bin/python - <<'PYTHON'
           from pathlib import Path
+          from PIL import Image, ImageOps, ImageDraw
           import hashlib
+          import json
+          import struct
+          import base64
+          import io
 
           root=Path('site')
           game=root/'knight/gameasync'
+
+          original_rel='Graphics/Windowskins/스킨.png'
+          original_key='graphics/windowskins/스킨'
+
+          new_rel='Graphics/Windowskins/SLInventory.png'
+          new_key='graphics/windowskins/slinventory'
+
+          original=game/original_rel
+          target=game/new_rel
+
+          assert not target.exists()
+
+          raw=original.read_bytes()
+
+          assert len(raw)==9929
+
+          assert hashlib.md5(
+              raw
+          ).hexdigest()=='b944521800f1066434045a21ae8ff72d'
+
+          old=Image.open(
+              io.BytesIO(raw)
+          ).convert('RGBA')
+
+          assert old.size==(192,128)
+
+          skin=old.copy()
+
+          tile=old.crop((32,32,96,96))
+
+          assert tile.size==(64,64)
+
+          skin.paste(tile,(0,0))
+
+          skin.paste(
+              ImageOps.mirror(tile),
+              (64,0)
+          )
+
+          skin.paste(
+              ImageOps.flip(tile),
+              (0,64)
+          )
+
+          skin.paste(
+              ImageOps.flip(
+                  ImageOps.mirror(tile)
+              ),
+              (64,64)
+          )
+
+          skin.paste(
+              (0,0,0,0),
+              (128,0,192,64)
+          )
+
+          skin.paste(
+              old.crop((144,16,176,48)),
+              (144,16)
+          )
+
+          draw=ImageDraw.Draw(skin)
+
+          draw.rectangle(
+              (128,0,191,63),
+              outline=(153,142,121,255)
+          )
+
+          draw.rectangle(
+              (129,1,190,62),
+              outline=(53,48,42,255)
+          )
+
+          assert (
+              skin.crop((128,64,192,128)).tobytes()
+              ==
+              old.crop((128,64,192,128)).tobytes()
+          )
+
+          assert (
+              skin.crop((144,16,176,48)).tobytes()
+              ==
+              old.crop((144,16,176,48)).tobytes()
+          )
+
+          assert skin.size==(192,128)
+
+          buffer=io.BytesIO()
+
+          skin.save(
+              buffer,
+              format='PNG'
+          )
+
+          new_bytes=buffer.getvalue()
+
+          target.write_bytes(new_bytes)
+
+          new_digest=hashlib.md5(
+              new_bytes
+          ).hexdigest()
+
+          assert original.read_bytes()==raw
+
+          print('PASS original skin unchanged')
+          print('PASS original cursor preserved')
+          print('PASS original central frame indicators preserved')
+          print('PASS inventory-only two-pixel frame')
+          print('PASS native 192x128 windowskin dimensions')
+
+          packs=sorted(
+              (root/'knight/assets').glob('*.pack')
+          )
+
+          assert len(packs)==50
+
+          matches=[]
+
+          for p in packs:
+
+              with p.open('rb') as f:
+
+                  hlen=struct.unpack(
+                      '<I',f.read(4)
+                  )[0]
+
+                  info=json.loads(
+                      f.read(hlen).decode('utf8')
+                  )
+
+              for row in info['files']:
+
+                  assert row[0]!=new_key
+
+                  if row[0]==original_key:
+                      matches.append(p)
+
+          pack=root/'knight/assets/shared-v229r115.pack'
+
+          assert matches==[pack]
+
+          old_pack=pack.read_bytes()
+
+          assert hashlib.sha256(
+              old_pack
+          ).hexdigest().startswith(
+              '848a3d863d953bdc'
+          )
+
+          hlen=struct.unpack_from(
+              '<I',old_pack,0
+          )[0]
+
+          header=json.loads(
+              old_pack[4:4+hlen].decode('utf8')
+          )
+
+          payload=old_pack[4+hlen:]
+
+          assert header['kind']=='shared'
+
+          old_rows=header['files']
+
+          assert len(old_rows)==2292
+
+          assert len({
+              row[0] for row in old_rows
+          })==2292
+
+          offset=0
+
+          for key,start,length in old_rows:
+
+              assert start==offset
+              assert length>0
+
+              offset+=length
+
+          assert offset==len(payload)
+
+          original_rows=[
+              row for row in old_rows
+              if row[0]==original_key
+          ]
+
+          assert len(original_rows)==1
+
+          _,start,length=original_rows[0]
+
+          assert payload[start:start+length]==raw
+
+          header['files']=old_rows+[
+              [
+                  new_key,
+                  len(payload),
+                  len(new_bytes)
+              ]
+          ]
+
+          new_payload=payload+new_bytes
+
+          new_header=json.dumps(
+              header,
+              ensure_ascii=False,
+              separators=(',',':')
+          ).encode('utf8')
+
+          pack.write_bytes(
+              struct.pack('<I',len(new_header))+
+              new_header+
+              new_payload
+          )
+
+          check_pack=pack.read_bytes()
+
+          check_hlen=struct.unpack_from(
+              '<I',check_pack,0
+          )[0]
+
+          check_header=json.loads(
+              check_pack[
+                  4:4+check_hlen
+              ].decode('utf8')
+          )
+
+          check_payload=check_pack[
+              4+check_hlen:
+          ]
+
+          assert len(
+              check_header['files']
+          )==2293
+
+          assert (
+              check_header['files'][:-1]
+              ==old_rows
+          )
+
+          assert (
+              check_payload[:len(payload)]
+              ==payload
+          )
+
+          assert (
+              check_payload[len(payload):]
+              ==new_bytes
+          )
+
+          pack_digest=hashlib.sha256(
+              check_pack
+          ).hexdigest()[:16]
+
+          print('PASS all 50 packs checked')
+          print('PASS all 2292 original packed resources unchanged')
+          print('PASS inventory skin appended')
 
           mapper=game/'mapping.js'
 
@@ -442,37 +470,114 @@ jobs:
               mapper.read_bytes()
           ).hexdigest()[:16]
 
+          s=mapper.read_text('utf8')
+
+          assert new_key not in s
+
+          old_script_digest='07e7a62cb188150271de853d2d38facf'
+
           script_digest=hashlib.md5(
               (game/'Data/Scripts.rxdata').read_bytes()
           ).hexdigest()
 
-          old_script_digest='07e7a62cb188150271de853d2d38facf'
-
           assert script_digest!=old_script_digest
 
-          s=mapper.read_text('utf8')
+          old_marker=(
+              'Data/Scripts.rxdata?h='+
+              old_script_digest
+          )
 
-          old='Data/Scripts.rxdata?h='+old_script_digest
+          new_marker=(
+              'Data/Scripts.rxdata?h='+
+              script_digest
+          )
 
-          new='Data/Scripts.rxdata?h='+script_digest
+          assert s.count(old_marker)==1
 
-          assert s.count(old)==1
+          s=s.replace(
+              old_marker,
+              new_marker
+          )
 
-          s=s.replace(old,new)
+          entry=json.dumps(
+              [
+                  new_key,
+                  new_rel+'?h='+new_digest
+              ],
+              ensure_ascii=False
+          )
 
-          assert s.count(new)==1
+          anchor='];\n\nvar mapping = {};'
 
-          mapper.write_text(s,'utf8')
+          assert s.count(anchor)==1
+
+          s=s.replace(
+              anchor,
+              entry+',\n'+anchor
+          )
+
+          assert s.count(new_key)==1
+
+          mapper.write_text(
+              s,
+              'utf8'
+          )
 
           mapping_digest=hashlib.sha256(
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          bitmap_digest=hashlib.sha256(
-              (game/'bitmap-map.js').read_bytes()
+          bitmap_map=game/'bitmap-map.js'
+
+          old_bitmap_digest=hashlib.sha256(
+              bitmap_map.read_bytes()
           ).hexdigest()[:16]
 
-          assert bitmap_digest=='30b5b4a619a81d4c'
+          assert old_bitmap_digest=='30b5b4a619a81d4c'
+
+          s=bitmap_map.read_text('utf8')
+
+          assert new_key not in s
+
+          encoded=base64.b64encode(
+              new_bytes
+          ).decode('ascii')
+
+          entry=json.dumps(
+              new_key,
+              ensure_ascii=False
+          )+': '+json.dumps(
+              [
+                  192,
+                  128,
+                  'data:image/png;base64,'+encoded
+              ],
+              ensure_ascii=False
+          )+','
+
+          anchor='\n};'
+
+          assert s.count(anchor)==1
+
+          s=s.replace(
+              anchor,
+              '\n'+entry+anchor
+          )
+
+          assert s.count(new_key)==1
+
+          bitmap_map.write_text(
+              s,
+              'utf8'
+          )
+
+          bitmap_digest=hashlib.sha256(
+              bitmap_map.read_bytes()
+          ).hexdigest()[:16]
+
+          print('PASS native inventory skin mapping')
+          print('PASS full-resolution inventory skin preview')
+          print('PASS no low-resolution frame stretching')
 
           loader=root/'knight/js/sl-assets-v229r115.js'
 
@@ -482,12 +587,25 @@ jobs:
 
           s=loader.read_text('utf8')
 
-          assert s.count(
-              "var version='V4.14';"
-          )==1
+          old_pack_url=(
+              'shared-v229r115.pack?v=V4.14&h='
+              '848a3d863d953bdc'
+          )
+
+          new_pack_url=(
+              'shared-v229r115.pack?v=V4.15&h='
+              +pack_digest
+          )
+
+          assert s.count(old_pack_url)==1
+
+          s=s.replace(
+              old_pack_url,
+              new_pack_url
+          )
 
           assert s.count(
-              'shared-v229r115.pack?v=V4.14&h=848a3d863d953bdc'
+              "var version='V4.14';"
           )==1
 
           s=s.replace(
@@ -495,7 +613,10 @@ jobs:
               "var version='V4.15';"
           )
 
-          loader.write_text(s,'utf8')
+          loader.write_text(
+              s,
+              'utf8'
+          )
 
           loader_digest=hashlib.sha256(
               loader.read_bytes()
@@ -507,31 +628,41 @@ jobs:
 
           references=[
               (
-                  'gameasync/mapping.js?v=v4.14&h='+old_mapping_digest,
-                  'gameasync/mapping.js?v=v4.15&h='+mapping_digest,
+                  'gameasync/mapping.js?v=v4.14&h='+
+                  old_mapping_digest,
+                  'gameasync/mapping.js?v=v4.15&h='+
+                  mapping_digest,
                   1
               ),
               (
-                  'gameasync/bitmap-map.js?v=v4.14&h='+bitmap_digest,
-                  'gameasync/bitmap-map.js?v=v4.15&h='+bitmap_digest,
+                  'gameasync/bitmap-map.js?v=v4.14&h='+
+                  old_bitmap_digest,
+                  'gameasync/bitmap-map.js?v=v4.15&h='+
+                  bitmap_digest,
                   2
               ),
               (
-                  'js/sl-assets-v229r115.js?v=v4.14&h='+old_loader_digest,
-                  'js/sl-assets-v229r115.js?v=v4.15&h='+loader_digest,
+                  'js/sl-assets-v229r115.js?v=v4.14&h='+
+                  old_loader_digest,
+                  'js/sl-assets-v229r115.js?v=v4.15&h='+
+                  loader_digest,
                   1
               )
           ]
 
-          for old,new,count in references:
+          for old_ref,new_ref,count in references:
 
-              assert s.count(old)==count,(
-                  old,s.count(old)
+              assert s.count(old_ref)==count,(
+                  old_ref,
+                  s.count(old_ref)
               )
 
-              s=s.replace(old,new)
+              s=s.replace(
+                  old_ref,
+                  new_ref
+              )
 
-              assert s.count(new)==count
+              assert s.count(new_ref)==count
 
           assert 'V4.14' in s
 
@@ -555,18 +686,24 @@ jobs:
               'utf8'
           )
 
+          assert original.read_bytes()==raw
+
           print('PASS script cache',script_digest)
+          print('PASS inventory skin cache',new_digest)
+          print('PASS shared pack cache',pack_digest)
           print('PASS mapping cache',mapping_digest)
+          print('PASS bitmap cache',bitmap_digest)
           PYTHON
 
-      - name: Verify exact modification scope
+      - name: Verify inventory-only modification
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib, json
+          import hashlib
+          import json
 
           root=Path('site')
 
@@ -581,9 +718,16 @@ jobs:
               if p.is_file()
           }
 
-          assert set(before)==set(after)
+          added=set(after)-set(before)
+          removed=set(before)-set(after)
 
-          assert len(after)==6085
+          assert added=={
+              'knight/gameasync/Graphics/Windowskins/SLInventory.png'
+          }
+
+          assert not removed
+
+          assert len(after)==6086
 
           changed={
               k for k in before
@@ -593,6 +737,8 @@ jobs:
           expected={
               'knight/gameasync/Data/Scripts.rxdata',
               'knight/gameasync/mapping.js',
+              'knight/gameasync/bitmap-map.js',
+              'knight/assets/shared-v229r115.pack',
               'knight/js/sl-assets-v229r115.js',
               'knight/index.html',
               'index.html'
@@ -606,12 +752,32 @@ jobs:
               if k not in expected
           )
 
-          print('PASS 5 modified files')
-          print('PASS 6080 unchanged files')
-          print('PASS original engine preserved')
-          print('PASS original graphics preserved')
-          print('PASS original maps preserved')
-          print('PASS original mobile controls preserved')
+          original_skin=(
+              'knight/gameasync/Graphics/Windowskins/스킨.png'
+          )
+
+          original_inventory=(
+              'knight/gameasync/Graphics/Pictures/아이템창.png'
+          )
+
+          assert (
+              before[original_skin]
+              ==after[original_skin]
+          )
+
+          assert (
+              before[original_inventory]
+              ==after[original_inventory]
+          )
+
+          print('PASS one dedicated inventory skin added')
+          print('PASS seven original files modified')
+          print('PASS 6078 original files unchanged')
+          print('PASS common windowskin unchanged')
+          print('PASS original inventory picture unchanged')
+          print('PASS original equipment windows unchanged')
+          print('PASS original combat and maps unchanged')
+          print('PASS original engine unchanged')
           PYTHON
 
           node --check site/knight/gameasync/mapping.js
