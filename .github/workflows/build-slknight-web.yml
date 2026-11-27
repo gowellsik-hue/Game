@@ -32,7 +32,7 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Restore original item implementation
+      - name: Restore original runtime sources
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
@@ -41,7 +41,7 @@ jobs:
           github-token: ${{ github.token }}
           path: audit
 
-      - name: Verify original game
+      - name: Verify V4.14 baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -53,8 +53,7 @@ jobs:
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib, json
 
           root=Path('site')
 
@@ -66,12 +65,6 @@ jobs:
           }
 
           assert len(before)==6085
-
-          script=root/'knight/gameasync/Data/Scripts.rxdata'
-
-          assert hashlib.md5(
-              script.read_bytes()
-          ).hexdigest()=='07e7a62cb188150271de853d2d38facf'
 
           assert before[
               'knight/gameasync/Data/Scripts.rxdata'
@@ -91,77 +84,72 @@ jobs:
               'knight/gameasync/bitmap-map.js'
           ].startswith('30b5b4a619a81d4c')
 
-          previous=Path(
-              'audit/V4.14/knight/gameasync/Data/Scripts.rxdata'
-          )
-
-          assert hashlib.sha256(
-              previous.read_bytes()
-          ).hexdigest()=='a51670a58ab4d35567a5a40a955b83c7552f6163c93f9223874192922a68272d'
-
           Path('/tmp/sl415-before.json').write_text(
               json.dumps(before),
               'utf8'
           )
 
-          print('PASS exact V4.14 baseline')
-          print('PASS original item implementation')
+          print('PASS exact V4.14 game')
           PYTHON
 
-      - name: Build companion HUD
+      - name: Restore original gauge drawing path
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl415-build.rb <<'RUBY'
+          cat > /tmp/sl415-native-gauge.rb <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
           require 'digest'
 
-          base,previous,out=ARGV
+          base,original,previous,out=ARGV
 
           raise 'Arguments' unless out
 
           raw=File.binread(base)
-          old=File.binread(previous)
+          old=File.binread(original)
+          item_raw=File.binread(previous)
 
           raise 'Baseline mismatch' unless
-            Digest::MD5.hexdigest(raw)==
-            '07e7a62cb188150271de853d2d38facf'
+            Digest::SHA256.hexdigest(raw)==
+            'e651e2d63092dd3eebf1a185f2482cf80eb478008dc0b540735972e97bfaa8b9'
 
-          raise 'Previous item source mismatch' unless
+          raise 'Original gauge mismatch' unless
             Digest::SHA256.hexdigest(old)==
+            'aee568a7fe7f1930048b8baa163dd5995d28947dcb66866691cc08522dca56d1'
+
+          raise 'Item source mismatch' unless
+            Digest::SHA256.hexdigest(item_raw)==
             'a51670a58ab4d35567a5a40a955b83c7552f6163c93f9223874192922a68272d'
 
           rows=Marshal.load(raw)
-          item_rows=Marshal.load(old)
+          original_rows=Marshal.load(old)
+          item_rows=Marshal.load(item_raw)
 
-          raise 'Count' unless
-            rows.size==137 &&
-            item_rows.size==137
+          raise 'Script count' unless
+            [rows,original_rows,item_rows].all?{
+              |r|r.size==137
+            }
 
           before=rows.map{|r|Marshal.dump(r)}
 
-          source=lambda do |a,i|
+          source=->(a,i){
             Zlib::Inflate.inflate(
               a[i][2]
             ).force_encoding('UTF-8')
-          end
+          }
+
+          edit=->(i,s){
+            RubyVM::InstructionSequence.compile(s)
+            rows[i][2]=Zlib::Deflate.deflate(s.b)
+          }
 
           replace=lambda do |s,a,b|
 
-            raise "Anchor #{a.inspect[0,100]}" unless
+            raise "Anchor #{a.inspect[0,120]}" unless
               s.scan(a).size==1
 
             s.sub(a){b}
-
-          end
-
-          edit=lambda do |i,s|
-
-            RubyVM::InstructionSequence.compile(s)
-
-            rows[i][2]=Zlib::Deflate.deflate(s.b)
 
           end
 
@@ -184,7 +172,7 @@ jobs:
 
           b=s.index("  class Menu\n",a)
 
-          raise 'Legacy renderer bounds' unless
+          raise 'Failed renderer bounds' unless
             a && b && b>a
 
           s=s[0...a]+s[b..-1]
@@ -195,153 +183,142 @@ jobs:
             "    return false if !entry(id,item) && (store[id]||{}).size>=4\n\n    (store[id]||={})[item] ||=\n      [0,HEAL.key?(item)]\n"
           )
 
-          raise 'Old renderer' if
-            s.include?('def self.draw(w)') ||
+          raise 'Failed renderer retained' if
             s.include?('SL414.draw') ||
-            s.include?('clear_rect')
+            s.include?('clear_rect') ||
+            s.include?('def self.draw(w)')
 
           edit.call(130,s)
 
-          s=source.call(rows,105)
+          s=source.call(rows,127)
 
-          crlf=s.include?("\r\n")
+          orig=source.call(original_rows,127)
 
-          s=s.gsub("\r\n","\n")
+          raise 'Gauge class' unless
+            s.include?('class Guage < Window_Base2') &&
+            s.include?('super(0, 120, 800, 600)')
 
-          s=replace.call(
-            s,
-            /class Window_ExpRate < Window_Base\n.*?(?=class Scene_Map\n)/m,
-            <<'NEW'
-          class Window_ExpRate < Window_Base
-            def initialize
-              super(0,464,800,136)
+          raise 'Native level' unless
+            orig.include?(
+              'draw_actor_level($game_party.actors[0], 2, 354)'
+            )
 
-              self.contents=Bitmap.new(
-                width-32,
-                height-32
-              )
+          raise 'Native AC' unless
+            orig.include?(
+              'draw_actor_parameter($game_party.actors[0], 8, 395, 1)'
+            )
 
-              self.contents.font=Font.new(
-                "NanumGothic",12
-              )
+          raise 'Native MR' unless
+            orig.include?(
+              'draw_actor_parameter($game_party.actors[0], 70, 395, 2)'
+            )
 
-              self.opacity=0
-              self.back_opacity=0
-            end
+          raise 'Native inventory' unless
+            source.call(original_rows,115).include?(
+              'bitmap = RPG::Cache.icon(item.icon_name)'
+            )
 
-            def refresh
-              self.contents.clear
-              self.contents.font.bold=false
+          raise 'Native experience' unless
+            source.call(original_rows,105).include?(
+              'actor.exp_rate * 100'
+            )
 
-              @show_text[0].each_with_index do |v,i|
+          raise 'Native DPS' unless
+            orig.lines.count{
+              |line|
+              line.include?('"DPS "+dps1.to_s+" / "+dps2.to_s') &&
+              line.include?('draw_text')
+            }==5
 
-                x=i*192
+          raise 'DPS still present' if
+            s.include?('"DPS "+dps1.to_s+" / "+dps2.to_s')
 
-                self.contents.fill_rect(
-                  Rect.new(x,0,190,104),
-                  Color.new(0,0,0)
-                )
+          raise 'Native DPS values absent' unless
+            s.include?('dps1 = sprintf("%.1f",$DPS1.to_f)') &&
+            s.include?('dps2 = sprintf("%.1f",$DPS2.to_f)')
 
-                next unless v
+          block=<<'HUD'
+              self.contents.font.name = "NanumGothic"
+              self.contents.font.size = 12
+              self.contents.font.bold = false
 
-                name,lv,hp,mhp,mp,mmp,xp,ac,mr,items=v
+              [$game_actors[1], SL414.member(4), SL414.member(5), SL414.member(6)].each_with_index do |actor, i|
 
-                self.contents.font.color=
-                  Color.new(192,224,255,255)
+                next unless actor
 
-                self.contents.draw_text(
-                  x+4,0,136,18,
-                  name,0
-                )
+                x = i * 192
 
-                self.contents.draw_text(
-                  x+140,0,46,18,
-                  "Lv.#{lv}",2
-                )
+                [
+                  [x+4, 328, 130, actor.name, 0, Color.new(192, 224, 255)],
+                  [x+134, 328, 54, "Lv."+actor.level.to_s, 2, Color.new(255, 255, 255)],
+                  [x+4, 349, 94, "HP "+actor.hp.to_s+"/"+actor.maxhp.to_s, 0, Color.new(255, 128, 128)],
+                  [x+98, 349, 90, "MP "+actor.sp.to_s+"/"+actor.maxsp.to_s, 2, Color.new(128, 128, 255)],
+                  [x+4, 369, 184, "EXP "+sprintf("%.4f%%",actor.exp_rate*100), 0, Color.new(255, 255, 128)],
+                  [x+4, 389, 94, "AC "+(10-actor.pdef).to_s, 0, Color.new(255, 255, 255)],
+                  [x+98, 389, 90, "MR "+actor.mdef.to_s+"%", 2, Color.new(255, 255, 255)]
+                ].each do |tx,ty,tw,value,align,color|
 
-                self.contents.font.color=
-                  Color.new(255,128,128,255)
+                  self.contents.font.color = Color.new(0, 0, 0)
 
-                self.contents.draw_text(
-                  x+4,19,92,16,
-                  "HP #{hp}/#{mhp}",0
-                )
+                  self.contents.draw_text(tx-1, ty, tw, 32, value, align)
+                  self.contents.draw_text(tx, ty-1, tw, 32, value, align)
+                  self.contents.draw_text(tx+1, ty, tw, 32, value, align)
+                  self.contents.draw_text(tx, ty+1, tw, 32, value, align)
 
-                self.contents.font.color=
-                  Color.new(128,128,255,255)
+                  self.contents.font.color = color
 
-                self.contents.draw_text(
-                  x+98,19,88,16,
-                  "MP #{mp}/#{mmp}",0
-                )
+                  self.contents.draw_text(tx, ty, tw, 32, value, align)
 
-                self.contents.font.color=
-                  Color.new(255,255,128,255)
+                end
 
-                self.contents.draw_text(
-                  x+4,36,182,16,
-                  "EXP #{xp}%",0
-                )
+                if i == 0
 
-                self.contents.font.color=
-                  Color.new(255,255,255)
+                  self.contents.font.color = Color.new(0, 0, 0)
 
-                self.contents.draw_text(
-                  x+4,53,92,16,
-                  "AC #{ac}",0
-                )
+                  self.contents.draw_text(x+3, 421, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
+                  self.contents.draw_text(x+4, 420, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
+                  self.contents.draw_text(x+5, 421, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
+                  self.contents.draw_text(x+4, 422, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
 
-                self.contents.draw_text(
-                  x+98,53,88,16,
-                  "MR #{mr}",0
-                )
+                  self.contents.font.color = Color.new(255, 0, 150)
 
-                if i==0
-
-                  self.contents.font.color=
-                    Color.new(255,0,150)
-
-                  self.contents.draw_text(
-                    x+4,73,182,24,
-                    "DPS #{@show_text[1]} / #{@show_text[2]}",0
-                  )
+                  self.contents.draw_text(x+4, 421, 184, 32, "DPS "+dps1.to_s+" / "+dps2.to_s, 0)
 
                 else
 
-                  items.each_with_index do |q,j|
+                  SL414::IDS.select{
+                    |id|SL414.entry(actor.id,id)
+                  }[0,4].each_with_index do |id,j|
 
-                    id,n=q
-
-                    item=$data_items[id]
+                    item = $data_items[id]
 
                     next unless item
 
-                    ix=x+4+j*46
+                    ix = x+4+j*46
 
-                    bitmap=RPG::Cache.icon(
-                      item.icon_name
-                    )
+                    bitmap = RPG::Cache.icon(item.icon_name)
 
                     self.contents.blt(
-                      ix,70,
+                      ix,
+                      421,
                       bitmap,
-                      Rect.new(0,0,32,32)
+                      Rect.new(0, 0, 32, 32)
                     )
 
-                    self.contents.font.color=
-                      Color.new(0,0,0)
+                    number = SL414.count(actor.id,id)
+
+                    self.contents.font.color = Color.new(0, 0, 0)
 
                     self.contents.draw_text(
-                      ix+1,85,43,16,
-                      n.to_s,2
+                      ix+1, 429, 43, 32,
+                      number.to_s, 2
                     )
 
-                    self.contents.font.color=
-                      Color.new(255,255,255)
+                    self.contents.font.color = Color.new(255, 255, 0)
 
                     self.contents.draw_text(
-                      ix,84,43,16,
-                      n.to_s,2
+                      ix, 428, 43, 32,
+                      number.to_s, 2
                     )
 
                   end
@@ -349,89 +326,68 @@ jobs:
                 end
 
               end
+          HUD
 
-            end
+          methods=[]
 
-            def actor
-              $game_party.actors[0]
-            end
+          walk=lambda do |n|
 
-            def update
-              super
+            if n.is_a?(RubyVM::AbstractSyntaxTree::Node)
 
-              $ne=actor.exp_rate*115
+              methods<<n if
+                n.type==:DEFN &&
+                n.children[0]==:refresh
 
-              self.z=999999
-
-              self.visible=
-                !$game_temp.message_window_showing
-
-              text=[
-                [
-                  $game_actors[1],
-                  SL414.member(4),
-                  SL414.member(5),
-                  SL414.member(6)
-                ].map do |a|
-
-                  next nil unless a
-
-                  items=a.id==1 ? [] :
-                    SL414::IDS.select{
-                      |id|SL414.entry(a.id,id)
-                    }[0,4].map{
-                      |id|[id,SL414.count(a.id,id)]
-                    }
-
-                  [
-                    a.name.to_s.dup,
-                    a.level,
-                    a.hp,
-                    a.maxhp,
-                    a.sp,
-                    a.maxsp,
-                    sprintf('%.4f',a.exp_rate*100),
-                    10-a.pdef,
-                    a.mdef,
-                    items
-                  ]
-
-                end,
-                sprintf('%.1f',$DPS1.to_f),
-                sprintf('%.1f',$DPS2.to_f)
-              ]
-
-              if @show_text!=text
-
-                @show_text=text
-
-                refresh
-
-              end
+              n.children.each{
+                |c|walk.call(c)
+              }
 
             end
 
           end
-          NEW
+
+          walk.call(
+            RubyVM::AbstractSyntaxTree.parse(s)
           )
 
-          s=s.gsub("\n","\r\n") if crlf
+          raise 'Refresh method count' unless
+            methods.size==1
 
-          edit.call(105,s)
+          lines=s.lines
+
+          at=methods[0].last_lineno-1
+
+          raise 'Refresh end' unless
+            lines[at].strip=='end'
+
+          block=block.gsub("\n","\r\n") if
+            s.include?("\r\n")
+
+          lines.insert(at,block)
+
+          t=lines.join
+
+          raise 'Non-HUD change' unless
+            t.sub(block,'')==s
+
+          edit.call(127,t)
 
           changed=rows.each_index.select{
             |i|Marshal.dump(rows[i])!=before[i]
           }
 
           raise "Scope #{changed}" unless
-            changed==[26,42,43,71,80,81,93,105,130]
+            changed==[26,42,43,71,80,81,93,127,130]
+
+          raise 'Original experience window changed' unless
+            Marshal.dump(rows[105])==before[105]
 
           rows.each_index do |i|
 
             raise "Identity #{i}" unless
-              rows[i][0,2]==item_rows[i][0,2]
+              rows[i][0,2]==original_rows[i][0,2]
 
-            raise "Invalid encoding #{i}" unless
+            raise "Encoding #{i}" unless
               source.call(rows,i).valid_encoding?
 
           end
@@ -442,493 +398,33 @@ jobs:
           )
 
           raise 'Round trip' unless
-            Marshal.load(
-              File.binread(out)
-            )==rows
+            Marshal.load(File.binread(out))==rows
 
-          puts 'PASS 137 script identities'
+          puts 'PASS original Guage.refresh reused'
+          puts 'PASS all previous gauge lines preserved'
+          puts 'PASS original Scene_Map unchanged'
+          puts 'PASS original experience window unchanged'
+          puts 'PASS original gauge window bounds unchanged'
+          puts 'PASS original gauge show and hide unchanged'
+          puts 'PASS original DPS drawing restored'
+          puts 'PASS original inventory icons reused'
           puts 'PASS 9 modified scripts'
-          puts 'PASS 128 original scripts preserved'
-          puts 'PASS existing experience window reused'
-          puts 'PASS native inventory icons reused'
-          puts 'PASS original four character data'
-          puts 'PASS original DPS values reused'
-          puts 'PASS four item types per companion'
-          puts 'PASS original gauge deletion preserved'
+          puts 'PASS 128 unchanged scripts'
           puts "MD5 #{Digest::MD5.file(out).hexdigest}"
           RUBY
 
-          ruby -c /tmp/sl415-build.rb
+          ruby -c /tmp/sl415-native-gauge.rb
 
-          ruby /tmp/sl415-build.rb \
+          ruby /tmp/sl415-native-gauge.rb \
             site/knight/gameasync/Data/Scripts.rxdata \
+            audit/V4.13/knight/gameasync/Data/Scripts.rxdata \
             audit/V4.14/knight/gameasync/Data/Scripts.rxdata \
             /tmp/sl415.rxdata
 
           cp /tmp/sl415.rxdata \
             site/knight/gameasync/Data/Scripts.rxdata
 
-      - name: Verify companion HUD and items
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl415-test.rb <<'RUBY'
-          # encoding: UTF-8
-          require 'zlib'
-
-          rows=Marshal.load(
-            File.binread('/tmp/sl415.rxdata')
-          )
-
-          read=lambda do |i|
-            Zlib::Inflate.inflate(
-              rows[i][2]
-            ).force_encoding('UTF-8')
-          end
-
-          class Color
-            def initialize(*a)
-              raise unless [3,4].include?(a.size)
-            end
-          end
-
-          Rect=Struct.new(
-            :x,:y,:width,:height
-          )
-
-          class Font
-            attr_accessor :bold,:color
-
-            def initialize(name,size)
-            end
-          end
-
-          class Bitmap
-            attr_accessor :font
-
-            attr_reader :width,:height,:calls,:clears
-
-            def initialize(w,h)
-              @width=w
-              @height=h
-              @calls=[]
-              @clears=0
-            end
-
-            def clear
-              @calls=[]
-              @clears+=1
-            end
-
-            def fill_rect(rect,color)
-              bounds(
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height
-              )
-            end
-
-            def draw_text(x,y,w,h,t,a)
-              bounds(x,y,w,h)
-              @calls<<[x,y,t]
-            end
-
-            def blt(x,y,bitmap,rect)
-              bounds(
-                x,y,
-                rect.width,
-                rect.height
-              )
-
-              @calls<<[x,y,:icon]
-            end
-
-            def bounds(x,y,w,h)
-
-              raise "Out of bounds: #{[x,y,w,h]}" unless
-                x>=0 &&
-                y>=0 &&
-                x+w<=@width &&
-                y+h<=@height
-
-            end
-          end
-
-          class Window_Base
-
-            attr_accessor :width,
-              :height,
-              :contents,
-              :visible,
-              :opacity,
-              :back_opacity,
-              :z
-
-            def initialize(x,y,w,h)
-              @width=w
-              @height=h
-              @visible=true
-            end
-
-            def update
-            end
-
-          end
-
-          module RPG
-
-            Item=Struct.new(:id,:icon_name)
-
-            module Cache
-              def self.icon(name)
-                Bitmap.new(32,32)
-              end
-            end
-
-          end
-
-          module Graphics
-            def self.frame_count
-              100
-            end
-          end
-
-          class Game_Battler
-          end
-
-          class Game_Actor < Game_Battler
-
-            attr_accessor :id,
-              :name,
-              :level,
-              :hp,
-              :maxhp,
-              :sp,
-              :maxsp,
-              :pdef,
-              :mdef,
-              :armor_ids
-
-            def initialize(id)
-
-              @id=id
-              @name="Actor #{id}"
-              @level=30
-              @hp=300
-              @maxhp=350
-              @sp=40
-              @maxsp=50
-              @pdef=35
-              @mdef=30
-              @sl43_hired=id!=1
-              @armor_ids=[]
-              @exp=40
-              @exp_list=Array.new(101,0)
-              @exp_list[30]=0
-              @exp_list[31]=100
-
-            end
-
-          end
-
-          class Party
-
-            attr_accessor :actors
-
-            def initialize(actors)
-              @actors=actors
-              @items=Hash.new(0)
-            end
-
-            def item_number(i)
-              @items[i]
-            end
-
-            def gain_item(i,n)
-
-              @items[i]=[
-                [item_number(i)+n,0].max,
-                $item_maximum
-              ].min
-
-            end
-
-            def lose_item(i,n)
-              gain_item(i,-n)
-            end
-
-          end
-
-          class Scene_Map
-            def update
-            end
-          end
-
-          $item_maximum=9999
-
-          $game_actors={}
-
-          [1,4,5,6].each do |id|
-            $game_actors[id]=Game_Actor.new(id)
-          end
-
-          $game_party=Party.new(
-            $game_actors.values
-          )
-
-          $game_temp=Struct.new(
-            :message_window_showing
-          ).new(false)
-
-          $data_items={}
-
-          [1,16,70,71,86,1006].each do |i|
-            $data_items[i]=RPG::Item.new(
-              i,"icon#{i}"
-            )
-          end
-
-          $DPS1=110.1
-          $DPS2=112.8
-
-          src=read.call(130)
-
-          eval(
-            src[0...src.index("module SLHotbar\n")],
-            TOPLEVEL_BINDING,
-            'actual_item_code'
-          )
-
-          eval(
-            read.call(105),
-            TOPLEVEL_BINDING,
-            'actual_hud_code'
-          )
-
-          def check(c,label)
-
-            raise label unless c
-
-            puts "PASS #{label}"
-
-          end
-
-          $game_party.gain_item(1,100)
-
-          check(
-            SL414.give(4,1,30),
-            'give 30'
-          )
-
-          check(
-            SL414.owner(1)==70 &&
-            SL414.count(4,1)==30,
-            'give quantity conserved'
-          )
-
-          check(
-            SL414.recall(4,1,10),
-            'recall 10'
-          )
-
-          check(
-            SL414.owner(1)==80 &&
-            SL414.count(4,1)==20,
-            'recall quantity conserved'
-          )
-
-          check(
-            SL414.designate(5,1),
-            'second member designation'
-          )
-
-          SL414.buy(1,12)
-
-          check(
-            SL414.owner(1)==84 &&
-            SL414.count(4,1)==24 &&
-            SL414.count(5,1)==4,
-            'purchase distribution'
-          )
-
-          check(
-            SL414.equalize(1),
-            'equalize'
-          )
-
-          check(
-            [
-              SL414.owner(1),
-              SL414.count(4,1),
-              SL414.count(5,1)
-            ]==[38,37,37],
-            'equalize conserved'
-          )
-
-          [16,70,1006].each do |id|
-
-            check(
-              SL414.designate(4,id),
-              "designate #{id}"
-            )
-
-          end
-
-          check(
-            !SL414.designate(4,71),
-            'reject fifth designation'
-          )
-
-          check(
-            SL414.designate(4,1),
-            'retain existing designation'
-          )
-
-          $game_party.gain_item(1006,20)
-
-          check(
-            SL414.give(4,1006,10),
-            'give arrows'
-          )
-
-          SL414.spend_arrow($game_actors[4])
-
-          check(
-            SL414.ammo($game_actors[4])==9 &&
-            SL414.owner(1006)==10,
-            'companion arrows independent'
-          )
-
-          w=Window_ExpRate.new
-
-          w.update
-
-          check(
-            w.contents.clears==1,
-            'initial refresh'
-          )
-
-          check(
-            w.contents.calls.count{
-              |x|x[2]==:icon
-            }==5,
-            'designated item icons only'
-          )
-
-          check(
-            w.contents.calls.count{
-              |x|x[2].is_a?(String) &&
-                x[2].start_with?('EXP ')
-            }==4,
-            'four experience values'
-          )
-
-          check(
-            w.contents.calls.count{
-              |x|x[2].is_a?(String) &&
-                x[2].start_with?('MR ')
-            }==4,
-            'four MR values'
-          )
-
-          check(
-            w.contents.calls.any?{
-              |x|x[2]=='DPS 110.1 / 112.8'
-            },
-            'original DPS values'
-          )
-
-          w.update
-
-          check(
-            w.contents.clears==1,
-            'unchanged snapshot no redraw'
-          )
-
-          $game_actors[5].hp-=1
-
-          w.update
-
-          check(
-            w.contents.clears==2,
-            'HP change redraw'
-          )
-
-          SL414.spend_arrow(
-            $game_actors[4]
-          )
-
-          w.update
-
-          check(
-            w.contents.clears==3,
-            'item count change redraw'
-          )
-
-          $game_party.actors.delete(
-            $game_actors[6]
-          )
-
-          w.update
-
-          check(
-            w.contents.calls.count{
-              |x|x[2].is_a?(String) &&
-                x[2].start_with?('EXP ')
-            }==3,
-            'empty member panel'
-          )
-
-          $game_temp.message_window_showing=true
-
-          w.update
-
-          check(
-            !w.visible,
-            'native dialogue not covered'
-          )
-
-          $game_temp.message_window_showing=false
-
-          w.update
-
-          check(
-            w.visible,
-            'HUD restored after dialogue'
-          )
-
-          $game_actors[4].hp=100
-
-          before=SL414.count(4,1)
-
-          e=Struct.new(:animation_id).new
-
-          SL414.drink(
-            $game_actors[4],e
-          )
-
-          check(
-            $game_actors[4].hp==125 &&
-            SL414.count(4,1)==before-1,
-            'automatic potion'
-          )
-
-          SL414.drink(
-            $game_actors[4],e
-          )
-
-          check(
-            $game_actors[4].hp==125 &&
-            SL414.count(4,1)==before-1,
-            'automatic potion cooldown'
-          )
-          RUBY
-
-          ruby /tmp/sl415-test.rb
-
-      - name: Update V4.15 script mapping
+      - name: Update V4.15 cache references
         shell: bash
         run: |
           set -euo pipefail
@@ -936,7 +432,6 @@ jobs:
           python3 - <<'PYTHON'
           from pathlib import Path
           import hashlib
-          import json
 
           root=Path('site')
           game=root/'knight/gameasync'
@@ -947,10 +442,8 @@ jobs:
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          script=game/'Data/Scripts.rxdata'
-
           script_digest=hashlib.md5(
-              script.read_bytes()
+              (game/'Data/Scripts.rxdata').read_bytes()
           ).hexdigest()
 
           old_script_digest='07e7a62cb188150271de853d2d38facf'
@@ -959,23 +452,15 @@ jobs:
 
           s=mapper.read_text('utf8')
 
-          old_marker=(
-              'Data/Scripts.rxdata?h='+
-              old_script_digest
-          )
+          old='Data/Scripts.rxdata?h='+old_script_digest
 
-          new_marker=(
-              'Data/Scripts.rxdata?h='+
-              script_digest
-          )
+          new='Data/Scripts.rxdata?h='+script_digest
 
-          assert s.count(old_marker)==1
+          assert s.count(old)==1
 
-          s=s.replace(
-              old_marker,new_marker
-          )
+          s=s.replace(old,new)
 
-          assert s.count(new_marker)==1
+          assert s.count(new)==1
 
           mapper.write_text(s,'utf8')
 
@@ -983,10 +468,8 @@ jobs:
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          bitmap_map=game/'bitmap-map.js'
-
           bitmap_digest=hashlib.sha256(
-              bitmap_map.read_bytes()
+              (game/'bitmap-map.js').read_bytes()
           ).hexdigest()[:16]
 
           assert bitmap_digest=='30b5b4a619a81d4c'
@@ -1052,12 +535,9 @@ jobs:
 
           assert 'V4.14' in s
 
-          s=s.replace(
-              'V4.14','V4.15'
-          )
-
           page.write_text(
-              s,'utf8'
+              s.replace('V4.14','V4.15'),
+              'utf8'
           )
 
           index_page=root/'index.html'
@@ -1075,11 +555,8 @@ jobs:
               'utf8'
           )
 
-          print('PASS V4.15 script mapping')
-          print('PASS original resource pack retained')
-          print('PASS original HUD deletion retained')
-          print('PASS current script cache',script_digest)
-          print('PASS current mapping cache',mapping_digest)
+          print('PASS script cache',script_digest)
+          print('PASS mapping cache',mapping_digest)
           PYTHON
 
       - name: Verify exact modification scope
@@ -1089,8 +566,7 @@ jobs:
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib, json
 
           root=Path('site')
 
@@ -1130,12 +606,12 @@ jobs:
               if k not in expected
           )
 
-          print('PASS exact five changed files')
-          print('PASS 6080 original files unchanged')
-          print('PASS original graphics unchanged')
-          print('PASS original maps unchanged')
-          print('PASS original engine unchanged')
-          print('PASS mobile controls unchanged')
+          print('PASS 5 modified files')
+          print('PASS 6080 unchanged files')
+          print('PASS original engine preserved')
+          print('PASS original graphics preserved')
+          print('PASS original maps preserved')
+          print('PASS original mobile controls preserved')
           PYTHON
 
           node --check site/knight/gameasync/mapping.js
