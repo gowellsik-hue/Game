@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.12 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.13 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -21,17 +21,18 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
     steps:
-      - name: Restore V4.11 game
+      - name: Restore V4.12 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45949620110
+          run-id: 45951348846
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify V4.11 baseline
+      - name: Verify V4.12 baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -58,820 +59,341 @@ jobs:
           assert (
               root/'knight/js/sl-assets-v229r115.js'
           ).read_bytes().count(
-              b"var version='V4.11';"
+              b"var version='V4.12';"
           )==1
 
           for name in ('index.html','knight/index.html'):
-              assert b'V4.11' in (root/name).read_bytes(),name
+              assert b'V4.12' in (root/name).read_bytes(),name
 
-          Path('/tmp/sl412-before.json').write_text(
+          Path('/tmp/sl413-before.json').write_text(
               json.dumps(before,sort_keys=True),'utf8'
           )
 
-          print('PASS V4.11 original files',len(before))
+          print('PASS V4.12 baseline',len(before))
           PYTHON
 
-      - name: Separate native hit effect and party refresh branches
+      - name: Adjust original experience distribution
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl412-patch.rb <<'RUBY'
+          cat > /tmp/sl413-patch.rb <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
 
-          module RPG
-            %w[
-              Map Event EventCommand MoveRoute
-              MoveCommand AudioFile CommonEvent
-            ].each{|n|const_set(n,Class.new)}
-
-            Event.const_set(:Page,Class.new)
-            Event::Page.const_set(:Condition,Class.new)
-            Event::Page.const_set(:Graphic,Class.new)
-          end
-
-          %w[Table Tone Color].each do |n|
-
-            Object.const_set(n,Class.new do
-
-              def self._load(raw)
-                o=allocate
-                o.instance_variable_set(:@raw,raw)
-                o
-              end
-
-              def _dump(depth)
-                @raw
-              end
-
-            end)
-
-          end
-
-          def check(v,msg)
-            raise msg unless v
-          end
-
-          def iv(o,k)
-            o.instance_variable_get(k)
-          end
-
-          def utf(s)
-            s.to_s.dup.force_encoding('UTF-8')
+          def check(ok,msg)
+            raise msg unless ok
           end
 
           def once(s,a,b)
-
             check(
               s.scan(a).size==1,
-              "Anchor #{a.inspect[0,100]}"
+              "Anchor #{a.inspect[0,120]}"
             )
-
             s.sub(a){b}
-
           end
 
-          def patch_party(s)
+          def patch(s)
 
-            a=s[/^  def add_actor\(actor_id\)\n.*?^  end\n/m]
-            b=s[/^  def remove_actor\(actor_id\)\n.*?^  end\n/m]
+            old=s[
+              /^  def self\.distribute_exp\(event,xp,info\)\n.*?^  end\n/m
+            ]
 
-            check(a && b,'Party methods')
+            check(old,'Original distribute_exp')
 
-            x=once(
-              a,
-              '      $game_player.refresh',
-              <<~'SRC'.chomp.gsub(/^/,'      ')
-              if (4..6).include?(actor_id) && @actors[0] && @actors[0].id==1
-                $game_map.need_refresh=true if $game_map
-              else
-                $game_player.refresh
-              end
+            t=once(
+              old,
+              "    base=(xp*20)/100\n",
+              <<~'SRC'.gsub(/^/,'    ')
+              bonus=[0,0,10,16,20][[actors.size,4].min]
+              xp+=xp*bonus/100
+              base=xp/2
             SRC
             )
 
-            y=once(
-              b,
-              '    @actors.delete($game_actors[actor_id])',
-              "    leader=@actors[0]\n    @actors.delete($game_actors[actor_id])"
-            )
+            support=<<~'SRC'.gsub(/^/,'    ')
+              support=actors.select{|a|a.id==3 || a.instance_variable_get(:@slv117_support_member)==true}
+              if !support.empty?
+                bonus=(xp*20)/100
+                support.each{|a|amounts[a.id]+=bonus/support.size}
+                (bonus%support.size).times{|i|amounts[support[i].id]+=1}
+              end
+            SRC
 
-            y=once(
-              y,
-              '    $game_player.refresh',
-              '    $game_player.refresh unless (4..6).include?(actor_id) && leader && leader.id==1'
-            )
+            t=once(t,support,'')
 
-            once(once(s,a,x),b,y)
-
-          end
-
-          def patch_hit(ce)
-
-            hit=ce.fetch(57)
-
-            check(
-              iv(hit,:@trigger)==0,
-              'CE57 trigger'
-            )
-
-            list=iv(hit,:@list)
-
-            before=list.map{|c|Marshal.dump(c)}
-
-            check(
-              list.size==153,
-              "CE57 size #{list.size}"
-            )
-
-            check(
-              iv(list[0],:@code)==111 &&
-              utf(iv(list[0],:@parameters)[1])==
-                '@sl_attack_target && @sl_attack_target[0] == 3',
-              'CE57 condition'
-            )
-
-            check(
-              iv(list[1],:@code)==117 &&
-              iv(list[1],:@parameters)==[137] &&
-              iv(list[1],:@indent)==1,
-              'Old healer effect'
-            )
-
-            check(
-              iv(list[2],:@code)==115 &&
-              iv(list[2],:@indent)==1 &&
-              iv(list[4],:@code)==412,
-              'Existing exit branch'
-            )
-
-            heal=list.each_index.select do |i|
-
-              iv(list[i],:@code)==311 &&
-              iv(list[i],:@parameters)==[0,0,0,120,false]
-
-            end
-
-            check(
-              heal==[142],
-              'CE57 HP command'
-            )
-
-            p=iv(list[0],:@parameters)
-
-            p[1]=p[1].sub('== 3','!= 1')
-
-            iv(list[heal[0]],:@parameters)[0]=1
-
-            check(
-              list.each_index.select{
-                |i|Marshal.dump(list[i])!=before[i]
-              }==[0,142],
-              'CE57 change scope'
-            )
-
-            list.delete_at(1)
-
-            check(
-              list.size==152 &&
-              iv(list[1],:@code)==115,
-              'CE57 old branch removal'
-            )
+            once(s,old,t)
 
           end
 
           if __FILE__==$0
 
-            root=ARGV.fetch(0)
+            file=ARGV.fetch(0)
 
-            pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-            sp=File.join(root,'Scripts.rxdata')
-
-            cp=File.join(
-              root,
-              pre+'CommonEvents.rxdata'
+            rows=Marshal.load(
+              File.binread(file)
             )
-
-            rows=Marshal.load(File.binread(sp))
-            ce=Marshal.load(File.binread(cp))
 
             check(rows.size==137,'Script count')
 
+            idx=rows.each_index.select{
+              |i|rows[i][1].to_s=='V230 Boss Respawn 60s 180s'
+            }
+
+            check(idx==[134],'Reward script identity')
+
+            before=rows.map{|r|Marshal.dump(r)}
+
+            original=Zlib::Inflate.inflate(
+              rows[134][2]
+            ).force_encoding('UTF-8')
+
             check(
-              utf(rows[19][1])=='Game_Party',
-              'Game_Party identity'
+              original.valid_encoding?,
+              'Script encoding'
             )
 
-            oldrows=rows.map{|r|Marshal.dump(r)}
-            oldce=ce.map{|r|Marshal.dump(r)}
+            s=original.gsub("\r\n","\n")
 
-            old=utf(
-              Zlib::Inflate.inflate(rows[19][2])
-            )
+            t=patch(s)
 
-            s=old.gsub("\r\n","\n")
-
-            t=patch_party(s)
+            check(t!=s,'Reward script change')
 
             RubyVM::InstructionSequence.compile(t)
 
-            check(t!=s,'Party change')
-
-            rows[19][2]=Zlib::Deflate.deflate(
+            rows[134][2]=Zlib::Deflate.deflate(
               (
-                old.include?("\r\n") ?
+                original.include?("\r\n") ?
                 t.gsub("\n","\r\n") :
                 t
               ).b
             )
 
-            patch_hit(ce)
-
             check(
               rows.each_index.select{
-                |i|Marshal.dump(rows[i])!=oldrows[i]
-              }==[19],
-              'Other scripts changed'
+                |i|Marshal.dump(rows[i])!=before[i]
+              }==[134],
+              'Script scope'
+            )
+
+            File.binwrite(
+              file,
+              Marshal.dump(rows)
             )
 
             check(
-              ce.each_index.select{
-                |i|Marshal.dump(ce[i])!=oldce[i]
-              }==[57],
-              'Other CE changed'
+              Marshal.dump(
+                Marshal.load(File.binread(file))
+              )==Marshal.dump(rows),
+              'Marshal roundtrip'
             )
 
-            {sp=>rows,cp=>ce}.each do |p,o|
-
-              raw=Marshal.dump(o)
-
-              File.binwrite(p,raw)
-
-              check(
-                Marshal.dump(
-                  Marshal.load(File.binread(p))
-                )==raw,
-                "Roundtrip #{p}"
-              )
-
-            end
-
-            puts 'PASS Game_Party and CE57 only'
+            puts 'PASS only original EXP distribution modified'
 
           end
           RUBY
 
-          ruby -c /tmp/sl412-patch.rb
+          ruby -c /tmp/sl413-patch.rb
 
-          ruby /tmp/sl412-patch.rb site/knight/gameasync/Data
+          ruby /tmp/sl413-patch.rb \
+            site/knight/gameasync/Data/Scripts.rxdata
 
-      - name: Audit original hit and recruitment paths
+      - name: Verify all original experience records
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl412-audit.rb <<'RUBY'
+          cat > /tmp/sl413-test.rb <<'RUBY'
           # encoding: UTF-8
-          require_relative 'sl412-patch'
+          require_relative 'sl413-patch'
 
-          root=ARGV.fetch(0)
-
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          ce=Marshal.load(
-            File.binread(
-              File.join(root,pre+'CommonEvents.rxdata')
-            )
+          rows=Marshal.load(
+            File.binread(ARGV.fetch(0))
           )
 
-          physical=0
-          calls=0
+          s=Zlib::Inflate.inflate(
+            rows[134][2]
+          ).force_encoding('UTF-8').gsub("\r\n","\n")
 
-          ce.compact.each do |e|
+          source=s[/^module SLV541\n.*?^end\n/m]
 
-            list=iv(e,:@list)
+          check(source,'Original reward module')
 
-            refs=list.count do |c|
+          eval(
+            source,
+            TOPLEVEL_BINDING,
+            'SLV541'
+          )
 
-              iv(c,:@code)==117 &&
-              iv(c,:@parameters)==[57]
+          Actor=Struct.new(:id,:hp,:exp)
+          Party=Struct.new(:actors)
 
-            end
+          $game_player=Object.new
+          $game_map=Object.new
+          $game_switches=Hash.new(false)
+          $game_actors={}
 
-            calls+=refs
+          [1,4,5,6].each do |id|
 
-            n=list.count do |c|
-
-              iv(c,:@code)==355 &&
-              iv(c,:@parameters)[0]=='SL49_NPC_PREP'
-
-            end
-
-            next if n==0
-
-            check(
-              n==1 && refs==1,
-              'Physical hit route'
-            )
-
-            check(
-              list.count{
-                |c|iv(c,:@code)==311 &&
-                iv(c,:@parameters)==[1,1,1,26,false]
-              }==1,
-              'Physical HP route'
-            )
-
-            physical+=1
+            $game_actors[id]=Actor.new(id,100,0)
 
           end
 
+          $game_party=Party.new([])
+
+          records=SLV541::DATA.values.flat_map{
+            |m|m.values
+          }
+
           check(
-            physical==69,
-            "Physical CE count #{physical}"
+            records.size==491,
+            'Original reward count'
           )
 
           check(
-            calls==150,
-            "CE57 common calls #{calls}"
+            records.count{|r|r[0]>0}==490,
+            'Positive reward count'
           )
 
-          maps=Dir.glob(
-            File.join(
-              root,
-              pre+'Map[0-9][0-9][0-9].rxdata'
-            )
-          ).sort
+          cases=0
 
-          check(maps.size==46,'Map count')
+          [1,2,3,4].each do |n|
 
-          refs=0
-          recruiters=0
+            actors=[1,4,5,6].first(n).map{
+              |id|$game_actors[id]
+            }
 
-          maps.each do |p|
+            $game_party.actors=actors
 
-            m=Marshal.load(File.binread(p))
+            [
+              Array.new(n,0),
+              Array.new(n,1),
+              [100]+Array.new(n-1,0),
+              [40,30,25,5].first(n)
+            ].each do |weights|
 
-            iv(m,:@events).each_value do |e|
+              records.each do |info|
 
-              recruiters+=1 if
-                utf(iv(e,:@name))=='[ID고용사]'
+                actors.each{|a|a.exp=0}
 
-              iv(e,:@pages).each do |page|
+                ledger={}
 
-                refs+=iv(page,:@list).count do |c|
+                actors.each_with_index do |a,i|
 
-                  iv(c,:@code)==117 &&
-                  iv(c,:@parameters)==[57]
+                  ledger[a.id]=weights[i]
 
                 end
 
-              end
-            end
-          end
-
-          check(
-            refs==27,
-            "CE57 map calls #{refs}"
-          )
-
-          check(
-            recruiters==9,
-            "Recruiter count #{recruiters}"
-          )
-
-          puts 'PASS 69 physical CEs'
-          puts 'PASS all 177 CE57 calls'
-          puts 'PASS 46 maps and 9 recruiters'
-          RUBY
-
-          ruby -c /tmp/sl412-audit.rb
-
-          ruby /tmp/sl412-audit.rb site/knight/gameasync/Data
-
-      - name: Verify original player and companion hit branches
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl412-test.rb <<'RUBY'
-          # encoding: UTF-8
-          require_relative 'sl412-patch'
-
-          root=ARGV.fetch(0)
-
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          rows=Marshal.load(
-            File.binread(
-              File.join(root,'Scripts.rxdata')
-            )
-          )
-
-          ce=Marshal.load(
-            File.binread(
-              File.join(root,pre+'CommonEvents.rxdata')
-            )
-          )
-
-          class RPG::EventCommand
-            attr_reader :code,:parameters,:indent
-          end
-
-          def native(rows,i,name)
-
-            s=utf(
-              Zlib::Inflate.inflate(rows[i][2])
-            ).gsub("\r\n","\n")
-
-            nodes=[]
-
-            walk=lambda do |node|
-
-              if node.is_a?(RubyVM::AbstractSyntaxTree::Node)
-
-                nodes<<node if
-                  node.type==:DEFN &&
-                  node.children[0]==name.to_sym
-
-                node.children.each{
-                  |child|walk.call(child)
-                }
-
-              end
-
-            end
-
-            walk.call(
-              RubyVM::AbstractSyntaxTree.parse(s)
-            )
-
-            check(
-              nodes.size==1,
-              "Missing or duplicate #{i}:#{name}"
-            )
-
-            n=nodes[0]
-
-            s.lines[
-              (n.first_lineno-1)..(n.last_lineno-1)
-            ].join
-
-          end
-
-          class Game_Party
-            attr_reader :actors
-          end
-
-          class Game_Player
-          end
-
-          class Interpreter
-          end
-
-          class Game_Event
-          end
-
-          %w[
-            add_actor remove_actor all_dead?
-          ].each do |n|
-
-            Game_Party.class_eval(
-              native(rows,19,n)
-            )
-
-          end
-
-          Game_Player.class_eval(
-            native(rows,27,'refresh')
-          )
-
-          {
-            69=>%w[iterate_actor],
-            70=>%w[command_end command_skip operate_value],
-            71=>%w[command_111 command_115],
-            74=>%w[command_311]
-          }.each do |i,ns|
-
-            ns.each do |n|
-
-              Interpreter.class_eval(
-                native(rows,i,n)
-              )
-
-            end
-          end
-
-          Actor=Struct.new(
-            :id,:hp,:character_name,:character_hue
-          )
-
-          $game_actors={}
-
-          [1,4,5,6,7].each do |i|
-
-            $game_actors[i]=Actor.new(
-              i,500,"actor#{i}",0
-            )
-
-          end
-
-          $game_party=Game_Party.new
-
-          $game_party.instance_variable_set(
-            :@actors,
-            [$game_actors[1]]
-          )
-
-          $game_player=Game_Player.new
-
-          $game_player.instance_variable_set(
-            :@character_name,
-            'Existing transformed graphic'
-          )
-
-          $game_player.instance_variable_set(
-            :@character_hue,47
-          )
-
-          $game_player.instance_variable_set(
-            :@opacity,173
-          )
-
-          $game_player.instance_variable_set(
-            :@blend_type,1
-          )
-
-          $game_player.instance_variable_set(
-            :@move_speed,5
-          )
-
-          $game_switches=Hash.new(false)
-
-          $game_map=Struct.new(:need_refresh).new(false)
-
-          $game_temp=Struct.new(:gameover).new(false)
-
-          $game_variables=Hash.new(0)
-
-          $game_variables[26]=17
-
-          module Graphics
-
-            def self.frame_count
-              411
-            end
-
-          end
-
-          module SL411
-
-            @events={
-              4=>Game_Event.new,
-              5=>Game_Event.new,
-              6=>Game_Event.new
-            }
-
-            def self.member_event(id,alive=true)
-              @events[id]
-            end
-
-          end
-
-          visual=Marshal.dump($game_player)
-
-          [4,5,6].each do |id|
-
-            $game_party.add_actor(id)
-
-            check(
-              $game_party.actors.include?($game_actors[id]),
-              "Hire #{id}"
-            )
-
-            check(
-              Marshal.dump($game_player)==visual,
-              "Hire #{id} changed player"
-            )
-
-          end
-
-          [4,5,6].each do |id|
-
-            $game_party.remove_actor(id)
-
-            check(
-              !$game_party.actors.include?($game_actors[id]),
-              "Remove #{id}"
-            )
-
-            check(
-              Marshal.dump($game_player)==visual,
-              "Remove #{id} changed player"
-            )
-
-            $game_party.add_actor(id)
-
-            check(
-              Marshal.dump($game_player)==visual,
-              "Rehire #{id} changed player"
-            )
-
-          end
-
-          puts 'PASS hire, removal and rehire preserve player state'
-
-          list=iv(ce[57],:@list)
-
-          [nil,1,0,3,4,5,6].each do |id|
-
-            it=Interpreter.new
-
-            it.instance_variable_set(:@main,false)
-
-            it.instance_variable_set(:@list,list)
-
-            it.instance_variable_set(:@index,0)
-
-            it.instance_variable_set(:@branch,{})
-
-            it.instance_variable_set(
-              :@sl_attack_target,
-              id.nil? ? nil : [id,3,5]
-            )
-
-            it.instance_variable_set(
-              :@parameters,
-              list[0].parameters
-            )
-
-            check(
-              it.command_111,
-              'CE57 native branch'
-            )
-
-            if id.nil? || id==1
-
-              check(
-                list[iv(it,:@index)+1].code==412,
-                'Player bypass old exit branch'
-              )
-
-            else
-
-              check(
-                iv(it,:@index)==0 &&
-                list[1].code==115,
-                'Nonplayer exit'
-              )
-
-              it.command_115
-
-              check(
-                iv(it,:@list).nil?,
-                'Native exit terminates hit CE'
-              )
-
-            end
-          end
-
-          puts 'PASS CE57 player hit visual isolation'
-
-          [1,4,5,6,0].each do |id|
-
-            [1,4,5,6].each do |a|
-
-              $game_actors[a].hp=500
-
-              e=SL411.member_event(a)
-
-              e.instance_variable_set(
-                :@sl411_hit_at,nil
-              ) if e
-
-            end
-
-            it=Interpreter.new
-
-            it.instance_variable_set(
-              :@sl_attack_target,
-              [id,3,5]
-            )
-
-            it.instance_variable_set(
-              :@parameters,
-              [1,1,1,26,false]
-            )
-
-            check(
-              it.command_311,
-              'HP command'
-            )
-
-            [1,4,5,6].each do |a|
-
-              check(
-                $game_actors[a].hp==
-                  (a==id ? 483 : 500),
-                "Damage crossed actor #{id}:#{a}"
-              )
-
-              e=SL411.member_event(a)
-
-              if e
-
-                check(
-                  iv(e,:@sl411_hit_at)==
-                    (a==id ? 411 : nil),
-                  "Visual crossed actor #{id}:#{a}"
+                $game_map.instance_variable_set(
+                  :@slv117_damage,
+                  {info[6]=>ledger}
                 )
 
+                xp=info[0]
+
+                SLV541.distribute_exp(nil,xp,info)
+
+                total=xp+xp*[0,10,16,20][n-1]/100
+
+                check(
+                  actors.inject(0){|v,a|v+a.exp}==total,
+                  "Total #{n}:#{xp}"
+                )
+
+                base=total/2
+
+                if n>1
+
+                  check(
+                    actors.all?{|a|a.exp>=base/n},
+                    'Equal pool floor'
+                  )
+
+                  if weights.all?{|w|w==0}
+
+                    check(
+                      actors.first.exp>=total-base+base/n,
+                      'No-ledger leader fallback'
+                    )
+
+                  end
+
+                else
+
+                  check(
+                    actors.first.exp==xp,
+                    'Solo unchanged'
+                  )
+
+                end
+
+                cases+=1
+
               end
-            end
-          end
-
-          puts 'PASS native HP and companion hit marker isolation'
-
-          heal=list.find{|c|c.code==311}
-
-          check(
-            heal.parameters==[1,0,0,120,false],
-            'Hero heal only'
-          )
-
-          [nil,1].each do |id|
-
-            [1,4,5,6].each do |a|
-
-              $game_actors[a].hp=500
 
             end
 
-            it=Interpreter.new
-
-            it.instance_variable_set(
-              :@sl_attack_target,
-              id ? [id] : nil
-            )
-
-            it.instance_variable_set(
-              :@parameters,
-              heal.parameters
-            )
-
-            it.command_311
-
-            check(
-              [1,4,5,6].map{
-                |a|$game_actors[a].hp
-              }==[620,500,500,500],
-              'Hero CE effect changed companion HP'
-            )
-
           end
 
-          puts 'PASS original CE57 heal restricted to hero'
+          actors=[1,4,5,6].map{
+            |id|$game_actors[id]
+          }
 
-          $game_party.add_actor(7)
+          $game_party.actors=actors
+
+          info=[1000,0,nil,nil,1,0,9999]
+
+          actors.each{|a|a.exp=0}
+
+          actors.last.instance_variable_set(
+            :@slv117_support_member,true
+          )
+
+          $game_map.instance_variable_set(
+            :@slv117_damage,
+            {
+              9999=>{
+                1=>40,
+                4=>30,
+                5=>25,
+                6=>5
+              }
+            }
+          )
+
+          SLV541.distribute_exp(nil,1000,info)
 
           check(
-            $game_player.instance_variable_get(
-              :@character_name
-            )=='actor1',
-            'Other actor refresh preserved'
+            actors.map{|a|a.exp}==[390,330,300,180],
+            'Exact 4-person 50:50 distribution; no obsolete bonus'
           )
 
-          puts 'PASS non-target party refresh retained'
+          actors.each{|a|a.exp=0}
 
-          $game_party.instance_variable_set(
-            :@actors,
-            [$game_actors[4],$game_actors[1]]
-          )
+          actors.last.hp=0
 
-          $game_player.instance_variable_set(
-            :@character_name,
-            'Companion leader'
-          )
-
-          $game_party.remove_actor(4)
+          SLV541.distribute_exp(nil,1000,info)
 
           check(
-            $game_player.instance_variable_get(
-              :@character_name
-            )=='actor1',
-            'Leader change refresh preserved'
+            actors.last.exp==0 &&
+            actors.inject(0){|v,a|v+a.exp}==1160,
+            'Dead actor excluded from original membership'
           )
 
-          puts 'PASS actual leader change still refreshes player'
+          check(cases==7856,'Full reward test count')
+
+          puts "PASS #{cases} reward tests across all 491 records"
+          puts 'PASS exact 4-person distribution'
+          puts 'PASS no duplicate legacy bonus'
+          puts 'PASS dead-member exclusion'
           RUBY
 
-          ruby -c /tmp/sl412-test.rb
+          ruby -c /tmp/sl413-test.rb
 
-          ruby /tmp/sl412-test.rb site/knight/gameasync/Data
+          ruby /tmp/sl413-test.rb \
+            site/knight/gameasync/Data/Scripts.rxdata
 
-      - name: Update original checksums and verify exact V4.12 scope
+      - name: Update original checksum and verify V4.13 scope
         shell: bash
         run: |
           set -euo pipefail
@@ -881,62 +403,51 @@ jobs:
           import hashlib,json,re
 
           root=Path('site')
-          game=root/'knight/gameasync'
 
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+          mapper=root/'knight/gameasync/mapping.js'
+
+          script=root/'knight/gameasync/Data/Scripts.rxdata'
 
           before=json.loads(
-              Path('/tmp/sl412-before.json').read_text('utf8')
+              Path('/tmp/sl413-before.json').read_text('utf8')
           )
 
-          mapper=game/'mapping.js'
+          old=before[
+              script.relative_to(root).as_posix()
+          ]['md5']
+
+          new=hashlib.md5(
+              script.read_bytes()
+          ).hexdigest()
 
           s=mapper.read_text('utf8')
 
-          for name in (
-              'Scripts.rxdata',
-              pre+'CommonEvents.rxdata'
-          ):
+          marker='Data/Scripts.rxdata?h='
 
-              p=game/'Data'/name
+          assert old!=new
 
-              key=p.relative_to(root).as_posix()
+          assert re.findall(
+              re.escape(marker)+r'[0-9a-f]{32}',
+              s
+          )==[marker+old]
 
-              old=before[key]['md5']
-
-              new=hashlib.md5(
-                  p.read_bytes()
-              ).hexdigest()
-
-              marker='Data/'+name+'?h='
-
-              pattern=re.escape(marker)+r'[0-9a-f]{32}'
-
-              assert old!=new,name
-
-              assert re.findall(
-                  pattern,s
-              )==[marker+old],name
-
-              s=s.replace(
-                  marker+old,
-                  marker+new
-              )
-
-          mapper.write_text(s,'utf8')
+          mapper.write_text(
+              s.replace(marker+old,marker+new),
+              'utf8'
+          )
 
           loader=root/'knight/js/sl-assets-v229r115.js'
 
           s=loader.read_bytes()
 
           assert s.count(
-              b"var version='V4.11';"
+              b"var version='V4.12';"
           )==1
 
           loader.write_bytes(
               s.replace(
-                  b"var version='V4.11';",
-                  b"var version='V4.12';"
+                  b"var version='V4.12';",
+                  b"var version='V4.13';"
               )
           )
 
@@ -946,11 +457,11 @@ jobs:
 
               s=p.read_bytes()
 
-              assert b'V4.11' in s,name
+              assert b'V4.12' in s,name
 
               p.write_bytes(
-                  s.replace(b'V4.11',b'V4.12')
-                   .replace(b'v4.11',b'v4.12')
+                  s.replace(b'V4.12',b'V4.13')
+                   .replace(b'v4.12',b'v4.13')
               )
 
           after={
@@ -961,7 +472,7 @@ jobs:
 
           assert len(after)==6085
 
-          assert set(before)==set(after)
+          assert set(after)==set(before)
 
           changed={
               k for k in before
@@ -970,7 +481,6 @@ jobs:
 
           allowed={
               'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/Data/'+pre+'CommonEvents.rxdata',
               'knight/gameasync/mapping.js',
               'knight/js/sl-assets-v229r115.js',
               'index.html',
@@ -979,20 +489,18 @@ jobs:
 
           assert changed==allowed,sorted(changed^allowed)
 
-          print('PASS two data files modified')
-          print('PASS four checksum and version files updated')
-          print('PASS 6079 unchanged files')
-          print('PASS all original maps preserved')
-          print('PASS all original SPR graphics preserved')
-          print('PASS original L1J attack calculations preserved')
-          print('PASS original movement and collision preserved')
-          print('PASS V4.12 candidate')
+          print('PASS only EXP script, checksum and version files changed')
+          print('PASS 50 percent equal distribution')
+          print('PASS 50 percent damage contribution')
+          print('PASS party bonuses 0, 10, 16, 20 percent')
+          print('PASS 6080 unchanged files')
+          print('PASS V4.13 candidate')
           PYTHON
 
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Upload V4.12 candidate
+      - name: Upload V4.13 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -1004,6 +512,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - uses: actions/deploy-pages@v5
         id: deployment
