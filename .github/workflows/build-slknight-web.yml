@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.9 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.10 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -23,141 +23,122 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Restore V4.8 game
+      - name: Restore V4.9 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45919348509
+          run-id: 45925114157
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Retrieve frozen original combat source
-        uses: actions/checkout@v4
-        with:
-          repository: gowellsik-hue/Game
-          ref: e25068012e029a4d3704c8f9cb0afc683c99ce03
-          path: frozen-v49
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Retrieve frozen startup correction
-        uses: actions/checkout@v4
-        with:
-          repository: gowellsik-hue/Game
-          ref: d66584ceb073a023e63e4b2a7bac0f9093edf594
-          path: frozen-boot
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Verify frozen sources
+      - name: Verify V4.9 baseline
         shell: bash
         run: |
           set -euo pipefail
 
-          test "$(git -C frozen-v49 rev-parse HEAD)" = \
-            "e25068012e029a4d3704c8f9cb0afc683c99ce03"
+          test -s baseline/artifact.tar
+          mkdir -p site
+          tar -xf baseline/artifact.tar -C site
 
-          test "$(git -C frozen-v49 rev-parse HEAD:.github/workflows/build-slknight-web.yml)" = \
-            "afabbb2ae261596e670b1509d92c1d245aeca319"
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import hashlib,json,re
 
-          test "$(git -C frozen-boot rev-parse HEAD)" = \
-            "d66584ceb073a023e63e4b2a7bac0f9093edf594"
+          root=Path('site')
+          game=root/'knight/gameasync'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          test "$(git -C frozen-boot rev-parse HEAD:.github/workflows/build-slknight-web.yml)" = \
-            "923ce37bfd980ef9efc27bdf81fe1b6c3772d904"
-
-          ruby -ryaml - <<'RUBY'
-          source='frozen-boot/.github/workflows/build-slknight-web.yml'
-
-          workflow=YAML.safe_load(
-            File.read(source,encoding:'UTF-8')
-          )
-
-          steps=workflow.fetch('jobs').fetch('build').fetch('steps')
-
-          wanted={
-            'Verify and extract original patch steps'=>'extract',
-            'Verify V4.8 baseline'=>'baseline',
-            'Prepare original L1J monster traits'=>'traits',
-            'Prepare original physical combat runtime'=>'runtime',
-            'Separate monster data from startup compilation'=>'boot',
-            'Apply corrected physical combat patch'=>'apply',
-            'Merge traits into existing MonsterStats data'=>'merge',
-            'Verify startup data access and combat runtime'=>'startup',
-            'Update mapping verification for separated data'=>'mapping_prepare',
-            'Update data mappings and version'=>'mapping',
-            'Verify exact combat changes'=>'verify',
-            'Verify final startup script and original engine'=>'final'
+          before={
+              str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in root.rglob('*') if p.is_file()
           }
 
-          wanted.each do |name,key|
-            matches=steps.select{|s|s['name']==name}
+          assert len(before)==6033,len(before)
 
-            raise "Missing source step #{name}" unless matches.size==1
+          loader=root/'knight/js/sl-assets-v229r115.js'
 
-            run=matches.first.fetch('run')
+          assert loader.read_bytes().count(
+              b"var version='V4.9';"
+          )==1
 
-            raise "Empty source step #{name}" unless
-              run.is_a?(String) && !run.empty?
+          mapping=(game/'mapping.js').read_bytes()
+          md5={}
 
-            File.binwrite("/tmp/sl49-source-#{key}.sh",run)
-          end
+          for mid in (29,47,48,49,50):
+              name=pre+f'Map{mid:03d}.rxdata'
+              p=game/'Data'/name
 
-          puts 'PASS frozen source workflows'
-          RUBY
+              digest=hashlib.md5(p.read_bytes()).hexdigest()
 
-          for name in extract baseline traits runtime boot apply merge startup mapping_prepare mapping verify final; do
-            bash -n "/tmp/sl49-source-${name}.sh"
-          done
+              marker=('Data/'+name+'?h=').encode('ascii')
 
-      - name: Reconstruct corrected V4.9 from V4.8
+              assert re.findall(
+                  re.escape(marker)+rb'[0-9a-f]{32}',
+                  mapping
+              )==[marker+digest.encode('ascii')],name
+
+              md5[name]=digest
+
+          Path('/tmp/sl410-before.json').write_text(
+              json.dumps(before,sort_keys=True),'utf8'
+          )
+
+          Path('/tmp/sl410-md5.json').write_text(
+              json.dumps(md5,sort_keys=True),'utf8'
+          )
+
+          print('PASS V4.9 baseline',len(before))
+          print('PASS original five map mappings')
+          PYTHON
+
+      - name: Clone existing recruiter into town centers
         shell: bash
         run: |
           set -euo pipefail
 
-          for name in extract baseline traits runtime boot apply merge startup mapping_prepare; do
-            bash "/tmp/sl49-source-${name}.sh"
-          done
-
-      - name: Replace repeated combat eval with native interpreter execution
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl49-direct.rb <<'RUBY'
+          cat > /tmp/sl410-recruiters.rb <<'RUBY'
           # encoding: UTF-8
-          require 'zlib'
           require 'json'
-          require 'digest'
 
           module RPG
             %w[
               Map MapInfo Event EventCommand MoveRoute
-              MoveCommand AudioFile CommonEvent Weapon
-            ].each{|n|const_set(n,::Class.new)}
+              MoveCommand AudioFile CommonEvent Tileset
+            ].each{|n|const_set(n,Class.new)}
 
-            Event.const_set(:Page,::Class.new)
-            Event::Page.const_set(:Condition,::Class.new)
-            Event::Page.const_set(:Graphic,::Class.new)
+            Event.const_set(:Page,Class.new)
+            Event::Page.const_set(:Condition,Class.new)
+            Event::Page.const_set(:Graphic,Class.new)
           end
 
-          %w[Table Tone Color].each do |n|
-            Object.const_set(n,Class.new do
+          %w[Table Tone Color].each do |name|
+            Object.const_set(name,Class.new do
               def self._load(raw)
                 o=allocate
                 o.instance_variable_set(:@raw,raw)
                 o
               end
 
-              def _dump(d)
+              def _dump(depth)
                 @raw
               end
             end)
           end
 
-          def check(v,msg)
-            raise msg unless v
+          class Table
+            def get(x,y=0,z=0)
+              w,h,d=@raw.unpack('V5')[1,3]
+
+              return nil unless
+                x.between?(0,w-1) &&
+                y.between?(0,h-1) &&
+                z.between?(0,d-1)
+
+              @cells ||= @raw.byteslice(20..-1).unpack('v*')
+
+              @cells[x+y*w+z*w*h]
+            end
           end
 
           def iv(o,k)
@@ -168,639 +149,486 @@ jobs:
             s.to_s.dup.force_encoding('UTF-8')
           end
 
-          def once(s,a,b)
-            check(s.scan(a).size==1,"Anchor #{a.inspect}")
-            s.sub(a){b}
+          def check(ok,msg)
+            raise msg unless ok
+          end
+
+          def lists(m)
+            iv(m,:@events).values.flat_map do |e|
+              iv(e,:@pages).map{|p|iv(p,:@list)}
+            end
+          end
+
+          def passable(m,tiles,x,y,d)
+            return false unless
+              x.between?(0,iv(m,:@width)-1) &&
+              y.between?(0,iv(m,:@height)-1)
+
+            ts=tiles.fetch(iv(m,:@tileset_id))
+            bit=(1<<(d/2-1))&15
+
+            [2,1,0].each do |z|
+              id=iv(m,:@data).get(x,y,z)
+
+              return false if id.nil?
+
+              p=iv(ts,:@passages).get(id)
+              q=iv(ts,:@priorities).get(id)
+
+              return false if
+                p.nil? ||
+                q.nil? ||
+                (p&bit)!=0 ||
+                (p&15)==15
+
+              return true if q==0
+            end
+
+            true
           end
 
           root=ARGV.fetch(0)
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           path=->(n){File.join(root,pre+n+'.rxdata')}
-
-          counts=Hash.new(0)
-          updates={}
+          read=->(n){Marshal.load(File.binread(path.call(n)))}
 
           files=Dir.glob(
             path.call('Map[0-9][0-9][0-9]')
-          ).sort+[path.call('CommonEvents')]
+          ).sort
 
-          check(files.size==47,'Map and CE count')
+          check(files.size==46,'Map count')
 
-          files.each do |f|
-            o=Marshal.load(File.binread(f))
-
-            lists=if f.end_with?('CommonEvents.rxdata')
-              o.compact.map{|e|iv(e,:@list)}
-            else
-              iv(o,:@events).values.flat_map do |e|
-                iv(e,:@pages).map{|p|iv(p,:@list)}
-              end
-            end
-
-            n=0
-
-            lists.each do |list|
-              list.each do |c|
-                p=iv(c,:@parameters)
-                code=iv(c,:@code)
-
-                next unless [111,355].include?(code)
-
-                s=code==355 ? p[0] :
-                  p[0]==12 ? p[1] : nil
-
-                next unless s.is_a?(String) &&
-                  (s.include?('@sl49_') || s.include?('SL49.'))
-
-                s=utf(s)
-
-                out=nil
-                new_code=code
-                tag=nil
-
-                if code==355
-                  case s
-
-                  when /\Aa=\$game_actors\[1\]; w=SL49\.weapon\(a\); @sl49_active=!w\.nil\?; if @sl49_active; @sl49_damage=SL49\.pc_attack\(a,(\d+),(\d+),w\); else; (\$game_variables\[334\]=a\.agi; )?\$game_variables\[335\]=(-?\d+)\+rand\((\d+)\); \$game_map\.need_refresh=true; end; true\z/
-
-                    mid=$1.to_i
-                    eid=$2.to_i
-                    agi=!$3.nil?
-                    lo=$4.to_i
-                    span=$5.to_i
-
-                    out=[
-                      'SL49_PC_PREP',
-                      mid,eid,agi,lo,span
-                    ]
-
-                    tag=:pc_prep
-
-                  when /\ASL49\.apply_damage\((\d+),(\d+),(\d+),@sl49_damage\) if @sl49_active; @sl49_active=false; true\z/
-
-                    out=[
-                      'SL49_PC_DONE',
-                      $1.to_i,$2.to_i,$3.to_i
-                    ]
-
-                    tag=:pc_done
-
-                  when /\A@sl49_npc=SL49\.npc_context\(@event_id,@sl_attack_target,(\d+)\); if @sl49_npc; @sl49_nhit=SL49\.npc_hit\(@sl49_npc\); else; \$game_variables\[336\]=(-?\d+)\+rand\((\d+)\); \$game_map\.need_refresh=true; end; true\z/
-
-                    out=[
-                      'SL49_NPC_PREP',
-                      $1.to_i,$2.to_i,$3.to_i
-                    ]
-
-                    tag=:npc_prep
-
-                  when /\Aunless (@sl49_active|@sl49_npc); @parameters=(\[[\d, \-]+\]); command_122; end; true\z/
-
-                    pc=$1=='@sl49_active'
-                    legacy=JSON.parse($2)
-
-                    check(
-                      legacy.size>=5 &&
-                      legacy.size<=6 &&
-                      legacy.all?{|v|v.is_a?(Integer)},
-                      'Legacy parameters'
-                    )
-
-                    out=legacy+[
-                      pc ? :sl49_pc_legacy : :sl49_npc_legacy
-                    ]
-
-                    new_code=122
-                    tag=pc ? :pc_legacy : :npc_legacy
-                  end
-
-                else
-
-                  case s
-
-                  when '@sl49_active ? !@sl49_damage.nil? : $game_variables[334] >= $game_variables[335]'
-
-                    out=[49]
-                    tag=:pc_hit
-
-                  when '@sl49_npc ? @sl49_nhit : $game_variables[336] >= $game_variables[337]'
-
-                    out=[50]
-                    tag=:npc_hit
-
-                  when 'if @sl49_npc; $game_variables[26]=SL49.npc_damage(@sl49_npc); end; $game_variables[26]<=0'
-
-                    out=[51]
-                    tag=:npc_zero
-                  end
-
-                end
-
-                check(out,"Unrecognized V4.9 command #{s}")
-
-                c.instance_variable_set(:@code,new_code)
-                c.instance_variable_set(:@parameters,out)
-
-                counts[tag]+=1
-                n+=1
-              end
-            end
-
-            updates[f]=o if n>0
+          maps=files.to_h do |f|
+            [
+              f[/Map(\d+)\.rxdata$/,1].to_i,
+              Marshal.load(File.binread(f))
+            ]
           end
 
-          expected={
-            pc_prep:1696,
-            pc_hit:1696,
-            pc_done:1696,
-            pc_legacy:6291,
-            npc_prep:69,
-            npc_hit:69,
-            npc_zero:69,
-            npc_legacy:203
-          }
+          ce=read.call('CommonEvents')
+          tiles=read.call('Tilesets')
+          stats=read.call('MonsterStats')
 
-          check(counts==expected,"Coverage #{counts.inspect}")
-          check(updates.size==36,'Data routes count')
-
-          sp=File.join(root,'Scripts.rxdata')
-
-          rows=Marshal.load(File.binread(sp))
-          oldrows=rows.map{|r|Marshal.dump(r)}
-
-          edit=lambda do |name,&block|
-            r=rows.select{|x|x && utf(x[1])==name}
-
-            check(r.size==1,name)
-
-            r=r[0]
-
-            old=utf(Zlib::Inflate.inflate(r[2]))
-            s=old.gsub("\r\n","\n")
-
-            t=block.call(s)
-
-            RubyVM::InstructionSequence.compile(t)
-
-            t=t.gsub("\n","\r\n") if old.include?("\r\n")
-
-            check(t!=old,name)
-
-            r[2]=Zlib::Deflate.deflate(t)
-          end
-
-          weapons=Marshal.load(
-            File.binread(path.call('Weapons'))
-          )
-
-          edit.call('Interpreter 3') do |s|
-
-            a=s.index("  WEAPONS={\n")
-            b=s.index("\n  STR_HIT=",a||0)
-
-            check(a && b,'Weapon table')
-
-            original=s[a...b]
-
-            specs=eval(original.split('=',2)[1])
-
-            check(
-              specs.is_a?(Hash) &&
-              specs.size==27,
-              'Original weapon definitions'
-            )
-
-            values=specs.values.uniq
-
-            ids=[]
-            missing=[]
-            total=0
-
-            weapons.each_with_index do |w,id|
-              next if w.nil?
-
-              total+=1
-
-              name=utf(iv(w,:@name)).strip
-
-              en=name[/^\+(\d+)\s+/,1].to_i
-
-              base=name.sub(/^\+\d+\s+/,'')
-
-              spec=specs[base]
-
-              if spec
-                ids<<[id,values.index(spec),en]
-              else
-                missing<<id
-              end
+          recruiters=maps.flat_map do |mid,m|
+            iv(m,:@events).filter_map do |id,e|
+              [mid,id] if utf(iv(e,:@name))=='[ID고용사]'
             end
-
-            check(
-              ids.size+missing.size==total &&
-              ids.map(&:first).uniq.size==ids.size,
-              'Weapon ID coverage'
-            )
-
-            check(
-              [170,1000,1001,1002].all?{
-                |id|ids.any?{|r|r[0]==id}
-              },
-              'Starter weapon IDs'
-            )
-
-            direct={0=>[0,0,0,0,0,'','bare',0,0]}
-
-            ids.each do |id,index,en|
-              direct[id]=values[index]+[en]
-            end
-
-            weapons.each_with_index do |w,id|
-
-              if w.nil?
-                expected=direct[0]
-                actual=direct[0]
-              else
-                name=utf(iv(w,:@name)).strip
-                en=name[/^\+(\d+)\s+/,1].to_i
-                base=name.sub(/^\+\d+\s+/,'')
-                spec=specs[base]
-
-                expected=spec && spec+[en]
-                actual=direct[id]
-              end
-
-              check(
-                actual==expected,
-                "Weapon lookup #{id}"
-              )
-            end
-
-            table=
-              "  WEAPON_SPECS=#{values.inspect}\n"+
-              "  WEAPON_IDS={0=>[0,0,0,0,0,'','bare',0,0]}\n"+
-              "  #{ids.inspect}.each{|r| WEAPON_IDS[r[0]]=WEAPON_SPECS[r[1]]+[r[2]]}\n"
-
-            s=s[0...a]+table+s[b..-1]
-
-            old=s[/  def self\.weapon\(a\)\n.*?\n  end\n/m]
-
-            check(
-              old && old.include?('WEAPONS[name]'),
-              'Weapon lookup source'
-            )
-
-            s=once(
-              s,
-              old,
-              <<~'SRC'.gsub(/^/,'  ')
-              def self.weapon(a)
-                return WEAPON_IDS[0] if $data_weapons[a.weapon_id].nil?
-                WEAPON_IDS[a.weapon_id]
-              end
-            SRC
-            )
-
-            old="    when 12  # \uc2a4\ud06c\ub9bd\ud2b8\n      result = eval(@parameters[1])"
-
-            new=<<~'SRC'.chomp.gsub(/^/,'    ')
-            when 49
-              result = @sl49_active ? !@sl49_damage.nil? : $game_variables[334] >= $game_variables[335]
-            when 50
-              result = @sl49_npc ? @sl49_nhit : $game_variables[336] >= $game_variables[337]
-            when 51
-              $game_variables[26]=SL49.npc_damage(@sl49_npc) if @sl49_npc
-              result = $game_variables[26]<=0
-            SRC
-
-            s=once(s,old,new+"\n"+old)
-
-            check(
-              s.bytesize<=32000,
-              "Interpreter 3 size #{s.bytesize}"
-            )
-
-            puts "PASS weapon IDs #{ids.size}/#{total}"
-            puts "PASS original fallback IDs #{missing.size}"
-            puts "PASS #{weapons.size} equivalent weapon lookups"
-            puts "PASS Interpreter 3 bytes #{s.bytesize}"
-
-            s
-          end
-
-          edit.call('Interpreter 4') do |s|
-
-            a="  def command_122\n"
-
-            once(
-              s,
-              a,
-              a+<<~'SRC'.gsub(/^/,'    ')
-              return true if @sl49_active && @parameters[-1]==:sl49_pc_legacy
-              return true if @sl49_npc && @parameters[-1]==:sl49_npc_legacy
-            SRC
-            )
-          end
-
-          edit.call('Interpreter 7') do |s|
-
-            a="  def command_355\n"
-
-            once(
-              s,
-              a,
-              a+<<~'SRC'.gsub(/^/,'    ')
-              case @parameters[0]
-              when 'SL49_PC_PREP'
-                a=$game_actors[1]
-                w=SL49.weapon(a)
-                @sl49_active=!w.nil?
-
-                if @sl49_active
-                  @sl49_damage=SL49.pc_attack(
-                    a,@parameters[1],@parameters[2],w
-                  )
-                else
-                  $game_variables[334]=a.agi if @parameters[3]
-
-                  $game_variables[335]=
-                    @parameters[4]+rand(@parameters[5])
-
-                  $game_map.need_refresh=true
-                end
-
-                return true
-
-              when 'SL49_PC_DONE'
-
-                SL49.apply_damage(
-                  @parameters[1],
-                  @parameters[2],
-                  @parameters[3],
-                  @sl49_damage
-                ) if @sl49_active
-
-                @sl49_active=false
-
-                return true
-
-              when 'SL49_NPC_PREP'
-
-                @sl49_npc=SL49.npc_context(
-                  @event_id,
-                  @sl_attack_target,
-                  @parameters[1]
-                )
-
-                if @sl49_npc
-                  @sl49_nhit=SL49.npc_hit(@sl49_npc)
-                else
-                  $game_variables[336]=
-                    @parameters[2]+rand(@parameters[3])
-
-                  $game_map.need_refresh=true
-                end
-
-                return true
-              end
-            SRC
-            )
           end
 
           check(
-            rows.each_index.select{
-              |i|Marshal.dump(rows[i])!=oldrows[i]
-            }.map{
-              |i|utf(rows[i][1])
-            }.sort==
-            [
-              'Interpreter 3',
-              'Interpreter 4',
-              'Interpreter 7'
-            ],
-            'Script scope'
+            recruiters==[[47,14]],
+            'Existing recruiter count'
           )
 
-          updates[sp]=rows
+          source=iv(maps.fetch(47),:@events).fetch(14)
 
-          check(updates.size==37,'Optimized file count')
+          check(
+            [iv(source,:@x),iv(source,:@y)]==[370,138],
+            'Talking Island location'
+          )
 
-          updates.each do |f,o|
-            raw=Marshal.dump(o)
+          pages=iv(source,:@pages)
 
-            File.binwrite(f,raw)
+          check(pages.size==2,'Source pages')
 
+          hire=0
+
+          pages.each do |p|
             check(
-              Marshal.dump(
-                Marshal.load(File.binread(f))
-              )==raw,
-              "Roundtrip #{f}"
+              iv(p,:@trigger)==0 &&
+              !iv(iv(p,:@condition),:@self_switch_valid),
+              'Local page state'
             )
-          end
 
-          puts "PASS direct event routes #{counts.inspect}"
-          puts "PASS #{counts.values.sum} combat eval sites removed"
-          RUBY
+            iv(p,:@list).each do |c|
+              code=iv(c,:@code)
+              q=iv(c,:@parameters)
 
-          ruby -c /tmp/sl49-direct.rb
+              check(
+                ![117,123,201,202,209,210,214].include?(code),
+                "Local command #{code}"
+              )
 
-          ruby /tmp/sl49-direct.rb site/knight/gameasync/Data
+              s=code==355 ? q[0] :
+                code==111 && q[0]==12 ? q[1] : nil
 
-      - name: Verify all optimized combat command routes
-        shell: bash
-        run: |
-          set -euo pipefail
+              next unless s.is_a?(String)
 
-          ruby -rzlib -rjson - <<'RUBY'
-          # encoding: UTF-8
+              s=utf(s)
 
-          module RPG
-            %w[
-              Map MapInfo Event EventCommand MoveRoute
-              MoveCommand AudioFile CommonEvent
-            ].each{|n|const_set(n,::Class.new)}
+              check(
+                !s.match?(/@event_id|\$game_self_switches|\$game_map\.events|\$game_map\.map_id|\bMap0?47\b/),
+                'Map-specific script'
+              )
 
-            Event.const_set(:Page,::Class.new)
-            Event::Page.const_set(:Condition,::Class.new)
-            Event::Page.const_set(:Graphic,::Class.new)
-          end
-
-          %w[Table Tone Color].each do |n|
-            Object.const_set(n,Class.new do
-              def self._load(raw)
-                o=allocate
-                o.instance_variable_set(:@raw,raw)
-                o
-              end
-
-              def _dump(d)
-                @raw
-              end
-            end)
-          end
-
-          def iv(o,k)
-            o.instance_variable_get(k)
-          end
-
-          root='site/knight/gameasync/Data'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          files=Dir.glob(
-            File.join(root,pre+'Map[0-9][0-9][0-9].rxdata')
-          ).sort
-
-          files<<File.join(root,pre+'CommonEvents.rxdata')
-
-          raise 'Data count' unless files.size==47
-
-          counts=Hash.new(0)
-
-          files.each do |f|
-            o=Marshal.load(File.binread(f))
-
-            lists=if f.end_with?('CommonEvents.rxdata')
-              o.compact.map{|e|iv(e,:@list)}
-            else
-              iv(o,:@events).values.flat_map do |e|
-                iv(e,:@pages).map{|p|iv(p,:@list)}
-              end
+              hire+=1 if
+                s.include?('$game_party.gain_weapon(w,1)')
             end
+          end
 
-            lists.each do |list|
-              list.each do |c|
-                p=iv(c,:@parameters)
+          check(hire==16,'V4.8 equipment grant count')
 
-                case iv(c,:@code)
+          reserved=Hash.new{|h,k|h[k]=[]}
 
-                when 355
+          all_lists=
+            maps.values.flat_map{|m|lists(m)}+
+            ce.compact.map{|e|iv(e,:@list)}
 
-                  case p[0]
-                  when 'SL49_PC_PREP'
-                    raise 'PC prep parameters' unless p.size==6
-                    counts[:pc_prep]+=1
+          all_lists.each do |l|
+            l.each do |c|
+              q=iv(c,:@parameters)
 
-                  when 'SL49_PC_DONE'
-                    raise 'PC done parameters' unless p.size==4
-                    counts[:pc_done]+=1
-
-                  when 'SL49_NPC_PREP'
-                    raise 'NPC prep parameters' unless p.size==4
-                    counts[:npc_prep]+=1
-
-                  else
-                    if p[0].is_a?(String) &&
-                      (
-                        p[0].include?('@sl49_') ||
-                        p[0].include?('SL49.')
-                      )
-                      raise 'Repeated combat script remains'
-                    end
-                  end
-
-                when 111
-
-                  case p[0]
-
-                  when 49
-                    counts[:pc_hit]+=1
-
-                  when 50
-                    counts[:npc_hit]+=1
-
-                  when 51
-                    counts[:npc_zero]+=1
-
-                  when 12
-                    if p[1].is_a?(String) &&
-                      (
-                        p[1].include?('@sl49_') ||
-                        p[1].include?('SL49.')
-                      )
-                      raise 'Repeated combat condition remains'
-                    end
-                  end
-
-                when 122
-
-                  case p[-1]
-
-                  when :sl49_pc_legacy
-                    counts[:pc_legacy]+=1
-
-                  when :sl49_npc_legacy
-                    counts[:npc_legacy]+=1
-                  end
-                end
+              if iv(c,:@code)==201 && q[0]==0
+                reserved[q[1]]<<q[2,2]
               end
             end
           end
 
-          expected={
-            pc_prep:1696,
-            pc_hit:1696,
-            pc_done:1696,
-            pc_legacy:6291,
-            npc_prep:69,
-            npc_hit:69,
-            npc_zero:69,
-            npc_legacy:203
+          placements={
+            29=>[
+              [49,72,48]
+            ],
+            48=>[
+              [7,367,383],
+              [8,744,546],
+              [9,1212,450]
+            ],
+            49=>[
+              [7,445,562],
+              [8,595,410],
+              [9,1204,221]
+            ],
+            50=>[
+              [7,238,147]
+            ]
           }
 
-          raise counts.inspect unless counts==expected
-
-          rows=Marshal.load(
-            File.binread(File.join(root,'Scripts.rxdata'))
+          check(
+            placements.values.sum(&:size)==8,
+            'Placement count'
           )
 
-          ['Interpreter 3','Interpreter 4','Interpreter 7'].each do |name|
+          changed=[]
 
-            selected=rows.select{
-              |r|r && r[1].to_s.dup.force_encoding('UTF-8')==name
-            }
+          placements.each do |mid,rows|
+            m=maps.fetch(mid)
+            ev=iv(m,:@events)
 
-            raise name unless selected.size==1
+            before=ev.transform_values{|e|Marshal.dump(e)}
 
-            src=Zlib::Inflate.inflate(
-              selected.first[2]
-            ).force_encoding('UTF-8')
-
-            RubyVM::InstructionSequence.compile(src)
-
-            if name=='Interpreter 3'
-              raise 'Startup script size' if src.bytesize>32000
-
-              raise 'Embedded monster tables' if
-                src.include?('TRAITS=') ||
-                src.include?('STATS=')
-
-              raise 'Weapon ID table missing' unless
-                src.include?('WEAPON_IDS[a.weapon_id]')
+            fields=m.instance_variables.reject do |k|
+              k==:@events
+            end.to_h do |k|
+              [k,Marshal.dump(iv(m,k))]
             end
+
+            ids=rows.map(&:first)
+
+            lists(m).each do |l|
+              l.each do |c|
+                code=iv(c,:@code)
+                q=iv(c,:@parameters)
+
+                ref=code==111 && q[0]==6 ? q[1] :
+                  [202,203,207,209,212,213].include?(code) ?
+                  q[0] : nil
+
+                check(
+                  !ids.include?(ref),
+                  "Existing event reference #{mid}:#{ref}"
+                )
+              end
+            end
+
+            rows.each do |id,x,y|
+
+              check(
+                !ev.key?(id) &&
+                !stats.key?([mid,id]),
+                "ID collision #{mid}:#{id}"
+              )
+
+              occupied=ev.values.map do |e|
+                [iv(e,:@x),iv(e,:@y)]
+              end
+
+              check(
+                !occupied.include?([x,y]) &&
+                !reserved[mid].include?([x,y]),
+                "Position collision #{mid}:#{x},#{y}"
+              )
+
+              directions=[
+                [0,1,2],
+                [-1,0,4],
+                [1,0,6],
+                [0,-1,8]
+              ]
+
+              directions.each do |dx,dy,d|
+                check(
+                  passable(m,tiles,x,y,d) &&
+                  passable(m,tiles,x+dx,y+dy,10-d) &&
+                  !occupied.include?([x+dx,y+dy]),
+                  "Approach blocked #{mid}:#{x},#{y},#{d}"
+                )
+              end
+
+              clone=Marshal.load(Marshal.dump(source))
+
+              clone.instance_variable_set(:@id,id)
+              clone.instance_variable_set(:@x,x)
+              clone.instance_variable_set(:@y,y)
+
+              ev[id]=clone
+
+              puts "PASS Map#{mid} EV#{id} at #{x},#{y}"
+            end
+
+            target=path.call(format('Map%03d',mid))
+            raw=Marshal.dump(m)
+
+            File.binwrite(target,raw)
+
+            m=Marshal.load(File.binread(target))
+            out=iv(m,:@events)
+
+            check(Marshal.dump(m)==raw,'Marshal roundtrip')
+
+            check(
+              out.keys.sort==(before.keys+ids).sort,
+              'Event list changed'
+            )
+
+            check(
+              before.all?{|id,bytes|
+                Marshal.dump(out.fetch(id))==bytes
+              },
+              'Existing events changed'
+            )
+
+            check(
+              fields.all?{|k,bytes|
+                Marshal.dump(iv(m,k))==bytes
+              },
+              'Terrain or map fields changed'
+            )
+
+            rows.each do |id,x,y|
+              e=out.fetch(id)
+
+              check(
+                [iv(e,:@id),iv(e,:@x),iv(e,:@y)]==[id,x,y],
+                'Clone coordinates'
+              )
+
+              check(
+                e.instance_variables.reject{|k|
+                  [:@id,:@x,:@y].include?(k)
+                }.all?{|k|
+                  Marshal.dump(iv(e,k))==
+                  Marshal.dump(iv(source,k))
+                },
+                'Clone differs'
+              )
+            end
+
+            changed<<File.basename(target)
           end
 
-          puts 'PASS 1696 direct PC attack branches'
-          puts 'PASS 69 direct NPC attack routes'
-          puts 'PASS 6494 restored numeric commands'
-          puts 'PASS no additional combat eval strings'
-          puts 'PASS original startup data separation'
+          check(changed.size==4,'Changed map count')
+
+          File.write(
+            '/tmp/sl410-changed.json',
+            JSON.generate(changed.sort)
+          )
+
+          puts 'PASS eight new recruiters, nine total'
+          puts 'PASS original recruiter pages preserved'
+          puts 'PASS all 16 initial equipment grant routes preserved'
+          puts 'PASS all existing events and terrain preserved'
           RUBY
 
-      - name: Update final data mappings
+          ruby -c /tmp/sl410-recruiters.rb
+
+          ruby /tmp/sl410-recruiters.rb site/knight/gameasync/Data
+
+      - name: Update map mappings and V4.10 version
         shell: bash
         run: |
           set -euo pipefail
-          bash /tmp/sl49-source-mapping.sh
 
-      - name: Verify exact approved changes
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import hashlib,json,re
+
+          root=Path('site')
+          game=root/'knight/gameasync'
+
+          names=json.loads(
+              Path('/tmp/sl410-changed.json').read_text('utf8')
+          )
+
+          old=json.loads(
+              Path('/tmp/sl410-md5.json').read_text('utf8')
+          )
+
+          assert len(names)==4
+          assert len(set(names))==4
+
+          mapper=game/'mapping.js'
+          s=mapper.read_bytes()
+
+          for name in names:
+              assert name in old,name
+
+              p=game/'Data'/name
+
+              marker=('Data/'+name+'?h=').encode('ascii')
+
+              pattern=re.escape(marker)+rb'[0-9a-f]{32}'
+
+              original=marker+old[name].encode('ascii')
+
+              assert re.findall(pattern,s)==[original],name
+
+              digest=hashlib.md5(p.read_bytes()).hexdigest()
+
+              assert digest!=old[name],name
+
+              s=re.sub(
+                  pattern,
+                  lambda _:marker+digest.encode('ascii'),
+                  s
+              )
+
+          mapper.write_bytes(s)
+
+          loader=root/'knight/js/sl-assets-v229r115.js'
+
+          s=loader.read_bytes()
+
+          assert s.count(b"var version='V4.9';")==1
+
+          loader.write_bytes(
+              s.replace(
+                  b"var version='V4.9';",
+                  b"var version='V4.10';"
+              )
+          )
+
+          for name in ('index.html','knight/index.html'):
+              p=root/name
+              s=p.read_bytes()
+
+              assert b'V4.9' in s,name
+
+              p.write_bytes(
+                  s.replace(b'V4.9',b'V4.10')
+                   .replace(b'v4.9',b'v4.10')
+              )
+
+          print('PASS four updated map mappings')
+          print('PASS V4.10 version')
+          PYTHON
+
+          node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
+
+      - name: Verify exact recruiter placement changes
         shell: bash
         run: |
           set -euo pipefail
-          bash /tmp/sl49-source-verify.sh
-          bash /tmp/sl49-source-final.sh
 
-      - name: Upload V4.9 candidate
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import hashlib,json
+
+          root=Path('site')
+          game=root/'knight/gameasync'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          before=json.loads(
+              Path('/tmp/sl410-before.json').read_text('utf8')
+          )
+
+          after={
+              str(p.relative_to(root)):hashlib.sha256(
+                  p.read_bytes()
+              ).hexdigest()
+              for p in root.rglob('*') if p.is_file()
+          }
+
+          assert set(before)==set(after)
+          assert len(after)==6033
+
+          changed={
+              name for name in before
+              if before[name]!=after[name]
+          }
+
+          maps={
+              pre+f'Map{mid:03d}.rxdata'
+              for mid in (29,48,49,50)
+          }
+
+          names=set(json.loads(
+              Path('/tmp/sl410-changed.json').read_text('utf8')
+          ))
+
+          assert names==maps
+
+          allowed={
+              'knight/gameasync/Data/'+name
+              for name in maps
+          }|{
+              'knight/gameasync/mapping.js',
+              'knight/js/sl-assets-v229r115.js',
+              'index.html',
+              'knight/index.html'
+          }
+
+          assert changed==allowed,sorted(changed^allowed)
+
+          for name in (
+              'Actors','Classes','Weapons','Armors',
+              'Items','MonsterStats','CommonEvents',
+              'Tilesets','System','MapInfos','Map047'
+          ):
+              key='knight/gameasync/Data/'+pre+name+'.rxdata'
+
+              assert before[key]==after[key],name
+
+          key='knight/gameasync/Data/Scripts.rxdata'
+
+          assert before[key]==after[key]
+
+          mapping=(game/'mapping.js').read_bytes()
+
+          for name in names:
+              p=game/'Data'/name
+
+              marker=(
+                  'Data/'+name+'?h='+
+                  hashlib.md5(p.read_bytes()).hexdigest()
+              ).encode('ascii')
+
+              assert mapping.count(marker)==1,name
+
+          assert len(changed)==8
+
+          print('PASS 8 new recruiter NPCs')
+          print('PASS 9 total recruiter NPCs')
+          print('PASS original Talking Island recruiter unchanged')
+          print('PASS original combat and movement scripts unchanged')
+          print('PASS original engine and graphics unchanged')
+          print('PASS modified files',len(changed))
+          print('PASS unchanged files',len(before)-len(changed))
+          print('PASS V4.10 recruiter placement')
+          PYTHON
+
+      - name: Upload V4.10 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
