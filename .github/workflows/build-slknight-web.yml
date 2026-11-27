@@ -32,1596 +32,398 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Verify V4.13 baseline
+      - name: Restore verified V4.14 implementation source
+        uses: actions/checkout@v4
+        with:
+          repository: gowellsik-hue/Game
+          ref: 554844c39cef42bcc1cc62c30d18759909638c78
+          path: verified-414
+          sparse-checkout: .github/workflows/build-slknight-web.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare corrected V4.14 implementation
         shell: bash
         run: |
           set -euo pipefail
+
           test -s baseline/artifact.tar
-          mkdir -p site
-          tar -xf baseline/artifact.tar -C site
+
+          git -C verified-414 show \
+            HEAD:.github/workflows/build-slknight-web.yml \
+            > /tmp/sl414-prev.yml
+
+          test "$(git hash-object /tmp/sl414-prev.yml)" = \
+            "90192a5661e62ff7267ff0741d20fcfa67fc4257"
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib,json
+          import re
+          import textwrap
 
-          root=Path('site')
+          source=Path('/tmp/sl414-prev.yml').read_text('utf8')
 
-          before={
-              p.relative_to(root).as_posix():{
-                  'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
-                  'md5':hashlib.md5(p.read_bytes()).hexdigest()
-              }
-              for p in root.rglob('*') if p.is_file()
+          blocks=dict(
+              re.findall(
+                  r"^          cat > /tmp/(sl414-[^ ]+\.rb) <<'RUBY'\n(.*?)^          RUBY$",
+                  source,
+                  re.M|re.S
+              )
+          )
+
+          assert set(blocks)=={
+              'sl414-runtime.rb',
+              'sl414-patch.rb',
+              'sl414-test.rb'
           }
 
-          assert len(before)==6085,len(before)
+          blocks={
+              name:textwrap.dedent(body)
+              for name,body in blocks.items()
+          }
 
-          assert (
-              root/'knight/js/sl-assets-v229r115.js'
-          ).read_bytes().count(
-              b"var version='V4.13';"
-          )==1
-
-          for name in ('index.html','knight/index.html'):
-              assert b'V4.13' in (root/name).read_bytes(),name
-
-          Path('/tmp/sl414-before.json').write_text(
-              json.dumps(before,sort_keys=True),'utf8'
+          python_blocks=re.findall(
+              r"^          python3 - <<'PYTHON'\n(.*?)^          PYTHON$",
+              source,
+              re.M|re.S
           )
 
-          print('PASS V4.13 baseline',len(before))
-          PYTHON
-
-      - name: Connect designated items and native HUD
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl414-runtime.rb <<'RUBY'
-          # encoding: UTF-8
-
-          module SL414
-            HEAL=__HEAL__
-            IDS=(HEAL.keys+[1006]).sort
-            SLOTS=[4,5,6]
-
-            def self.eligible?(item)
-              item.is_a?(RPG::Item) && IDS.include?(item.id)
-            end
-
-            def self.store
-              h=$game_party.instance_variable_get(:@sl414_items)
-              unless h.is_a?(Hash)
-                h={}
-                $game_party.instance_variable_set(:@sl414_items,h)
-              end
-              h
-            end
-
-            def self.entry(id,item)
-              (store[id] || {})[item]
-            end
-
-            def self.count(id,item)
-              r=entry(id,item)
-              r ? r[0] : 0
-            end
-
-            def self.member(id)
-              a=$game_actors[id]
-              a if a &&
-                a.instance_variable_get(:@sl43_hired) &&
-                $game_party.actors.include?(a)
-            end
-
-            def self.active_ids
-              SLOTS.select{|id|a=member(id);a && a.hp>0}
-            end
-
-            def self.selected(item)
-              active_ids.select{|id|entry(id,item)}
-            end
-
-            def self.retained?(item)
-              IDS.include?(item) &&
-                SLOTS.any?{|id|entry(id,item)}
-            end
-
-            def self.owner(item)
-              $game_party.item_number(item)
-            end
-
-            def self.capacity(item)
-              [$item_maximum.to_i-owner(item),0].max
-            end
-
-            def self.set_owner(item,n)
-              $game_party.instance_variable_get(:@items)[item]=n
-            end
-
-            def self.designate(id,item)
-              return false unless IDS.include?(item) &&
-                active_ids.include?(id)
-
-              (store[id]||={})[item] ||=
-                [0,HEAL.key?(item)]
-
-              true
-            end
-
-            def self.give(id,item,n)
-              return false unless n>0 &&
-                n<=owner(item) &&
-                designate(id,item)
-
-              set_owner(item,owner(item)-n)
-              entry(id,item)[0]+=n
-
-              true
-            end
-
-            def self.recall(id,item,n)
-              r=entry(id,item)
-
-              return false unless r &&
-                n>0 &&
-                n<=r[0] &&
-                n<=capacity(item)
-
-              $game_party.gain_item(item,n)
-              r[0]-=n
-
-              true
-            end
-
-            def self.undesignate(id,item)
-              r=entry(id,item)
-
-              return false unless r
-
-              return false if r[0]>0 &&
-                !recall(id,item,r[0])
-
-              store[id].delete(item)
-
-              true
-            end
-
-            def self.equalize(item)
-              ids=selected(item)
-              return false if ids.empty?
-
-              total=owner(item)+ids.inject(0){
-                |sum,id|sum+count(id,item)
-              }
-
-              share=total/(ids.size+1)
-              own=total-share*ids.size
-
-              return false if own>owner(item) &&
-                own-owner(item)>capacity(item)
-
-              set_owner(item,own)
-              ids.each{|id|entry(id,item)[0]=share}
-
-              true
-            end
-
-            def self.buy(item,n)
-              ids=IDS.include?(item) ? selected(item) : []
-
-              return $game_party.gain_item(item,n) if ids.empty?
-
-              share=n/(ids.size+1)
-
-              $game_party.gain_item(
-                item,n-share*ids.size
-              )
-
-              ids.each{|id|entry(id,item)[0]+=share}
-            end
-
-            def self.ammo(a)
-              r=entry(a.id,1006) if SLOTS.include?(a.id)
-              r ? r[0] : owner(1006)
-            end
-
-            def self.spend_arrow(a)
-              r=entry(a.id,1006) if SLOTS.include?(a.id)
-
-              if r
-                r[0]-=1 if r[0]>0
-              else
-                $game_party.lose_item(1006,1)
-              end
-            end
-
-            def self.drink(a,e)
-              return unless a.hp>0 &&
-                a.hp*100<=a.maxhp*70
-
-              now=Graphics.frame_count
-
-              last=a.instance_variable_get(
-                :@sl414_potion_frame
-              )
-
-              wait=a.instance_variable_get(
-                :@sl414_potion_wait
-              ).to_i
-
-              return if last &&
-                now>=last &&
-                now-last<wait
-
-              missing=a.maxhp-a.hp
-
-              ids=HEAL.keys.select do |id|
-                r=entry(a.id,id)
-                r && r[1] && r[0]>0
-              end
-
-              return if ids.empty?
-
-              id=ids.min_by do |i|
-                h=HEAL[i][0]
-
-                [
-                  h>=missing ? 0 : 1,
-                  (h-missing).abs,
-                  HEAL[i][1],
-                  i
-                ]
-              end
-
-              hp,wait,anim=HEAL[id]
-
-              armor=a.armor_ids
-
-              ring=(645..653).find{
-                |i|armor.include?(i)
-              }
-
-              if ring
-                rate=(ring-644)*2
-                hp+=hp*rate/100+rate
-              end
-
-              entry(a.id,id)[0]-=1
-
-              a.hp+=hp
-
-              a.instance_variable_set(
-                :@sl414_potion_frame,now
-              )
-
-              a.instance_variable_set(
-                :@sl414_potion_wait,wait*2
-              )
-
-              e.animation_id=anim
-            end
-
-            def self.draw(w)
-              return unless w &&
-                !w.disposed? &&
-                w.contents &&
-                $game_party &&
-                $game_actors
-
-              w.visible=!$game_temp.message_window_showing
-
-              return unless w.visible
-
-              actors=[$game_actors[1]]+
-                SLOTS.map{|id|member(id)}
-
-              info=actors.map do |a|
-                next nil unless a
-
-                items=a.id==1 ? [] :
-                  IDS.select{
-                    |i|entry(a.id,i)
-                  }.map{
-                    |i|[i,count(a.id,i),entry(a.id,i)[1]]
-                  }
-
-                extra=a.id==1 ? [
-                  10-a.pdef,
-                  a.mdef,
-                  $game_switches[171]||$game_switches[368],
-                  $game_switches[172]
-                ] : []
-
-                [
-                  a.name,
-                  a.level,
-                  a.hp,
-                  a.maxhp,
-                  a.sp,
-                  a.maxsp,
-                  (a.exp_rate*1000).to_i,
-                  items,
-                  extra
-                ]
-              end
-
-              return if w.instance_variable_get(
-                :@sl414_info
-              )==info
-
-              w.instance_variable_set(
-                :@sl414_info,info
-              )
-
-              b=w.contents
-              b.clear
-
-              b.font.name='NanumGothic'
-              b.font.bold=false
-
-              info.each_with_index do |v,i|
-                x=122+i*86
-                y=365
-
-                b.fill_rect(
-                  x,y,85,98,
-                  Color.new(20,18,16,255)
-                )
-
-                b.fill_rect(
-                  x+85,y,1,98,
-                  Color.new(110,94,76,220)
-                )
-
-                next unless v
-
-                name,lv,hp,mhp,mp,mmp,xp,items,extra=v
-
-                b.font.size=11
-                b.font.color=Color.new(240,224,190)
-
-                b.draw_text(
-                  x+2,y,82,13,
-                  "#{name} Lv.#{lv}",1
-                )
-
-                [
-                  [hp,mhp,'HP',Color.new(130,44,40)],
-                  [mp,mmp,'MP',Color.new(48,75,132)]
-                ].each_with_index do |q,j|
-
-                  n,m,label,c=q
-                  yy=y+14+j*13
-
-                  b.fill_rect(
-                    x+2,yy,81,12,
-                    Color.new(35,31,30)
-                  )
-
-                  b.fill_rect(
-                    x+2,yy,
-                    [[81*n/[m,1].max,0].max,81].min,
-                    12,c
-                  )
-
-                  b.font.color=Color.new(255,255,255)
-
-                  b.draw_text(
-                    x+2,yy,81,12,
-                    "#{label} #{n}/#{m}",1
-                  )
-                end
-
-                b.font.color=Color.new(226,210,150)
-
-                b.draw_text(
-                  x+2,y+40,82,12,
-                  sprintf('EXP %.1f%%',xp/10.0),1
-                )
-
-                if i==0
-                  b.font.color=Color.new(220,220,220)
-
-                  b.draw_text(
-                    x+2,y+55,82,13,
-                    "AC #{extra[0]} MR #{extra[1]}",1
-                  )
-
-                  buffs=[]
-                  buffs << '촐기' if extra[2]
-                  buffs << '용기' if extra[3]
-
-                  b.draw_text(
-                    x+2,y+70,82,13,
-                    buffs.join(' '),1
-                  )
-
-                else
-                  items.each_with_index do |q,j|
-                    id,n,auto=q
-
-                    ix=x+2+(j%3)*28
-                    iy=y+52+(j/3)*23
-
-                    icon=RPG::Cache.icon(
-                      $data_items[id].icon_name
-                    )
-
-                    b.stretch_blt(
-                      Rect.new(ix,iy,25,23),
-                      icon,
-                      Rect.new(0,0,icon.width,icon.height),
-                      n>0 ? 255 : 85
-                    )
-
-                    b.fill_rect(
-                      ix,iy,4,4,
-                      Color.new(70,200,90)
-                    ) if auto
-
-                    b.font.size=10
-
-                    b.font.color=Color.new(0,0,0)
-
-                    b.draw_text(
-                      ix-1,iy+12,26,11,
-                      n.to_s,2
-                    )
-
-                    b.font.color=Color.new(255,255,255)
-
-                    b.draw_text(
-                      ix-2,iy+11,26,11,
-                      n.to_s,2
-                    )
-                  end
-                end
-              end
-            end
-
-            class Menu
-              def initialize(item)
-                @item=item
-                @id=item.id
-                @actor=nil
-                @number=nil
-
-                rebuild
-              end
-
-              def close
-                @number.dispose if @number &&
-                  !@number.disposed?
-
-                @window.dispose if @window &&
-                  !@window.disposed?
-
-                @number=nil
-                @window=nil
-              end
-
-              def rebuild
-                index=@window ? @window.index : 0
-
-                @window.dispose if @window &&
-                  !@window.disposed?
-
-                @options=[]
-
-                if @actor
-                  r=SL414.entry(@actor,@id)
-
-                  @options << [
-                    :toggle,
-                    r ?
-                      '분배 지정 해제 (회수)' :
-                      '구매 시 자동 분배 지정'
-                  ]
-
-                  @options << [
-                    :give,
-                    "지급 (본캐 #{SL414.owner(@id)}개)"
-                  ] if SL414.active_ids.include?(@actor)
-
-                  @options << [
-                    :recall,
-                    "회수 (보유 #{SL414.count(@actor,@id)}개)"
-                  ] if r
-
-                  @options << [
-                    :auto,
-                    "자동 회복: #{r[1] ? 'ON' : 'OFF'}"
-                  ] if r && HEAL.key?(@id)
-
-                  @options << [:back,'뒤로']
-
-                else
-                  @options << [
-                    :use,
-                    "기존 사용 (본캐 #{SL414.owner(@id)}개)"
-                  ]
-
-                  @options << [
-                    :equal,
-                    '지정 인원 균등 재분배'
-                  ]
-
-                  SLOTS.each do |id|
-                    a=$game_actors[id]
-
-                    r=SL414.entry(id,@id)
-
-                    next unless SL414.member(id) || r
-
-                    text="#{a.name} #{SL414.count(id,@id)}개"
-
-                    text+=' [지정]' if r
-
-                    text+=' (미고용)' unless SL414.member(id)
-
-                    @options << [id,text]
-                  end
-
-                  @options << [:close,'닫기']
-                end
-
-                @window=Window_Command.new(
-                  280,@options.map{|q|q[1]}
-                )
-
-                @window.x=260
-                @window.y=160
-                @window.z=999999
-                @window.opacity=255
-                @window.back_opacity=255
-                @window.active=true
-
-                @window.index=[
-                  [index,0].max,
-                  @options.size-1
-                ].min
-              end
-
-              def sound(ok)
-                $game_system.se_play(
-                  ok ?
-                    $data_system.decision_se :
-                    $data_system.buzzer_se
-                )
-              end
-
-              def begin_number(action)
-                max=action==:give ?
-                  SL414.owner(@id) :
-                  [
-                    SL414.count(@actor,@id),
-                    SL414.capacity(@id)
-                  ].min
-
-                return sound(false) if max<=0
-
-                @action=action
-                @max=max
-
-                @number=Window_InputNumber.new(
-                  [max.to_s.size,1].max
-                )
-
-                @number.number=max
-
-                @number.x=260
-                @number.y=@window.y+@window.height
-                @number.z=1000000
-                @number.opacity=255
-                @number.back_opacity=255
-
-                @window.active=false
-              end
-
-              def update
-                if @number
-                  @number.update
-
-                  if Input.trigger?(Input::B)
-                    @number.dispose
-                    @number=nil
-                    @window.active=true
-
-                  elsif Input.trigger?(Input::C)
-                    n=@number.number
-
-                    unless n>0 && n<=@max
-                      sound(false)
-                      return nil
-                    end
-
-                    ok=@action==:give ?
-                      SL414.give(@actor,@id,n) :
-                      SL414.recall(@actor,@id,n)
-
-                    sound(ok)
-
-                    @number.dispose
-                    @number=nil
-
-                    rebuild
-                  end
-
-                  return nil
-                end
-
-                @window.update
-
-                if Input.trigger?(Input::B)
-                  if @actor
-                    @actor=nil
-                    rebuild
-                    return nil
-                  end
-
-                  return :close
-                end
-
-                return nil unless Input.trigger?(Input::C)
-
-                action=@options[@window.index][0]
-
-                case action
-
-                when :use,:close
-                  return action
-
-                when :equal
-                  sound(SL414.equalize(@id))
-
-                when :back
-                  @actor=nil
-
-                when :toggle
-                  r=SL414.entry(@actor,@id)
-
-                  sound(
-                    r ?
-                      SL414.undesignate(@actor,@id) :
-                      SL414.designate(@actor,@id)
-                  )
-
-                when :auto
-                  r=SL414.entry(@actor,@id)
-                  r[1]=!r[1] if r
-
-                when :give,:recall
-                  begin_number(action)
-                  return nil
-
-                else
-                  @actor=action
-                end
-
-                rebuild
-
-                nil
-              end
-            end
-
-            def self.open_inventory(scene,w)
-              return false unless Input.trigger?(Input::C) &&
-                !$game_temp.in_battle
-
-              item=w.item
-
-              return false unless eligible?(item) &&
-                (!active_ids.empty? || retained?(item.id))
-
-              scene.instance_variable_set(
-                :@sl414_menu,
-                Menu.new(item)
-              )
-
-              w.active=false
-
-              true
-            end
-
-            def self.update_inventory(scene,w)
-              menu=scene.instance_variable_get(:@sl414_menu)
-
-              return false unless menu
-
-              result=menu.update
-
-              if result
-                close_inventory(scene)
-
-                w.active=true
-
-                if result==:use
-                  scene.sl_hotbar_update_item
-
-                else
-                  index=w.index
-
-                  w.refresh
-
-                  size=w.instance_variable_get(:@item_max)
-
-                  w.index=size>0 ?
-                    [[index,0].max,size-1].min :
-                    -1
-                end
-              end
-
-              true
-            end
-
-            def self.close_inventory(scene)
-              menu=scene.instance_variable_get(:@sl414_menu)
-
-              menu.close if menu
-
-              scene.instance_variable_set(
-                :@sl414_menu,nil
-              )
-            end
-          end
-          RUBY
-
-          cat > /tmp/sl414-patch.rb <<'RUBY'
-          # encoding: UTF-8
-          require 'zlib'
-
-          module RPG
-            %w[
-              Item CommonEvent EventCommand MoveRoute
-              MoveCommand AudioFile Animation
-            ].each{|n|const_set(n,Class.new)}
-
-            Animation.const_set(:Frame,Class.new)
-            Animation.const_set(:Timing,Class.new)
-          end
-
-          %w[Table Tone Color].each do |n|
-            Object.const_set(n,Class.new do
-              def self._load(raw)
-                o=allocate
-                o.instance_variable_set(:@raw,raw)
-                o
-              end
-            end)
-          end
-
-          def iv(o,k)
-            o.instance_variable_get(k)
-          end
-
-          def check(ok,msg)
-            raise msg unless ok
-          end
-
-          def one(s,a,b)
-            check(
-              s.scan(a).size==1,
-              "Anchor #{a.inspect[0,100]}"
-            )
-
-            s.sub(a){b}
-          end
-
-          def method_source(s,name)
-            nodes=[]
-
-            walk=lambda do |n|
-              if n.is_a?(RubyVM::AbstractSyntaxTree::Node)
-                nodes<<n if n.type==:DEFN &&
-                  n.children[0]==name.to_sym
-
-                n.children.each{|c|walk.call(c)}
-              end
-            end
-
-            walk.call(
-              RubyVM::AbstractSyntaxTree.parse(s)
-            )
-
-            check(
-              nodes.size==1,
-              "Method #{name}: #{nodes.size}"
-            )
-
-            n=nodes[0]
-
-            s.lines[
-              (n.first_lineno-1)..(n.last_lineno-1)
-            ].join
-          end
-
-          def heal_specs(root)
-            pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-            items=Marshal.load(
-              File.binread(
-                File.join(root,pre+'Items.rxdata')
-              )
-            )
-
-            ce=Marshal.load(
-              File.binread(
-                File.join(root,pre+'CommonEvents.rxdata')
-              )
-            )
-
-            anim=Marshal.load(
-              File.binread(
-                File.join(root,pre+'Animations.rxdata')
-              )
-            )
-
-            list=iv(ce[51],:@list)
-
-            h={}
-
-            [1,16,70,71,86].each do |id|
-              hits=list.each_index.select do |i|
-                iv(list[i],:@code)==126 &&
-                iv(list[i],:@parameters)==[id,1,0,1]
-              end
-
-              check(
-                hits.size==1,
-                "Potion route #{id}"
-              )
-
-              i=hits[0]
-
-              p=iv(list[i+1],:@parameters)
-
-              check(
-                iv(list[i+1],:@code)==311 &&
-                p[0,3]==[1,0,0] &&
-                p[4]==false,
-                "Potion HP #{id}"
-              )
-
-              check(
-                iv(list[i+3],:@code)==117 &&
-                iv(list[i+3],:@parameters)==[782],
-                "Potion bonus #{id}"
-              )
-
-              check(
-                iv(list[i+4],:@code)==117,
-                "Potion effect call #{id}"
-              )
-
-              a=iv(
-                ce[iv(list[i+4],:@parameters)[0]],
-                :@list
-              )
-
-              check(
-                a.map{|c|iv(c,:@code)}==[106,207,0],
-                "Potion effect route #{id}"
-              )
-
-              h[id]=[
-                p[3],
-                iv(a[0],:@parameters)[0],
-                iv(a[1],:@parameters)[1]
-              ]
-
-              check(
-                iv(a[1],:@parameters)[0]==-1 &&
-                anim[h[id][2]],
-                "Potion animation #{id}"
-              )
-            end
-
-            check(
-              h=={
-                1=>[25,10,29],
-                16=>[90,12,19],
-                70=>[60,12,30],
-                71=>[90,6,19],
-                86=>[1000,10,29]
-              },
-              'Original recovery values'
-            )
-
-            l=iv(ce[782],:@list)
-
-            (645..653).each do |id|
-              i=l.index do |c|
-                iv(c,:@code)==111 &&
-                iv(c,:@parameters)==[4,1,4,id]
-              end
-
-              check(
-                i &&
-                iv(l[i+4],:@code)==311 &&
-                iv(l[i+4],:@parameters)==[1,0,1,781,false] &&
-                iv(l[i+5],:@code)==311 &&
-                iv(l[i+5],:@parameters)==[
-                  1,0,0,(id-644)*2,false
-                ],
-                "Original ring effect #{id}"
-              )
-
-              check(
-                iv(l[i+2],:@parameters)[0].to_s.include?(
-                  "* #{(id-644)*2}"
-                ),
-                "Original ring rate #{id}"
-              )
-            end
-
-            (h.keys+[1006]).each do |id|
-              check(
-                items[id] &&
-                !iv(items[id],:@icon_name).to_s.empty?,
-                "Original item icon #{id}"
-              )
-            end
-
-            h
-          end
-
-          def edit(s,i,runtime)
-            case i
-
-            when 26
-              s=one(
-                s,
-                "    SL411.starter(a)\n",
-                "    SL411.starter(a)\n    SL414.drink(a,self)\n"
-              )
-
-              one(
-                s,
-                '$game_party.item_number(1006)<1',
-                'SL414.ammo(a)<1'
-              )
-
-            when 42,43
-              one(
-                s,
-                'if $game_party.item_number(i) > 0',
-                'if $game_party.item_number(i) > 0 || (!$game_temp.in_battle && SL414.retained?(i))'
-              )
-
-            when 71
-              check(
-                s.include?('@wait_count = @parameters[0] * 2'),
-                'Native wait conversion'
-              )
-
-              s=one(
-                s,
-                'return nil if bow && $game_party.item_number(1006)<1',
-                'return nil if bow && SL414.ammo(a)<1'
-              )
-
-              one(
-                s,
-                '$game_party.lose_item(1006,1) if bow',
-                'SL414.spend_arrow(a) if bow'
-              )
-
-            when 78
-              one(
-                s,
-                "    @message_window.update\n",
-                "    @message_window.update\n    SL414.draw($메세지)\n"
-              )
-
-            when 80,81
-              s=one(
-                s,
-                "  def update\n",
-                "  def update\n    return if SL414.update_inventory(self,@item_window)\n"
-              )
-
-              one(
-                s,
-                /^( +)def dispose\n/,
-                s[/^( +)def dispose\n/]+
-                  "      SL414.close_inventory(self)\n"
-              )
-
-            when 93
-              one(
-                s,
-                '$game_party.gain_item(@item.id, @number_window.number)',
-                'SL414.buy(@item.id, @number_window.number)'
-              )
-
-            when 100
-              one(
-                s,
-                method_source(s,'set_text2'),
-                "  def set_text2(text)\n    SL414.draw(self)\n  end\n"
-              )
-
-            when 127
-              a=/^[ \t]*#도움말 출력\n.*?(?=^[ \t]*#스텟 출력)/m
-
-              block=s[a]
-
-              check(
-                block &&
-                block.scan(
-                  'self.contents.draw_text(143, 441, 500, 32'
-                ).size==19,
-                'Original help lines'
-              )
-
-              one(
-                s,
-                a,
-                "    self.contents.font.name = \"NanumGothic\"\n    self.contents.font.size = 12\n    self.contents.font.bold = false\n\n"
-              )
-
-            when 130
-              a='    return if SLHotbar.assign_from_window(@item_window)'
-
-              check(
-                s.scan(a).size==2,
-                'Both native inventory paths'
-              )
-
-              s=s.gsub(
-                a,
-                a+"\n    return if SL414.open_inventory(self,@item_window)"
-              )
-
-              runtime+"\n"+s
-
-            else
-              raise "Unexpected script #{i}"
-            end
-          end
-
-          if __FILE__==$0
-            root=ARGV.fetch(0)
-
-            file=File.join(root,'Scripts.rxdata')
-
-            h=heal_specs(root)
-
-            runtime=File.read(
-              '/tmp/sl414-runtime.rb',
-              encoding:'UTF-8'
-            ).sub('__HEAL__',h.inspect)
-
-            rows=Marshal.load(
-              File.binread(file)
-            )
-
-            check(rows.size==137,'Script count')
-
-            targets={
-              26=>'Game_Event',
-              42=>'Window_Item',
-              43=>'★Window_Item2',
-              71=>'Interpreter 3',
-              78=>'Scene_Map',
-              80=>'Scene_Item',
-              81=>'★Scene_Item2',
-              93=>'Scene_Shop',
-              100=>'Window_Help2',
-              127=>'게이지',
-              130=>'Mobile Hotbar'
-            }
-
-            before=rows.map{|r|Marshal.dump(r)}
-
-            targets.each do |i,name|
-              check(
-                rows[i][1].dup.force_encoding('UTF-8')==name,
-                "Script #{i}"
-              )
-
-              original=Zlib::Inflate.inflate(
-                rows[i][2]
-              ).force_encoding('UTF-8')
-
-              s=original.gsub("\r\n","\n")
-
-              t=edit(s,i,runtime)
-
-              check(s!=t,"Edit #{i}")
-
-              RubyVM::InstructionSequence.compile(t)
-
-              rows[i][2]=Zlib::Deflate.deflate(
-                (
-                  original.include?("\r\n") ?
-                  t.gsub("\n","\r\n") :
-                  t
-                ).b
-              )
-            end
-
-            check(
-              rows.each_index.select{
-                |i|Marshal.dump(rows[i])!=before[i]
-              }==targets.keys.sort,
-              'Script change scope'
-            )
-
-            File.binwrite(
-              file,Marshal.dump(rows)
-            )
-
-            check(
-              Marshal.dump(
-                Marshal.load(File.binread(file))
-              )==Marshal.dump(rows),
-              'Roundtrip'
-            )
-
-            puts 'PASS original CE recovery/animation/ring data'
-            puts 'PASS eleven approved script edits'
-          end
-          RUBY
-
-          ruby -c /tmp/sl414-patch.rb
-
-          ruby /tmp/sl414-patch.rb \
-            site/knight/gameasync/Data
-
-      - name: Verify native inventory and companion branches
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl414-test.rb <<'RUBY'
-          # encoding: UTF-8
-          require_relative 'sl414-patch'
-
-          rows=Marshal.load(
-            File.binread(ARGV.fetch(0))
+          assert len(python_blocks)==2
+
+          baseline=textwrap.dedent(python_blocks[0])
+          verify=textwrap.dedent(python_blocks[1])
+
+          def once(s,a,b):
+              n=s.count(a)
+              assert n==1,(a,n)
+              return s.replace(a,b,1)
+
+          def section(s,start,end,replacement):
+              assert s.count(start)==1,start
+              assert s.count(end)==1,end
+              i=s.index(start)
+              j=s.index(end,i)
+              return s[:i]+replacement+s[j:]
+
+          runtime=blocks['sl414-runtime.rb']
+
+          start=runtime.index('  def self.draw(w)\n')
+          end=runtime.index('  class Menu\n',start)
+
+          draw=runtime[start:end]
+
+          draw=once(
+              draw,
+              '    return unless w.visible\n',
+              '    return unless w.visible\n'
+              '    w.contents_opacity=255\n'
           )
 
-          read=lambda do |i|
-            Zlib::Inflate.inflate(
-              rows[i][2]
-            ).force_encoding('UTF-8').gsub("\r\n","\n")
-          end
-
-          runtime=read.call(130).split(
-            "\nmodule SLHotbar\n",2
-          )[0]
-
-          class Game_Party
-            attr_accessor :actors
-
-            def initialize
-              @items={}
-              @actors=[]
-            end
-          end
-
-          %w[item_number lose_item].each do |n|
-            Game_Party.class_eval(
-              method_source(read.call(19),n)
-            )
-          end
-
-          Game_Party.class_eval(
-            method_source(read.call(115),'gain_item')
+          draw=once(
+              draw,
+              '    w.instance_variable_set(\n'
+              '      :@sl414_info,info\n'
+              '    )\n\n',
+              ''
           )
 
-          class RPG::Item
-            attr_accessor :id,:icon_name,:name
-          end
+          changes=[
+              (
+                  '      x=122+i*86\n      y=365\n',
+                  '      x=i*86\n      y=0\n'
+              ),
+              ('x,y,85,98,','x,y,85,93,'),
+              ('x+85,y,1,98,','x+85,y,1,93,'),
+              ('iy=y+52+(j/3)*23','iy=y+52+(j/3)*20'),
+              ('Rect.new(ix,iy,25,23)','Rect.new(ix,iy,25,20)'),
+              ('ix-1,iy+12,26,11,','ix-1,iy+9,26,11,'),
+              ('ix-2,iy+11,26,11,','ix-2,iy+8,26,11,')
+          ]
 
-          class Actor
-            attr_accessor :id,:hp,:maxhp,:sp,:maxsp
-            attr_accessor :level,:name,:armor_ids
+          for old,new in changes:
+              draw=once(draw,old,new)
 
-            def initialize(id)
-              @id=id
-              @hp=@maxhp=200
-              @sp=@maxsp=50
-              @level=20
-              @name="actor#{id}"
-              @armor_ids=[]
-              @sl43_hired=id!=1
-            end
+          ending='  end\n\n'
 
-            def hp=(v)
-              @hp=[[v,0].max,@maxhp].min
-            end
+          assert draw.endswith(ending)
 
-            def pdef;10;end
-            def mdef;25;end
-            def exp_rate;0.4;end
-          end
-
-          module Graphics
-            class << self
-              attr_accessor :frame_count
-            end
-          end
-
-          class Color
-            def initialize(*args);end
-          end
-
-          Rect=Struct.new(:x,:y,:width,:height)
-
-          FontMock=Struct.new(
-            :name,:bold,:size,:color
+          draw=(
+              draw[:-len(ending)]
+              +'    w.instance_variable_set(:@sl414_info,info)\n'
+              +ending
           )
 
-          class BitmapMock
-            attr_reader :font,:calls
+          revised_runtime=(
+              runtime[:start]
+              +draw
+              +runtime[end:]
+          )
 
-            def initialize
-              @font=FontMock.new
-              @calls=[]
-            end
+          assert revised_runtime[:start]==runtime[:start]
 
-            def clear
-              @calls.clear
-            end
+          assert revised_runtime.endswith(runtime[end:])
 
-            def fill_rect(*q)
-              @calls<<[:fill,*q]
-            end
+          patch=blocks['sl414-patch.rb']
 
-            def draw_text(*q)
-              @calls<<[:text,*q]
-            end
+          scene_branch=r'''  when 78
+              old="    $메세지 = Window_Help2.new\n"
 
-            def stretch_blt(*q)
-              @calls<<[:icon,*q]
-            end
-          end
+              new=<<~'SRC'.gsub(/^/,'    ')
+              $메세지 = Window_Help2.new
+              $메세지.x=122
+              $메세지.y=475
+              $메세지.width=376
+              $메세지.height=125
+              $메세지.contents.dispose
+              $메세지.contents=Bitmap.new(344,93)
+              $메세지.ox=0
+              $메세지.oy=0
+              $메세지.opacity=0
+              $메세지.back_opacity=0
+              $메세지.contents_opacity=255
+              $메세지.z=999999
+              SRC
 
-          module RPG::Cache
-            def self.icon(n)
-              Struct.new(
-                :width,:height,:name
-              ).new(32,32,n)
-            end
-          end
+              s=one(s,old,new)
 
-          class HudMock
-            attr_accessor :visible
-            attr_reader :contents
+              one(
+                s,
+                "      sl_native_skill_icons\n      Graphics.update\n",
+                "      sl_native_skill_icons\n      SL414.draw($메세지)\n      Graphics.update\n"
+              )
 
-            def initialize
-              @contents=BitmapMock.new
-            end
+          '''
 
-            def disposed?
-              false
-            end
-          end
+          scene_branch=(
+              '  when 78\n'
+              +textwrap.indent(
+                  textwrap.dedent(
+                      scene_branch.split('\n',1)[1]
+                  ),
+                  '    '
+              )
+          )
 
-          class Window_Command
-            attr_accessor :x,:y,:z,:opacity
-            attr_accessor :back_opacity,:active,:index
+          patch=section(
+              patch,
+              '  when 78\n',
+              '  when 80,81\n',
+              scene_branch
+          )
 
-            attr_reader :height
+          message_branch=r'''  when 100
+              one(
+                s,
+                "  def set_text2(text)\n",
+                "  def set_text2(text)\n    return if self.equal?($메세지)\n"
+              )
 
-            def initialize(width,commands)
-              @index=0
-              @height=commands.size*32+32
-              @disposed=false
-            end
+          '''
 
-            def update;end
+          message_branch=(
+              '  when 100\n'
+              +textwrap.indent(
+                  textwrap.dedent(
+                      message_branch.split('\n',1)[1]
+                  ),
+                  '    '
+              )
+          )
 
-            def disposed?
-              @disposed
+          patch=section(
+              patch,
+              '  when 100\n',
+              '  when 127\n',
+              message_branch
+          )
+
+          assert patch.count('SL414.draw($메세지)')==1
+
+          test=blocks['sl414-test.rb']
+
+          test=once(
+              test,
+              '  attr_accessor :visible\n',
+              '  attr_accessor :visible,:contents_opacity\n'
+          )
+
+          test=once(
+              test,
+              'c[4]==98',
+              'c[4]==93'
+          )
+
+          test=once(
+              test,
+              'c[1].x>=208',
+              'c[1].x>=86'
+          )
+
+          test+=r'''
+
+          class Bitmap < BitmapMock
+
+            attr_reader :width,:height
+
+            def initialize(w,h)
+              super()
+              @width=w
+              @height=h
             end
 
             def dispose
               @disposed=true
             end
-          end
 
-          class Window_InputNumber < Window_Command
-            attr_accessor :number
-
-            def initialize(n)
-              super(1,[])
-            end
-          end
-
-          module Input
-            C=1
-            B=2
-
-            class << self
-              attr_accessor :key
+            def disposed?
+              @disposed==true
             end
 
-            def self.trigger?(k)
-              @key==k
+          end
+
+          class Window_Base
+
+            attr_accessor :x,:y,:width,:height
+            attr_accessor :contents,:visible,:opacity
+            attr_accessor :back_opacity,:contents_opacity
+            attr_accessor :ox,:oy,:z
+
+            def initialize(x,y,w,h)
+              @x=x
+              @y=y
+              @width=w
+              @height=h
             end
+
+            def disposed?
+              false
+            end
+
           end
 
-          $game_system=Object.new
+          scene=read.call(78)
 
-          def $game_system.se_play(x);end
+          frame="      sl_native_skill_icons\n"+
+                "      SL414.draw($메세지)\n"+
+                "      Graphics.update\n"
 
-          $data_system=Struct.new(
-            :decision_se,:buzzer_se
-          ).new(nil,nil)
+          assert(
+            scene.scan(frame).size==1,
+            'Native Scene_Map render loop'
+          )
 
-          $game_temp=Struct.new(
-            :message_window_showing,:in_battle
-          ).new(false,false)
+          setup=scene[
+            /^    \$메세지 = Window_Help2.new\n.*?(?=^    \$KeyIcon = IconShow.new)/m
+          ]
 
-          $game_switches=Hash.new(false)
-
-          $data_items=Array.new(1007)
-
-          [1,16,70,71,86,1006,2].each do |i|
-            item=RPG::Item.new
-            item.id=i
-            item.icon_name="icon#{i}"
-            item.name="item#{i}"
-
-            $data_items[i]=item
-          end
-
-          $item_maximum=9999
-
-          $game_party=Game_Party.new
-
-          $game_actors={}
-
-          [1,4,5,6].each do |i|
-            $game_actors[i]=Actor.new(i)
-          end
-
-          $game_party.actors=$game_actors.values
-
-          Graphics.frame_count=100
+          assert(
+            setup,
+            'Actual original message window initialization'
+          )
 
           eval(
-            runtime,
+            read.call(100),
             TOPLEVEL_BINDING,
-            'SL414 runtime'
+            'Window_Help2'
           )
 
-          def total(id)
-            SL414.owner(id)+[4,5,6].sum{
-              |i|SL414.count(i,id)
-            }
+          eval(
+            setup,
+            TOPLEVEL_BINDING,
+            'Actual native HUD setup'
+          )
+
+          w=$메세지
+
+          assert(
+            [
+              w.x+16,
+              w.y+16,
+              w.contents.width,
+              w.contents.height
+            ]==[138,491,344,93],
+            'Exact original central message screen bounds'
+          )
+
+          assert(
+            w.contents_opacity==255 &&
+            w.opacity==0 &&
+            w.z==999999,
+            'Native HUD contents explicitly visible'
+          )
+
+          SL414::IDS.each do |id|
+            SL414.designate(4,id)
           end
 
-          def counts(id)
-            [SL414.owner(id)]+[4,5,6].map{
-              |i|SL414.count(i,id)
-            }
-          end
-
-          def assert(v,s)
-            raise s unless v
-            puts "PASS #{s}"
-          end
-
-          SL414.buy(1,103)
-
-          assert(
-            counts(1)==[103,0,0,0],
-            'Unassigned purchase remains in original inventory'
-          )
-
-          [4,5,6].each{|i|SL414.designate(i,1)}
-
-          assert(
-            SL414.equalize(1) &&
-            counts(1)==[28,25,25,25],
-            'Equal split and remainder to owner'
-          )
-
-          SL414.buy(1,101)
-
-          assert(
-            counts(1)==[54,50,50,50] &&
-            total(1)==204,
-            'Purchase distributes only designated item'
-          )
-
-          SL414.buy(2,10)
-
-          assert(
-            counts(2)==[10,0,0,0],
-            'Non-target item unchanged'
-          )
-
-          assert(
-            SL414.give(4,1,14) &&
-            counts(1)==[40,64,50,50],
-            'Manual transfer'
-          )
-
-          assert(
-            SL414.recall(4,1,14) &&
-            counts(1)==[54,50,50,50],
-            'Manual recall'
-          )
-
-          assert(
-            !SL414.give(4,1,55) &&
-            total(1)==204,
-            'Invalid transfer rejected'
-          )
-
-          $item_maximum=60
-
-          assert(
-            !SL414.undesignate(4,1) &&
-            counts(1)==[54,50,50,50],
-            'Capacity limit preserves stock and designation'
-          )
-
-          $item_maximum=9999
-
-          assert(
-            SL414.undesignate(4,1) &&
-            counts(1)==[104,0,50,50],
-            'Unassign returns stock'
-          )
-
-          $game_party.actors.delete(
-            $game_actors[6]
-          )
-
-          SL414.buy(1,99)
-
-          assert(
-            counts(1)==[154,0,99,50],
-            'Inactive member excluded from new purchase'
-          )
-
-          assert(
-            SL414.retained?(1),
-            'Inactive stock stays selectable'
-          )
-
-          $game_party.actors << $game_actors[6]
-
-          SL414.designate(4,1)
-          SL414.give(4,1,10)
-
-          $game_actors[4].hp=100
-          $game_actors[4].armor_ids=[645]
-
-          e=Struct.new(:animation_id).new(0)
-
-          original=counts(1)
-
-          SL414.drink($game_actors[4],e)
-
-          assert(
-            $game_actors[4].hp==127 &&
-            e.animation_id==29 &&
-            counts(1)==[
-              original[0],
-              original[1]-1,
-              original[2],
-              original[3]
-            ],
-            'Only selected actor heals using native potion and ring amount'
-          )
-
-          SL414.drink($game_actors[4],e)
-
-          assert(
-            $game_actors[4].hp==127,
-            'Per-actor cooldown'
-          )
-
-          $game_actors[5].hp=100
-
-          SL414.drink($game_actors[5],e)
-
-          assert(
-            $game_actors[5].hp==125,
-            'Independent cooldown'
-          )
-
-          Graphics.frame_count=120
-
-          SL414.entry(4,1)[1]=false
-
-          SL414.drink($game_actors[4],e)
-
-          assert(
-            $game_actors[4].hp==127,
-            'Automatic potion toggle respected'
-          )
-
-          $game_actors[5].hp=0
-
-          old=counts(1)
-
-          SL414.drink($game_actors[5],e)
-
-          assert(
-            counts(1)==old &&
-            $game_actors[5].hp==0,
-            'Dead actor never uses potion'
-          )
-
-          $game_actors[5].hp=200
-
-          SL414.buy(1006,100)
-
-          SL414.designate(5,1006)
-          SL414.equalize(1006)
-
-          SL414.spend_arrow($game_actors[5])
-
-          assert(
-            counts(1006)==[50,0,49,0],
-            'Designated arrow consumed from correct actor'
-          )
-
-          SL414.spend_arrow($game_actors[1])
-          SL414.spend_arrow($game_actors[4])
-
-          assert(
-            counts(1006)==[48,0,49,0],
-            'Unassigned and hero arrow use preserved'
-          )
-
-          SL414.entry(5,1006)[0]=0
-
-          assert(
-            SL414.ammo($game_actors[5])==0 &&
-            SL414.ammo($game_actors[1])==48,
-            'Empty designated stock does not consume hero arrows'
-          )
-
-          old=counts(1)
-
-          $game_party=Marshal.load(
-            Marshal.dump($game_party)
-          )
-
-          $game_actors=$game_party.actors.to_h{
-            |a|[a.id,a]
-          }
-
-          assert(
-            counts(1)==old,
-            'Saved stock and assignments survive marshal'
-          )
-
-          w=HudMock.new
+          $game_temp.message_window_showing=false
 
           SL414.draw(w)
 
-          panels=w.contents.calls.select{
-            |c|c[0]==:fill && c[3]==85 && c[4]==98
+          assert(
+            w.visible,
+            'Native message window displays party HUD'
+          )
+
+          fills=w.contents.calls.select{
+            |q|q[0]==:fill &&
+              q[3]==85 &&
+              q[4]==93
           }
+
+          assert(
+            fills.map{|q|q[1]}==[0,86,172,258],
+            'Four equal native HUD columns'
+          )
+
+          w.contents.calls.each do |q|
+
+            case q[0]
+
+            when :fill,:text
+              x,y,ww,hh=q[1,4]
+
+            when :icon
+              r=q[1]
+              x,y,ww,hh=r.x,r.y,r.width,r.height
+
+            else
+              next
+
+            end
+
+            assert(
+              x>=0 &&
+              y>=0 &&
+              x+ww<=344 &&
+              y+hh<=93,
+              'Native HUD drawing inside bitmap'
+            )
+
+          end
 
           icons=w.contents.calls.select{
-            |c|c[0]==:icon
+            |q|q[0]==:icon
           }
 
           assert(
-            panels.size==4 && icons.size==4,
-            'Four native HUD panels and designated icons only'
+            icons.count{
+              |q|q[1].x>=86 && q[1].x<172
+            }==6,
+            'All six designated items fit inside one companion column'
           )
 
           assert(
-            icons.any?{|c|c[-1]==85},
-            'Zero stock icon dimmed'
+            icons.all?{|q|q[1].x>=86},
+            'No designated item icons in hero column'
           )
 
+          old=w.contents.calls.dup
+
+          w.set_text2('Original legacy message')
+
           assert(
-            icons.all?{|c|c[1].x>=208},
-            'No item icon in hero panel'
+            w.contents.calls==old,
+            'Legacy message cannot overwrite party HUD'
           )
 
           $game_temp.message_window_showing=true
@@ -1630,167 +432,159 @@ jobs:
 
           assert(
             !w.visible,
-            'Dialogue remains unobstructed'
+            'Native dialogue is not obstructed'
           )
 
           $game_temp.message_window_showing=false
 
-          menu=SL414::Menu.new($data_items[70])
-
-          window=menu.instance_variable_get(:@window)
-
-          window.index=2
-
-          Input.key=Input::C
-
-          menu.update
+          SL414.draw(w)
 
           assert(
-            menu.instance_variable_get(:@actor)==4,
-            'Actor submenu'
+            w.visible,
+            'Party HUD returns after dialogue'
           )
 
-          menu.instance_variable_get(:@window).index=0
+          actor=$game_actors[4]
 
-          menu.update
+          actor.hp=actor.hp-1
+
+          SL414.draw(w)
 
           assert(
-            SL414.entry(4,70),
-            'Assignment through menu'
+            w.contents.calls.any?{
+              |q|q[0]==:text &&
+                q[5]=="HP #{actor.hp}/#{actor.maxhp}"
+            },
+            'Actual companion HP change refreshes native HUD'
           )
 
-          SL414.buy(70,20)
+          puts 'PASS corrected native HUD lifecycle'
+          '''
 
-          menu.instance_variable_get(:@window).index=1
+          cache_fix=r'''
+          mapping_digest=hashlib.sha256(
+              mapper.read_bytes()
+          ).hexdigest()[:16]
 
-          menu.update
+          references=0
 
-          number=menu.instance_variable_get(:@number)
-
-          number.number=3
-
-          menu.update
-
-          assert(
-            counts(70)==[7,13,0,0],
-            'Manual numeric distribution via menu'
+          path_pattern=re.compile(
+              r"""(["'])([^"'<> \t\r\n]*mapping\.js)(?:\?[^"'<> \t\r\n]*)?\1""",
+              re.I
           )
 
-          menu.close
+          for name in ('index.html','knight/index.html'):
 
-          puts 'PASS all 27 runtime checks'
-          RUBY
+              p=root/name
+              html=p.read_text('utf8')
 
+              def replace_mapping(m):
+
+                  global references
+
+                  raw=m.group(2)
+
+                  if not raw.lower().endswith('mapping.js'):
+                      return m.group(0)
+
+                  if raw.startswith(('http:','https:','//')):
+                      return m.group(0)
+
+                  target=(p.parent/raw).resolve()
+
+                  if target!=mapper.resolve():
+                      return m.group(0)
+
+                  references+=1
+
+                  quote=m.group(1)
+
+                  return (
+                      quote
+                      +raw
+                      +'?v=V4.14&h='
+                      +mapping_digest
+                      +quote
+                  )
+
+              new_html=path_pattern.sub(replace_mapping,html)
+
+              if new_html!=html:
+                  p.write_text(new_html,'utf8')
+
+          assert references>=1,'Actual mapping.js load reference not found'
+
+          print(
+              'PASS cache-keyed mapping.js references',
+              references,
+              mapping_digest
+          )
+
+          '''
+
+          verify=once(
+              verify,
+              'after={\n',
+              textwrap.dedent(cache_fix)+'after={\n'
+          )
+
+          output={
+              'sl414-runtime.rb':revised_runtime,
+              'sl414-patch.rb':patch,
+              'sl414-test.rb':test,
+              'sl414-baseline.py':baseline,
+              'sl414-verify.py':verify
+          }
+
+          for name,body in output.items():
+
+              if name.endswith('.py'):
+                  compile(body,name,'exec')
+
+              Path('/tmp',name).write_text(body,'utf8')
+
+          print('PASS exact previous source verified')
+          print('PASS original inventory implementation retained')
+          print('PASS native HUD coordinates corrected')
+          print('PASS legacy message output isolated')
+          print('PASS original version retained: V4.14')
+          PYTHON
+
+          ruby -c /tmp/sl414-patch.rb
           ruby -c /tmp/sl414-test.rb
 
-          ruby /tmp/sl414-test.rb \
-            site/knight/gameasync/Data/Scripts.rxdata
-
-      - name: Verify exact V4.14 scope
+      - name: Verify V4.13 baseline
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import hashlib,json,re
+          mkdir -p site
+          tar -xf baseline/artifact.tar -C site
 
-          root=Path('site')
+          python3 /tmp/sl414-baseline.py
 
-          mapper=root/'knight/gameasync/mapping.js'
+      - name: Apply designated items and corrected native HUD
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          script=root/'knight/gameasync/Data/Scripts.rxdata'
+          ruby /tmp/sl414-patch.rb \
+            site/knight/gameasync/Data
 
-          before=json.loads(
-              Path('/tmp/sl414-before.json').read_text('utf8')
-          )
+      - name: Verify original inventory and corrected HUD
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          old=before[
-              script.relative_to(root).as_posix()
-          ]['md5']
+          ruby /tmp/sl414-test.rb \
+            site/knight/gameasync/Data/Scripts.rxdata
 
-          new=hashlib.md5(
-              script.read_bytes()
-          ).hexdigest()
+      - name: Verify exact V4.14 scope and cache mapping
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          s=mapper.read_text('utf8')
-
-          marker='Data/Scripts.rxdata?h='
-
-          assert old!=new
-
-          assert re.findall(
-              re.escape(marker)+r'[0-9a-f]{32}',
-              s
-          )==[marker+old]
-
-          mapper.write_text(
-              s.replace(marker+old,marker+new),
-              'utf8'
-          )
-
-          loader=root/'knight/js/sl-assets-v229r115.js'
-
-          s=loader.read_bytes()
-
-          assert s.count(
-              b"var version='V4.13';"
-          )==1
-
-          loader.write_bytes(
-              s.replace(
-                  b"var version='V4.13';",
-                  b"var version='V4.14';"
-              )
-          )
-
-          for name in ('index.html','knight/index.html'):
-              p=root/name
-
-              s=p.read_bytes()
-
-              assert b'V4.13' in s,name
-
-              p.write_bytes(
-                  s.replace(b'V4.13',b'V4.14')
-                   .replace(b'v4.13',b'v4.14')
-              )
-
-          after={
-              p.relative_to(root).as_posix():
-                hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-
-          assert len(after)==6085
-
-          assert set(after)==set(before)
-
-          changed={
-              k for k in before
-              if before[k]['sha256']!=after[k]
-          }
-
-          allowed={
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/mapping.js',
-              'knight/js/sl-assets-v229r115.js',
-              'index.html',
-              'knight/index.html'
-          }
-
-          assert changed==allowed,sorted(changed^allowed)
-
-          print('PASS four-character HUD')
-          print('PASS designated item icons')
-          print('PASS individual inventory and automatic purchase allocation')
-          print('PASS original potion values and actor-specific recovery')
-          print('PASS original arrow consumption branches')
-          print('PASS original 50:50 EXP and party bonuses')
-          print('PASS all maps, CE data, graphics and equipment preserved')
-          print('PASS 6080 unchanged files')
-          print('PASS V4.14 candidate')
-          PYTHON
+          python3 /tmp/sl414-verify.py
 
           node --check site/knight/gameasync/mapping.js
           node --check site/knight/js/sl-assets-v229r115.js
