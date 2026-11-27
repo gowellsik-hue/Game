@@ -32,7 +32,7 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Retrieve frozen V4.9 patch source
+      - name: Retrieve frozen original combat source
         uses: actions/checkout@v4
         with:
           repository: gowellsik-hue/Game
@@ -41,7 +41,16 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Verify and extract original patch steps
+      - name: Retrieve frozen startup correction
+        uses: actions/checkout@v4
+        with:
+          repository: gowellsik-hue/Game
+          ref: d66584ceb073a023e63e4b2a7bac0f9093edf594
+          path: frozen-boot
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify frozen sources
         shell: bash
         run: |
           set -euo pipefail
@@ -52,8 +61,14 @@ jobs:
           test "$(git -C frozen-v49 rev-parse HEAD:.github/workflows/build-slknight-web.yml)" = \
             "afabbb2ae261596e670b1509d92c1d245aeca319"
 
+          test "$(git -C frozen-boot rev-parse HEAD)" = \
+            "d66584ceb073a023e63e4b2a7bac0f9093edf594"
+
+          test "$(git -C frozen-boot rev-parse HEAD:.github/workflows/build-slknight-web.yml)" = \
+            "923ce37bfd980ef9efc27bdf81fe1b6c3772d904"
+
           ruby -ryaml - <<'RUBY'
-          source='frozen-v49/.github/workflows/build-slknight-web.yml'
+          source='frozen-boot/.github/workflows/build-slknight-web.yml'
 
           workflow=YAML.safe_load(
             File.read(source,encoding:'UTF-8')
@@ -62,496 +77,728 @@ jobs:
           steps=workflow.fetch('jobs').fetch('build').fetch('steps')
 
           wanted={
-            'Verify V4.8 baseline'=>'verify',
+            'Verify and extract original patch steps'=>'extract',
+            'Verify V4.8 baseline'=>'baseline',
             'Prepare original L1J monster traits'=>'traits',
-            'Prepare L1J physical combat runtime'=>'runtime',
-            'Replace verified physical combat event paths'=>'apply',
+            'Prepare original physical combat runtime'=>'runtime',
+            'Separate monster data from startup compilation'=>'boot',
+            'Apply corrected physical combat patch'=>'apply',
+            'Merge traits into existing MonsterStats data'=>'merge',
+            'Verify startup data access and combat runtime'=>'startup',
+            'Update mapping verification for separated data'=>'mapping_prepare',
             'Update data mappings and version'=>'mapping',
-            'Verify exact combat changes'=>'final'
+            'Verify exact combat changes'=>'verify',
+            'Verify final startup script and original engine'=>'final'
           }
 
           wanted.each do |name,key|
             matches=steps.select{|s|s['name']==name}
 
-            raise "Missing original step #{name}" unless matches.size==1
+            raise "Missing source step #{name}" unless matches.size==1
 
             run=matches.first.fetch('run')
 
-            raise "Empty original step #{name}" unless run.is_a?(String) && !run.empty?
+            raise "Empty source step #{name}" unless
+              run.is_a?(String) && !run.empty?
 
-            File.binwrite("/tmp/sl49-v49-#{key}.sh",run)
+            File.binwrite("/tmp/sl49-source-#{key}.sh",run)
           end
 
-          puts 'PASS frozen V4.9 workflow source'
+          puts 'PASS frozen source workflows'
           RUBY
 
-          for name in verify traits runtime apply mapping final; do
-            bash -n "/tmp/sl49-v49-${name}.sh"
+          for name in extract baseline traits runtime boot apply merge startup mapping_prepare mapping verify final; do
+            bash -n "/tmp/sl49-source-${name}.sh"
           done
 
-      - name: Verify V4.8 baseline
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash /tmp/sl49-v49-verify.sh
-
-      - name: Prepare original L1J monster traits
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash /tmp/sl49-v49-traits.sh
-
-      - name: Prepare original physical combat runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash /tmp/sl49-v49-runtime.sh
-
-      - name: Separate monster data from startup compilation
+      - name: Reconstruct corrected V4.9 from V4.8
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl49-boot-fix.rb <<'RUBY'
+          for name in extract baseline traits runtime boot apply merge startup mapping_prepare; do
+            bash "/tmp/sl49-source-${name}.sh"
+          done
+
+      - name: Replace repeated combat eval with native interpreter execution
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/sl49-direct.rb <<'RUBY'
           # encoding: UTF-8
+          require 'zlib'
+          require 'json'
+          require 'digest'
 
-          def once(s,a,b,n=1)
-            count=s.scan(a).size
+          module RPG
+            %w[
+              Map MapInfo Event EventCommand MoveRoute
+              MoveCommand AudioFile CommonEvent Weapon
+            ].each{|n|const_set(n,::Class.new)}
 
-            raise "Anchor #{a.inspect}: #{count}/#{n}" unless count==n
-
-            s.gsub(a){b}
+            Event.const_set(:Page,::Class.new)
+            Event::Page.const_set(:Condition,::Class.new)
+            Event::Page.const_set(:Graphic,::Class.new)
           end
 
-          s=File.read('/tmp/sl49-runtime.rb',encoding:'UTF-8')
-
-          s=once(
-            s,
-            /  TRAITS=__TRAITS__\n  STATS=__STATS__/,
-            <<~'SRC'.chomp.gsub(/^/,'  ')
-            def self.stats(mid,eid)
-              if @stats.nil?
-                data=load_data('Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMonsterStats.rxdata')
-                @stats={}
-                data.each{|key,row| (@stats[key[0]] ||= {})[key[1]]=row}
+          %w[Table Tone Color].each do |n|
+            Object.const_set(n,Class.new do
+              def self._load(raw)
+                o=allocate
+                o.instance_variable_set(:@raw,raw)
+                o
               end
-              map=@stats[mid]
-              map && map[eid]
-            end
-          SRC
-          )
 
-          s=once(
-            s,
-            /t=TRAITS\.fetch\(\[mid,eid\]\)[;\s]+s=STATS\.fetch\(\[mid,eid\]\)/,
-            's=stats(mid,eid); t=s[:sl49_traits]'
-          )
-
-          s=once(
-            s,
-            /t=TRAITS\[\[mid,eid\]\][;\s]+s=STATS\[\[mid,eid\]\]/,
-            's=stats(mid,eid); t=s && s[:sl49_traits]'
-          )
-
-          s=once(
-            s,
-            /t=TRAITS\.fetch\(ctx\);? */,
-            '',
-            2
-          )
-
-          s=once(
-            s,
-            's=STATS.fetch(ctx)',
-            's=stats(*ctx)'
-          )
-
-          raise 'Embedded monster data remains' if
-            s.match?(/\b(?:TRAITS|STATS|__TRAITS__|__STATS__)\b/)
-
-          raise 'Runtime too large' if s.bytesize>16000
-
-          RubyVM::InstructionSequence.compile(s)
-
-          File.binwrite('/tmp/sl49-runtime-fixed.rb',s)
-
-          p='/tmp/sl49-v49-apply.sh'
-          s=File.read(p,encoding:'UTF-8')
-
-          old=<<~'OLD'.chomp
-          runtime=File.read(
-            '/tmp/sl49-runtime.rb',
-            encoding:'UTF-8'
-          ).sub('__TRAITS__'){
-            traits.inspect
-          }.sub('__STATS__'){
-            stats.inspect
-          }
-          OLD
-
-          s=once(
-            s,
-            old,
-            "runtime=File.read('/tmp/sl49-runtime-fixed.rb',encoding:'UTF-8')"
-          )
-
-          s=once(
-            s,
-            'SL49::TRAITS.has_key?([@map_id,@event_id])',
-            'SL49.stats(@map_id,@event_id)'
-          )
-
-          File.binwrite(p,s)
-
-          puts 'PASS embedded monster data removed'
-          puts 'PASS lazy monster data access'
-          puts 'PASS original combat formulas retained'
-          RUBY
-
-          ruby -c /tmp/sl49-boot-fix.rb
-          ruby /tmp/sl49-boot-fix.rb
-
-          ruby -c /tmp/sl49-runtime-fixed.rb
-          bash -n /tmp/sl49-v49-apply.sh
-
-      - name: Apply corrected physical combat patch
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash /tmp/sl49-v49-apply.sh
-
-      - name: Merge traits into existing MonsterStats data
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ruby -rdigest -rjson -rzlib - <<'RUBY'
-          root='site/knight/gameasync/Data'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          name=pre+'MonsterStats.rxdata'
-          path=File.join(root,name)
-
-          raw=File.binread(path)
-
-          raise 'Original MonsterStats checksum' unless
-            Digest::SHA256.hexdigest(raw)==
-            'b75e5047db2bb6a5a9217f730a909a911fb2020e8d5952e90e37dced9bd52d93'
-
-          old=Marshal.load(raw)
-          data=Marshal.load(raw)
-
-          traits={}
-          npcs={}
-
-          File.foreach('/tmp/sl49_npc_traits.txt') do |line|
-            id,sz,u,h,r,lv,ev=line.split
-
-            raise 'Duplicate NPC' if npcs[id]
-
-            raise 'Invalid NPC size' unless
-              ['small','large'].include?(sz)
-
-            npcs[id]=true
-
-            ev.split(',').each do |entry|
-              key=entry.split(':').map(&:to_i)
-
-              raise "Duplicate trait #{key.inspect}" if traits[key]
-
-              traits[key]=[
-                sz,u.to_i,h.to_i,r.to_i,lv.to_i
-              ]
-            end
+              def _dump(d)
+                @raw
+              end
+            end)
           end
 
-          raise 'NPC count' unless npcs.size==142
-
-          raise 'Monster count' unless
-            old.size==421 &&
-            traits.size==421 &&
-            traits.keys.sort==old.keys.sort
-
-          raise 'Original stat count' unless
-            old.values.inject(0){|n,row|n+row.size}==3368
-
-          traits.each do |key,t|
-            raise 'Unexpected existing trait' if
-              data.fetch(key).has_key?(:sl49_traits)
-
-            data.fetch(key)[:sl49_traits]=t
+          def check(v,msg)
+            raise msg unless v
           end
 
-          raise 'Original stats changed' unless
-            data.all?{|key,row|
-              row.reject{|k,v|k==:sl49_traits}==old[key] &&
-              row[:sl49_traits]==traits[key]
-            }
-
-          merged=Marshal.dump(data)
-
-          File.binwrite(path,merged)
-
-          raise 'MonsterStats roundtrip' unless
-            Marshal.load(File.binread(path))==data
-
-          names=JSON.parse(
-            File.read('/tmp/sl49-changed.json',encoding:'UTF-8')
-          )
-
-          raise 'Unexpected original data count' unless
-            names.size==37 && names.uniq.size==37
-
-          raise 'Unexpected duplicate data' if names.include?(name)
-
-          names<<name
-
-          File.write(
-            '/tmp/sl49-changed.json',
-            JSON.generate(names.sort)
-          )
-
-          puts 'PASS 3368 original stat fields preserved'
-          puts 'PASS 421 monster traits merged'
-          puts "PASS MonsterStats bytes #{merged.bytesize}"
-          RUBY
-
-      - name: Verify startup data access and combat runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ruby -rzlib - <<'RUBY'
-          # encoding: UTF-8
-
-          $sl49_data_root='site/knight/gameasync'
-          $sl49_reads=0
-
-          def load_data(path)
-            $sl49_reads+=1
-
-            Marshal.load(
-              File.binread(File.join($sl49_data_root,path))
-            )
+          def iv(o,k)
+            o.instance_variable_get(k)
           end
 
-          runtime=File.read(
-            '/tmp/sl49-runtime-fixed.rb',
-            encoding:'UTF-8'
-          )
-
-          eval(runtime)
-
-          raise 'Data loaded during startup' unless $sl49_reads==0
-
-          name='Data/MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMonsterStats.rxdata'
-
-          expected=Marshal.load(
-            File.binread(File.join($sl49_data_root,name))
-          )
-
-          raise 'Monster count' unless expected.size==421
-
-          expected.each do |key,row|
-            actual=SL49.stats(key[0],key[1])
-
-            raise "Incorrect monster data #{key.inspect}" unless
-              actual==row
+          def utf(s)
+            s.to_s.dup.force_encoding('UTF-8')
           end
 
-          raise 'Repeated monster data loading' unless $sl49_reads==1
-
-          raise 'Unmapped monster lookup' unless
-            SL49.stats(999,999).nil?
-
-          raise 'STR hit table' unless SL49::STR_HIT.size==59
-          raise 'DEX hit table' unless SL49::DEX_HIT.size==60
-          raise 'STR damage table' unless SL49::STR_DMG.size==128
-          raise 'DEX damage table' unless SL49::DEX_DMG.size==128
-
-          rows=Marshal.load(
-            File.binread(
-              File.join($sl49_data_root,'Data/Scripts.rxdata')
-            )
-          )
-
-          entry=rows.select{|r|
-            r && r[1].to_s.dup.force_encoding('UTF-8')=='Interpreter 3'
-          }
-
-          raise 'Interpreter 3 count' unless entry.size==1
-
-          source=Zlib::Inflate.inflate(entry.first[2])
-
-          raise 'Oversized startup script' if source.bytesize>32000
-
-          raise 'Embedded monster table remains' if
-            source.include?('TRAITS=') ||
-            source.include?('STATS=')
-
-          RubyVM::InstructionSequence.compile(
-            source.force_encoding('UTF-8')
-          )
-
-          puts "PASS Interpreter 3 bytes #{source.bytesize}"
-          puts 'PASS no combat data loading during script initialization'
-          puts 'PASS 421 monster lookups'
-          puts 'PASS monster data loaded once'
-          RUBY
-
-      - name: Update mapping verification for separated data
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ruby - <<'RUBY'
           def once(s,a,b)
-            raise "Anchor #{a.inspect}" unless s.scan(a).size==1
-
+            check(s.scan(a).size==1,"Anchor #{a.inspect}")
             s.sub(a){b}
           end
 
-          p='/tmp/sl49-v49-mapping.sh'
-          s=File.read(p,encoding:'UTF-8')
+          root=ARGV.fetch(0)
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          s=once(
-            s,
-            'assert len(names)==37',
-            'assert len(names)==38'
+          path=->(n){File.join(root,pre+n+'.rxdata')}
+
+          counts=Hash.new(0)
+          updates={}
+
+          files=Dir.glob(
+            path.call('Map[0-9][0-9][0-9]')
+          ).sort+[path.call('CommonEvents')]
+
+          check(files.size==47,'Map and CE count')
+
+          files.each do |f|
+            o=Marshal.load(File.binread(f))
+
+            lists=if f.end_with?('CommonEvents.rxdata')
+              o.compact.map{|e|iv(e,:@list)}
+            else
+              iv(o,:@events).values.flat_map do |e|
+                iv(e,:@pages).map{|p|iv(p,:@list)}
+              end
+            end
+
+            n=0
+
+            lists.each do |list|
+              list.each do |c|
+                p=iv(c,:@parameters)
+                code=iv(c,:@code)
+
+                next unless [111,355].include?(code)
+
+                s=code==355 ? p[0] :
+                  p[0]==12 ? p[1] : nil
+
+                next unless s.is_a?(String) &&
+                  (s.include?('@sl49_') || s.include?('SL49.'))
+
+                s=utf(s)
+
+                out=nil
+                new_code=code
+                tag=nil
+
+                if code==355
+                  case s
+
+                  when /\Aa=\$game_actors\[1\]; w=SL49\.weapon\(a\); @sl49_active=!w\.nil\?; if @sl49_active; @sl49_damage=SL49\.pc_attack\(a,(\d+),(\d+),w\); else; (\$game_variables\[334\]=a\.agi; )?\$game_variables\[335\]=(-?\d+)\+rand\((\d+)\); \$game_map\.need_refresh=true; end; true\z/
+
+                    mid=$1.to_i
+                    eid=$2.to_i
+                    agi=!$3.nil?
+                    lo=$4.to_i
+                    span=$5.to_i
+
+                    out=[
+                      'SL49_PC_PREP',
+                      mid,eid,agi,lo,span
+                    ]
+
+                    tag=:pc_prep
+
+                  when /\ASL49\.apply_damage\((\d+),(\d+),(\d+),@sl49_damage\) if @sl49_active; @sl49_active=false; true\z/
+
+                    out=[
+                      'SL49_PC_DONE',
+                      $1.to_i,$2.to_i,$3.to_i
+                    ]
+
+                    tag=:pc_done
+
+                  when /\A@sl49_npc=SL49\.npc_context\(@event_id,@sl_attack_target,(\d+)\); if @sl49_npc; @sl49_nhit=SL49\.npc_hit\(@sl49_npc\); else; \$game_variables\[336\]=(-?\d+)\+rand\((\d+)\); \$game_map\.need_refresh=true; end; true\z/
+
+                    out=[
+                      'SL49_NPC_PREP',
+                      $1.to_i,$2.to_i,$3.to_i
+                    ]
+
+                    tag=:npc_prep
+
+                  when /\Aunless (@sl49_active|@sl49_npc); @parameters=(\[[\d, \-]+\]); command_122; end; true\z/
+
+                    pc=$1=='@sl49_active'
+                    legacy=JSON.parse($2)
+
+                    check(
+                      legacy.size>=5 &&
+                      legacy.size<=6 &&
+                      legacy.all?{|v|v.is_a?(Integer)},
+                      'Legacy parameters'
+                    )
+
+                    out=legacy+[
+                      pc ? :sl49_pc_legacy : :sl49_npc_legacy
+                    ]
+
+                    new_code=122
+                    tag=pc ? :pc_legacy : :npc_legacy
+                  end
+
+                else
+
+                  case s
+
+                  when '@sl49_active ? !@sl49_damage.nil? : $game_variables[334] >= $game_variables[335]'
+
+                    out=[49]
+                    tag=:pc_hit
+
+                  when '@sl49_npc ? @sl49_nhit : $game_variables[336] >= $game_variables[337]'
+
+                    out=[50]
+                    tag=:npc_hit
+
+                  when 'if @sl49_npc; $game_variables[26]=SL49.npc_damage(@sl49_npc); end; $game_variables[26]<=0'
+
+                    out=[51]
+                    tag=:npc_zero
+                  end
+
+                end
+
+                check(out,"Unrecognized V4.9 command #{s}")
+
+                c.instance_variable_set(:@code,new_code)
+                c.instance_variable_set(:@parameters,out)
+
+                counts[tag]+=1
+                n+=1
+              end
+            end
+
+            updates[f]=o if n>0
+          end
+
+          expected={
+            pc_prep:1696,
+            pc_hit:1696,
+            pc_done:1696,
+            pc_legacy:6291,
+            npc_prep:69,
+            npc_hit:69,
+            npc_zero:69,
+            npc_legacy:203
+          }
+
+          check(counts==expected,"Coverage #{counts.inspect}")
+          check(updates.size==36,'Data routes count')
+
+          sp=File.join(root,'Scripts.rxdata')
+
+          rows=Marshal.load(File.binread(sp))
+          oldrows=rows.map{|r|Marshal.dump(r)}
+
+          edit=lambda do |name,&block|
+            r=rows.select{|x|x && utf(x[1])==name}
+
+            check(r.size==1,name)
+
+            r=r[0]
+
+            old=utf(Zlib::Inflate.inflate(r[2]))
+            s=old.gsub("\r\n","\n")
+
+            t=block.call(s)
+
+            RubyVM::InstructionSequence.compile(t)
+
+            t=t.gsub("\n","\r\n") if old.include?("\r\n")
+
+            check(t!=old,name)
+
+            r[2]=Zlib::Deflate.deflate(t)
+          end
+
+          weapons=Marshal.load(
+            File.binread(path.call('Weapons'))
           )
 
-          s=once(
-            s,
-            'assert len(set(names))==37',
-            'assert len(set(names))==38'
+          edit.call('Interpreter 3') do |s|
+
+            a=s.index("  WEAPONS={\n")
+            b=s.index("\n  STR_HIT=",a||0)
+
+            check(a && b,'Weapon table')
+
+            original=s[a...b]
+
+            specs=eval(original.split('=',2)[1])
+
+            check(
+              specs.is_a?(Hash) &&
+              specs.size==27,
+              'Original weapon definitions'
+            )
+
+            values=specs.values.uniq
+
+            ids=[]
+            missing=[]
+            total=0
+
+            weapons.each_with_index do |w,id|
+              next if w.nil?
+
+              total+=1
+
+              name=utf(iv(w,:@name)).strip
+
+              en=name[/^\+(\d+)\s+/,1].to_i
+
+              base=name.sub(/^\+\d+\s+/,'')
+
+              spec=specs[base]
+
+              if spec
+                ids<<[id,values.index(spec),en]
+              else
+                missing<<id
+              end
+            end
+
+            check(
+              ids.size+missing.size==total &&
+              ids.map(&:first).uniq.size==ids.size,
+              'Weapon ID coverage'
+            )
+
+            check(
+              [170,1000,1001,1002].all?{
+                |id|ids.any?{|r|r[0]==id}
+              },
+              'Starter weapon IDs'
+            )
+
+            direct={0=>[0,0,0,0,0,'','bare',0,0]}
+
+            ids.each do |id,index,en|
+              direct[id]=values[index]+[en]
+            end
+
+            weapons.each_with_index do |w,id|
+
+              if w.nil?
+                expected=direct[0]
+                actual=direct[0]
+              else
+                name=utf(iv(w,:@name)).strip
+                en=name[/^\+(\d+)\s+/,1].to_i
+                base=name.sub(/^\+\d+\s+/,'')
+                spec=specs[base]
+
+                expected=spec && spec+[en]
+                actual=direct[id]
+              end
+
+              check(
+                actual==expected,
+                "Weapon lookup #{id}"
+              )
+            end
+
+            table=
+              "  WEAPON_SPECS=#{values.inspect}\n"+
+              "  WEAPON_IDS={0=>[0,0,0,0,0,'','bare',0,0]}\n"+
+              "  #{ids.inspect}.each{|r| WEAPON_IDS[r[0]]=WEAPON_SPECS[r[1]]+[r[2]]}\n"
+
+            s=s[0...a]+table+s[b..-1]
+
+            old=s[/  def self\.weapon\(a\)\n.*?\n  end\n/m]
+
+            check(
+              old && old.include?('WEAPONS[name]'),
+              'Weapon lookup source'
+            )
+
+            s=once(
+              s,
+              old,
+              <<~'SRC'.gsub(/^/,'  ')
+              def self.weapon(a)
+                return WEAPON_IDS[0] if $data_weapons[a.weapon_id].nil?
+                WEAPON_IDS[a.weapon_id]
+              end
+            SRC
+            )
+
+            old="    when 12  # \uc2a4\ud06c\ub9bd\ud2b8\n      result = eval(@parameters[1])"
+
+            new=<<~'SRC'.chomp.gsub(/^/,'    ')
+            when 49
+              result = @sl49_active ? !@sl49_damage.nil? : $game_variables[334] >= $game_variables[335]
+            when 50
+              result = @sl49_npc ? @sl49_nhit : $game_variables[336] >= $game_variables[337]
+            when 51
+              $game_variables[26]=SL49.npc_damage(@sl49_npc) if @sl49_npc
+              result = $game_variables[26]<=0
+            SRC
+
+            s=once(s,old,new+"\n"+old)
+
+            check(
+              s.bytesize<=32000,
+              "Interpreter 3 size #{s.bytesize}"
+            )
+
+            puts "PASS weapon IDs #{ids.size}/#{total}"
+            puts "PASS original fallback IDs #{missing.size}"
+            puts "PASS #{weapons.size} equivalent weapon lookups"
+            puts "PASS Interpreter 3 bytes #{s.bytesize}"
+
+            s
+          end
+
+          edit.call('Interpreter 4') do |s|
+
+            a="  def command_122\n"
+
+            once(
+              s,
+              a,
+              a+<<~'SRC'.gsub(/^/,'    ')
+              return true if @sl49_active && @parameters[-1]==:sl49_pc_legacy
+              return true if @sl49_npc && @parameters[-1]==:sl49_npc_legacy
+            SRC
+            )
+          end
+
+          edit.call('Interpreter 7') do |s|
+
+            a="  def command_355\n"
+
+            once(
+              s,
+              a,
+              a+<<~'SRC'.gsub(/^/,'    ')
+              case @parameters[0]
+              when 'SL49_PC_PREP'
+                a=$game_actors[1]
+                w=SL49.weapon(a)
+                @sl49_active=!w.nil?
+
+                if @sl49_active
+                  @sl49_damage=SL49.pc_attack(
+                    a,@parameters[1],@parameters[2],w
+                  )
+                else
+                  $game_variables[334]=a.agi if @parameters[3]
+
+                  $game_variables[335]=
+                    @parameters[4]+rand(@parameters[5])
+
+                  $game_map.need_refresh=true
+                end
+
+                return true
+
+              when 'SL49_PC_DONE'
+
+                SL49.apply_damage(
+                  @parameters[1],
+                  @parameters[2],
+                  @parameters[3],
+                  @sl49_damage
+                ) if @sl49_active
+
+                @sl49_active=false
+
+                return true
+
+              when 'SL49_NPC_PREP'
+
+                @sl49_npc=SL49.npc_context(
+                  @event_id,
+                  @sl_attack_target,
+                  @parameters[1]
+                )
+
+                if @sl49_npc
+                  @sl49_nhit=SL49.npc_hit(@sl49_npc)
+                else
+                  $game_variables[336]=
+                    @parameters[2]+rand(@parameters[3])
+
+                  $game_map.need_refresh=true
+                end
+
+                return true
+              end
+            SRC
+            )
+          end
+
+          check(
+            rows.each_index.select{
+              |i|Marshal.dump(rows[i])!=oldrows[i]
+            }.map{
+              |i|utf(rows[i][1])
+            }.sort==
+            [
+              'Interpreter 3',
+              'Interpreter 4',
+              'Interpreter 7'
+            ],
+            'Script scope'
           )
 
-          s=once(
-            s,
-            'PASS 37 updated data mappings',
-            'PASS 38 updated data mappings'
-          )
+          updates[sp]=rows
 
-          File.binwrite(p,s)
+          check(updates.size==37,'Optimized file count')
 
-          p='/tmp/sl49-v49-final.sh'
-          s=File.read(p,encoding:'UTF-8')
+          updates.each do |f,o|
+            raw=Marshal.dump(o)
 
-          s=once(
-            s,
-            "    pre+'CommonEvents.rxdata'\n}",
-            "    pre+'CommonEvents.rxdata',\n    pre+'MonsterStats.rxdata'\n}"
-          )
+            File.binwrite(f,raw)
 
-          s=once(
-            s,
-            "'Armors','Items','MonsterStats',",
-            "'Armors','Items',"
-          )
+            check(
+              Marshal.dump(
+                Marshal.load(File.binread(f))
+              )==raw,
+              "Roundtrip #{f}"
+            )
+          end
 
-          s=once(
-            s,
-            'assert len(changed)==41',
-            'assert len(changed)==42'
-          )
-
-          File.binwrite(p,s)
-
-          puts 'PASS separated data mapping verification'
+          puts "PASS direct event routes #{counts.inspect}"
+          puts "PASS #{counts.values.sum} combat eval sites removed"
           RUBY
 
-          bash -n /tmp/sl49-v49-mapping.sh
-          bash -n /tmp/sl49-v49-final.sh
+          ruby -c /tmp/sl49-direct.rb
 
-      - name: Update data mappings and version
+          ruby /tmp/sl49-direct.rb site/knight/gameasync/Data
+
+      - name: Verify all optimized combat command routes
         shell: bash
         run: |
           set -euo pipefail
 
-          bash /tmp/sl49-v49-mapping.sh
+          ruby -rzlib -rjson - <<'RUBY'
+          # encoding: UTF-8
 
-      - name: Verify exact combat changes
-        shell: bash
-        run: |
-          set -euo pipefail
+          module RPG
+            %w[
+              Map MapInfo Event EventCommand MoveRoute
+              MoveCommand AudioFile CommonEvent
+            ].each{|n|const_set(n,::Class.new)}
 
-          bash /tmp/sl49-v49-final.sh
+            Event.const_set(:Page,::Class.new)
+            Event::Page.const_set(:Condition,::Class.new)
+            Event::Page.const_set(:Graphic,::Class.new)
+          end
 
-      - name: Verify final startup script and original engine
-        shell: bash
-        run: |
-          set -euo pipefail
+          %w[Table Tone Color].each do |n|
+            Object.const_set(n,Class.new do
+              def self._load(raw)
+                o=allocate
+                o.instance_variable_set(:@raw,raw)
+                o
+              end
 
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import hashlib,json,re
+              def _dump(d)
+                @raw
+              end
+            end)
+          end
 
-          root=Path('site')
-          game=root/'knight/gameasync'
+          def iv(o,k)
+            o.instance_variable_get(k)
+          end
 
-          before=json.loads(
-              Path('/tmp/sl49-before.json').read_text('utf8')
-          )
+          root='site/knight/gameasync/Data'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          after={
-              str(p.relative_to(root)):hashlib.sha256(
-                  p.read_bytes()
-              ).hexdigest()
-              for p in root.rglob('*') if p.is_file()
+          files=Dir.glob(
+            File.join(root,pre+'Map[0-9][0-9][0-9].rxdata')
+          ).sort
+
+          files<<File.join(root,pre+'CommonEvents.rxdata')
+
+          raise 'Data count' unless files.size==47
+
+          counts=Hash.new(0)
+
+          files.each do |f|
+            o=Marshal.load(File.binread(f))
+
+            lists=if f.end_with?('CommonEvents.rxdata')
+              o.compact.map{|e|iv(e,:@list)}
+            else
+              iv(o,:@events).values.flat_map do |e|
+                iv(e,:@pages).map{|p|iv(p,:@list)}
+              end
+            end
+
+            lists.each do |list|
+              list.each do |c|
+                p=iv(c,:@parameters)
+
+                case iv(c,:@code)
+
+                when 355
+
+                  case p[0]
+                  when 'SL49_PC_PREP'
+                    raise 'PC prep parameters' unless p.size==6
+                    counts[:pc_prep]+=1
+
+                  when 'SL49_PC_DONE'
+                    raise 'PC done parameters' unless p.size==4
+                    counts[:pc_done]+=1
+
+                  when 'SL49_NPC_PREP'
+                    raise 'NPC prep parameters' unless p.size==4
+                    counts[:npc_prep]+=1
+
+                  else
+                    if p[0].is_a?(String) &&
+                      (
+                        p[0].include?('@sl49_') ||
+                        p[0].include?('SL49.')
+                      )
+                      raise 'Repeated combat script remains'
+                    end
+                  end
+
+                when 111
+
+                  case p[0]
+
+                  when 49
+                    counts[:pc_hit]+=1
+
+                  when 50
+                    counts[:npc_hit]+=1
+
+                  when 51
+                    counts[:npc_zero]+=1
+
+                  when 12
+                    if p[1].is_a?(String) &&
+                      (
+                        p[1].include?('@sl49_') ||
+                        p[1].include?('SL49.')
+                      )
+                      raise 'Repeated combat condition remains'
+                    end
+                  end
+
+                when 122
+
+                  case p[-1]
+
+                  when :sl49_pc_legacy
+                    counts[:pc_legacy]+=1
+
+                  when :sl49_npc_legacy
+                    counts[:npc_legacy]+=1
+                  end
+                end
+              end
+            end
+          end
+
+          expected={
+            pc_prep:1696,
+            pc_hit:1696,
+            pc_done:1696,
+            pc_legacy:6291,
+            npc_prep:69,
+            npc_hit:69,
+            npc_zero:69,
+            npc_legacy:203
           }
 
-          assert len(after)==6033
-          assert set(before)==set(after)
+          raise counts.inspect unless counts==expected
 
-          changed={
-              name for name in before
-              if before[name]!=after[name]
-          }
-
-          assert len(changed)==42
-
-          for name in before:
-              if name.endswith('.wasm') or name.endswith('.pack'):
-                  assert before[name]==after[name],name
-
-          assert all(
-              before[name]==after[name]
-              for name in before
-              if name.endswith('/mkxp.js')
-              or name.endswith('/drive.js')
-              or name.endswith('/bitmap-map.js')
+          rows=Marshal.load(
+            File.binread(File.join(root,'Scripts.rxdata'))
           )
 
-          mapping=(game/'mapping.js').read_bytes()
+          ['Interpreter 3','Interpreter 4','Interpreter 7'].each do |name|
 
-          name='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIOMonsterStats.rxdata'
+            selected=rows.select{
+              |r|r && r[1].to_s.dup.force_encoding('UTF-8')==name
+            }
 
-          for filename in ('Scripts.rxdata',name):
-              raw=(game/'Data'/filename).read_bytes()
+            raise name unless selected.size==1
 
-              marker=(
-                  'Data/'+filename+'?h='+
-                  hashlib.md5(raw).hexdigest()
-              ).encode('ascii')
+            src=Zlib::Inflate.inflate(
+              selected.first[2]
+            ).force_encoding('UTF-8')
 
-              assert mapping.count(marker)==1,filename
+            RubyVM::InstructionSequence.compile(src)
 
-          loader=root/'knight/js/sl-assets-v229r115.js'
+            if name=='Interpreter 3'
+              raise 'Startup script size' if src.bytesize>32000
 
-          assert loader.read_bytes().count(
-              b"var version='V4.9';"
-          )==1
+              raise 'Embedded monster tables' if
+                src.include?('TRAITS=') ||
+                src.include?('STATS=')
 
-          print('PASS original engine unchanged')
-          print('PASS original asset packs unchanged')
-          print('PASS modified files',len(changed))
-          print('PASS unchanged files',len(before)-len(changed))
-          print('PASS V4.9 startup correction')
-          PYTHON
+              raise 'Weapon ID table missing' unless
+                src.include?('WEAPON_IDS[a.weapon_id]')
+            end
+          end
 
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
+          puts 'PASS 1696 direct PC attack branches'
+          puts 'PASS 69 direct NPC attack routes'
+          puts 'PASS 6494 restored numeric commands'
+          puts 'PASS no additional combat eval strings'
+          puts 'PASS original startup data separation'
+          RUBY
+
+      - name: Update final data mappings
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash /tmp/sl49-source-mapping.sh
+
+      - name: Verify exact approved changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash /tmp/sl49-source-verify.sh
+          bash /tmp/sl49-source-final.sh
 
       - name: Upload V4.9 candidate
         uses: actions/upload-pages-artifact@v5
