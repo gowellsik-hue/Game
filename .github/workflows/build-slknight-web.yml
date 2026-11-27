@@ -10,598 +10,312 @@ name: build-slknight-web.yml | V4.14 | Companion Separation and Ground Alignment
 permissions:
   contents: read
   actions: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: slknight-github-pages
   cancel-in-progress: false
 
 jobs:
-  build:
+  audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
-      - name: Restore V4.13 game
+      - name: Restore V4.13 original
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
           run-id: 45953980268
           name: github-pages
           github-token: ${{ github.token }}
-          path: baseline
+          path: original
 
-      - name: Restore verified V4.14 implementation source
-        uses: actions/checkout@v4
+      - name: Restore V4.14 candidate
+        uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          ref: 554844c39cef42bcc1cc62c30d18759909638c78
-          path: verified-414
-          sparse-checkout: .github/workflows/build-slknight-web.yml
-          sparse-checkout-cone-mode: false
+          run-id: 45987745324
+          name: github-pages
+          github-token: ${{ github.token }}
+          path: candidate
 
-      - name: Prepare corrected V4.14 implementation
+      - name: Extract complete original runtime and loading paths
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s baseline/artifact.tar
+          mkdir -p audit
 
-          git -C verified-414 show \
-            HEAD:.github/workflows/build-slknight-web.yml \
-            > /tmp/sl414-prev.yml
-
-          test "$(git hash-object /tmp/sl414-prev.yml)" = \
-            "90192a5661e62ff7267ff0741d20fcfa67fc4257"
-
-          python3 - <<'PYTHON'
+          python3 - <<'PY'
           from pathlib import Path
-          import re
-          import textwrap
+          import tarfile
+          import hashlib
+          import json
+          import struct
 
-          source=Path('/tmp/sl414-prev.yml').read_text('utf8')
+          root=Path('audit')
+          manifests={}
 
-          blocks=dict(
-              re.findall(
-                  r"^          cat > /tmp/(sl414-[^ ]+\.rb) <<'RUBY'\n(.*?)^          RUBY$",
-                  source,
-                  re.M|re.S
-              )
-          )
+          for version,folder in [
+              ('V4.13','original'),
+              ('V4.14','candidate')
+          ]:
+              out=root/version
+              out.mkdir()
 
-          assert set(blocks)=={
-              'sl414-runtime.rb',
-              'sl414-patch.rb',
-              'sl414-test.rb'
-          }
+              manifest={}
+              packs={}
 
-          blocks={
-              name:textwrap.dedent(body)
-              for name,body in blocks.items()
-          }
+              archive=Path(folder)/'artifact.tar'
+              assert archive.is_file()
 
-          python_blocks=re.findall(
-              r"^          python3 - <<'PYTHON'\n(.*?)^          PYTHON$",
-              source,
-              re.M|re.S
-          )
+              with tarfile.open(archive,'r:*') as tar:
+                  for entry in tar:
+                      if not entry.isfile():
+                          continue
 
-          assert len(python_blocks)==2
+                      name=entry.name
+                      while name.startswith('./'):
+                          name=name[2:]
 
-          baseline=textwrap.dedent(python_blocks[0])
-          verify=textwrap.dedent(python_blocks[1])
+                      path=Path(name)
 
-          def once(s,a,b):
-              n=s.count(a)
-              assert n==1,(a,n)
-              return s.replace(a,b,1)
+                      assert not path.is_absolute()
+                      assert '..' not in path.parts
+                      assert name not in manifest
 
-          def section(s,start,end,replacement):
-              assert s.count(start)==1,start
-              assert s.count(end)==1,end
-              i=s.index(start)
-              j=s.index(end,i)
-              return s[:i]+replacement+s[j:]
+                      manifest[name]=entry.size
 
-          runtime=blocks['sl414-runtime.rb']
+                      if not name.startswith('knight/'):
+                          continue
 
-          start=runtime.index('  def self.draw(w)\n')
-          end=runtime.index('  class Menu\n',start)
+                      suffix=path.suffix.lower()
 
-          draw=runtime[start:end]
+                      if suffix=='.pack':
+                          f=tar.extractfile(entry)
+                          header=f.read(4)
 
-          draw=once(
-              draw,
-              '    return unless w.visible\n',
-              '    return unless w.visible\n'
-              '    w.contents_opacity=255\n'
-          )
+                          assert len(header)==4
 
-          draw=once(
-              draw,
-              '    w.instance_variable_set(\n'
-              '      :@sl414_info,info\n'
-              '    )\n\n',
-              ''
-          )
+                          size=struct.unpack('<I',header)[0]
+                          assert 0<size<=entry.size-4
 
-          changes=[
-              (
-                  '      x=122+i*86\n      y=365\n',
-                  '      x=i*86\n      y=0\n'
-              ),
-              ('x,y,85,98,','x,y,85,93,'),
-              ('x+85,y,1,98,','x+85,y,1,93,'),
-              ('iy=y+52+(j/3)*23','iy=y+52+(j/3)*20'),
-              ('Rect.new(ix,iy,25,23)','Rect.new(ix,iy,25,20)'),
-              ('ix-1,iy+12,26,11,','ix-1,iy+9,26,11,'),
-              ('ix-2,iy+11,26,11,','ix-2,iy+8,26,11,')
-          ]
+                          index=json.loads(
+                              f.read(size).decode('utf8')
+                          )
 
-          for old,new in changes:
-              draw=once(draw,old,new)
+                          packs[name]=index
 
-          ending='  end\n\n'
+                          continue
 
-          assert draw.endswith(ending)
+                      if (
+                          suffix in [
+                              '.js','.html','.ini','.rb','.json'
+                          ]
+                          or path.name=='Scripts.rxdata'
+                      ):
+                          raw=tar.extractfile(entry).read()
 
-          draw=(
-              draw[:-len(ending)]
-              +'    w.instance_variable_set(:@sl414_info,info)\n'
-              +ending
-          )
+                          target=out/path
+                          target.parent.mkdir(
+                              parents=True,
+                              exist_ok=True
+                          )
 
-          revised_runtime=(
-              runtime[:start]
-              +draw
-              +runtime[end:]
-          )
+                          target.write_bytes(raw)
 
-          assert revised_runtime[:start]==runtime[:start]
+              assert len(manifest)==6085
 
-          assert revised_runtime.endswith(runtime[end:])
+              script=out/'knight/gameasync/Data/Scripts.rxdata'
+              mapper=out/'knight/gameasync/mapping.js'
+              loader=out/'knight/js/sl-assets-v229r115.js'
+              page=out/'knight/index.html'
+              ini=out/'knight/gameasync/Game.ini'
 
-          patch=blocks['sl414-patch.rb']
+              for p in [script,mapper,loader,page,ini]:
+                  assert p.is_file(),str(p)
 
-          scene_branch=r'''  when 78
-              old="    $메세지 = Window_Help2.new\n"
+              digest=hashlib.md5(
+                  script.read_bytes()
+              ).hexdigest()
 
-              new=<<~'SRC'.gsub(/^/,'    ')
-              $메세지 = Window_Help2.new
-              $메세지.x=122
-              $메세지.y=475
-              $메세지.width=376
-              $메세지.height=125
-              $메세지.contents.dispose
-              $메세지.contents=Bitmap.new(344,93)
-              $메세지.ox=0
-              $메세지.oy=0
-              $메세지.opacity=0
-              $메세지.back_opacity=0
-              $메세지.contents_opacity=255
-              $메세지.z=999999
-              SRC
+              print(version,'Scripts MD5',digest)
 
-              s=one(s,old,new)
-
-              one(
-                s,
-                "      sl_native_skill_icons\n      Graphics.update\n",
-                "      sl_native_skill_icons\n      SL414.draw($메세지)\n      Graphics.update\n"
+              print(
+                  version,
+                  'Scripts mapping matches:',
+                  'Data/Scripts.rxdata?h='+digest
+                  in mapper.read_text('utf8')
               )
 
-          '''
-
-          scene_branch=(
-              '  when 78\n'
-              +textwrap.indent(
-                  textwrap.dedent(
-                      scene_branch.split('\n',1)[1]
+              (out/'manifest.json').write_text(
+                  json.dumps(
+                      manifest,
+                      ensure_ascii=False,
+                      indent=2
                   ),
-                  '    '
-              )
-          )
-
-          patch=section(
-              patch,
-              '  when 78\n',
-              '  when 80,81\n',
-              scene_branch
-          )
-
-          message_branch=r'''  when 100
-              one(
-                s,
-                "  def set_text2(text)\n",
-                "  def set_text2(text)\n    return if self.equal?($메세지)\n"
+                  encoding='utf8'
               )
 
-          '''
-
-          message_branch=(
-              '  when 100\n'
-              +textwrap.indent(
-                  textwrap.dedent(
-                      message_branch.split('\n',1)[1]
+              (out/'pack-indexes.json').write_text(
+                  json.dumps(
+                      packs,
+                      ensure_ascii=False,
+                      indent=2
                   ),
-                  '    '
+                  encoding='utf8'
               )
-          )
 
-          patch=section(
-              patch,
-              '  when 100\n',
-              '  when 127\n',
-              message_branch
-          )
+              manifests[version]=manifest
 
-          assert patch.count('SL414.draw($메세지)')==1
+              print(version,'files:',len(manifest))
+              print(version,'packs:',len(packs))
 
-          test=blocks['sl414-test.rb']
+              for name,index in packs.items():
+                  for row in index.get('files',[]):
+                      if 'scripts.rxdata' in str(row).lower():
+                          print('SCRIPT PACK REFERENCE',name,row)
 
-          test=once(
-              test,
-              '  attr_accessor :visible\n',
-              '  attr_accessor :visible,:contents_opacity\n'
-          )
-
-          test=once(
-              test,
-              'c[4]==98',
-              'c[4]==93'
-          )
-
-          test=once(
-              test,
-              'c[1].x>=208',
-              'c[1].x>=86'
-          )
-
-          test+=r'''
-
-          class Bitmap < BitmapMock
-
-            attr_reader :width,:height
-
-            def initialize(w,h)
-              super()
-              @width=w
-              @height=h
-            end
-
-            def dispose
-              @disposed=true
-            end
-
-            def disposed?
-              @disposed==true
-            end
-
-          end
-
-          class Window_Base
-
-            attr_accessor :x,:y,:width,:height
-            attr_accessor :contents,:visible,:opacity
-            attr_accessor :back_opacity,:contents_opacity
-            attr_accessor :ox,:oy,:z
-
-            def initialize(x,y,w,h)
-              @x=x
-              @y=y
-              @width=w
-              @height=h
-            end
-
-            def disposed?
-              false
-            end
-
-          end
-
-          scene=read.call(78)
-
-          frame="      sl_native_skill_icons\n"+
-                "      SL414.draw($메세지)\n"+
-                "      Graphics.update\n"
-
-          assert(
-            scene.scan(frame).size==1,
-            'Native Scene_Map render loop'
-          )
-
-          setup=scene[
-            /^    \$메세지 = Window_Help2.new\n.*?(?=^    \$KeyIcon = IconShow.new)/m
-          ]
-
-          assert(
-            setup,
-            'Actual original message window initialization'
-          )
-
-          eval(
-            read.call(100),
-            TOPLEVEL_BINDING,
-            'Window_Help2'
-          )
-
-          eval(
-            setup,
-            TOPLEVEL_BINDING,
-            'Actual native HUD setup'
-          )
-
-          w=$메세지
-
-          assert(
-            [
-              w.x+16,
-              w.y+16,
-              w.contents.width,
-              w.contents.height
-            ]==[138,491,344,93],
-            'Exact original central message screen bounds'
-          )
-
-          assert(
-            w.contents_opacity==255 &&
-            w.opacity==0 &&
-            w.z==999999,
-            'Native HUD contents explicitly visible'
-          )
-
-          SL414::IDS.each do |id|
-            SL414.designate(4,id)
-          end
-
-          $game_temp.message_window_showing=false
-
-          SL414.draw(w)
-
-          assert(
-            w.visible,
-            'Native message window displays party HUD'
-          )
-
-          fills=w.contents.calls.select{
-            |q|q[0]==:fill &&
-              q[3]==85 &&
-              q[4]==93
-          }
-
-          assert(
-            fills.map{|q|q[1]}==[0,86,172,258],
-            'Four equal native HUD columns'
-          )
-
-          w.contents.calls.each do |q|
-
-            case q[0]
-
-            when :fill,:text
-              x,y,ww,hh=q[1,4]
-
-            when :icon
-              r=q[1]
-              x,y,ww,hh=r.x,r.y,r.width,r.height
-
-            else
-              next
-
-            end
-
-            assert(
-              x>=0 &&
-              y>=0 &&
-              x+ww<=344 &&
-              y+hh<=93,
-              'Native HUD drawing inside bitmap'
-            )
-
-          end
-
-          icons=w.contents.calls.select{
-            |q|q[0]==:icon
-          }
-
-          assert(
-            icons.count{
-              |q|q[1].x>=86 && q[1].x<172
-            }==6,
-            'All six designated items fit inside one companion column'
-          )
-
-          assert(
-            icons.all?{|q|q[1].x>=86},
-            'No designated item icons in hero column'
-          )
-
-          old=w.contents.calls.dup
-
-          w.set_text2('Original legacy message')
-
-          assert(
-            w.contents.calls==old,
-            'Legacy message cannot overwrite party HUD'
-          )
-
-          $game_temp.message_window_showing=true
-
-          SL414.draw(w)
-
-          assert(
-            !w.visible,
-            'Native dialogue is not obstructed'
-          )
-
-          $game_temp.message_window_showing=false
-
-          SL414.draw(w)
-
-          assert(
-            w.visible,
-            'Party HUD returns after dialogue'
-          )
-
-          actor=$game_actors[4]
-
-          actor.hp=actor.hp-1
-
-          SL414.draw(w)
-
-          assert(
-            w.contents.calls.any?{
-              |q|q[0]==:text &&
-                q[5]=="HP #{actor.hp}/#{actor.maxhp}"
-            },
-            'Actual companion HP change refreshes native HUD'
-          )
-
-          puts 'PASS corrected native HUD lifecycle'
-          '''
-
-          cache_fix=r'''
-          mapping_digest=hashlib.sha256(
-              mapper.read_bytes()
-          ).hexdigest()[:16]
-
-          references=0
-
-          path_pattern=re.compile(
-              r"""(["'])([^"'<> \t\r\n]*mapping\.js)(?:\?[^"'<> \t\r\n]*)?\1""",
-              re.I
-          )
-
-          for name in ('index.html','knight/index.html'):
-
-              p=root/name
-              html=p.read_text('utf8')
-
-              def replace_mapping(m):
-
-                  global references
-
-                  raw=m.group(2)
-
-                  if not raw.lower().endswith('mapping.js'):
-                      return m.group(0)
-
-                  if raw.startswith(('http:','https:','//')):
-                      return m.group(0)
-
-                  target=(p.parent/raw).resolve()
-
-                  if target!=mapper.resolve():
-                      return m.group(0)
-
-                  references+=1
-
-                  quote=m.group(1)
-
-                  return (
-                      quote
-                      +raw
-                      +'?v=V4.14&h='
-                      +mapping_digest
-                      +quote
+              for p in [ini,page,mapper,loader]:
+                  text=p.read_text(
+                      'utf8',
+                      errors='replace'
                   )
 
-              new_html=path_pattern.sub(replace_mapping,html)
+                  for i,line in enumerate(text.splitlines(),1):
+                      if any(
+                          word in line.lower()
+                          for word in [
+                              'scripts.rxdata',
+                              'mapping.js',
+                              'fileasynccache',
+                              'localforage',
+                              'game.ini'
+                          ]
+                      ):
+                          print(
+                              version,
+                              p.name,
+                              i,
+                              line[:1000]
+                          )
 
-              if new_html!=html:
-                  p.write_text(new_html,'utf8')
-
-          assert references>=1,'Actual mapping.js load reference not found'
-
-          print(
-              'PASS cache-keyed mapping.js references',
-              references,
-              mapping_digest
+          assert set(manifests['V4.13'])==set(
+              manifests['V4.14']
           )
 
-          '''
+          print('PASS original file inventory')
+          PY
 
-          verify=once(
-              verify,
-              'after={\n',
-              textwrap.dedent(cache_fix)+'after={\n'
-          )
-
-          output={
-              'sl414-runtime.rb':revised_runtime,
-              'sl414-patch.rb':patch,
-              'sl414-test.rb':test,
-              'sl414-baseline.py':baseline,
-              'sl414-verify.py':verify
-          }
-
-          for name,body in output.items():
-
-              if name.endswith('.py'):
-                  compile(body,name,'exec')
-
-              Path('/tmp',name).write_text(body,'utf8')
-
-          print('PASS exact previous source verified')
-          print('PASS original inventory implementation retained')
-          print('PASS native HUD coordinates corrected')
-          print('PASS legacy message output isolated')
-          print('PASS original version retained: V4.14')
-          PYTHON
-
-          ruby -c /tmp/sl414-patch.rb
-          ruby -c /tmp/sl414-test.rb
-
-      - name: Verify V4.13 baseline
+      - name: Extract and compare all 137 Ruby scripts
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p site
-          tar -xf baseline/artifact.tar -C site
+          ruby -rzlib -rdigest -rjson - <<'RUBY'
+          # encoding: UTF-8
 
-          python3 /tmp/sl414-baseline.py
+          versions=['V4.13','V4.14']
+          sources={}
 
-      - name: Apply designated items and corrected native HUD
-        shell: bash
-        run: |
-          set -euo pipefail
+          versions.each do |version|
+            root=File.join('audit',version)
 
-          ruby /tmp/sl414-patch.rb \
-            site/knight/gameasync/Data
+            path=File.join(
+              root,
+              'knight/gameasync/Data/Scripts.rxdata'
+            )
 
-      - name: Verify original inventory and corrected HUD
-        shell: bash
-        run: |
-          set -euo pipefail
+            rows=Marshal.load(File.binread(path))
 
-          ruby /tmp/sl414-test.rb \
-            site/knight/gameasync/Data/Scripts.rxdata
+            raise "Script count #{rows.size}" unless rows.size==137
 
-      - name: Verify exact V4.14 scope and cache mapping
-        shell: bash
-        run: |
-          set -euo pipefail
+            directory=File.join(root,'ruby')
+            Dir.mkdir(directory)
 
-          python3 /tmp/sl414-verify.py
+            sources[version]=[]
 
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/js/sl-assets-v229r115.js
+            rows.each_with_index do |row,i|
+              name=row[1].to_s.dup.force_encoding('UTF-8')
 
-      - name: Upload V4.14 candidate
-        uses: actions/upload-pages-artifact@v5
+              source=Zlib::Inflate.inflate(
+                row[2]
+              ).force_encoding('UTF-8')
+
+              raise "Encoding #{i}" unless source.valid_encoding?
+
+              filename=format('%03d.rb',i)
+
+              File.write(
+                File.join(directory,filename),
+                source,
+                encoding:'UTF-8'
+              )
+
+              sources[version]<<[name,source]
+
+              puts [
+                version,
+                i,
+                name,
+                source.bytesize,
+                Digest::SHA256.hexdigest(source)
+              ].join(' | ')
+
+              source.each_line.with_index(1) do |line,n|
+                if line.match?(
+                  /메세지|Window_Help2|set_text2|Guage|캐릭터는 또 다른 나|SL414|sl_native_skill_icons|main_update_loop|web_pre_update/
+                )
+                  puts "#{version} #{i}:#{n} #{line}"
+                end
+              end
+            end
+
+            File.write(
+              File.join(root,'script-names.json'),
+              JSON.pretty_generate(
+                sources[version].map(&:first)
+              )
+            )
+
+            puts "PASS #{version}: all 137 scripts"
+          end
+
+          changed=(0...137).select do |i|
+            sources['V4.13'][i]!=sources['V4.14'][i]
+          end
+
+          puts "CHANGED SCRIPTS: #{changed.inspect}"
+
+          expected=[26,42,43,71,78,80,81,93,100,127,130]
+
+          raise 'Unexpected changes' unless changed==expected
+
+          versions.each do |version|
+            sources[version].each_with_index do |entry,i|
+              name,source=entry
+
+              relevant=
+                [78,100,127,130].include?(i) ||
+                name=='Main' ||
+                source.include?('class Window_Help2') ||
+                source.include?('$메세지 =') ||
+                source.include?('def set_text2')
+
+              next unless relevant
+
+              puts "BEGIN #{version} #{i} #{name}"
+              puts source
+              puts "END #{version} #{i} #{name}"
+            end
+          end
+
+          puts 'PASS complete runtime extraction'
+          RUBY
+
+      - name: Upload original runtime audit
+        uses: actions/upload-artifact@v4
         with:
-          path: site
+          name: sl414-original-runtime-audit
+          path: audit
           retention-days: 30
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-    steps:
-      - uses: actions/deploy-pages@v5
-        id: deployment
