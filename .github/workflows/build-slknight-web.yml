@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.11 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.12 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -21,1486 +21,39 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-
     steps:
-      - name: Restore V4.10 game
+      - name: Restore V4.11 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 45926982327
+          run-id: 45949620110
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Restore verified V4.11 build resources
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 45945910468
-          name: github-pages
-          github-token: ${{ github.token }}
-          path: previous
-
-      - name: Verify original and approved V4.11 resources
+      - name: Verify V4.11 baseline
         shell: bash
         run: |
           set -euo pipefail
-
           test -s baseline/artifact.tar
-          test -s previous/artifact.tar
-          mkdir -p site candidate
+          mkdir -p site
           tar -xf baseline/artifact.tar -C site
-          tar -xf previous/artifact.tar -C candidate
 
-          python3 - <<'PY'
+          python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib,json,re,shutil
+          import hashlib,json
 
           root=Path('site')
-          prior=Path('candidate')
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-          game='knight/gameasync/'
 
-          def inventory(p):
-              return {
-                  f.relative_to(p).as_posix():hashlib.sha256(f.read_bytes()).hexdigest()
-                  for f in p.rglob('*') if f.is_file()
+          before={
+              p.relative_to(root).as_posix():{
+                  'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
+                  'md5':hashlib.md5(p.read_bytes()).hexdigest()
               }
-
-          before=inventory(root)
-          old=inventory(prior)
-
-          assert len(before)==6033,len(before)
-          assert len(old)==6085,len(old)
-          assert not set(before)-set(old)
-
-          loader='knight/js/sl-assets-v229r115.js'
-
-          assert (root/loader).read_bytes().count(b"var version='V4.10';")==1
-          assert (prior/loader).read_bytes().count(b"var version='V4.11';")==1
-
-          scripts=game+'Data/Scripts.rxdata'
-
-          allowed={scripts}|{
-              game+'Data/'+pre+f'Map{mid:03d}.rxdata'
-              for mid in (29,47,48,49,50)
-          }|{
-              game+'mapping.js',
-              game+'bitmap-map.js',
-              'knight/assets/shared-v229r115.pack',
-              loader,
-              'index.html',
-              'knight/index.html'
+              for p in root.rglob('*') if p.is_file()
           }
 
-          changed={k for k in before if before[k]!=old[k]}
-          added=set(old)-set(before)
-
-          assert changed==allowed,sorted(changed^allowed)
-          assert len(added)==52
-
-          forms={3213,3215,3217,3474,3476,3221,2786,2796}
-          deaths=set()
-          motions=set()
-
-          for k in sorted(added):
-
-              m=re.fullmatch(
-                  re.escape(game+'Graphics/Characters/')+
-                  r'SL411_(\d+)_(bare|sword|bow|staff|dagger|tohandsword|edoryu|claw|death)\.png',
-                  k
-              )
-
-              assert m,k
-
-              body=int(m[1])
-              typ=m[2]
-
-              assert body in forms,k
-
-              assert (prior/k).read_bytes()[:8]==b'\x89PNG\r\n\x1a\n',k
-
-              if typ=='death':
-                  deaths.add(body)
-              else:
-                  motions.add((body,typ))
-
-          assert deaths==forms
-          assert len(motions)==44
-          assert {b for b,t in motions}==forms
-
-          for k in sorted((allowed-{scripts})|added):
-
-              p=root/k
-              p.parent.mkdir(parents=True,exist_ok=True)
-              shutil.copy2(prior/k,p)
-
-          assert hashlib.sha256(
-              (root/scripts).read_bytes()
-          ).hexdigest()==before[scripts]
-
-          Path('/tmp/sl411-base.json').write_text(
-              json.dumps(before,sort_keys=True),'utf8'
-          )
-
-          Path('/tmp/sl411-prior.json').write_text(
-              json.dumps(old,sort_keys=True),'utf8'
-          )
-
-          Path('/tmp/sl411-approved.json').write_text(
-              json.dumps(sorted(allowed)),'utf8'
-          )
-
-          print('PASS V4.10 original files:',len(before))
-          print('PASS previous V4.11 approved changes:',len(allowed))
-          print('PASS reuse 44 weapon motions and 8 death sheets')
-          PY
-
-      - name: Repair target sharing and reciprocal collision
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl411-repair.rb <<'RUBY'
-          # encoding: UTF-8
-          require 'zlib'
-
-          def once(s,a,b)
-
-            n=s.scan(a).size
-
-            raise "Anchor #{a.inspect[0,120]}: #{n}" unless n==1
-
-            s.sub(a){b}
-
-          end
-
-          def method_replace(s,name,body)
-
-            once(
-              s,
-              /^  def #{Regexp.escape(name)}(?:\([^\n]*\))?\n.*?^  end\n/m,
-              body
-            )
-
-          end
-
-          def repair23(s)
-
-            a=s.lines.select{|l|
-              l.include?('return false if (self==$game_player || sl46_slot)') &&
-              l.include?('@sl_healer_teleport')
-            }
-
-            raise 'Original collision guard' unless a.size==1
-
-            once(s,a[0],<<~'SRC'.gsub(/^/,'    '))
-            return false if (self==$game_player || sl46_slot || @sl_combat_event) && $game_map.events.values.any?{|e|
-
-              next false if e==self
-
-              occupied=e.x==new_x && e.y==new_y
-
-              near=e.moving? &&
-                (e.real_x-new_x*128).abs<64 &&
-                (e.real_y-new_y*128).abs<64
-
-              if e.sl46_slot
-
-                pending=e.instance_variable_get(:@sl_healer_teleport)
-
-                occupied ||
-                  (pending && pending[0,2]==[new_x,new_y]) ||
-                  (@sl_combat_event && near)
-
-              elsif sl46_slot &&
-                    (occupied || near) &&
-                    e.instance_variable_get(:@sl_combat_event)
-
-                !SL411.enemy(e.id).nil?
-
-              else
-
-                false
-
-              end
-            }
-            SRC
-
-          end
-
-          def repair25(s)
-
-            a=/^([ \t]*)return if companion_target &&\s+SL411\.in_range\?\(\s*self,companion_target,w\[6\]=='bow'\s*\)\n/
-
-            matches=s.scan(a)
-
-            raise 'Original pursuit guard' unless matches.size==1
-
-            pad=matches[0][0]
-
-            s=once(s,a,<<~'SRC'.gsub(/^/,pad))
-            if companion_target
-
-              bow=w[6]=='bow'
-
-              return if SL411.in_range?(self,companion_target,bow)
-
-              queue=[[@x,@y,nil]]
-              seen={[@x,@y]=>true}
-              pos=0
-              step=nil
-
-              while pos<queue.size
-
-                x,y,first=queue[pos]
-                pos+=1
-
-                if first && SL411.in_range?(
-                  self,companion_target,bow,x,y
-                )
-
-                  step=first
-                  break
-
-                end
-
-                [2,4,6,8].each do |d|
-
-                  nx=x+(d==6 ? 1 : d==4 ? -1 : 0)
-                  ny=y+(d==2 ? 1 : d==8 ? -1 : 0)
-
-                  next unless $game_map.valid?(nx,ny)
-
-                  next if (nx-$game_player.x).abs+
-                    (ny-$game_player.y).abs>=12
-
-                  key=[nx,ny]
-
-                  next if seen[key]
-
-                  next if nx==companion_target.x &&
-                    ny==companion_target.y
-
-                  next if sl46_occupied?(nx,ny) ||
-                    !passable?(x,y,d)
-
-                  seen[key]=true
-
-                  queue<<[nx,ny,first || d]
-
-                end
-              end
-
-              case step
-              when 2; move_down
-              when 4; move_left
-              when 6; move_right
-              when 8; move_up
-              end
-
-              return
-
-            end
-            SRC
-
-            a=s.lines.select{|l|
-              l.include?('if d == 0 || $game_map.events.values.any?') &&
-              l.include?('e.sl46_slot<sl46_slot')
-            }
-
-            raise 'Original overlap branch' unless a.size==1
-
-            once(
-              s,
-              a[0],
-              a[0][/^\s*/]+
-              "if d == 0 || $game_map.events.values.any?{|e|e!=self && e.x==@x && e.y==@y && ((e.sl46_slot && sl46_slot && e.sl46_slot<sl46_slot) || (sl46_slot && SL411.enemy(e.id)))}\n"
-            )
-
-          end
-
-          def repair26(s)
-
-            s=method_replace(
-              s,
-              'self.enemy',
-              <<~'SRC'.gsub(/^/,'  ')
-              def self.enemy(eid)
-
-                return nil unless eid && eid>0
-
-                mid=$game_map.map_id
-                e=$game_map.events[eid]
-
-                info=SLV541.stat(mid,eid)
-
-                return nil unless e && info &&
-                  SL49.stats(mid,eid) &&
-                  e.instance_variable_get(:@sl_combat_event) &&
-                  [1,2].include?(e.trigger) &&
-                  e.list &&
-                  e.list.any?{|c|c.code==111 && c.parameters==[11,13]} &&
-                  e.character_name!='' &&
-                  !e.transparent &&
-                  !e.instance_variable_get(:@erased) &&
-                  $game_variables[info[6]].to_i<info[4] &&
-                  !SLV541.rewarded?(mid,eid)
-
-                e
-
-              end
-            SRC
-            )
-
-            s=method_replace(
-              s,
-              'self.target_for',
-              <<~'SRC'.gsub(/^/,'  ')
-              def self.target_for(e)
-
-                return nil unless @focus_events.equal?(
-                  $game_map.events
-                )
-
-                t=enemy(@focus)
-
-                unless t
-
-                  @focus=nil
-
-                  return nil
-
-                end
-
-                return nil if distance(t,$game_player)>=12 ||
-                  distance(e,$game_player)>=12
-
-                t
-
-              end
-            SRC
-            )
-
-            s=method_replace(
-              s,
-              'self.in_range?',
-              <<~'SRC'.gsub(/^/,'  ')
-              def self.in_range?(e,t,bow,x=e.x,y=e.y)
-
-                dx=t.x-x
-                dy=t.y-y
-
-                d=dx.abs+dy.abs
-
-                return d==1 unless bow
-
-                return false unless d.between?(1,8)
-
-                while x!=t.x || y!=t.y
-
-                  rx=t.x-x
-                  ry=t.y-y
-
-                  dir=rx.abs>=ry.abs && rx!=0 ?
-                    (rx>0 ? 6 : 4) :
-                    (ry>0 ? 2 : 8)
-
-                  nx=x+(dir==6 ? 1 : dir==4 ? -1 : 0)
-                  ny=y+(dir==2 ? 1 : dir==8 ? -1 : 0)
-
-                  return false unless
-                    $game_map.passable?(x,y,dir,e) &&
-                    $game_map.passable?(nx,ny,10-dir,e)
-
-                  x=nx
-                  y=ny
-
-                end
-
-                true
-
-              end
-            SRC
-            )
-
-            s=once(
-              s,
-              't=SL411.enemy(p[1])',
-              't=SL411.target_for(self); t=nil if t && t.id!=p[1]'
-            )
-
-            a=/a\.weapon_id!=p\[4\]\s*\|\|\s*elapsed<0\s*\|\|\s*elapsed>=duration\s*\|\|\s*!t/
-
-            s=once(
-              s,
-              a,
-              "a.weapon_id!=p[4] || elapsed<0 || elapsed>=duration || !t || !SL411.in_range?(self,t,w[6]=='bow')"
-            )
-
-            s=once(
-              s,
-              "if SL411.in_range?(self,t,w[6]=='bow')",
-              "if SL411.in_range?(self,t,w[6]=='bow') && t.list.any?{|c|c.code==355 && c.parameters[0,3]==['SL49_PC_PREP',$game_map.map_id,t.id]}"
-            )
-
-            tick=s[
-              /^  def sl411_tick\(id\)\n.*?^  end\n/m
-            ]
-
-            raise 'Companion attack tick' unless tick
-
-            revised=once(
-              tick,
-              'return false unless t',
-              "return false unless t\n    return false unless t.list.any?{|c|c.code==355 && c.parameters[0,3]==['SL49_PC_PREP',$game_map.map_id,t.id]}"
-            )
-
-            once(s,tick,revised)
-
-          end
-
-          def repair27(s)
-
-            n=0
-
-            s=s.gsub(
-              /^( +)event\.start\n( +)result = true$/
-            ) do
-
-              a,b=$1,$2
-
-              n+=1
-
-              "#{a}event.start\n#{a}SL411.mark_target($game_map.map_id,event.id) if event.starting && Input.press?(13)\n#{b}result = true"
-
-            end
-
-            raise "Player attack starts #{n}" unless n==4
-
-            s
-
-          end
-
-          def repair71(s)
-
-            once(
-              s,
-              '          @sl_attack_target = [1] if result',
-              <<~'SRC'.chomp.gsub(/^/,'          ')
-              if result
-
-                @sl_attack_target = [1]
-
-                SL411.mark_target(
-                  $game_map.map_id,@event_id
-                )
-
-              end
-            SRC
-            )
-
-          end
-
-          if __FILE__==$0
-
-            basefile,candidate,out=ARGV
-
-            base=Marshal.load(File.binread(basefile))
-            rows=Marshal.load(File.binread(candidate))
-
-            raise 'Script count' unless
-              base.size==137 && rows.size==137
-
-            prior=[25,26,28,69,70,71,72,73,74,75]
-
-            fixes=[23,25,26,27,71]
-
-            names={
-              23=>'Game_Character 1',
-              25=>'Game_Character 3',
-              26=>'Game_Event',
-              27=>'Game_Player',
-              28=>'Sprite_Character',
-              69=>'Interpreter 1',
-              70=>'Interpreter 2',
-              71=>'Interpreter 3',
-              72=>'Interpreter 4',
-              73=>'Interpreter 5',
-              74=>'Interpreter 6',
-              75=>'Interpreter 7'
-            }
-
-            names.each do |i,n|
-
-              raise n unless
-                base[i][1].dup.force_encoding('UTF-8')==n &&
-                rows[i][1].dup.force_encoding('UTF-8')==n
-
-            end
-
-            raise 'Previous scope' unless rows.each_index.select{
-              |i|Marshal.dump(rows[i])!=Marshal.dump(base[i])
-            }==prior
-
-            snapshot=rows.map{|r|Marshal.dump(r)}
-
-            fixes.each do |i|
-
-              old=Zlib::Inflate.inflate(
-                rows[i][2]
-              ).force_encoding('UTF-8')
-
-              raise 'Encoding' unless old.valid_encoding?
-
-              s=old.gsub("\r\n","\n")
-
-              t=case i
-
-                when 23; repair23(s)
-                when 25; repair25(s)
-                when 26; repair26(s)
-                when 27; repair27(s)
-                when 71; repair71(s)
-
-              end
-
-              raise 'No repair' if t==s
-
-              RubyVM::InstructionSequence.compile(t)
-
-              raise 'Interpreter 3 size' if i==71 &&
-                t.bytesize>32000
-
-              rows[i][2]=Zlib::Deflate.deflate(
-                old.include?("\r\n") ?
-                t.gsub("\n","\r\n").b :
-                t.b
-              )
-
-              File.write(
-                "/tmp/sl411-repair-#{i}.rb",t
-              )
-
-            end
-
-            raise 'Repair scope' unless rows.each_index.select{
-              |i|Marshal.dump(rows[i])!=snapshot[i]
-            }==fixes
-
-            allowed=(prior|fixes).sort
-
-            raise 'Baseline scope' unless rows.each_index.select{
-              |i|Marshal.dump(rows[i])!=Marshal.dump(base[i])
-            }==allowed
-
-            result=base.dup
-
-            allowed.each{|i|result[i]=rows[i]}
-
-            raise 'Reconstruction' unless
-              Marshal.dump(result)==Marshal.dump(rows)
-
-            raw=Marshal.dump(result)
-
-            File.binwrite(out,raw)
-
-            raise 'Roundtrip' unless Marshal.dump(
-              Marshal.load(File.binread(out))
-            )==raw
-
-            puts "PASS corrected original scripts #{fixes.inspect}"
-
-          end
-          RUBY
-
-          ruby -c /tmp/sl411-repair.rb
-
-          ruby /tmp/sl411-repair.rb \
-            site/knight/gameasync/Data/Scripts.rxdata \
-            candidate/knight/gameasync/Data/Scripts.rxdata \
-            site/knight/gameasync/Data/Scripts.rxdata
-
-      - name: Audit every original companion and attack page
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl411-audit.rb <<'RUBY'
-          # encoding: UTF-8
-
-          module RPG
-
-            %w[
-              Map MapInfo Event EventCommand MoveRoute
-              MoveCommand AudioFile CommonEvent
-            ].each{|n|const_set(n,Class.new)}
-
-            Event.const_set(:Page,Class.new)
-            Event::Page.const_set(:Condition,Class.new)
-            Event::Page.const_set(:Graphic,Class.new)
-
-          end
-
-          %w[Table Tone Color].each do |n|
-
-            Object.const_set(n,Class.new do
-
-              def self._load(raw)
-
-                o=allocate
-                o.instance_variable_set(:@raw,raw)
-                o
-
-              end
-
-            end)
-
-          end
-
-          def iv(o,k)
-            o.instance_variable_get(k)
-          end
-
-          root=ARGV.fetch(0)
-
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          stats=Marshal.load(
-            File.binread(
-              File.join(root,pre+'MonsterStats.rxdata')
-            )
-          )
-
-          raise 'Monster data count' unless stats.size==421
-
-          maps=Dir.glob(
-            File.join(root,pre+'Map[0-9][0-9][0-9].rxdata')
-          ).sort
-
-          raise 'Map count' unless maps.size==46
-
-          counts=Hash.new(0)
-          enemies={}
-
-          maps.each do |f|
-
-            mid=f[/Map(\d+)\.rxdata$/,1].to_i
-
-            map=Marshal.load(File.binread(f))
-
-            iv(map,:@events).each do |eid,e|
-
-              pages=iv(e,:@pages)
-
-              name=iv(e,:@name).to_s.dup.force_encoding('UTF-8')
-
-              if name.start_with?('동료 ')
-
-                p=pages[0]
-
-                c=iv(p,:@condition)
-
-                if iv(c,:@switch1_valid) &&
-                   (2001..2003).include?(iv(c,:@switch1_id))
-
-                  raise 'Original companion route' unless
-                    iv(p,:@through) &&
-                    iv(iv(p,:@move_route),:@list).map{
-                      |x|iv(x,:@code)
-                    }==[10,0]
-
-                  counts[:companions]+=1
-
-                end
-              end
-
-              next unless stats.key?([mid,eid])
-
-              flag=pages.any?{|p|
-
-                iv(p,:@trigger)==2 &&
-                iv(p,:@list).any?{|c|
-                  iv(c,:@code)==111 &&
-                  iv(c,:@parameters)==[11,13]
-                }
-
-              }
-
-              pages.each do |p|
-
-                list=iv(p,:@list)
-
-                input=list.any?{|c|
-
-                  iv(c,:@code)==111 &&
-                  iv(c,:@parameters)==[11,13]
-
-                }
-
-                prep=list.select{|c|
-
-                  iv(c,:@code)==355 &&
-                  iv(c,:@parameters)[0]=='SL49_PC_PREP'
-
-                }
-
-                done=list.select{|c|
-
-                  iv(c,:@code)==355 &&
-                  iv(c,:@parameters)[0]=='SL49_PC_DONE'
-
-                }
-
-                raise 'Unpaired attacks' unless
-                  prep.size==done.size
-
-                if prep.empty?
-
-                  counts[:waking]+=1 if
-                    flag && input &&
-                    [1,2].include?(iv(p,:@trigger))
-
-                  next
-
-                end
-
-                raise 'Attack page excluded' unless
-                  flag && input &&
-                  [1,2].include?(iv(p,:@trigger))
-
-                raise 'Target ID mismatch' unless
-                  (prep+done).all?{|c|
-                    iv(c,:@parameters)[1,2]==[mid,eid]
-                  }
-
-                counts[:pages]+=1
-                counts[:prep]+=prep.size
-                counts[:done]+=done.size
-
-                counts[:trigger1]+=1 if iv(p,:@trigger)==1
-
-                enemies[[mid,eid]]=true
-
-              end
-            end
-          end
-
-          expected={
-            companions:138,
-            pages:436,
-            trigger1:16,
-            waking:67,
-            prep:1696,
-            done:1696
-          }
-
-          raise "Route audit #{counts.inspect}" unless
-            counts==expected
-
-          raise 'Attack event count' unless enemies.size==420
-
-          puts "PASS #{counts.inspect}, enemies #{enemies.size}"
-          RUBY
-
-          ruby -c /tmp/sl411-audit.rb
-
-          ruby /tmp/sl411-audit.rb \
-            site/knight/gameasync/Data
-
-      - name: Verify original weapons motions and L1J damage
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl411-weapons.rb <<'RUBY'
-          # encoding: UTF-8
-
-          require 'zlib'
-
-          root=ARGV.fetch(0)
-
-          rows=Marshal.load(
-            File.binread(
-              File.join(root,'Scripts.rxdata')
-            )
-          )
-
-          class Game_Character;end
-          class Interpreter;end
-
-          [26,71].each do |i|
-
-            eval(
-              Zlib::Inflate.inflate(rows[i][2]).force_encoding('UTF-8'),
-              TOPLEVEL_BINDING,
-              "source-#{i}"
-            )
-
-          end
-
-          module RPG
-            class Weapon;end
-          end
-
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          $data_weapons=Marshal.load(
-            File.binread(
-              File.join(root,pre+'Weapons.rxdata')
-            )
-          )
-
-          $repair_data_root=root
-
-          def load_data(path)
-
-            Marshal.load(
-              File.binread(
-                File.join(
-                  $repair_data_root,
-                  File.basename(path)
-                )
-              )
-            )
-
-          end
-
-          $game_variables=Hash.new(0)
-          $game_switches=Hash.new(false)
-
-          $game_party=Object.new
-
-          def $game_party.item_number(id);1000;end
-          def $game_party.lose_item(id,n);end
-
-          actor=Struct.new(
-            :id,
-            :weapon_id,
-            :level,
-            :str,
-            :dex
-          )
-
-          srand(411)
-
-          {
-            '기사'=>[170,'sword'],
-            '요정'=>[1000,'bow'],
-            '법사'=>[1001,'staff'],
-            '다엘'=>[1002,'edoryu']
-          }.each do |job,(weapon,typ)|
-
-            %w[남 여].each do |sex|
-
-              a=actor.new(4,weapon,50,20,18)
-
-              a.instance_variable_set(
-                :@sl43_form,sex+job
-              )
-
-              a.instance_variable_set(
-                :@sl43_stats,[20,18,14,8,12,12]
-              )
-
-              w=SL49.weapon(a)
-
-              raise "Weapon #{sex+job}" unless
-                w && w[6]==typ
-
-              m=SL411.motion(a)
-
-              raise "Motion #{sex+job}" unless
-                m && m[1]>0 &&
-                m[2].between?(0,5)
-
-              raise "L1J #{sex+job}" unless
-                40.times.any?{|_|
-                  d=SL49.pc_attack(a,3,5,w)
-                  d && d>0
-                }
-
-              puts "PASS #{sex+job}: original weapon, motion, L1J calculation"
-
-            end
-          end
-          RUBY
-
-          ruby -c /tmp/sl411-weapons.rb
-
-          ruby /tmp/sl411-weapons.rb \
-            site/knight/gameasync/Data
-
-      - name: Test native collision movement and shared target execution
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/sl411-test.rb <<'RUBY'
-          # encoding: UTF-8
-
-          require 'zlib'
-          require 'ostruct'
-
-          rows=Marshal.load(
-            File.binread(ARGV.fetch(0))
-          )
-
-          src=->(i){
-            Zlib::Inflate.inflate(
-              rows[i][2]
-            ).force_encoding('UTF-8').gsub("\r\n","\n")
-          }
-
-          [21,23,24,25,26,27].each do |i|
-
-            eval(
-              src.call(i),
-              TOPLEVEL_BINDING,
-              "script-#{i}"
-            )
-
-          end
-
-          def check(x,s)
-
-            raise s unless x
-
-            puts "PASS #{s}"
-
-          end
-
-          Command=Struct.new(:code,:parameters)
-          Condition=Struct.new(:switch1_valid,:switch1_id)
-          Page=Struct.new(:condition)
-          EventSource=Struct.new(:name,:pages)
-          Actor=Struct.new(:id,:hp,:weapon_id,:character_name)
-          Route=Struct.new(:list,:repeat,:skippable)
-
-          module Graphics
-
-            class << self
-              attr_accessor :frame_count
-            end
-
-          end
-
-          module Input
-
-            def self.press?(k)
-              k==13
-            end
-
-          end
-
-          module SLV229
-
-            module Speed
-
-              ATTACK_TIMINGS={
-                1=>[[30,15],[24,11],[18,11]]
-              }
-
-            end
-
-          end
-
-          module SLV541
-
-            def self.stat(mid,eid)
-
-              mid==3 && [5,6,7].include?(eid) ?
-                [0,0,nil,nil,500,2,100+eid] :
-                nil
-
-            end
-
-            def self.rewarded?(mid,eid)
-              false
-            end
-
-          end
-
-          module SL49
-
-            def self.stats(mid,eid)
-
-              SLV541.stat(mid,eid) ? {} : nil
-
-            end
-
-            def self.weapon(a)
-
-              [
-                0,8,8,5,0,'iron',
-                a.weapon_id==1000 ? 'bow' : 'sword',
-                0,0
-              ]
-
-            end
-
-            def self.pc_attack(a,mid,eid,w)
-              7
-            end
-
-            def self.apply_damage(mid,eid,var,dmg,id)
-
-              $hits<<[mid,eid,var,dmg,id]
-
-              $game_variables[var]+=dmg
-
-            end
-
-          end
-
-          class TestTiles
-
-            attr_accessor :blocked
-
-            def initialize
-              @blocked={}
-            end
-
-            def [](x,y,z)
-              @blocked[[x,y]] ? 1 : 0
-            end
-
-          end
-
-          $game_map=Game_Map.new
-
-          $game_map.instance_variable_set(:@map_id,3)
-
-          $game_map.instance_variable_set(
-            :@map,
-            Struct.new(:width,:height,:data).new(
-              32,32,TestTiles.new
-            )
-          )
-
-          $game_map.instance_variable_set(:@passages,[0,15])
-          $game_map.instance_variable_set(:@priorities,[5,5])
-          $game_map.instance_variable_set(:@events,{})
-
-          $game_switches=Hash.new(false)
-          $game_variables=Hash.new(0)
-          $game_self_switches=Hash.new(false)
-
-          interp=Object.new
-
-          def interp.running?
-            false
-          end
-
-          $game_system=Struct.new(:map_interpreter).new(interp)
-
-          $game_player=Game_Player.new
-
-          Game_Character.instance_method(:moveto).bind(
-            $game_player
-          ).call(5,5)
-
-          $game_player.instance_variable_set(:@character_name,'knight')
-          $game_player.instance_variable_set(:@direction,8)
-
-          $game_actors={
-            1=>Actor.new(1,100,170,'knight')
-          }
-
-          [4,5,6].each do |i|
-
-            a=Actor.new(i,100,170,'knight')
-
-            a.instance_variable_set(:@sl43_hired,true)
-            a.instance_variable_set(:@sl43_form,'남기사')
-            a.instance_variable_set(:@sl411_starter_done,true)
-
-            $game_actors[i]=a
-
-            $game_switches[1997+i]=true
-
-          end
-
-          $game_party=Struct.new(:actors).new(
-            $game_actors.values
-          )
-
-          def $game_party.item_number(id)
-            1000
-          end
-
-          $hits=[]
-
-          Graphics.frame_count=0
-
-          def event(id,x,y,slot=nil,trigger=2,awake=true)
-
-            e=Game_Event.allocate
-
-            Game_Character.instance_method(:initialize).bind(e).call
-
-            c=Condition.new(
-              !slot.nil?,
-              slot ? slot+1997 : 1
-            )
-
-            e.instance_variable_set(
-              :@event,
-              EventSource.new(
-                slot ? '동료 기사' : 'monster',
-                [Page.new(c)]
-              )
-            )
-
-            e.instance_variable_set(:@id,id)
-            e.instance_variable_set(:@map_id,3)
-            e.instance_variable_set(:@character_name,'Visible')
-            e.instance_variable_set(:@sl_combat_event,slot.nil?)
-            e.instance_variable_set(:@through,!slot.nil?)
-            e.instance_variable_set(:@trigger,slot ? 0 : trigger)
-
-            e.instance_variable_set(
-              :@list,
-              slot ? [Command.new(0,[])] : [
-                Command.new(111,[11,13]),
-                awake ?
-                  Command.new(355,['SL49_PC_PREP',3,id,true,1,2]) :
-                  Command.new(122,[500,500,0,0,1]),
-                Command.new(0,[])
-              ]
-            )
-
-            e.instance_variable_set(
-              :@move_type,
-              slot ? 3 : 0
-            )
-
-            e.instance_variable_set(
-              :@move_route,
-              Route.new(
-                [Command.new(10,[]),Command.new(0,[])],
-                true,false
-              )
-            )
-
-            e.instance_variable_set(:@stop_count,100)
-
-            e.moveto(x,y)
-
-            e
-
-          end
-
-          m=event(5,5,4,nil,1,false)
-          n=event(6,8,5)
-          u=event(7,10,10)
-
-          u.instance_variable_set(:@list,[Command.new(0,[])])
-
-          a=event(20,5,6,4)
-          b=event(21,5,7,5)
-          c=event(22,6,6,6)
-
-          $game_map.events.merge!({
-            5=>m,
-            6=>n,
-            7=>u,
-            20=>a,
-            21=>b,
-            22=>c
-          })
-
-          check(
-            !m.passable?(5,5,2),
-            'monster cannot enter companion tile'
-          )
-
-          m.instance_variable_set(:@through,true)
-
-          check(
-            !m.passable?(5,5,2),
-            'through monster cannot enter companion tile'
-          )
-
-          m.moveto(4,6)
-
-          check(
-            !a.passable?(5,6,4),
-            'companion cannot enter through monster tile'
-          )
-
-          $game_switches[2001]=false
-
-          check(
-            m.passable?(5,5,2),
-            'inactive companion does not block monster'
-          )
-
-          $game_switches[2001]=true
-
-          m.moveto(5,4)
-          m.instance_variable_set(:@through,false)
-
-          check(
-            SL411.enemy(7).nil?,
-            'nonattack page excluded'
-          )
-
-          check(
-            $game_player.check_event_trigger_there([0,1,2]),
-            'native player starts waking trigger-1 target'
-          )
-
-          check(
-            [a,b,c].all?{|e|SL411.target_for(e)==m},
-            'all three get same selected target before first hit'
-          )
-
-          5.times do |i|
-
-            Graphics.frame_count=i
-
-            [a,b,c].each{|e|e.update}
-
-          end
-
-          check(
-            $hits.empty?,
-            'waking page not damaged before activation'
-          )
-
-          m.instance_variable_set(
-            :@list,
-            [
-              Command.new(111,[11,13]),
-              Command.new(355,['SL49_PC_PREP',3,5,true,1,2]),
-              Command.new(0,[])
-            ]
-          )
-
-          m.instance_variable_set(:@trigger,2)
-
-          check(
-            SL411.target_for(a)==m,
-            'focus retained after wake-page transition'
-          )
-
-          500.times do |i|
-
-            Graphics.frame_count=i+10
-
-            [a,b,c].each{|e|e.update}
-
-            raise 'overlap during approach' unless
-              [a,b,c,m,$game_player].map{
-                |e|[e.x,e.y]
-              }.uniq.size==5
-
-            break if $hits.map{|x|x[4]}.uniq.sort==[4,5,6]
-
-          end
-
-          check(
-            $hits.map{|x|x[4]}.uniq.sort==[4,5,6],
-            'native update and move routes dispatch all 3 actors to attack'
-          )
-
-          check(
-            $hits.all?{|h|h[0,3]==[3,5,105]},
-            'all strikes use selected monster native HP variable'
-          )
-
-          check(
-            [a,b,c].all?{|e|SL411.in_range?(e,m,false)},
-            'three distinct adjacent melee positions'
-          )
-
-          $game_map.data.blocked[[m.x,m.y]]=true
-
-          check(
-            SL411.in_range?(a,m,false),
-            'melee contact is not walkability of target tile'
-          )
-
-          $game_map.data.blocked.clear
-
-          SL411.mark_target(3,6)
-
-          check(
-            [a,b,c].all?{|e|SL411.target_for(e)==n},
-            'target switch shared'
-          )
-
-          old=$hits.size
-
-          Graphics.frame_count+=1
-
-          [a,b,c].each{|e|e.update}
-
-          check(
-            $hits[old..-1].all?{|h|h[1]==6},
-            'no strikes on old target after switch'
-          )
-
-          check(
-            [a,b,c].all?{|e|
-              p=e.instance_variable_get(:@sl411_attack)
-              !p || p[1]==6
-            },
-            'old swing state cancelled'
-          )
-
-          $game_variables[106]=500
-
-          check(
-            [a,b,c].all?{|e|SL411.target_for(e).nil?},
-            'dead target invalidated'
-          )
-
-          $game_variables[106]=0
-
-          check(
-            SL411.target_for(a).nil?,
-            'respawn does not resurrect focus'
-          )
-
-          SL411.mark_target(3,5)
-
-          a.moveto(m.x,m.y)
-
-          a.instance_variable_set(:@sl411_attack,nil)
-
-          a.move_toward_player
-
-          check(
-            [a.x,a.y]!=[m.x,m.y],
-            'already-overlapping companion separates'
-          )
-
-          check(
-            SL411.in_range?(a,m,false),
-            'separated companion reaches attack position'
-          )
-
-          $game_actors[4].weapon_id=1000
-
-          $game_actors[4].instance_variable_set(
-            :@sl43_form,'남요정'
-          )
-
-          a.moveto(5,9)
-
-          a.instance_variable_set(:@sl411_ready,nil)
-
-          check(
-            SL411.in_range?(a,m,true),
-            'bow range accepted'
-          )
-
-          check(
-            a.sl411_tick(4),
-            'bow attack begins on shared target'
-          )
-
-          check(
-            a.instance_variable_get(:@sl411_attack)[1]==5,
-            'bow targets selected monster'
-          )
-
-          $game_map.instance_variable_set(
-            :@events,
-            $game_map.events.dup
-          )
-
-          check(
-            SL411.target_for(a).nil?,
-            'map change invalidates focus'
-          )
-          RUBY
-
-          ruby -c /tmp/sl411-test.rb
-
-          ruby /tmp/sl411-test.rb \
-            site/knight/gameasync/Data/Scripts.rxdata
-
-      - name: Update existing script mapping and verify exact changes
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib,json,re
-
-          root=Path('site')
-          prior=Path('candidate')
-
-          prefix='knight/gameasync/'
-
-          script=prefix+'Data/Scripts.rxdata'
-          mapping=prefix+'mapping.js'
-
-          p=root/mapping
-
-          old=hashlib.md5(
-              (prior/script).read_bytes()
-          ).hexdigest()
-
-          new=hashlib.md5(
-              (root/script).read_bytes()
-          ).hexdigest()
-
-          assert old!=new
-
-          text=p.read_text('utf8')
-
-          marker='Data/Scripts.rxdata?h='
-
-          pattern=re.escape(marker)+r'[0-9a-f]{32}'
-
-          assert re.findall(pattern,text)==[marker+old]
-
-          p.write_text(
-              text.replace(marker+old,marker+new),
-              'utf8'
-          )
-
-          before=json.loads(
-              Path('/tmp/sl411-base.json').read_text('utf8')
-          )
-
-          previous=json.loads(
-              Path('/tmp/sl411-prior.json').read_text('utf8')
-          )
-
-          allowed=set(
-              json.loads(
-                  Path('/tmp/sl411-approved.json').read_text('utf8')
-              )
-          )
-
-          after={
-              f.relative_to(root).as_posix():hashlib.sha256(f.read_bytes()).hexdigest()
-              for f in root.rglob('*') if f.is_file()
-          }
-
-          assert len(after)==6085
-
-          assert set(after)==set(previous)
-
-          assert {
-              k for k in after
-              if after[k]!=previous[k]
-          }=={script,mapping}
-
-          assert {
-              k for k in before
-              if before[k]!=after[k]
-          }==allowed
-
-          assert len(set(after)-set(before))==52
-
-          assert p.read_text('utf8').count(marker+new)==1
+          assert len(before)==6085,len(before)
 
           assert (
               root/'knight/js/sl-assets-v229r115.js'
@@ -1508,17 +61,938 @@ jobs:
               b"var version='V4.11';"
           )==1
 
-          print('PASS V4.11 reciprocal collision')
-          print('PASS original companion movement branches')
-          print('PASS original target selection and L1J attack routes')
-          print('PASS only Scripts.rxdata and mapping.js differ from previous V4.11')
-          print('PASS all original graphics, equipment and map resources preserved')
-          print('PASS all V4.10 non-target files preserved')
-          PY
+          for name in ('index.html','knight/index.html'):
+              assert b'V4.11' in (root/name).read_bytes(),name
+
+          Path('/tmp/sl412-before.json').write_text(
+              json.dumps(before,sort_keys=True),'utf8'
+          )
+
+          print('PASS V4.11 original files',len(before))
+          PYTHON
+
+      - name: Separate native hit effect and party refresh branches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/sl412-patch.rb <<'RUBY'
+          # encoding: UTF-8
+          require 'zlib'
+
+          module RPG
+            %w[
+              Map Event EventCommand MoveRoute
+              MoveCommand AudioFile CommonEvent
+            ].each{|n|const_set(n,Class.new)}
+
+            Event.const_set(:Page,Class.new)
+            Event::Page.const_set(:Condition,Class.new)
+            Event::Page.const_set(:Graphic,Class.new)
+          end
+
+          %w[Table Tone Color].each do |n|
+
+            Object.const_set(n,Class.new do
+
+              def self._load(raw)
+                o=allocate
+                o.instance_variable_set(:@raw,raw)
+                o
+              end
+
+              def _dump(depth)
+                @raw
+              end
+
+            end)
+
+          end
+
+          def check(v,msg)
+            raise msg unless v
+          end
+
+          def iv(o,k)
+            o.instance_variable_get(k)
+          end
+
+          def utf(s)
+            s.to_s.dup.force_encoding('UTF-8')
+          end
+
+          def once(s,a,b)
+
+            check(
+              s.scan(a).size==1,
+              "Anchor #{a.inspect[0,100]}"
+            )
+
+            s.sub(a){b}
+
+          end
+
+          def patch_party(s)
+
+            a=s[/^  def add_actor\(actor_id\)\n.*?^  end\n/m]
+            b=s[/^  def remove_actor\(actor_id\)\n.*?^  end\n/m]
+
+            check(a && b,'Party methods')
+
+            x=once(
+              a,
+              '      $game_player.refresh',
+              <<~'SRC'.chomp.gsub(/^/,'      ')
+              if (4..6).include?(actor_id) && @actors[0] && @actors[0].id==1
+                $game_map.need_refresh=true if $game_map
+              else
+                $game_player.refresh
+              end
+            SRC
+            )
+
+            y=once(
+              b,
+              '    @actors.delete($game_actors[actor_id])',
+              "    leader=@actors[0]\n    @actors.delete($game_actors[actor_id])"
+            )
+
+            y=once(
+              y,
+              '    $game_player.refresh',
+              '    $game_player.refresh unless (4..6).include?(actor_id) && leader && leader.id==1'
+            )
+
+            once(once(s,a,x),b,y)
+
+          end
+
+          def patch_hit(ce)
+
+            hit=ce.fetch(57)
+
+            check(
+              iv(hit,:@trigger)==0,
+              'CE57 trigger'
+            )
+
+            list=iv(hit,:@list)
+
+            before=list.map{|c|Marshal.dump(c)}
+
+            check(
+              list.size==153,
+              "CE57 size #{list.size}"
+            )
+
+            check(
+              iv(list[0],:@code)==111 &&
+              utf(iv(list[0],:@parameters)[1])==
+                '@sl_attack_target && @sl_attack_target[0] == 3',
+              'CE57 condition'
+            )
+
+            check(
+              iv(list[1],:@code)==117 &&
+              iv(list[1],:@parameters)==[137] &&
+              iv(list[1],:@indent)==1,
+              'Old healer effect'
+            )
+
+            check(
+              iv(list[2],:@code)==115 &&
+              iv(list[2],:@indent)==1 &&
+              iv(list[4],:@code)==412,
+              'Existing exit branch'
+            )
+
+            heal=list.each_index.select do |i|
+
+              iv(list[i],:@code)==311 &&
+              iv(list[i],:@parameters)==[0,0,0,120,false]
+
+            end
+
+            check(
+              heal==[142],
+              'CE57 HP command'
+            )
+
+            p=iv(list[0],:@parameters)
+
+            p[1]=p[1].sub('== 3','!= 1')
+
+            iv(list[heal[0]],:@parameters)[0]=1
+
+            check(
+              list.each_index.select{
+                |i|Marshal.dump(list[i])!=before[i]
+              }==[0,142],
+              'CE57 change scope'
+            )
+
+            list.delete_at(1)
+
+            check(
+              list.size==152 &&
+              iv(list[1],:@code)==115,
+              'CE57 old branch removal'
+            )
+
+          end
+
+          if __FILE__==$0
+
+            root=ARGV.fetch(0)
+
+            pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+            sp=File.join(root,'Scripts.rxdata')
+
+            cp=File.join(
+              root,
+              pre+'CommonEvents.rxdata'
+            )
+
+            rows=Marshal.load(File.binread(sp))
+            ce=Marshal.load(File.binread(cp))
+
+            check(rows.size==137,'Script count')
+
+            check(
+              utf(rows[19][1])=='Game_Party',
+              'Game_Party identity'
+            )
+
+            oldrows=rows.map{|r|Marshal.dump(r)}
+            oldce=ce.map{|r|Marshal.dump(r)}
+
+            old=utf(
+              Zlib::Inflate.inflate(rows[19][2])
+            )
+
+            s=old.gsub("\r\n","\n")
+
+            t=patch_party(s)
+
+            RubyVM::InstructionSequence.compile(t)
+
+            check(t!=s,'Party change')
+
+            rows[19][2]=Zlib::Deflate.deflate(
+              (
+                old.include?("\r\n") ?
+                t.gsub("\n","\r\n") :
+                t
+              ).b
+            )
+
+            patch_hit(ce)
+
+            check(
+              rows.each_index.select{
+                |i|Marshal.dump(rows[i])!=oldrows[i]
+              }==[19],
+              'Other scripts changed'
+            )
+
+            check(
+              ce.each_index.select{
+                |i|Marshal.dump(ce[i])!=oldce[i]
+              }==[57],
+              'Other CE changed'
+            )
+
+            {sp=>rows,cp=>ce}.each do |p,o|
+
+              raw=Marshal.dump(o)
+
+              File.binwrite(p,raw)
+
+              check(
+                Marshal.dump(
+                  Marshal.load(File.binread(p))
+                )==raw,
+                "Roundtrip #{p}"
+              )
+
+            end
+
+            puts 'PASS Game_Party and CE57 only'
+
+          end
+          RUBY
+
+          ruby -c /tmp/sl412-patch.rb
+
+          ruby /tmp/sl412-patch.rb site/knight/gameasync/Data
+
+      - name: Audit original hit and recruitment paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/sl412-audit.rb <<'RUBY'
+          # encoding: UTF-8
+          require_relative 'sl412-patch'
+
+          root=ARGV.fetch(0)
+
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          ce=Marshal.load(
+            File.binread(
+              File.join(root,pre+'CommonEvents.rxdata')
+            )
+          )
+
+          physical=0
+          calls=0
+
+          ce.compact.each do |e|
+
+            list=iv(e,:@list)
+
+            refs=list.count do |c|
+
+              iv(c,:@code)==117 &&
+              iv(c,:@parameters)==[57]
+
+            end
+
+            calls+=refs
+
+            n=list.count do |c|
+
+              iv(c,:@code)==355 &&
+              iv(c,:@parameters)[0]=='SL49_NPC_PREP'
+
+            end
+
+            next if n==0
+
+            check(
+              n==1 && refs==1,
+              'Physical hit route'
+            )
+
+            check(
+              list.count{
+                |c|iv(c,:@code)==311 &&
+                iv(c,:@parameters)==[1,1,1,26,false]
+              }==1,
+              'Physical HP route'
+            )
+
+            physical+=1
+
+          end
+
+          check(
+            physical==69,
+            "Physical CE count #{physical}"
+          )
+
+          check(
+            calls==150,
+            "CE57 common calls #{calls}"
+          )
+
+          maps=Dir.glob(
+            File.join(
+              root,
+              pre+'Map[0-9][0-9][0-9].rxdata'
+            )
+          ).sort
+
+          check(maps.size==46,'Map count')
+
+          refs=0
+          recruiters=0
+
+          maps.each do |p|
+
+            m=Marshal.load(File.binread(p))
+
+            iv(m,:@events).each_value do |e|
+
+              recruiters+=1 if
+                utf(iv(e,:@name))=='[ID고용사]'
+
+              iv(e,:@pages).each do |page|
+
+                refs+=iv(page,:@list).count do |c|
+
+                  iv(c,:@code)==117 &&
+                  iv(c,:@parameters)==[57]
+
+                end
+
+              end
+            end
+          end
+
+          check(
+            refs==27,
+            "CE57 map calls #{refs}"
+          )
+
+          check(
+            recruiters==9,
+            "Recruiter count #{recruiters}"
+          )
+
+          puts 'PASS 69 physical CEs'
+          puts 'PASS all 177 CE57 calls'
+          puts 'PASS 46 maps and 9 recruiters'
+          RUBY
+
+          ruby -c /tmp/sl412-audit.rb
+
+          ruby /tmp/sl412-audit.rb site/knight/gameasync/Data
+
+      - name: Verify original player and companion hit branches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/sl412-test.rb <<'RUBY'
+          # encoding: UTF-8
+          require_relative 'sl412-patch'
+
+          root=ARGV.fetch(0)
+
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          rows=Marshal.load(
+            File.binread(
+              File.join(root,'Scripts.rxdata')
+            )
+          )
+
+          ce=Marshal.load(
+            File.binread(
+              File.join(root,pre+'CommonEvents.rxdata')
+            )
+          )
+
+          class RPG::EventCommand
+            attr_reader :code,:parameters,:indent
+          end
+
+          def native(rows,i,name)
+
+            s=utf(
+              Zlib::Inflate.inflate(rows[i][2])
+            ).gsub("\r\n","\n")
+
+            nodes=[]
+
+            walk=lambda do |node|
+
+              if node.is_a?(RubyVM::AbstractSyntaxTree::Node)
+
+                nodes<<node if
+                  node.type==:DEFN &&
+                  node.children[0]==name.to_sym
+
+                node.children.each{
+                  |child|walk.call(child)
+                }
+
+              end
+
+            end
+
+            walk.call(
+              RubyVM::AbstractSyntaxTree.parse(s)
+            )
+
+            check(
+              nodes.size==1,
+              "Missing or duplicate #{i}:#{name}"
+            )
+
+            n=nodes[0]
+
+            s.lines[
+              (n.first_lineno-1)..(n.last_lineno-1)
+            ].join
+
+          end
+
+          class Game_Party
+            attr_reader :actors
+          end
+
+          class Game_Player
+          end
+
+          class Interpreter
+          end
+
+          class Game_Event
+          end
+
+          %w[
+            add_actor remove_actor all_dead?
+          ].each do |n|
+
+            Game_Party.class_eval(
+              native(rows,19,n)
+            )
+
+          end
+
+          Game_Player.class_eval(
+            native(rows,27,'refresh')
+          )
+
+          {
+            69=>%w[iterate_actor],
+            70=>%w[command_end command_skip operate_value],
+            71=>%w[command_111 command_115],
+            74=>%w[command_311]
+          }.each do |i,ns|
+
+            ns.each do |n|
+
+              Interpreter.class_eval(
+                native(rows,i,n)
+              )
+
+            end
+          end
+
+          Actor=Struct.new(
+            :id,:hp,:character_name,:character_hue
+          )
+
+          $game_actors={}
+
+          [1,4,5,6,7].each do |i|
+
+            $game_actors[i]=Actor.new(
+              i,500,"actor#{i}",0
+            )
+
+          end
+
+          $game_party=Game_Party.new
+
+          $game_party.instance_variable_set(
+            :@actors,
+            [$game_actors[1]]
+          )
+
+          $game_player=Game_Player.new
+
+          $game_player.instance_variable_set(
+            :@character_name,
+            'Existing transformed graphic'
+          )
+
+          $game_player.instance_variable_set(
+            :@character_hue,47
+          )
+
+          $game_player.instance_variable_set(
+            :@opacity,173
+          )
+
+          $game_player.instance_variable_set(
+            :@blend_type,1
+          )
+
+          $game_player.instance_variable_set(
+            :@move_speed,5
+          )
+
+          $game_switches=Hash.new(false)
+
+          $game_map=Struct.new(:need_refresh).new(false)
+
+          $game_temp=Struct.new(:gameover).new(false)
+
+          $game_variables=Hash.new(0)
+
+          $game_variables[26]=17
+
+          module Graphics
+
+            def self.frame_count
+              411
+            end
+
+          end
+
+          module SL411
+
+            @events={
+              4=>Game_Event.new,
+              5=>Game_Event.new,
+              6=>Game_Event.new
+            }
+
+            def self.member_event(id,alive=true)
+              @events[id]
+            end
+
+          end
+
+          visual=Marshal.dump($game_player)
+
+          [4,5,6].each do |id|
+
+            $game_party.add_actor(id)
+
+            check(
+              $game_party.actors.include?($game_actors[id]),
+              "Hire #{id}"
+            )
+
+            check(
+              Marshal.dump($game_player)==visual,
+              "Hire #{id} changed player"
+            )
+
+          end
+
+          [4,5,6].each do |id|
+
+            $game_party.remove_actor(id)
+
+            check(
+              !$game_party.actors.include?($game_actors[id]),
+              "Remove #{id}"
+            )
+
+            check(
+              Marshal.dump($game_player)==visual,
+              "Remove #{id} changed player"
+            )
+
+            $game_party.add_actor(id)
+
+            check(
+              Marshal.dump($game_player)==visual,
+              "Rehire #{id} changed player"
+            )
+
+          end
+
+          puts 'PASS hire, removal and rehire preserve player state'
+
+          list=iv(ce[57],:@list)
+
+          [nil,1,0,3,4,5,6].each do |id|
+
+            it=Interpreter.new
+
+            it.instance_variable_set(:@main,false)
+
+            it.instance_variable_set(:@list,list)
+
+            it.instance_variable_set(:@index,0)
+
+            it.instance_variable_set(:@branch,{})
+
+            it.instance_variable_set(
+              :@sl_attack_target,
+              id.nil? ? nil : [id,3,5]
+            )
+
+            it.instance_variable_set(
+              :@parameters,
+              list[0].parameters
+            )
+
+            check(
+              it.command_111,
+              'CE57 native branch'
+            )
+
+            if id.nil? || id==1
+
+              check(
+                list[iv(it,:@index)+1].code==412,
+                'Player bypass old exit branch'
+              )
+
+            else
+
+              check(
+                iv(it,:@index)==0 &&
+                list[1].code==115,
+                'Nonplayer exit'
+              )
+
+              it.command_115
+
+              check(
+                iv(it,:@list).nil?,
+                'Native exit terminates hit CE'
+              )
+
+            end
+          end
+
+          puts 'PASS CE57 player hit visual isolation'
+
+          [1,4,5,6,0].each do |id|
+
+            [1,4,5,6].each do |a|
+
+              $game_actors[a].hp=500
+
+              e=SL411.member_event(a)
+
+              e.instance_variable_set(
+                :@sl411_hit_at,nil
+              ) if e
+
+            end
+
+            it=Interpreter.new
+
+            it.instance_variable_set(
+              :@sl_attack_target,
+              [id,3,5]
+            )
+
+            it.instance_variable_set(
+              :@parameters,
+              [1,1,1,26,false]
+            )
+
+            check(
+              it.command_311,
+              'HP command'
+            )
+
+            [1,4,5,6].each do |a|
+
+              check(
+                $game_actors[a].hp==
+                  (a==id ? 483 : 500),
+                "Damage crossed actor #{id}:#{a}"
+              )
+
+              e=SL411.member_event(a)
+
+              if e
+
+                check(
+                  iv(e,:@sl411_hit_at)==
+                    (a==id ? 411 : nil),
+                  "Visual crossed actor #{id}:#{a}"
+                )
+
+              end
+            end
+          end
+
+          puts 'PASS native HP and companion hit marker isolation'
+
+          heal=list.find{|c|c.code==311}
+
+          check(
+            heal.parameters==[1,0,0,120,false],
+            'Hero heal only'
+          )
+
+          [nil,1].each do |id|
+
+            [1,4,5,6].each do |a|
+
+              $game_actors[a].hp=500
+
+            end
+
+            it=Interpreter.new
+
+            it.instance_variable_set(
+              :@sl_attack_target,
+              id ? [id] : nil
+            )
+
+            it.instance_variable_set(
+              :@parameters,
+              heal.parameters
+            )
+
+            it.command_311
+
+            check(
+              [1,4,5,6].map{
+                |a|$game_actors[a].hp
+              }==[620,500,500,500],
+              'Hero CE effect changed companion HP'
+            )
+
+          end
+
+          puts 'PASS original CE57 heal restricted to hero'
+
+          $game_party.add_actor(7)
+
+          check(
+            $game_player.instance_variable_get(
+              :@character_name
+            )=='actor1',
+            'Other actor refresh preserved'
+          )
+
+          puts 'PASS non-target party refresh retained'
+
+          $game_party.instance_variable_set(
+            :@actors,
+            [$game_actors[4],$game_actors[1]]
+          )
+
+          $game_player.instance_variable_set(
+            :@character_name,
+            'Companion leader'
+          )
+
+          $game_party.remove_actor(4)
+
+          check(
+            $game_player.instance_variable_get(
+              :@character_name
+            )=='actor1',
+            'Leader change refresh preserved'
+          )
+
+          puts 'PASS actual leader change still refreshes player'
+          RUBY
+
+          ruby -c /tmp/sl412-test.rb
+
+          ruby /tmp/sl412-test.rb site/knight/gameasync/Data
+
+      - name: Update original checksums and verify exact V4.12 scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import hashlib,json,re
+
+          root=Path('site')
+          game=root/'knight/gameasync'
+
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          before=json.loads(
+              Path('/tmp/sl412-before.json').read_text('utf8')
+          )
+
+          mapper=game/'mapping.js'
+
+          s=mapper.read_text('utf8')
+
+          for name in (
+              'Scripts.rxdata',
+              pre+'CommonEvents.rxdata'
+          ):
+
+              p=game/'Data'/name
+
+              key=p.relative_to(root).as_posix()
+
+              old=before[key]['md5']
+
+              new=hashlib.md5(
+                  p.read_bytes()
+              ).hexdigest()
+
+              marker='Data/'+name+'?h='
+
+              pattern=re.escape(marker)+r'[0-9a-f]{32}'
+
+              assert old!=new,name
+
+              assert re.findall(
+                  pattern,s
+              )==[marker+old],name
+
+              s=s.replace(
+                  marker+old,
+                  marker+new
+              )
+
+          mapper.write_text(s,'utf8')
+
+          loader=root/'knight/js/sl-assets-v229r115.js'
+
+          s=loader.read_bytes()
+
+          assert s.count(
+              b"var version='V4.11';"
+          )==1
+
+          loader.write_bytes(
+              s.replace(
+                  b"var version='V4.11';",
+                  b"var version='V4.12';"
+              )
+          )
+
+          for name in ('index.html','knight/index.html'):
+
+              p=root/name
+
+              s=p.read_bytes()
+
+              assert b'V4.11' in s,name
+
+              p.write_bytes(
+                  s.replace(b'V4.11',b'V4.12')
+                   .replace(b'v4.11',b'v4.12')
+              )
+
+          after={
+              p.relative_to(root).as_posix():
+                hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in root.rglob('*') if p.is_file()
+          }
+
+          assert len(after)==6085
+
+          assert set(before)==set(after)
+
+          changed={
+              k for k in before
+              if before[k]['sha256']!=after[k]
+          }
+
+          allowed={
+              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/Data/'+pre+'CommonEvents.rxdata',
+              'knight/gameasync/mapping.js',
+              'knight/js/sl-assets-v229r115.js',
+              'index.html',
+              'knight/index.html'
+          }
+
+          assert changed==allowed,sorted(changed^allowed)
+
+          print('PASS two data files modified')
+          print('PASS four checksum and version files updated')
+          print('PASS 6079 unchanged files')
+          print('PASS all original maps preserved')
+          print('PASS all original SPR graphics preserved')
+          print('PASS original L1J attack calculations preserved')
+          print('PASS original movement and collision preserved')
+          print('PASS V4.12 candidate')
+          PYTHON
 
           node --check site/knight/gameasync/mapping.js
+          node --check site/knight/js/sl-assets-v229r115.js
 
-      - name: Upload V4.11 candidate
+      - name: Upload V4.12 candidate
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -1530,7 +1004,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - uses: actions/deploy-pages@v5
         id: deployment
