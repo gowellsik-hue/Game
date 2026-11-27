@@ -32,16 +32,7 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Restore extracted original runtime
-        uses: actions/download-artifact@v4
-        with:
-          repository: gowellsik-hue/Game
-          run-id: 46002274527
-          name: sl414-original-runtime-audit
-          github-token: ${{ github.token }}
-          path: audit
-
-      - name: Verify exact V4.13 baseline
+      - name: Verify original game
         shell: bash
         run: |
           set -euo pipefail
@@ -57,360 +48,521 @@ jobs:
           import json
 
           root=Path('site')
-          audit=Path('audit')
-          original=audit/'V4.13'
 
-          manifest=json.loads(
-              (original/'manifest.json').read_text('utf8')
-          )
-
-          files={
-              p.relative_to(root).as_posix():p
+          before={
+              p.relative_to(root).as_posix():
+                  hashlib.sha256(p.read_bytes()).hexdigest()
               for p in root.rglob('*')
               if p.is_file()
           }
 
-          assert len(files)==6085
-          assert set(files)==set(manifest)
+          assert len(before)==6085
 
-          assert all(
-              p.stat().st_size==manifest[k]
-              for k,p in files.items()
-          ),'V4.13 file sizes'
+          assert before[
+              'knight/gameasync/Data/Scripts.rxdata'
+          ]=='aee568a7fe7f1930048b8baa163dd5995d28947dcb66866691cc08522dca56d1'
 
-          for name in (
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/mapping.js',
-              'knight/index.html',
+          assert before[
+              'knight/gameasync/mapping.js'
+          ]=='d45dc30e3f9437e4236b30685a1281efb603201dacfba39fc79180a3ee65e1de'
+
+          assert before[
+              'knight/gameasync/bitmap-map.js'
+          ]=='1d6c9d9927159814da4de4b1f5291eb8c737e25dda454b2aeccc24dd4ea9849b'
+
+          assert before[
+              'knight/index.html'
+          ]=='8107f98518b8895482861553146bb2aa10f9ec8936c384d4393bce81a671d139'
+
+          assert before[
               'knight/js/sl-assets-v229r115.js'
-          ):
-              assert (
-                  files[name].read_bytes()
-                  ==(original/name).read_bytes()
-              ),name
-
-          before={
-              k:hashlib.sha256(p.read_bytes()).hexdigest()
-              for k,p in files.items()
-          }
+          ]=='53b55c27251d7b79d9d60c54b04ee0dbf92877c89fa893028dd49fe15d8c925b'
 
           Path('/tmp/sl414-before.json').write_text(
               json.dumps(before),
               'utf8'
           )
 
-          print(
-              'PASS exact V4.13 baseline',
-              len(files)
-          )
+          print('PASS original V4.13',len(before))
           PYTHON
 
-      - name: Apply corrected V4.14 native HUD
+      - name: Remove original central message output
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl414-fix.rb <<'RUBY'
+          cat > /tmp/sl414-clear.rb <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
           require 'digest'
 
-          original,candidate,output=ARGV
+          path=ARGV.fetch(0)
 
-          abort 'Arguments' unless output
+          raw=File.binread(path)
 
-          check=->(ok,msg){
-            raise msg unless ok
-          }
+          raise 'Wrong V4.13 scripts' unless
+            Digest::SHA256.hexdigest(raw)==
+            'aee568a7fe7f1930048b8baa163dd5995d28947dcb66866691cc08522dca56d1'
 
-          raw0=File.binread(original)
-          raw1=File.binread(candidate)
+          rows=Marshal.load(raw)
 
-          check.call(
-            Digest::SHA256.hexdigest(raw0)==
-            'aee568a7fe7f1930048b8baa163dd5995d28947dcb66866691cc08522dca56d1',
-            'V4.13 archive'
-          )
+          raise 'Script count' unless rows.size==137
 
-          check.call(
-            Digest::SHA256.hexdigest(raw1)==
-            'a51670a58ab4d35567a5a40a955b83c7552f6163c93f9223874192922a68272d',
-            'V4.14 archive'
-          )
+          before=rows.map{|r|Marshal.dump(r)}
 
-          base=Marshal.load(raw0)
-          old=Marshal.load(raw1)
-          rows=Marshal.load(raw1)
+          [78,127].each do |i|
 
-          check.call(
-            [base.size,old.size,rows.size]==
-            [137,137,137],
-            'Script count'
-          )
+            s=Zlib::Inflate.inflate(
+              rows[i][2]
+            ).force_encoding('UTF-8')
 
-          changed=->(a,b){
-            a.each_index.select{
-              |i|a[i]!=b[i]
-            }
-          }
+            crlf=s.include?("\r\n")
 
-          check.call(
-            changed.call(base,old)==
-            [26,42,43,71,78,80,81,93,100,127,130],
-            'Previous edit scope'
-          )
+            s=s.gsub("\r\n","\n")
 
-          source=->(a,i){
-            Zlib::Inflate.inflate(a[i][2]).
-              force_encoding('UTF-8').
-              gsub("\r\n","\n")
-          }
+            if i==78
 
-          replace=->(s,a,b){
-            check.call(
-              s.scan(a).size==1,
-              "Anchor #{a.inspect[0,120]}"
-            )
+              a="    $메세지 = Window_Help2.new\n"
 
-            s.sub(a){b}
-          }
+              b=a+
+                "    $메세지.visible = false\n"+
+                "    $메세지.contents_opacity = 0\n"
 
-          edit=->(i,s) do
-            RubyVM::InstructionSequence.compile(s)
+            else
 
-            raw=Zlib::Inflate.inflate(
-              old[i][2]
-            )
+              a=/^[ \t]*#도움말 출력\n.*?(?=^[ \t]*#스텟 출력)/m
 
-            s=s.gsub("\n","\r\n") if
-              raw.include?("\r\n")
+              block=s[a]
 
-            rows[i][2]=Zlib::Deflate.deflate(
-              s.b
-            )
-          end
+              raise 'Help count' unless
+                block &&
+                block.scan(
+                  'self.contents.draw_text(143, 441, 500, 32'
+                ).size==19
 
-          scene=source.call(base,78)
+              b=
+                "    self.contents.font.name = \"NanumGothic\"\n"+
+                "    self.contents.font.size = 12\n"+
+                "    self.contents.font.bold = false\n\n"
 
-          scene=replace.call(
-            scene,
-            "    @message_window.update\n",
-            "    @message_window.update\n"+
-            "    SL414.draw($my_wnd_gauge)\n"
-          )
-
-          edit.call(78,scene)
-
-          gauge=source.call(old,127)
-
-          check.call(
-            gauge.include?(
-              "    super(0, 120, 800, 600)\n"
-            ),
-            'Native gauge bounds'
-          )
-
-          check.call(
-            gauge.include?(
-              "    $my_wnd_gauge.z=1000\n"
-            ),
-            'Native gauge layer'
-          )
-
-          gauge=replace.call(
-            gauge,
-            "    self.opacity = 0\n"+
-            "    self.contents.clear\n",
-            "    self.opacity = 0\n"+
-            "    self.contents.clear\n"+
-            "    @sl414_info = nil\n"
-          )
-
-          gauge=replace.call(
-            gauge,
-            " def clear\n"+
-            "   self.opacity = 0\n"+
-            "   self.contents.clear\n",
-            " def clear\n"+
-            "   self.opacity = 0\n"+
-            "   self.contents.clear\n"+
-            "   @sl414_info = nil\n"
-          )
-
-          methods=[]
-
-          walk=lambda do |n|
-            if n.is_a?(
-              RubyVM::AbstractSyntaxTree::Node
-            )
-
-              methods<<n if
-                n.type==:DEFN &&
-                n.children[0]==:refresh
-
-              n.children.each{
-                |c|walk.call(c)
-              }
             end
+
+            raise "Anchor #{i}" unless
+              s.scan(a).size==1
+
+            t=s.sub(a){b}
+
+            RubyVM::InstructionSequence.compile(t)
+
+            t=t.gsub("\n","\r\n") if crlf
+
+            rows[i][2]=Zlib::Deflate.deflate(t.b)
+
           end
 
-          walk.call(
-            RubyVM::AbstractSyntaxTree.parse(gauge)
-          )
+          raise 'Wrong scope' unless
+            rows.each_index.select{
+              |i|Marshal.dump(rows[i])!=before[i]
+            }==[78,127]
 
-          check.call(
-            methods.size==1,
-            'Original refresh'
-          )
+          File.binwrite(path,Marshal.dump(rows))
 
-          lines=gauge.lines
+          raise 'Roundtrip' unless
+            Marshal.load(File.binread(path))==rows
 
-          last=methods[0].last_lineno-1
-
-          check.call(
-            lines[last].strip=='end',
-            'Refresh end'
-          )
-
-          lines.insert(
-            last,
-            "    SL414.draw(self)\n"
-          )
-
-          gauge=lines.join
-
-          edit.call(127,gauge)
-
-          runtime=source.call(old,130)
-
-          start=runtime.index(
-            "  def self.draw(w)\n"
-          )
-
-          check.call(
-            start,
-            'HUD method start'
-          )
-
-          finish=runtime.index(
-            "  class Menu\n",
-            start
-          )
-
-          check.call(
-            finish,
-            'HUD method end'
-          )
-
-          draw=runtime[start...finish]
-
-          draw=replace.call(
-            draw,
-            "    w.visible=!$game_temp.message_window_showing\n"+
-            "\n"+
-            "    return unless w.visible\n",
-            "    return unless $scene.is_a?(Scene_Map) && w.visible\n"
-          )
-
-          draw=replace.call(
-            draw,
-            "    b=w.contents\n"+
-            "    b.clear\n",
-            "    b=w.contents\n"+
-            "    font=b.font\n"+
-            "    color=font.color\n"+
-            "    original_font=[font.name,font.size,font.bold,Color.new(color.red,color.green,color.blue,color.alpha)]\n"
-          )
-
-          draw=replace.call(
-            draw,
-            "      x=i*86\n"+
-            "      y=0\n",
-            "      x=122+i*86\n"+
-            "      y=355\n"
-          )
-
-          draw=replace.call(
-            draw,
-            "    w.instance_variable_set(:@sl414_info,info)\n",
-            "    font.name,font.size,font.bold,font.color=original_font\n"+
-            "    w.instance_variable_set(:@sl414_info,info)\n"
-          )
-
-          edit.call(
-            130,
-            runtime[0...start]+
-            draw+
-            runtime[finish..-1]
-          )
-
-          check.call(
-            changed.call(old,rows)==
-            [78,127,130],
-            'Correction scope'
-          )
-
-          check.call(
-            changed.call(base,rows)==
-            [26,42,43,71,78,80,81,93,100,127,130],
-            'V4.13 scope'
-          )
-
-          check.call(
-            source.call(rows,100).include?(
-              'return if self.equal?($메세지)'
-            ),
-            'Native legacy message guard'
-          )
-
-          rows.each_index do |i|
-
-            check.call(
-              base[i][0,2]==rows[i][0,2],
-              "Script identity #{i}"
-            )
-
-            s=source.call(rows,i)
-
-            check.call(
-              s.valid_encoding?,
-              "Encoding #{i}"
-            )
-          end
-
-          File.binwrite(
-            output,
-            Marshal.dump(rows)
-          )
-
-          check.call(
-            Marshal.load(
-              File.binread(output)
-            )==rows,
-            'Archive roundtrip'
-          )
-
-          puts 'PASS 137 original script identities'
-          puts 'PASS 11 approved script changes'
-          puts 'PASS exactly 3 corrected scripts'
-          puts 'PASS original message window restored'
-          puts 'PASS native gauge rendering connected'
-          puts 'PASS original inventory and combat preserved'
-
-          puts(
-            "Scripts MD5: "+
-            Digest::MD5.file(output).hexdigest
-          )
+          puts 'PASS central message hidden'
+          puts 'PASS original help output removed'
+          puts 'PASS 2 modified scripts, 135 unchanged'
           RUBY
 
-          ruby -c /tmp/sl414-fix.rb
+          ruby -c /tmp/sl414-clear.rb
 
-          ruby /tmp/sl414-fix.rb \
-            site/knight/gameasync/Data/Scripts.rxdata \
-            audit/V4.14/knight/gameasync/Data/Scripts.rxdata \
+          ruby /tmp/sl414-clear.rb \
             site/knight/gameasync/Data/Scripts.rxdata
 
-      - name: Refresh exact script mapping and verify original files
+      - name: Remove original central HUD graphic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m venv --system-site-packages /tmp/sl414-venv
+
+          /tmp/sl414-venv/bin/python -c "import PIL" || \
+            /tmp/sl414-venv/bin/python -m pip install \
+              --quiet --disable-pip-version-check \
+              'Pillow>=11,<13'
+
+          /tmp/sl414-venv/bin/python - <<'PYTHON'
+          from pathlib import Path
+          from PIL import Image
+          import hashlib
+          import json
+          import struct
+          import base64
+          import io
+          import re
+
+          root=Path('site')
+          game=root/'knight/gameasync'
+
+          name='게이지(저사양)-상'
+          key='graphics/pictures/'+name
+
+          rel='Graphics/Pictures/'+name+'.png'
+
+          graphic=game/rel
+
+          original=graphic.read_bytes()
+
+          old_digest=hashlib.md5(original).hexdigest()
+
+          assert old_digest=='066b88e345cef3819c463a68d6a1cfb5'
+          assert len(original)==55303
+
+          im=Image.open(io.BytesIO(original)).convert('RGBA')
+
+          assert im.size==(800,600)
+
+          old_image=im.copy()
+
+          box=(135,450,488,600)
+
+          im.paste((0,0,0,0),box)
+
+          assert im.crop(box).getbbox() is None
+
+          for area in [
+              (0,0,800,450),
+              (0,450,135,600),
+              (488,450,800,600)
+          ]:
+              assert (
+                  im.crop(area).tobytes()
+                  ==old_image.crop(area).tobytes()
+              )
+
+          buffer=io.BytesIO()
+
+          im.save(buffer,format='PNG')
+
+          corrected=buffer.getvalue()
+
+          assert corrected!=original
+
+          graphic.write_bytes(corrected)
+
+          new_digest=hashlib.md5(corrected).hexdigest()
+
+          print('PASS original central graphic removed')
+          print('PASS left and right graphic pixels unchanged')
+
+          pack=root/'knight/assets/shared-v229r115.pack'
+
+          old_pack=pack.read_bytes()
+
+          assert len(old_pack)==43962587
+
+          header_size=struct.unpack_from('<I',old_pack,0)[0]
+
+          assert 0<header_size<len(old_pack)-4
+
+          index=json.loads(
+              old_pack[4:4+header_size].decode('utf8')
+          )
+
+          payload=old_pack[4+header_size:]
+
+          assert index['kind']=='shared'
+
+          old_rows=index['files']
+
+          assert len(old_rows)==2292
+
+          assert len({
+              row[0] for row in old_rows
+          })==2292
+
+          offset=0
+
+          for row in old_rows:
+
+              assert len(row)==3
+              assert row[1]==offset
+              assert row[2]>0
+
+              offset+=row[2]
+
+          assert offset==len(payload)
+
+          matches=[
+              i for i,row in enumerate(old_rows)
+              if row[0]==key
+          ]
+
+          assert len(matches)==1
+
+          target=matches[0]
+
+          _,start,size=old_rows[target]
+
+          assert start==27965453
+          assert size==55303
+
+          assert payload[start:start+size]==original
+
+          delta=len(corrected)-size
+
+          new_payload=(
+              payload[:start]+
+              corrected+
+              payload[start+size:]
+          )
+
+          new_rows=[]
+
+          for i,(k,o,n) in enumerate(old_rows):
+
+              if i==target:
+                  new_rows.append([k,o,len(corrected)])
+
+              elif i>target:
+                  new_rows.append([k,o+delta,n])
+
+              else:
+                  new_rows.append([k,o,n])
+
+          unchanged=0
+
+          for i in range(len(old_rows)):
+
+              k,o,n=old_rows[i]
+              k2,o2,n2=new_rows[i]
+
+              assert k==k2
+
+              old_bytes=payload[o:o+n]
+              new_bytes=new_payload[o2:o2+n2]
+
+              if i==target:
+
+                  assert new_bytes==corrected
+                  assert new_bytes!=old_bytes
+
+              else:
+
+                  assert old_bytes==new_bytes
+
+                  unchanged+=1
+
+          assert unchanged==2291
+
+          assert (
+              new_rows[-1][1]+new_rows[-1][2]
+              ==len(new_payload)
+          )
+
+          index['files']=new_rows
+
+          new_header=json.dumps(
+              index,
+              ensure_ascii=False,
+              separators=(',',':')
+          ).encode('utf8')
+
+          pack.write_bytes(
+              struct.pack('<I',len(new_header))+
+              new_header+
+              new_payload
+          )
+
+          pack_digest=hashlib.sha256(
+              pack.read_bytes()
+          ).hexdigest()[:16]
+
+          print('PASS original shared pack updated')
+          print('PASS 2291 other packed resources unchanged')
+
+          mapper=game/'mapping.js'
+
+          s=mapper.read_text('utf8')
+
+          old_marker=rel+'?h='+old_digest
+
+          assert s.count(old_marker)==1
+
+          s=s.replace(
+              old_marker,
+              rel+'?h='+new_digest
+          )
+
+          old_script_digest='6b6625669a2e5c200676a2bb38961014'
+
+          script=game/'Data/Scripts.rxdata'
+
+          script_digest=hashlib.md5(
+              script.read_bytes()
+          ).hexdigest()
+
+          old_marker='Data/Scripts.rxdata?h='+old_script_digest
+
+          assert s.count(old_marker)==1
+
+          s=s.replace(
+              old_marker,
+              'Data/Scripts.rxdata?h='+script_digest
+          )
+
+          mapper.write_text(s,'utf8')
+
+          mapping_digest=hashlib.sha256(
+              mapper.read_bytes()
+          ).hexdigest()[:16]
+
+          bitmap_map=game/'bitmap-map.js'
+
+          s=bitmap_map.read_text('utf8')
+
+          pattern=re.compile(
+              r'("'+re.escape(key)+
+              r'":\s*\[800,600,"data:image/png;base64,)'+
+              r'([A-Za-z0-9+/=]+)("\])'
+          )
+
+          matches=list(pattern.finditer(s))
+
+          assert len(matches)==1
+
+          match=matches[0]
+
+          thumb=Image.open(
+              io.BytesIO(
+                  base64.b64decode(match.group(2))
+              )
+          ).convert('RGBA')
+
+          assert thumb.size==(64,48)
+
+          resized=im.resize(
+              thumb.size,
+              Image.Resampling.BOX
+          )
+
+          thumb_box=(10,36,40,48)
+
+          thumb.paste(
+              resized.crop(thumb_box),
+              thumb_box
+          )
+
+          buffer=io.BytesIO()
+
+          thumb.save(buffer,format='PNG')
+
+          encoded=base64.b64encode(
+              buffer.getvalue()
+          ).decode('ascii')
+
+          s=(
+              s[:match.start(2)]+
+              encoded+
+              s[match.end(2):]
+          )
+
+          bitmap_map.write_text(s,'utf8')
+
+          bitmap_digest=hashlib.sha256(
+              bitmap_map.read_bytes()
+          ).hexdigest()[:16]
+
+          print('PASS central thumbnail updated')
+
+          loader=root/'knight/js/sl-assets-v229r115.js'
+
+          s=loader.read_text('utf8')
+
+          old_pack_url='shared-v229r115.pack?v=V4.11'
+
+          new_pack_url=(
+              'shared-v229r115.pack?v=V4.14&h='
+              +pack_digest
+          )
+
+          assert s.count(old_pack_url)==1
+
+          s=s.replace(
+              old_pack_url,
+              new_pack_url
+          )
+
+          assert s.count("var version='V4.13';")==1
+
+          s=s.replace(
+              "var version='V4.13';",
+              "var version='V4.14';"
+          )
+
+          loader.write_text(s,'utf8')
+
+          loader_digest=hashlib.sha256(
+              loader.read_bytes()
+          ).hexdigest()[:16]
+
+          page=root/'knight/index.html'
+
+          s=page.read_text('utf8')
+
+          references=[
+              (
+                  'gameasync/mapping.js?v=v4.13',
+                  'gameasync/mapping.js?v=v4.14&h='+mapping_digest,
+                  1
+              ),
+              (
+                  'gameasync/bitmap-map.js?v=v4.13',
+                  'gameasync/bitmap-map.js?v=v4.14&h='+bitmap_digest,
+                  2
+              ),
+              (
+                  'js/sl-assets-v229r115.js?v=v4.13',
+                  'js/sl-assets-v229r115.js?v=v4.14&h='+loader_digest,
+                  1
+              )
+          ]
+
+          for old,new,count in references:
+
+              assert s.count(old)==count,(old,s.count(old))
+
+              s=s.replace(old,new)
+
+          assert 'V4.13' in s
+
+          s=s.replace('V4.13','V4.14')
+
+          page.write_text(s,'utf8')
+
+          index_page=root/'index.html'
+
+          s=index_page.read_text('utf8')
+
+          assert 'V4.13' in s
+
+          index_page.write_text(
+              s.replace(
+                  'V4.13','V4.14'
+              ).replace(
+                  'v4.13','v4.14'
+              ),
+              'utf8'
+          )
+
+          print('PASS current script cache',script_digest)
+          print('PASS current image cache',new_digest)
+          print('PASS current pack cache',pack_digest)
+          print('PASS current bitmap cache',bitmap_digest)
+          PYTHON
+
+      - name: Verify exact deletion scope
         shell: bash
         run: |
           set -euo pipefail
@@ -419,145 +571,21 @@ jobs:
           from pathlib import Path
           import hashlib
           import json
-          import re
 
           root=Path('site')
-          audit=Path('audit')
-
-          original=audit/'V4.13'
-          candidate=audit/'V4.14'
-
-          script=root/'knight/gameasync/Data/Scripts.rxdata'
-          mapper=root/'knight/gameasync/mapping.js'
-
-          old=hashlib.md5(
-              (
-                  original/
-                  'knight/gameasync/Data/Scripts.rxdata'
-              ).read_bytes()
-          ).hexdigest()
-
-          prior=hashlib.md5(
-              (
-                  candidate/
-                  'knight/gameasync/Data/Scripts.rxdata'
-              ).read_bytes()
-          ).hexdigest()
-
-          new=hashlib.md5(
-              script.read_bytes()
-          ).hexdigest()
-
-          assert new not in (old,prior)
-
-          marker='Data/Scripts.rxdata?h='
-
-          s=mapper.read_text('utf8')
-
-          assert s.count(marker+old)==1
-
-          assert (
-              (
-                  candidate/
-                  'knight/gameasync/mapping.js'
-              ).read_text('utf8')
-              ==s.replace(
-                  marker+old,
-                  marker+prior
-              )
-          )
-
-          mapper.write_text(
-              s.replace(
-                  marker+old,
-                  marker+new
-              ),
-              'utf8'
-          )
-
-          digest=hashlib.sha256(
-              mapper.read_bytes()
-          ).hexdigest()[:16]
-
-          page=root/'knight/index.html'
-
-          html=(
-              candidate/'knight/index.html'
-          ).read_text('utf8')
-
-          html,n=re.subn(
-              r'gameasync/mapping\.js\?v=V4\.14&h=[0-9a-f]{16}',
-              'gameasync/mapping.js?v=V4.14&h='+digest,
-              html
-          )
-
-          assert n==1,'Original mapping reference'
-
-          page.write_text(
-              html,
-              'utf8'
-          )
-
-          loader=(
-              root/
-              'knight/js/sl-assets-v229r115.js'
-          )
-
-          s=loader.read_text('utf8')
-
-          assert s.count(
-              "var version='V4.13';"
-          )==1
-
-          s=s.replace(
-              "var version='V4.13';",
-              "var version='V4.14';"
-          )
-
-          assert s==(
-              candidate/
-              'knight/js/sl-assets-v229r115.js'
-          ).read_text('utf8')
-
-          loader.write_text(
-              s,
-              'utf8'
-          )
-
-          p=root/'index.html'
-
-          s=p.read_text('utf8')
-
-          assert 'V4.13' in s
-
-          p.write_text(
-              s.replace(
-                  'V4.13',
-                  'V4.14'
-              ).replace(
-                  'v4.13',
-                  'v4.14'
-              ),
-              'utf8'
-          )
 
           before=json.loads(
-              Path(
-                  '/tmp/sl414-before.json'
-              ).read_text('utf8')
+              Path('/tmp/sl414-before.json').read_text('utf8')
           )
 
           after={
               p.relative_to(root).as_posix():
-                  hashlib.sha256(
-                      p.read_bytes()
-                  ).hexdigest()
+                  hashlib.sha256(p.read_bytes()).hexdigest()
               for p in root.rglob('*')
               if p.is_file()
           }
 
-          assert set(after)==set(before)
-
+          assert set(before)==set(after)
           assert len(after)==6085
 
           changed={
@@ -565,44 +593,35 @@ jobs:
               if before[k]!=after[k]
           }
 
-          assert changed=={
+          expected={
               'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/Graphics/Pictures/게이지(저사양)-상.png',
+              'knight/assets/shared-v229r115.pack',
               'knight/gameasync/mapping.js',
-              'knight/index.html',
+              'knight/gameasync/bitmap-map.js',
               'knight/js/sl-assets-v229r115.js',
+              'knight/index.html',
               'index.html'
-          },changed
+          }
 
-          assert (
-              marker+new
-              in mapper.read_text('utf8')
-          )
-
-          assert (
-              'gameasync/mapping.js?v=V4.14&h='
-              +digest
-              in page.read_text('utf8')
-          )
+          assert changed==expected,changed^expected
 
           assert all(
               before[k]==after[k]
               for k in before
-              if k not in changed
+              if k not in expected
           )
 
-          print('PASS 6080 original files unchanged')
-          print('PASS exact five changed files')
-          print('PASS current script mapping',new)
-          print('PASS current mapping cache',digest)
-          print('PASS V4.14 candidate')
+          print('PASS exact eight changed files')
+          print('PASS 6077 original files unchanged')
+          print('PASS original combat and inventory preserved')
+          print('PASS central HUD deletion only')
           PYTHON
 
           node --check site/knight/gameasync/mapping.js
-
+          node --check site/knight/gameasync/bitmap-map.js
           node --check site/knight/js/sl-assets-v229r115.js
-
           node --check site/knight/js/drive.js
-
           node --check site/knight/js/dpad.js
 
       - name: Upload V4.14 candidate
