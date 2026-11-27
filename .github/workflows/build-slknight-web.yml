@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.14 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.15 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -23,14 +23,23 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Restore V4.14 central deletion baseline
+      - name: Restore V4.14 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 46010973927
+          run-id: 46015932760
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
+
+      - name: Restore original item implementation
+        uses: actions/download-artifact@v4
+        with:
+          repository: gowellsik-hue/Game
+          run-id: 46002274527
+          name: sl414-original-runtime-audit
+          github-token: ${{ github.token }}
+          path: audit
 
       - name: Verify original game
         shell: bash
@@ -62,579 +71,875 @@ jobs:
 
           assert hashlib.md5(
               script.read_bytes()
-          ).hexdigest()=='de673e8cb737ab69af0213814bc5f9fc'
+          ).hexdigest()=='07e7a62cb188150271de853d2d38facf'
+
+          assert before[
+              'knight/gameasync/Data/Scripts.rxdata'
+          ]=='e651e2d63092dd3eebf1a185f2482cf80eb478008dc0b540735972e97bfaa8b9'
 
           image=root/'knight/gameasync/Graphics/Pictures/게이지(저사양)-상.png'
 
           assert hashlib.md5(
               image.read_bytes()
-          ).hexdigest()=='c223b7d1cbe4e66dd84a70fd2786fc95'
+          ).hexdigest()=='ed37440f448cd7ff710b00aeefd4915e'
 
           assert before[
               'knight/assets/shared-v229r115.pack'
-          ].startswith('a235eb3ce5c38daa')
+          ].startswith('848a3d863d953bdc')
 
           assert before[
               'knight/gameasync/bitmap-map.js'
-          ].startswith('738666fb2e2f514a')
+          ].startswith('30b5b4a619a81d4c')
 
-          assert (
-              root/'knight/js/sl-assets-v229r115.js'
-          ).read_text('utf8').count(
-              "var version='V4.14';"
-          )==1
+          previous=Path(
+              'audit/V4.14/knight/gameasync/Data/Scripts.rxdata'
+          )
 
-          Path('/tmp/sl414-before.json').write_text(
+          assert hashlib.sha256(
+              previous.read_bytes()
+          ).hexdigest()=='a51670a58ab4d35567a5a40a955b83c7552f6163c93f9223874192922a68272d'
+
+          Path('/tmp/sl415-before.json').write_text(
               json.dumps(before),
               'utf8'
           )
 
           print('PASS exact V4.14 baseline')
+          print('PASS original item implementation')
           PYTHON
 
-      - name: Remove original lower HUD drawing
+      - name: Build companion HUD
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl414-direct-clear.rb <<'RUBY'
+          cat > /tmp/sl415-build.rb <<'RUBY'
           # encoding: UTF-8
           require 'zlib'
           require 'digest'
 
-          path=ARGV.fetch(0)
-          raw=File.binread(path)
+          base,previous,out=ARGV
 
-          raise 'Baseline script digest' unless
+          raise 'Arguments' unless out
+
+          raw=File.binread(base)
+          old=File.binread(previous)
+
+          raise 'Baseline mismatch' unless
             Digest::MD5.hexdigest(raw)==
-            'de673e8cb737ab69af0213814bc5f9fc'
+            '07e7a62cb188150271de853d2d38facf'
+
+          raise 'Previous item source mismatch' unless
+            Digest::SHA256.hexdigest(old)==
+            'a51670a58ab4d35567a5a40a955b83c7552f6163c93f9223874192922a68272d'
 
           rows=Marshal.load(raw)
+          item_rows=Marshal.load(old)
 
-          raise 'Script count' unless rows.size==137
+          raise 'Count' unless
+            rows.size==137 &&
+            item_rows.size==137
 
           before=rows.map{|r|Marshal.dump(r)}
 
-          expected={
-            123=>'플레이어 체력 출력',
-            124=>'버프,물약 이미지 출력',
-            127=>'게이지'
-          }
-
-          expected.each do |i,name|
-
-            raise "Name #{i}" unless
-              rows[i][1].dup.force_encoding('UTF-8')==name
-
-            src=Zlib::Inflate.inflate(
-              rows[i][2]
+          source=lambda do |a,i|
+            Zlib::Inflate.inflate(
+              a[i][2]
             ).force_encoding('UTF-8')
+          end
 
-            s=src.gsub("\r\n","\n")
-            t=s.dup
+          replace=lambda do |s,a,b|
 
-            case i
+            raise "Anchor #{a.inspect[0,100]}" unless
+              s.scan(a).size==1
 
-            when 123
-
-              a="    @spr5 = Sprite.new\n"
-
-              raise 'EXP sprite' unless
-                t.scan(a).size==1
-
-              t=t.sub(a){
-                a+"    @spr5.visible = false\n"
-              }
-
-            when 124
-
-              ids=%w[
-                Ak Sk Dk Fk Zk Qk
-                ok tk ttk sk1
-                hk5 hk6 hk7 hk8
-              ]
-
-              ids.each do |id|
-
-                a=/^([ \t]*\$#{id} = Sprite\.new[ \t]*\n)/
-
-                raise "Native hotkey #{id}" unless
-                  t.scan(a).size==2
-
-                t=t.gsub(a){|m|
-                  m+"  $#{id}.visible = false\n"
-                }
-
-              end
-
-              raise 'Hotkey count' unless
-                t.scan(
-                  /^  \$\w+\.visible = false$/
-                ).size==28
-
-              raise 'Upper buff changed' unless
-                t.lines.grep(/\$Buf_/)==
-                s.lines.grep(/\$Buf_/)
-
-            when 127
-
-              calls=[]
-
-              walk=lambda do |n|
-
-                if n.is_a?(
-                  RubyVM::AbstractSyntaxTree::Node
-                )
-
-                  if [:CALL,:FCALL].include?(n.type)
-
-                    method_name=
-                      n.type==:CALL ?
-                      n.children[1] :
-                      n.children[0]
-
-                    if [
-                      :draw_text,
-                      :draw_actor_parameter,
-                      :draw_actor_level,
-                      :draw_actor_hp,
-                      :draw_actor_sp
-                    ].include?(method_name)
-
-                      raise 'Multiline drawing' unless
-                        n.first_lineno==n.last_lineno
-
-                      calls<<[
-                        n.first_lineno,
-                        method_name
-                      ]
-
-                    end
-
-                  end
-
-                  n.children.each{
-                    |c|walk.call(c)
-                  }
-
-                end
-
-              end
-
-              walk.call(
-                RubyVM::AbstractSyntaxTree.parse(s)
-              )
-
-              raise 'Native output counts' unless
-                calls.group_by{
-                  |x|x[1]
-                }.transform_values(&:size)=={
-                  draw_text:158,
-                  draw_actor_level:1,
-                  draw_actor_hp:5,
-                  draw_actor_sp:5,
-                  draw_actor_parameter:32
-                }
-
-              lines=s.lines
-
-              targets=calls.select do |line,method_name|
-
-                (
-                  method_name==:draw_text &&
-                  line<=653 &&
-                  !(177..191).include?(line) &&
-                  line!=464
-                ) ||
-                [
-                  :draw_actor_parameter,
-                  :draw_actor_level
-                ].include?(method_name)
-
-              end
-
-              raise 'Lower draw count' unless
-                targets.group_by{
-                  |x|x[1]
-                }.transform_values(&:size)=={
-                  draw_text:122,
-                  draw_actor_level:1,
-                  draw_actor_parameter:32
-                }
-
-              base_method=Zlib::Inflate.inflate(
-                rows[98][2]
-              ).force_encoding('UTF-8')
-
-              raise 'Original AC calculation' unless
-                base_method.include?(
-                  '$agi = actor.pdef * 0.8 unless actor.instance_variable_get(:@sl46_stats_ready)'
-                )
-
-              targets.each do |line,method_name|
-
-                original=lines[line-1]
-
-                case line
-
-                when 409
-
-                  raise 'AC call' unless
-                    original.strip==
-                    'draw_actor_parameter($game_party.actors[0], 8, 395, 1)'
-
-                  lines[line-1]=
-                    "    10 - $game_party.actors[0].pdef\n"+
-                    "    $agi = $game_party.actors[0].pdef * 0.8 unless $game_party.actors[0].instance_variable_get(:@sl46_stats_ready)\n"
-
-                when 479
-
-                  raise 'MR call' unless
-                    original.strip==
-                    'draw_actor_parameter($game_party.actors[0], 70, 395, 2)'
-
-                  lines[line-1]=
-                    "    $game_party.actors[0].mdef\n"
-
-                else
-
-                  lines[line-1]=''
-
-                end
-
-              end
-
-              t=lines.join
-
-              a="    $var3 = Window_Help2.new\n"
-
-              raise 'Map name window' unless
-                t.scan(a).size==1
-
-              t=t.sub(a){
-                a+
-                "    $var3.visible = false\n"+
-                "    $var3.contents_opacity = 0\n"
-              }
-
-              pattern=/^\s*(?:\$DPS[12]|dps[12]|\$atk|\$atkp|\$atkRating|\$game_variables\[\d+\]|\$hungry_persent|\$id_y|\$s|\$sy)\s*(?:\*=|=)/
-
-              raise 'Original calculations changed' unless
-                t.lines.grep(pattern)==
-                s.lines.grep(pattern)
-
-              calls.clear
-
-              walk.call(
-                RubyVM::AbstractSyntaxTree.parse(t)
-              )
-
-              raise 'Remaining output count' unless
-                calls.group_by{
-                  |x|x[1]
-                }.transform_values(&:size)=={
-                  draw_text:36,
-                  draw_actor_hp:5,
-                  draw_actor_sp:5
-                }
-
-              raise 'Unsupported clear_rect' if
-                t.include?('clear_rect')
-
-            end
-
-            RubyVM::InstructionSequence.compile(t)
-
-            raise "No edit #{i}" if s==t
-
-            t=t.gsub("\n","\r\n") if
-              src.include?("\r\n")
-
-            rows[i][2]=Zlib::Deflate.deflate(t.b)
+            s.sub(a){b}
 
           end
 
-          raise 'Unexpected script changes' unless
-            rows.each_index.select{
-              |i|Marshal.dump(rows[i])!=before[i]
-            }==expected.keys
+          edit=lambda do |i,s|
+
+            RubyVM::InstructionSequence.compile(s)
+
+            rows[i][2]=Zlib::Deflate.deflate(s.b)
+
+          end
+
+          [26,42,43,71,80,81,93].each do |i|
+
+            raise "Identity #{i}" unless
+              rows[i][0,2]==item_rows[i][0,2]
+
+            RubyVM::InstructionSequence.compile(
+              source.call(item_rows,i)
+            )
+
+            rows[i][2]=item_rows[i][2]
+
+          end
+
+          s=source.call(item_rows,130)
+
+          a=s.index("  def self.draw(w)\n")
+
+          b=s.index("  class Menu\n",a)
+
+          raise 'Legacy renderer bounds' unless
+            a && b && b>a
+
+          s=s[0...a]+s[b..-1]
+
+          s=replace.call(
+            s,
+            "    (store[id]||={})[item] ||=\n      [0,HEAL.key?(item)]\n",
+            "    return false if !entry(id,item) && (store[id]||{}).size>=4\n\n    (store[id]||={})[item] ||=\n      [0,HEAL.key?(item)]\n"
+          )
+
+          raise 'Old renderer' if
+            s.include?('def self.draw(w)') ||
+            s.include?('SL414.draw') ||
+            s.include?('clear_rect')
+
+          edit.call(130,s)
+
+          s=source.call(rows,105)
+
+          crlf=s.include?("\r\n")
+
+          s=s.gsub("\r\n","\n")
+
+          s=replace.call(
+            s,
+            /class Window_ExpRate < Window_Base\n.*?(?=class Scene_Map\n)/m,
+            <<'NEW'
+          class Window_ExpRate < Window_Base
+            def initialize
+              super(0,464,800,136)
+
+              self.contents=Bitmap.new(
+                width-32,
+                height-32
+              )
+
+              self.contents.font=Font.new(
+                "NanumGothic",12
+              )
+
+              self.opacity=0
+              self.back_opacity=0
+            end
+
+            def refresh
+              self.contents.clear
+              self.contents.font.bold=false
+
+              @show_text[0].each_with_index do |v,i|
+
+                x=i*192
+
+                self.contents.fill_rect(
+                  Rect.new(x,0,190,104),
+                  Color.new(0,0,0)
+                )
+
+                next unless v
+
+                name,lv,hp,mhp,mp,mmp,xp,ac,mr,items=v
+
+                self.contents.font.color=
+                  Color.new(192,224,255,255)
+
+                self.contents.draw_text(
+                  x+4,0,136,18,
+                  name,0
+                )
+
+                self.contents.draw_text(
+                  x+140,0,46,18,
+                  "Lv.#{lv}",2
+                )
+
+                self.contents.font.color=
+                  Color.new(255,128,128,255)
+
+                self.contents.draw_text(
+                  x+4,19,92,16,
+                  "HP #{hp}/#{mhp}",0
+                )
+
+                self.contents.font.color=
+                  Color.new(128,128,255,255)
+
+                self.contents.draw_text(
+                  x+98,19,88,16,
+                  "MP #{mp}/#{mmp}",0
+                )
+
+                self.contents.font.color=
+                  Color.new(255,255,128,255)
+
+                self.contents.draw_text(
+                  x+4,36,182,16,
+                  "EXP #{xp}%",0
+                )
+
+                self.contents.font.color=
+                  Color.new(255,255,255)
+
+                self.contents.draw_text(
+                  x+4,53,92,16,
+                  "AC #{ac}",0
+                )
+
+                self.contents.draw_text(
+                  x+98,53,88,16,
+                  "MR #{mr}",0
+                )
+
+                if i==0
+
+                  self.contents.font.color=
+                    Color.new(255,0,150)
+
+                  self.contents.draw_text(
+                    x+4,73,182,24,
+                    "DPS #{@show_text[1]} / #{@show_text[2]}",0
+                  )
+
+                else
+
+                  items.each_with_index do |q,j|
+
+                    id,n=q
+
+                    item=$data_items[id]
+
+                    next unless item
+
+                    ix=x+4+j*46
+
+                    bitmap=RPG::Cache.icon(
+                      item.icon_name
+                    )
+
+                    self.contents.blt(
+                      ix,70,
+                      bitmap,
+                      Rect.new(0,0,32,32)
+                    )
+
+                    self.contents.font.color=
+                      Color.new(0,0,0)
+
+                    self.contents.draw_text(
+                      ix+1,85,43,16,
+                      n.to_s,2
+                    )
+
+                    self.contents.font.color=
+                      Color.new(255,255,255)
+
+                    self.contents.draw_text(
+                      ix,84,43,16,
+                      n.to_s,2
+                    )
+
+                  end
+
+                end
+
+              end
+
+            end
+
+            def actor
+              $game_party.actors[0]
+            end
+
+            def update
+              super
+
+              $ne=actor.exp_rate*115
+
+              self.z=999999
+
+              self.visible=
+                !$game_temp.message_window_showing
+
+              text=[
+                [
+                  $game_actors[1],
+                  SL414.member(4),
+                  SL414.member(5),
+                  SL414.member(6)
+                ].map do |a|
+
+                  next nil unless a
+
+                  items=a.id==1 ? [] :
+                    SL414::IDS.select{
+                      |id|SL414.entry(a.id,id)
+                    }[0,4].map{
+                      |id|[id,SL414.count(a.id,id)]
+                    }
+
+                  [
+                    a.name.to_s.dup,
+                    a.level,
+                    a.hp,
+                    a.maxhp,
+                    a.sp,
+                    a.maxsp,
+                    sprintf('%.4f',a.exp_rate*100),
+                    10-a.pdef,
+                    a.mdef,
+                    items
+                  ]
+
+                end,
+                sprintf('%.1f',$DPS1.to_f),
+                sprintf('%.1f',$DPS2.to_f)
+              ]
+
+              if @show_text!=text
+
+                @show_text=text
+
+                refresh
+
+              end
+
+            end
+
+          end
+          NEW
+          )
+
+          s=s.gsub("\n","\r\n") if crlf
+
+          edit.call(105,s)
+
+          changed=rows.each_index.select{
+            |i|Marshal.dump(rows[i])!=before[i]
+          }
+
+          raise "Scope #{changed}" unless
+            changed==[26,42,43,71,80,81,93,105,130]
+
+          rows.each_index do |i|
+
+            raise "Identity #{i}" unless
+              rows[i][0,2]==item_rows[i][0,2]
+
+            raise "Invalid encoding #{i}" unless
+              source.call(rows,i).valid_encoding?
+
+          end
 
           File.binwrite(
-            path,
+            out,
             Marshal.dump(rows)
           )
 
-          raise 'Roundtrip' unless
+          raise 'Round trip' unless
             Marshal.load(
-              File.binread(path)
+              File.binread(out)
             )==rows
 
-          puts 'PASS 155 lower drawing calls removed'
-          puts 'PASS 46 upper drawing calls preserved'
-          puts 'PASS original AC and MR calculations preserved'
-          puts 'PASS original evasion calculation preserved'
-          puts 'PASS original DPS calculation preserved'
-          puts 'PASS 3 scripts changed'
-          puts 'PASS 134 scripts unchanged'
-          puts 'PASS no clear_rect call'
-          puts Digest::MD5.file(path).hexdigest
+          puts 'PASS 137 script identities'
+          puts 'PASS 9 modified scripts'
+          puts 'PASS 128 original scripts preserved'
+          puts 'PASS existing experience window reused'
+          puts 'PASS native inventory icons reused'
+          puts 'PASS original four character data'
+          puts 'PASS original DPS values reused'
+          puts 'PASS four item types per companion'
+          puts 'PASS original gauge deletion preserved'
+          puts "MD5 #{Digest::MD5.file(out).hexdigest}"
           RUBY
 
-          ruby -c /tmp/sl414-direct-clear.rb
+          ruby -c /tmp/sl415-build.rb
 
-          ruby /tmp/sl414-direct-clear.rb \
+          ruby /tmp/sl415-build.rb \
+            site/knight/gameasync/Data/Scripts.rxdata \
+            audit/V4.14/knight/gameasync/Data/Scripts.rxdata \
+            /tmp/sl415.rxdata
+
+          cp /tmp/sl415.rxdata \
             site/knight/gameasync/Data/Scripts.rxdata
 
-      - name: Remove entire original HUD background
+      - name: Verify companion HUD and items
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 -m venv \
-            --system-site-packages /tmp/sl414-venv
+          cat > /tmp/sl415-test.rb <<'RUBY'
+          # encoding: UTF-8
+          require 'zlib'
 
-          /tmp/sl414-venv/bin/python -c "import PIL" || \
-            /tmp/sl414-venv/bin/python -m pip install \
-              --quiet --disable-pip-version-check \
-              'Pillow>=11,<13'
+          rows=Marshal.load(
+            File.binread('/tmp/sl415.rxdata')
+          )
 
-          /tmp/sl414-venv/bin/python - <<'PYTHON'
+          read=lambda do |i|
+            Zlib::Inflate.inflate(
+              rows[i][2]
+            ).force_encoding('UTF-8')
+          end
+
+          class Color
+            def initialize(*a)
+              raise unless [3,4].include?(a.size)
+            end
+          end
+
+          Rect=Struct.new(
+            :x,:y,:width,:height
+          )
+
+          class Font
+            attr_accessor :bold,:color
+
+            def initialize(name,size)
+            end
+          end
+
+          class Bitmap
+            attr_accessor :font
+
+            attr_reader :width,:height,:calls,:clears
+
+            def initialize(w,h)
+              @width=w
+              @height=h
+              @calls=[]
+              @clears=0
+            end
+
+            def clear
+              @calls=[]
+              @clears+=1
+            end
+
+            def fill_rect(rect,color)
+              bounds(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height
+              )
+            end
+
+            def draw_text(x,y,w,h,t,a)
+              bounds(x,y,w,h)
+              @calls<<[x,y,t]
+            end
+
+            def blt(x,y,bitmap,rect)
+              bounds(
+                x,y,
+                rect.width,
+                rect.height
+              )
+
+              @calls<<[x,y,:icon]
+            end
+
+            def bounds(x,y,w,h)
+
+              raise "Out of bounds: #{[x,y,w,h]}" unless
+                x>=0 &&
+                y>=0 &&
+                x+w<=@width &&
+                y+h<=@height
+
+            end
+          end
+
+          class Window_Base
+
+            attr_accessor :width,
+              :height,
+              :contents,
+              :visible,
+              :opacity,
+              :back_opacity,
+              :z
+
+            def initialize(x,y,w,h)
+              @width=w
+              @height=h
+              @visible=true
+            end
+
+            def update
+            end
+
+          end
+
+          module RPG
+
+            Item=Struct.new(:id,:icon_name)
+
+            module Cache
+              def self.icon(name)
+                Bitmap.new(32,32)
+              end
+            end
+
+          end
+
+          module Graphics
+            def self.frame_count
+              100
+            end
+          end
+
+          class Game_Battler
+          end
+
+          class Game_Actor < Game_Battler
+
+            attr_accessor :id,
+              :name,
+              :level,
+              :hp,
+              :maxhp,
+              :sp,
+              :maxsp,
+              :pdef,
+              :mdef,
+              :armor_ids
+
+            def initialize(id)
+
+              @id=id
+              @name="Actor #{id}"
+              @level=30
+              @hp=300
+              @maxhp=350
+              @sp=40
+              @maxsp=50
+              @pdef=35
+              @mdef=30
+              @sl43_hired=id!=1
+              @armor_ids=[]
+              @exp=40
+              @exp_list=Array.new(101,0)
+              @exp_list[30]=0
+              @exp_list[31]=100
+
+            end
+
+          end
+
+          class Party
+
+            attr_accessor :actors
+
+            def initialize(actors)
+              @actors=actors
+              @items=Hash.new(0)
+            end
+
+            def item_number(i)
+              @items[i]
+            end
+
+            def gain_item(i,n)
+
+              @items[i]=[
+                [item_number(i)+n,0].max,
+                $item_maximum
+              ].min
+
+            end
+
+            def lose_item(i,n)
+              gain_item(i,-n)
+            end
+
+          end
+
+          class Scene_Map
+            def update
+            end
+          end
+
+          $item_maximum=9999
+
+          $game_actors={}
+
+          [1,4,5,6].each do |id|
+            $game_actors[id]=Game_Actor.new(id)
+          end
+
+          $game_party=Party.new(
+            $game_actors.values
+          )
+
+          $game_temp=Struct.new(
+            :message_window_showing
+          ).new(false)
+
+          $data_items={}
+
+          [1,16,70,71,86,1006].each do |i|
+            $data_items[i]=RPG::Item.new(
+              i,"icon#{i}"
+            )
+          end
+
+          $DPS1=110.1
+          $DPS2=112.8
+
+          src=read.call(130)
+
+          eval(
+            src[0...src.index("module SLHotbar\n")],
+            TOPLEVEL_BINDING,
+            'actual_item_code'
+          )
+
+          eval(
+            read.call(105),
+            TOPLEVEL_BINDING,
+            'actual_hud_code'
+          )
+
+          def check(c,label)
+
+            raise label unless c
+
+            puts "PASS #{label}"
+
+          end
+
+          $game_party.gain_item(1,100)
+
+          check(
+            SL414.give(4,1,30),
+            'give 30'
+          )
+
+          check(
+            SL414.owner(1)==70 &&
+            SL414.count(4,1)==30,
+            'give quantity conserved'
+          )
+
+          check(
+            SL414.recall(4,1,10),
+            'recall 10'
+          )
+
+          check(
+            SL414.owner(1)==80 &&
+            SL414.count(4,1)==20,
+            'recall quantity conserved'
+          )
+
+          check(
+            SL414.designate(5,1),
+            'second member designation'
+          )
+
+          SL414.buy(1,12)
+
+          check(
+            SL414.owner(1)==84 &&
+            SL414.count(4,1)==24 &&
+            SL414.count(5,1)==4,
+            'purchase distribution'
+          )
+
+          check(
+            SL414.equalize(1),
+            'equalize'
+          )
+
+          check(
+            [
+              SL414.owner(1),
+              SL414.count(4,1),
+              SL414.count(5,1)
+            ]==[38,37,37],
+            'equalize conserved'
+          )
+
+          [16,70,1006].each do |id|
+
+            check(
+              SL414.designate(4,id),
+              "designate #{id}"
+            )
+
+          end
+
+          check(
+            !SL414.designate(4,71),
+            'reject fifth designation'
+          )
+
+          check(
+            SL414.designate(4,1),
+            'retain existing designation'
+          )
+
+          $game_party.gain_item(1006,20)
+
+          check(
+            SL414.give(4,1006,10),
+            'give arrows'
+          )
+
+          SL414.spend_arrow($game_actors[4])
+
+          check(
+            SL414.ammo($game_actors[4])==9 &&
+            SL414.owner(1006)==10,
+            'companion arrows independent'
+          )
+
+          w=Window_ExpRate.new
+
+          w.update
+
+          check(
+            w.contents.clears==1,
+            'initial refresh'
+          )
+
+          check(
+            w.contents.calls.count{
+              |x|x[2]==:icon
+            }==5,
+            'designated item icons only'
+          )
+
+          check(
+            w.contents.calls.count{
+              |x|x[2].is_a?(String) &&
+                x[2].start_with?('EXP ')
+            }==4,
+            'four experience values'
+          )
+
+          check(
+            w.contents.calls.count{
+              |x|x[2].is_a?(String) &&
+                x[2].start_with?('MR ')
+            }==4,
+            'four MR values'
+          )
+
+          check(
+            w.contents.calls.any?{
+              |x|x[2]=='DPS 110.1 / 112.8'
+            },
+            'original DPS values'
+          )
+
+          w.update
+
+          check(
+            w.contents.clears==1,
+            'unchanged snapshot no redraw'
+          )
+
+          $game_actors[5].hp-=1
+
+          w.update
+
+          check(
+            w.contents.clears==2,
+            'HP change redraw'
+          )
+
+          SL414.spend_arrow(
+            $game_actors[4]
+          )
+
+          w.update
+
+          check(
+            w.contents.clears==3,
+            'item count change redraw'
+          )
+
+          $game_party.actors.delete(
+            $game_actors[6]
+          )
+
+          w.update
+
+          check(
+            w.contents.calls.count{
+              |x|x[2].is_a?(String) &&
+                x[2].start_with?('EXP ')
+            }==3,
+            'empty member panel'
+          )
+
+          $game_temp.message_window_showing=true
+
+          w.update
+
+          check(
+            !w.visible,
+            'native dialogue not covered'
+          )
+
+          $game_temp.message_window_showing=false
+
+          w.update
+
+          check(
+            w.visible,
+            'HUD restored after dialogue'
+          )
+
+          $game_actors[4].hp=100
+
+          before=SL414.count(4,1)
+
+          e=Struct.new(:animation_id).new
+
+          SL414.drink(
+            $game_actors[4],e
+          )
+
+          check(
+            $game_actors[4].hp==125 &&
+            SL414.count(4,1)==before-1,
+            'automatic potion'
+          )
+
+          SL414.drink(
+            $game_actors[4],e
+          )
+
+          check(
+            $game_actors[4].hp==125 &&
+            SL414.count(4,1)==before-1,
+            'automatic potion cooldown'
+          )
+          RUBY
+
+          ruby /tmp/sl415-test.rb
+
+      - name: Update V4.15 script mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYTHON'
           from pathlib import Path
-          from PIL import Image
           import hashlib
           import json
-          import struct
-          import base64
-          import io
-          import re
 
           root=Path('site')
           game=root/'knight/gameasync'
-
-          name='게이지(저사양)-상'
-          key='graphics/pictures/'+name
-          rel='Graphics/Pictures/'+name+'.png'
-
-          graphic=game/rel
-
-          original=graphic.read_bytes()
-
-          old_digest=hashlib.md5(
-              original
-          ).hexdigest()
-
-          assert old_digest=='c223b7d1cbe4e66dd84a70fd2786fc95'
-
-          im=Image.open(
-              io.BytesIO(original)
-          ).convert('RGBA')
-
-          assert im.size==(800,600)
-
-          im=Image.new(
-              'RGBA',
-              im.size,
-              (0,0,0,0)
-          )
-
-          assert im.getbbox() is None
-
-          buffer=io.BytesIO()
-
-          im.save(
-              buffer,
-              format='PNG'
-          )
-
-          corrected=buffer.getvalue()
-
-          graphic.write_bytes(corrected)
-
-          new_digest=hashlib.md5(
-              corrected
-          ).hexdigest()
-
-          assert new_digest!=old_digest
-
-          packs=sorted(
-              (root/'knight/assets').glob('*.pack')
-          )
-
-          assert len(packs)==50
-
-          targets=[]
-
-          for p in packs:
-
-              with p.open('rb') as f:
-
-                  header=f.read(4)
-
-                  assert len(header)==4
-
-                  length=struct.unpack(
-                      '<I',
-                      header
-                  )[0]
-
-                  assert 0<length<p.stat().st_size-4
-
-                  info=json.loads(
-                      f.read(length).decode('utf8')
-                  )
-
-                  for row in info['files']:
-
-                      if row[0]==key:
-                          targets.append(p)
-
-          pack=root/'knight/assets/shared-v229r115.pack'
-
-          assert targets==[pack],targets
-
-          old_pack=pack.read_bytes()
-
-          assert hashlib.sha256(
-              old_pack
-          ).hexdigest().startswith(
-              'a235eb3ce5c38daa'
-          )
-
-          header_size=struct.unpack_from(
-              '<I',
-              old_pack,
-              0
-          )[0]
-
-          index=json.loads(
-              old_pack[4:4+header_size].decode('utf8')
-          )
-
-          payload=old_pack[4+header_size:]
-
-          assert index['kind']=='shared'
-
-          old_rows=index['files']
-
-          assert len(old_rows)==2292
-
-          assert len({
-              row[0] for row in old_rows
-          })==2292
-
-          offset=0
-
-          for row in old_rows:
-
-              assert len(row)==3
-              assert row[1]==offset
-              assert row[2]>0
-
-              offset+=row[2]
-
-          assert offset==len(payload)
-
-          matches=[
-              i for i,row in enumerate(old_rows)
-              if row[0]==key
-          ]
-
-          assert len(matches)==1
-
-          target=matches[0]
-
-          _,start,size=old_rows[target]
-
-          assert payload[start:start+size]==original
-
-          delta=len(corrected)-size
-
-          new_payload=(
-              payload[:start]+
-              corrected+
-              payload[start+size:]
-          )
-
-          new_rows=[]
-
-          for i,(k,o,n) in enumerate(old_rows):
-
-              if i==target:
-
-                  new_rows.append([
-                      k,
-                      o,
-                      len(corrected)
-                  ])
-
-              elif i>target:
-
-                  new_rows.append([
-                      k,
-                      o+delta,
-                      n
-                  ])
-
-              else:
-
-                  new_rows.append([
-                      k,
-                      o,
-                      n
-                  ])
-
-          unchanged=0
-
-          for i in range(len(old_rows)):
-
-              k,o,n=old_rows[i]
-              k2,o2,n2=new_rows[i]
-
-              assert k==k2
-
-              old_bytes=payload[o:o+n]
-
-              new_bytes=new_payload[o2:o2+n2]
-
-              if i==target:
-
-                  assert new_bytes==corrected
-                  assert new_bytes!=old_bytes
-
-              else:
-
-                  assert old_bytes==new_bytes
-
-                  unchanged+=1
-
-          assert unchanged==2291
-
-          assert (
-              new_rows[-1][1]+new_rows[-1][2]
-              ==len(new_payload)
-          )
-
-          index['files']=new_rows
-
-          new_header=json.dumps(
-              index,
-              ensure_ascii=False,
-              separators=(',',':')
-          ).encode('utf8')
-
-          pack.write_bytes(
-              struct.pack('<I',len(new_header))+
-              new_header+
-              new_payload
-          )
-
-          pack_digest=hashlib.sha256(
-              pack.read_bytes()
-          ).hexdigest()[:16]
-
-          print('PASS entire original HUD image transparent')
-          print('PASS all 50 resource packs checked')
-          print('PASS 2291 other packed resources unchanged')
 
           mapper=game/'mapping.js'
 
@@ -642,43 +947,37 @@ jobs:
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          s=mapper.read_text('utf8')
-
-          old_marker=rel+'?h='+old_digest
-
-          assert s.count(old_marker)==1
-
-          s=s.replace(
-              old_marker,
-              rel+'?h='+new_digest
-          )
-
-          old_script_digest='de673e8cb737ab69af0213814bc5f9fc'
-
           script=game/'Data/Scripts.rxdata'
 
           script_digest=hashlib.md5(
               script.read_bytes()
           ).hexdigest()
 
+          old_script_digest='07e7a62cb188150271de853d2d38facf'
+
           assert script_digest!=old_script_digest
+
+          s=mapper.read_text('utf8')
 
           old_marker=(
               'Data/Scripts.rxdata?h='+
               old_script_digest
           )
 
+          new_marker=(
+              'Data/Scripts.rxdata?h='+
+              script_digest
+          )
+
           assert s.count(old_marker)==1
 
           s=s.replace(
-              old_marker,
-              'Data/Scripts.rxdata?h='+script_digest
+              old_marker,new_marker
           )
 
-          mapper.write_text(
-              s,
-              'utf8'
-          )
+          assert s.count(new_marker)==1
+
+          mapper.write_text(s,'utf8')
 
           mapping_digest=hashlib.sha256(
               mapper.read_bytes()
@@ -686,71 +985,11 @@ jobs:
 
           bitmap_map=game/'bitmap-map.js'
 
-          old_bitmap_digest=hashlib.sha256(
-              bitmap_map.read_bytes()
-          ).hexdigest()[:16]
-
-          assert old_bitmap_digest=='738666fb2e2f514a'
-
-          s=bitmap_map.read_text('utf8')
-
-          pattern=re.compile(
-              r'("'+re.escape(key)+
-              r'":\s*\[800,600,"data:image/png;base64,)'+
-              r'([A-Za-z0-9+/=]+)("\])'
-          )
-
-          matches=list(
-              pattern.finditer(s)
-          )
-
-          assert len(matches)==1
-
-          match=matches[0]
-
-          thumb=Image.open(
-              io.BytesIO(
-                  base64.b64decode(
-                      match.group(2)
-                  )
-              )
-          ).convert('RGBA')
-
-          assert thumb.size==(64,48)
-
-          thumb=Image.new(
-              'RGBA',
-              thumb.size,
-              (0,0,0,0)
-          )
-
-          assert thumb.getbbox() is None
-
-          buffer=io.BytesIO()
-
-          thumb.save(
-              buffer,
-              format='PNG'
-          )
-
-          encoded=base64.b64encode(
-              buffer.getvalue()
-          ).decode('ascii')
-
-          s=(
-              s[:match.start(2)]+
-              encoded+
-              s[match.end(2):]
-          )
-
-          bitmap_map.write_text(
-              s,
-              'utf8'
-          )
-
           bitmap_digest=hashlib.sha256(
               bitmap_map.read_bytes()
           ).hexdigest()[:16]
+
+          assert bitmap_digest=='30b5b4a619a81d4c'
 
           loader=root/'knight/js/sl-assets-v229r115.js'
 
@@ -760,31 +999,20 @@ jobs:
 
           s=loader.read_text('utf8')
 
-          old_pack_url=(
-              'shared-v229r115.pack?v=V4.14&h='
-              'a235eb3ce5c38daa'
-          )
-
-          new_pack_url=(
-              'shared-v229r115.pack?v=V4.14&h='
-              +pack_digest
-          )
-
-          assert s.count(old_pack_url)==1
-
-          s=s.replace(
-              old_pack_url,
-              new_pack_url
-          )
-
           assert s.count(
               "var version='V4.14';"
           )==1
 
-          loader.write_text(
-              s,
-              'utf8'
+          assert s.count(
+              'shared-v229r115.pack?v=V4.14&h=848a3d863d953bdc'
+          )==1
+
+          s=s.replace(
+              "var version='V4.14';",
+              "var version='V4.15';"
           )
+
+          loader.write_text(s,'utf8')
 
           loader_digest=hashlib.sha256(
               loader.read_bytes()
@@ -796,109 +1024,65 @@ jobs:
 
           references=[
               (
-                  'gameasync/mapping.js?v=v4.14&h=',
-                  old_mapping_digest,
-                  mapping_digest,
+                  'gameasync/mapping.js?v=v4.14&h='+old_mapping_digest,
+                  'gameasync/mapping.js?v=v4.15&h='+mapping_digest,
                   1
               ),
               (
-                  'gameasync/bitmap-map.js?v=v4.14&h=',
-                  old_bitmap_digest,
-                  bitmap_digest,
+                  'gameasync/bitmap-map.js?v=v4.14&h='+bitmap_digest,
+                  'gameasync/bitmap-map.js?v=v4.15&h='+bitmap_digest,
                   2
               ),
               (
-                  'js/sl-assets-v229r115.js?v=v4.14&h=',
-                  old_loader_digest,
-                  loader_digest,
+                  'js/sl-assets-v229r115.js?v=v4.14&h='+old_loader_digest,
+                  'js/sl-assets-v229r115.js?v=v4.15&h='+loader_digest,
                   1
               )
           ]
 
-          for prefix,old,new,count in references:
+          for old,new,count in references:
 
-              assert old!=new
-
-              assert s.count(
-                  prefix+old
-              )==count,(
-                  prefix,
-                  s.count(prefix+old)
+              assert s.count(old)==count,(
+                  old,s.count(old)
               )
 
-              s=s.replace(
-                  prefix+old,
-                  prefix+new
-              )
+              s=s.replace(old,new)
 
-              assert s.count(
-                  prefix+new
-              )==count
+              assert s.count(new)==count
 
           assert 'V4.14' in s
 
+          s=s.replace(
+              'V4.14','V4.15'
+          )
+
           page.write_text(
-              s,
+              s,'utf8'
+          )
+
+          index_page=root/'index.html'
+
+          s=index_page.read_text('utf8')
+
+          assert 'V4.14' in s
+
+          index_page.write_text(
+              s.replace(
+                  'V4.14','V4.15'
+              ).replace(
+                  'v4.14','v4.15'
+              ),
               'utf8'
           )
 
-          assert Image.open(
-              graphic
-          ).convert('RGBA').getbbox() is None
-
-          verify=pack.read_bytes()
-
-          size=struct.unpack_from(
-              '<I',
-              verify,
-              0
-          )[0]
-
-          verify_index=json.loads(
-              verify[4:4+size].decode('utf8')
-          )
-
-          verify_payload=verify[4+size:]
-
-          matches=[
-              row for row in verify_index['files']
-              if row[0]==key
-          ]
-
-          assert len(matches)==1
-
-          _,o,n=matches[0]
-
-          assert (
-              verify_payload[o:o+n]
-              ==graphic.read_bytes()
-          )
-
-          assert (
-              'Data/Scripts.rxdata?h='+script_digest
-              in mapper.read_text('utf8')
-          )
-
-          assert (
-              rel+'?h='+new_digest
-              in mapper.read_text('utf8')
-          )
-
-          assert (
-              new_pack_url
-              in loader.read_text('utf8')
-          )
-
-          print('PASS original HUD image removed')
-          print('PASS packed HUD image removed')
-          print('PASS HUD thumbnail removed')
+          print('PASS V4.15 script mapping')
+          print('PASS original resource pack retained')
+          print('PASS original HUD deletion retained')
           print('PASS current script cache',script_digest)
-          print('PASS current image cache',new_digest)
-          print('PASS current pack cache',pack_digest)
-          print('PASS current bitmap cache',bitmap_digest)
+          print('PASS current mapping cache',mapping_digest)
           PYTHON
 
-      - name: Verify exact removal scope
+      - name: Verify exact modification scope
         shell: bash
         run: |
           set -euo pipefail
@@ -911,7 +1095,7 @@ jobs:
           root=Path('site')
 
           before=json.loads(
-              Path('/tmp/sl414-before.json').read_text('utf8')
+              Path('/tmp/sl415-before.json').read_text('utf8')
           )
 
           after={
@@ -932,12 +1116,10 @@ jobs:
 
           expected={
               'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/Graphics/Pictures/게이지(저사양)-상.png',
-              'knight/assets/shared-v229r115.pack',
               'knight/gameasync/mapping.js',
-              'knight/gameasync/bitmap-map.js',
               'knight/js/sl-assets-v229r115.js',
-              'knight/index.html'
+              'knight/index.html',
+              'index.html'
           }
 
           assert changed==expected,changed^expected
@@ -948,11 +1130,12 @@ jobs:
               if k not in expected
           )
 
-          print('PASS exact seven changed files')
-          print('PASS 6078 original files unchanged')
-          print('PASS original engine unchanged')
+          print('PASS exact five changed files')
+          print('PASS 6080 original files unchanged')
+          print('PASS original graphics unchanged')
           print('PASS original maps unchanged')
-          print('PASS original mobile controls unchanged')
+          print('PASS original engine unchanged')
+          print('PASS mobile controls unchanged')
           PYTHON
 
           node --check site/knight/gameasync/mapping.js
@@ -961,7 +1144,7 @@ jobs:
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
 
-      - name: Upload V4.14 candidate
+      - name: Upload V4.15
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
