@@ -1,4 +1,4 @@
-name: build-slknight-web.yml | V4.15 | Companion Separation and Ground Alignment
+name: build-slknight-web.yml | V4.16 | Companion Separation and Ground Alignment
 
 "on":
   workflow_dispatch:
@@ -23,11 +23,75 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Restore V4.15 integrated menu
+      - name: Resolve final V4.15 deployment
+        id: baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BASE_SHA=09c0356b1bb3a077eac596d3d0bb465dcd8e0de5
+
+          gh api \
+            --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/build-slknight-web.yml/runs" \
+            -f head_sha="$BASE_SHA" \
+            -f status=success \
+            -f per_page=100 \
+            > /tmp/sl416-runs.json
+
+          RUN_ID=$(jq -er \
+            --arg sha "$BASE_SHA" \
+            '[.workflow_runs[]
+              | select(
+                  .head_sha == $sha
+                  and .head_branch == "main"
+                  and .status == "completed"
+                  and .conclusion == "success"
+                )]
+              | sort_by(.created_at)
+              | last
+              | .id // empty' \
+            /tmp/sl416-runs.json)
+
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            > /tmp/sl416-jobs.json
+
+          jq -e \
+            '[.jobs[]
+              | select(
+                  .name == "deploy"
+                  and .conclusion == "success"
+                )]
+              | length == 1' \
+            /tmp/sl416-jobs.json
+
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+            > /tmp/sl416-artifacts.json
+
+          jq -e \
+            '[.artifacts[]
+              | select(
+                  .name == "github-pages"
+                  and .expired == false
+                  and .size_in_bytes > 0
+                )]
+              | length == 1' \
+            /tmp/sl416-artifacts.json
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          echo "PASS final V4.15 commit $BASE_SHA"
+          echo "PASS successful deployment $RUN_ID"
+
+      - name: Restore final V4.15 game
         uses: actions/download-artifact@v4
         with:
           repository: gowellsik-hue/Game
-          run-id: 46028200464
+          run-id: ${{ steps.baseline.outputs.run_id }}
           name: github-pages
           github-token: ${{ github.token }}
           path: baseline
@@ -48,6 +112,9 @@ jobs:
           import json
 
           root = Path('site')
+          game = root/'knight/gameasync'
+
+          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
           before = {
               p.relative_to(root).as_posix():
@@ -56,610 +123,412 @@ jobs:
               if p.is_file()
           }
 
-          assert len(before) == 6086
+          assert len(before) == 6086, len(before)
 
-          assert before[
-              'knight/gameasync/Data/Scripts.rxdata'
-          ] == 'ab6069ec4444a74dff87c7505777ca7b58af4e7db79b0e48eaddf2a3b158f355'
+          required = [
+              'System',
+              'Map007',
+              'Map029',
+              'Map047'
+          ]
 
-          script = root/'knight/gameasync/Data/Scripts.rxdata'
+          for name in required:
+              p = game/'Data'/(pre+name+'.rxdata')
+              assert p.is_file(), name
+              assert p.stat().st_size > 4, name
 
-          assert hashlib.md5(
-              script.read_bytes()
-          ).hexdigest() == '94702578bec2b99471ffab7f74037a17'
+          scripts = game/'Data/Scripts.rxdata'
 
-          Path('/tmp/sl415-before.json').write_text(
-              json.dumps(before),
+          assert scripts.is_file()
+          assert scripts.stat().st_size > 100000
+
+          loader = root/'knight/js/sl-assets-v229r115.js'
+
+          assert loader.read_bytes().count(
+              b"var version='V4.15';"
+          ) == 1
+
+          for name in ('index.html', 'knight/index.html'):
+              assert b'V4.15' in (root/name).read_bytes(), name
+
+          names = [
+              pre+'System.rxdata',
+              pre+'Map007.rxdata'
+          ]
+
+          old_md5 = {
+              name: hashlib.md5(
+                  (game/'Data'/name).read_bytes()
+              ).hexdigest()
+              for name in names
+          }
+
+          Path('/tmp/sl416-before.json').write_text(
+              json.dumps(before, sort_keys=True),
               'utf8'
           )
 
-          print('PASS exact deployed V4.15 baseline')
+          Path('/tmp/sl416-md5.json').write_text(
+              json.dumps(old_md5),
+              'utf8'
+          )
+
+          print('PASS final V4.15 baseline')
+          print('PASS 6086 original files')
           PYTHON
 
-      - name: Refine integrated menu layout
+      - name: Restore original character creation
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl415-compact.rb <<'RUBY'
-          # encoding: UTF-8
+          cat > /tmp/sl416-patch.rb <<'RUBY'
           require 'zlib'
-          require 'digest'
 
-          path=ARGV.fetch(0)
-          out=ARGV.fetch(1)
-          raw=File.binread(path)
-
-          raise 'Wrong deployed baseline' unless
-            Digest::MD5.hexdigest(raw)=='94702578bec2b99471ffab7f74037a17'
-
-          rows=Marshal.load(raw)
-
-          raise 'Script count' unless rows.size==137
-
-          before=rows.map{|r|Marshal.dump(r)}
-
-          rep=->(s,a,b){
-            raise "Anchor #{a.inspect[0,120]} #{s.scan(a).size}" unless
-              s.scan(a).size==1
-            s.sub(a){b}
-          }
-
-          edit=->(i,&blk){
-            src=Zlib::Inflate.inflate(rows[i][2]).force_encoding('UTF-8')
-            s=src.gsub("\r\n","\n")
-            t=blk.call(s)
-            raise "No change #{i}" if s==t
-            RubyVM::InstructionSequence.compile(t)
-            t=t.gsub("\n","\r\n") if src.include?("\r\n")
-            rows[i][2]=Zlib::Deflate.deflate(t.b)
-          }
-
-          edit.call(79) do |s|
-
-            s=rep.call(
-              s,
-              '    @command_window.index = @menu_index',
-              "    @command_window.x = 12\n"+
-              "    @command_window.y = 16\n"+
-              "    @command_window.index = @menu_index"
-            )
-
-            s=rep.call(
-              s,
-              '    @gold_window.x = 0',
-              '    @gold_window.x = @command_window.x'
-            )
-
-            s=rep.call(
-              s,
-              '    @gold_window.y = @command_window.height + 4',
-              '    @gold_window.y = @command_window.y + @command_window.height + 8'
-            )
-
-            s=rep.call(
-              s,
-              '$아데나.x = 20',
-              '$아데나.x = @gold_window.x + 20'
-            )
-
-            s=rep.call(
-              s,
-              "    @status_window.x = 160\n    @status_window.y = 0",
-              "    @status_window.x = 176\n    @status_window.y = 16"
-            )
-
-            s=rep.call(
-              s,
-              "    @status_window.width = 640\n    @status_window.height = 600",
-              "    @status_window.width = 456\n    @status_window.height = 448"
-            )
-
-            s=rep.call(
-              s,
-              '@status_window.contents = Bitmap.new(608, 568)',
-              '@status_window.contents = Bitmap.new(424, 416)'
-            )
-
-            s=rep.call(
-              s,
-              '    @sl415_header.x = 160',
-              <<'NEW'.chomp
-              @sl415_header.x = @status_window.x
-              @sl415_header.y = @status_window.y
-              @sl415_header.width = @status_window.width
-              @sl415_header.contents.dispose
-              @sl415_header.contents = Bitmap.new(@sl415_header.width - 32, 32)
-              @sl415_header.opacity = 0
-              @sl415_header.z = @status_window.z + 1
-          NEW
-            )
-
-            s=rep.call(
-              s,
-              '        @status_window.visible = false',
-              '        @status_window.contents_opacity = 0'
-            )
-
-            s=rep.call(
-              s,
-              '        @status_window.visible = true',
-              "        @status_window.visible = true\n"+
-              "        @status_window.contents_opacity = 255"
-            )
-
-            a=s.index('  def update_status')
-            b=s.index('  def sl415_open_page',a)
-
-            raise 'Menu update bounds' unless a && b
-
-            body=s[a...b]
-
-            body=rep.call(
-              body,
-              "      target.x = 160\n      target.y = 68",
-              "      target.x = @status_window.x\n"+
-              "      target.y = @status_window.y + 32"
-            )
-
-            body=rep.call(
-              body,
-              /\n    end\n\n  end\n\n\z/,
-              <<'NEW'
-              elsif kind == 2
-                right = p.instance_variable_get(:@right_window)
-                right.visible = right.active
-                p.instance_variable_get(:@item_windows).each do |w|
-                  w.visible = w.active if w
-                end
-              end
-
+          module RPG
+            %w[
+              Map
+              MapInfo
+              Tileset
+              Event
+              EventCommand
+              MoveRoute
+              MoveCommand
+              AudioFile
+              CommonEvent
+              System
+              Item
+            ].each do |n|
+              const_set(n, Class.new)
             end
 
-          NEW
-            )
+            Event.const_set(:Page, Class.new)
+            Event::Page.const_set(:Condition, Class.new)
+            Event::Page.const_set(:Graphic, Class.new)
 
-            s=s[0...a]+body+s[b..-1]
+            System.const_set(:Words, Class.new)
+            System.const_set(:TestBattler, Class.new)
+          end
 
-            start=s.index(
-              '    windows = []',
-              s.index('  def sl415_open_page')
-            )
-
-            finish=s.index(
-              "    SLHotbar.mode(\n",
-              start
-            )
-
-            raise 'Original layout' unless
-              start && finish && finish>start
-
-            layout=<<'NEW'
-              windows = []
-              px = @status_window.x
-              py = @status_window.y
-              pw = @status_window.width
-              bottom = py + @status_window.height
-
-              if kind == 0 || kind == 1 || kind == 2
-                help = p.instance_variable_get(:@help_window)
-                help.x = px
-                help.y = py + 32
-                help.width = pw
-                help.contents.dispose
-                help.contents = Bitmap.new(pw - 32, 32)
-                help.instance_variable_set(:@text, nil)
-                windows.push(help)
+          %w[Table Tone Color].each do |n|
+            Object.const_set(n, Class.new do
+              def self._load(raw)
+                o = allocate
+                o.instance_variable_set(:@raw, raw)
+                o
               end
 
-              if kind == 0 || kind == 1
-                target = p.instance_variable_get(:@target_window)
-                target.x = px
-                target.y = py + 32
-                target.width = pw
-                target.height = bottom - target.y
-                target.contents.dispose
-                target.contents = Bitmap.new(pw - 32, target.height - 32)
-                target.refresh
-                windows.push(target)
-
-                if kind == 0
-                  list = p.instance_variable_get(:@item_window)
-                  list.y = py + 64
-                else
-                  status = p.instance_variable_get(:@status_window)
-                  status.x = px
-                  status.y = py + 64
-                  status.width = pw
-                  status.height = 96
-                  status.contents.dispose
-                  status.contents = Bitmap.new(pw - 32, 64)
-                  status.refresh
-                  windows.push(status)
-                  list = p.instance_variable_get(:@skill_window)
-                  list.y = py + 128
-                end
-
-                list.x = px
-                list.width = pw
-                list.height = bottom - list.y
-                list.refresh
-                list.index = list.index
-                windows.push(list)
-
-              elsif kind == 2
-                left = p.instance_variable_get(:@left_window)
-                right = p.instance_variable_get(:@right_window)
-
-                left.x = px
-                left.y = py + 64
-                left.width = pw
-                left.height = 128
-
-                left.contents.dispose
-                left.contents = Bitmap.new(pw - 32, left.height - 32)
-                left.refresh
-
-                right.x = px
-                right.y = left.y + left.height - 32
-                right.width = pw
-                right.height = bottom - right.y
-
-                h = right.contents.height
-                right.contents.dispose
-                right.contents = Bitmap.new(pw - 32, h)
-                right.refresh
-                right.index = right.index
-
-                windows.push(left, right)
-
-                p.instance_variable_get(:@item_windows).each do |w|
-                  next unless w
-
-                  w.x = px
-                  w.y = right.y
-                  w.width = pw
-                  w.height = right.height
-
-                  w.instance_variable_set(:@column_max, 1)
-
-                  w.refresh
-                  w.index = w.index
-                  w.visible = w.active
-
-                  windows.push(w)
-                end
-
-                right.visible = right.active
-
-              else
-                status = p.instance_variable_get(:@status_window)
-
-                status.x = px
-                status.y = py + 32
-                status.width = pw
-                status.height = bottom - status.y
-
-                status.contents.dispose
-                status.contents = Bitmap.new(pw - 32, status.height - 32)
-                status.refresh
-
-                windows.push(status)
+              def _dump(depth)
+                @raw
               end
-
-              windows.each do |w|
-                w.windowskin = RPG::Cache.windowskin("SLInventory")
-                w.opacity = 0
-                w.back_opacity = 0
-                w.z = @status_window.z + 1
-              end
-
-          NEW
-
-            s[0...start]+layout+s[finish..-1]
+            end)
           end
 
-          edit.call(41) do |s|
-
-            s=rep.call(
-              s,
-              '      x = 64',
-              '      x = 4'
-            )
-
-            s=rep.call(
-              s,
-              '      y = i * 116',
-              '      y = i * 100'
-            )
-
-            rep.call(
-              s,
-              '@index * 116, self.width - 32, 96',
-              '@index * 100, self.width - 32, 96'
-            )
+          def iv(o,k)
+            o.instance_variable_get(k)
           end
 
-          edit.call(42) do |s|
-
-            rep.call(
-              s,
-              'Bitmap.new(width - 33, row_max * 33)',
-              'Bitmap.new(@column_max == 1 ? width - 32 : width - 33, row_max * 33)'
-            )
+          def check(ok,msg)
+            raise msg unless ok
           end
 
-          edit.call(44) do |s|
+          root = 'site/knight/gameasync/Data'
 
-            rep.call(
-              s,
-              'rect = Rect.new(x, y, self.width / @column_max - 32, 32)',
-              'rect = Rect.new(x, y, @column_max == 1 ? self.contents.width - x : self.width / @column_max - 32, 32)'
-            )
+          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          paths = %w[System Map007 Map047].to_h do |n|
+            [n, File.join(root, pre+n+'.rxdata')]
           end
 
-          edit.call(45) do |s|
-
-            s=rep.call(
-              s,
-              'draw_actor_hp(@actor, 284, 0)',
-              'draw_actor_hp(@actor, self.width == 456 ? 4 : 284, self.width == 456 ? 32 : 0)'
-            )
-
-            rep.call(
-              s,
-              'draw_actor_sp(@actor, 460, 0)',
-              'draw_actor_sp(@actor, self.width == 456 ? 208 : 460, self.width == 456 ? 32 : 0)'
-            )
+          raw = paths.transform_values do |f|
+            File.binread(f)
           end
 
-          edit.call(46) do |s|
+          sys = Marshal.load(raw.fetch('System'))
 
-            s=rep.call(
-              s,
-              'y = i * 116',
-              'y = i * (self.width == 456 ? 96 : 116)'
-            )
-
-            s=rep.call(
-              s,
-              '(@index + 10) * 116',
-              '(@index + 10) * (self.width == 456 ? 96 : 116)'
-            )
-
-            s=rep.call(
-              s,
-              '@item_max * 116 - 20',
-              'self.width == 456 ? @item_max * 96 : @item_max * 116 - 20'
-            )
-
-            rep.call(
-              s,
-              '@index * 116',
-              '@index * (self.width == 456 ? 96 : 116)'
-            )
-          end
-
-          edit.call(47) do |s|
-
-            s=rep.call(
-              s,
-              'draw_actor_level(@actor, 4, 32)',
-              'draw_actor_level(@actor, self.width == 456 ? 148 : 4, self.width == 456 ? 0 : 32)'
-            )
-
-            s=rep.call(
-              s,
-              'draw_actor_parameter(@actor, 4, 64, 1)',
-              'draw_actor_parameter(@actor, 4, self.width == 456 ? 32 : 64, 1)'
-            )
-
-            s=rep.call(
-              s,
-              'draw_actor_parameter(@actor, 4, 96, 2)',
-              'draw_actor_parameter(@actor, 4, self.width == 456 ? 64 : 96, 2)'
-            )
-
-            [160,200].each do |x|
-              [64,96].each do |y|
-                s=rep.call(
-                  s,
-                  "self.contents.draw_text(#{x}, #{y},",
-                  "self.contents.draw_text(#{x}, self.width == 456 ? #{y-32} : #{y},"
-                )
-              end
-            end
-
-            s
-          end
-
-          edit.call(49) do |s|
-
-            s=rep.call(
-              s,
-              'x = 4 + index % 2 * (288 + 32)',
-              'x = 4 + index % @column_max * (288 + 32)'
-            )
-
-            s=rep.call(
-              s,
-              'y = index / 2 * 32',
-              'y = index / @column_max * 32'
-            )
-
-            s=rep.call(
-              s,
-              'self.contents.draw_text(x + 28, y, 212, 32, item.name, 0)',
-              'self.contents.draw_text(x + 28, y, @column_max == 1 ? self.contents.width - 108 : 212, 32, item.name, 0)'
-            )
-
-            s=rep.call(
-              s,
-              'self.contents.draw_text(x + 240, y, 16, 32, ":", 1)',
-              'self.contents.draw_text(@column_max == 1 ? self.contents.width - 70 : x + 240, y, 16, 32, ":", 1)'
-            )
-
-            rep.call(
-              s,
-              'self.contents.draw_text(x + 256, y, 24, 32, number.to_s, 2)',
-              'self.contents.draw_text(@column_max == 1 ? self.contents.width - 52 : x + 256, y, @column_max == 1 ? 48 : 24, 32, number.to_s, 2)'
-            )
-          end
-
-          edit.call(115) do |s|
-
-            a=s.index('class Window_Item < Window_Selectable')
-            b=s.index('class Window_ShopNumber',a)
-
-            raise 'Inventory drawing bounds' unless a && b
-
-            t=s[a...b]
-
-            t=rep.call(
-              t,
-              'rect = Rect.new(x, y, self.width / @column_max - 32, 32)',
-              'rect = Rect.new(x, y, @column_max == 1 ? self.contents.width - x : self.width / @column_max - 32, 32)'
-            )
-
-            t=rep.call(
-              t,
-              '@column_max == 1 ? self.contents.width - 100 : 212',
-              '@column_max == 1 ? self.contents.width - 108 : 212'
-            )
-
-            t=rep.call(
-              t,
-              'x_i = (@column_max == 1 ? self.contents.width - 264 : x + 24) - width',
-              'x_i = (@column_max == 1 ? self.contents.width - 260 : x + 24) - width'
-            )
-
-            t=rep.call(
-              t,
-              'self.contents.draw_text(x_i + 245, y, 16, 32, ":", 1)',
-              'self.contents.draw_text(x_i + (@column_max == 1 ? 238 : 245), y, 16, 32, ":", 1)'
-            )
-
-            s[0...a]+t+s[b..-1]
-          end
-
-          edit.call(118) do |s|
-
-            a=s.index('if G7_MS_MOD::STATUS_WINDOW_ARRANGE')
-
-            raise 'Status override' unless a
-
-            t=s[a..-1]
-
-            [
-              [
-                'draw_actor_graphic(@actor, 40, 112)',
-                'draw_actor_graphic(@actor, 40, self.width == 456 ? 96 : 112)'
-              ],
-              [
-                'draw_actor_class(@actor, 4 + 144, 0)',
-                'draw_actor_class(@actor, self.width == 456 ? 4 : 4 + 144, self.width == 456 ? 24 : 0)'
-              ],
-              [
-                'draw_actor_level(@actor, 96, 32)',
-                'draw_actor_level(@actor, self.width == 456 ? 136 : 96, self.width == 456 ? 0 : 32)'
-              ],
-              [
-                'draw_actor_state(@actor, 96, 64)',
-                'draw_actor_state(@actor, 96, self.width == 456 ? 48 : 64)'
-              ],
-              [
-                'draw_actor_hp(@actor, 96, 112, 172)',
-                'draw_actor_hp(@actor, self.width == 456 ? 4 : 96, self.width == 456 ? 96 : 112, 172)'
-              ],
-              [
-                'draw_actor_sp(@actor, 96, 144, 172)',
-                'draw_actor_sp(@actor, self.width == 456 ? 4 : 96, self.width == 456 ? 120 : 144, 172)'
-              ]
-            ].each do |old,new|
-              t=rep.call(t,old,new)
-            end
-
-            [
-              192,224,256,304,
-              336,368,400,432
-            ].each_with_index do |y,i|
-
-              t=rep.call(
-                t,
-                "draw_actor_parameter(@actor, 96, #{y}, #{i})",
-                "draw_actor_parameter(@actor, self.width == 456 ? 4 : 96, self.width == 456 ? #{152+i*22} : #{y}, #{i})"
-              )
-
-            end
-
-            [
-              [
-                "self.contents.draw_text(320, 16, 80, 32, 'EXP')",
-                "self.contents.draw_text(self.width == 456 ? 4 : 320, self.width == 456 ? 328 : 16, 80, 32, 'EXP')"
-              ],
-              [
-                "self.contents.draw_text(320, 48, 80, 32, 'NEXT')",
-                "self.contents.draw_text(self.width == 456 ? 4 : 320, self.width == 456 ? 352 : 48, 80, 32, 'NEXT')"
-              ],
-              [
-                'self.contents.draw_text(320 + 80, 16, 84, 32, @actor.exp_s, 2)',
-                'self.contents.draw_text(self.width == 456 ? 84 : 320 + 80, self.width == 456 ? 328 : 16, 84, 32, @actor.exp_s, 2)'
-              ],
-              [
-                'self.contents.draw_text(320 + 80, 48, 84, 32, @actor.next_rest_exp_s, 2)',
-                'self.contents.draw_text(self.width == 456 ? 84 : 320 + 80, self.width == 456 ? 352 : 48, 84, 32, @actor.next_rest_exp_s, 2)'
-              ],
-              [
-                "self.contents.draw_text(320, 80, 96, 32, 'Equipment')",
-                "self.contents.draw_text(self.width == 456 ? 184 : 320, self.width == 456 ? 0 : 80, 96, 32, 'Equipment')"
-              ],
-              [
-                'draw_item_name($data_weapons[@actor.weapon_ids[i]], 320 + 16, 80 + 24 * (i+1))',
-                'draw_item_name($data_weapons[@actor.weapon_ids[i]], self.width == 456 ? 184 : 320 + 16, self.width == 456 ? 32 + 24 * i : 80 + 24 * (i+1))'
-              ],
-              [
-                'draw_item_name($data_armors[@actor.armor_ids[i]], 320 + 16, 200 + 24 * (i - 4 + @actor.weapon_slots.size))',
-                'draw_item_name($data_armors[@actor.armor_ids[i]], self.width == 456 ? 184 : 320 + 16, self.width == 456 ? 32 + 24 * (i + @actor.weapon_slots.size) : 200 + 24 * (i - 4 + @actor.weapon_slots.size))'
-              ]
-            ].each do |old,new|
-              t=rep.call(t,old,new)
-            end
-
-            s[0...a]+t
-          end
-
-          changed=rows.each_index.select{
-            |i|Marshal.dump(rows[i])!=before[i]
-          }
-
-          raise "Unexpected script scope #{changed}" unless
-            changed==[41,42,44,45,46,47,49,79,115,118]
-
-          File.binwrite(
-            out,
-            Marshal.dump(rows)
+          creation = Marshal.load(
+            raw.fetch('Map007')
           )
 
-          raise 'Roundtrip' unless
-            Marshal.load(
-              File.binread(out)
-            )==rows
+          island = Marshal.load(
+            raw.fetch('Map047')
+          )
 
-          puts "PASS #{changed.size} layout scripts"
-          puts "PASS #{137-changed.size} unchanged scripts"
-          puts "MD5 #{Digest::MD5.file(out).hexdigest}"
+          keys = [
+            :@start_map_id,
+            :@start_x,
+            :@start_y
+          ]
+
+          old_start = keys.map do |k|
+            iv(sys,k)
+          end
+
+          check(
+            old_start[0] == 47 &&
+            old_start.all? { |v| v.is_a?(Integer) },
+            'Current Talking Island start missing'
+          )
+
+          _,x,y = old_start
+
+          check(
+            x.between?(0,iv(island,:@width)-1) &&
+            y.between?(0,iv(island,:@height)-1),
+            'Island start out of bounds'
+          )
+
+          check(
+            9 < iv(creation,:@width) &&
+            6 < iv(creation,:@height),
+            'Original creation coordinates out of bounds'
+          )
+
+          scripts = Marshal.load(
+            File.binread(
+              File.join(root,'Scripts.rxdata')
+            )
+          )
+
+          check(
+            scripts.size == 137,
+            'Unexpected script count'
+          )
+
+          source = scripts.map do |r|
+            [
+              r[1].to_s,
+              Zlib::Inflate.inflate(r[2])
+            ]
+          end
+
+          starts = source.select do |_,s|
+            s.match?(
+              /\$data_system\.start_map_id\b|\$data_system\.start_[xy]\b/
+            )
+          end
+
+          check(
+            starts.map(&:first) == ['Scene_Title'],
+            'Unexpected startup references'
+          )
+
+          title = starts.first[1]
+
+          check(
+            title.include?(
+              '$game_map.setup($data_system.start_map_id)'
+            ) &&
+            title.include?(
+              '$game_player.moveto($data_system.start_x, $data_system.start_y)'
+            ) &&
+            title.include?(
+              '$game_party.setup_starting_members'
+            ),
+            'Original new game path missing'
+          )
+
+          load = source.find do |n,_|
+            n == 'Scene_Load'
+          end
+
+          check(
+            load &&
+            load[1].match?(
+              /\$game_map\s*=\s*Marshal\.load\(file\)/
+            ) &&
+            load[1].match?(
+              /\$game_player\s*=\s*Marshal\.load\(file\)/
+            ),
+            'Original save load path missing'
+          )
+
+          event = iv(
+            creation,
+            :@events
+          ).fetch(1)
+
+          check(
+            iv(event,:@id) == 1 &&
+            iv(event,:@name) == 'EV001',
+            'Creation event identity mismatch'
+          )
+
+          pages = iv(event,:@pages)
+
+          check(
+            pages.size == 1 &&
+            iv(pages[0],:@trigger) == 4,
+            'Creation event page mismatch'
+          )
+
+          condition = iv(
+            pages[0],
+            :@condition
+          )
+
+          condition_keys = [
+            :@switch1_valid,
+            :@switch2_valid,
+            :@variable_valid,
+            :@self_switch_valid
+          ]
+
+          check(
+            condition_keys.none? {
+              |k| iv(condition,k)
+            },
+            'Creation page unexpectedly conditional'
+          )
+
+          list = iv(pages[0],:@list)
+
+          codes = list.map do |c|
+            iv(c,:@code)
+          end
+
+          check(
+            list.size == 121 &&
+            codes.count(102) == 2 &&
+            codes.count(303) == 1 &&
+            codes.include?(126) &&
+            codes.include?(209),
+            'Original creation command structure mismatch'
+          )
+
+          transfers = list.each_index.select do |i|
+            codes[i] == 201
+          end
+
+          check(
+            transfers == [119] &&
+            codes[120] == 0,
+            'Unexpected creation transfer commands'
+          )
+
+          command = list[119]
+
+          params = iv(
+            command,
+            :@parameters
+          )
+
+          old_params = params.dup
+
+          check(
+            iv(command,:@indent) == 0 &&
+            old_params == [0,29,83,52,2,1],
+            'Original creation transfer mismatch'
+          )
+
+          before_sys = Marshal.dump(sys)
+          before_map = Marshal.dump(creation)
+
+          keys.zip([7,9,6]).each do |k,v|
+            sys.instance_variable_set(k,v)
+          end
+
+          params[1,3] = [47,x,y]
+
+          new_sys = Marshal.dump(sys)
+          new_map = Marshal.dump(creation)
+
+          verified_sys = Marshal.load(new_sys)
+          verified_map = Marshal.load(new_map)
+
+          check(
+            keys.map {
+              |k| iv(verified_sys,k)
+            } == [7,9,6],
+            'New game start mismatch'
+          )
+
+          verified_event = iv(
+            verified_map,
+            :@events
+          ).fetch(1)
+
+          verified_page = iv(
+            verified_event,
+            :@pages
+          )[0]
+
+          verified_list = iv(
+            verified_page,
+            :@list
+          )
+
+          verified_params = iv(
+            verified_list[119],
+            :@parameters
+          )
+
+          check(
+            verified_params == [0,47,x,y,2,1],
+            'New creation destination mismatch'
+          )
+
+          keys.zip(old_start).each do |k,v|
+            verified_sys.instance_variable_set(k,v)
+          end
+
+          verified_params.replace(old_params)
+
+          check(
+            Marshal.dump(verified_sys) == before_sys,
+            'Unapproved System change'
+          )
+
+          check(
+            Marshal.dump(verified_map) == before_map,
+            'Unapproved Map007 change'
+          )
+
+          File.binwrite(
+            paths.fetch('System'),
+            new_sys
+          )
+
+          File.binwrite(
+            paths.fetch('Map007'),
+            new_map
+          )
+
+          check(
+            Marshal.dump(
+              Marshal.load(
+                File.binread(
+                  paths.fetch('System')
+                )
+              )
+            ) == new_sys,
+            'System roundtrip failed'
+          )
+
+          check(
+            Marshal.dump(
+              Marshal.load(
+                File.binread(
+                  paths.fetch('Map007')
+                )
+              )
+            ) == new_map,
+            'Map007 roundtrip failed'
+          )
+
+          puts "PASS previous island start #{old_start.inspect}"
+          puts 'PASS new game starts at Map007 (9,6)'
+          puts "PASS existing creation transfers to Map047 (#{x},#{y})"
+          puts 'PASS 120 untouched creation commands'
+          puts 'PASS one existing transfer command changed'
+          puts 'PASS existing save load path preserved'
+          puts 'PASS all 137 game scripts untouched'
           RUBY
 
-          ruby -c /tmp/sl415-compact.rb
+          ruby -c /tmp/sl416-patch.rb
+          ruby /tmp/sl416-patch.rb
 
-          ruby /tmp/sl415-compact.rb \
-            site/knight/gameasync/Data/Scripts.rxdata \
-            /tmp/sl415-compact.rxdata
-
-          cp /tmp/sl415-compact.rxdata \
-            site/knight/gameasync/Data/Scripts.rxdata
-
-      - name: Update V4.15 script references
+      - name: Update V4.16 data references
         shell: bash
         run: |
           set -euo pipefail
@@ -667,9 +536,15 @@ jobs:
           python3 - <<'PYTHON'
           from pathlib import Path
           import hashlib
+          import json
+          import re
 
           root = Path('site')
           game = root/'knight/gameasync'
+
+          old_md5 = json.loads(
+              Path('/tmp/sl416-md5.json').read_text('utf8')
+          )
 
           mapper = game/'mapping.js'
 
@@ -677,62 +552,133 @@ jobs:
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          old_script_digest = '94702578bec2b99471ffab7f74037a17'
+          s = mapper.read_bytes()
 
-          script_digest = hashlib.md5(
-              (game/'Data/Scripts.rxdata').read_bytes()
-          ).hexdigest()
+          for name, previous in old_md5.items():
+              marker = ('Data/'+name+'?h=').encode('ascii')
 
-          assert script_digest != old_script_digest
+              pattern = (
+                  re.escape(marker)
+                  + rb'[0-9a-f]{32}'
+              )
 
-          old = (
-              'Data/Scripts.rxdata?h='
-              + old_script_digest
-          )
+              expected = marker+previous.encode('ascii')
 
-          new = (
-              'Data/Scripts.rxdata?h='
-              + script_digest
-          )
+              assert re.findall(
+                  pattern,s
+              ) == [expected], name
 
-          s = mapper.read_text('utf8')
+              digest = hashlib.md5(
+                  (game/'Data'/name).read_bytes()
+              ).hexdigest()
 
-          assert s.count(old) == 1
+              assert digest != previous, name
 
-          s = s.replace(old,new)
+              updated = marker+digest.encode('ascii')
 
-          assert s.count(new) == 1
+              s = re.sub(
+                  pattern,
+                  lambda _: updated,
+                  s
+              )
 
-          mapper.write_text(s,'utf8')
+              assert s.count(updated) == 1, name
+
+              print('PASS updated data reference',name,digest)
+
+          mapper.write_bytes(s)
 
           mapping_digest = hashlib.sha256(
               mapper.read_bytes()
+          ).hexdigest()[:16]
+
+          bitmap_digest = hashlib.sha256(
+              (game/'bitmap-map.js').read_bytes()
+          ).hexdigest()[:16]
+
+          loader = root/'knight/js/sl-assets-v229r115.js'
+
+          old_loader_digest = hashlib.sha256(
+              loader.read_bytes()
+          ).hexdigest()[:16]
+
+          s = loader.read_bytes()
+
+          old = b"var version='V4.15';"
+          new = b"var version='V4.16';"
+
+          assert s.count(old) == 1
+
+          loader.write_bytes(
+              s.replace(old,new)
+          )
+
+          loader_digest = hashlib.sha256(
+              loader.read_bytes()
           ).hexdigest()[:16]
 
           page = root/'knight/index.html'
 
           s = page.read_text('utf8')
 
-          old = (
-              'gameasync/mapping.js?v=v4.15&h='
-              + old_mapping_digest
+          references = [
+              (
+                  'gameasync/mapping.js?v=v4.15&h='
+                  + old_mapping_digest,
+                  'gameasync/mapping.js?v=v4.16&h='
+                  + mapping_digest,
+                  1
+              ),
+              (
+                  'gameasync/bitmap-map.js?v=v4.15&h='
+                  + bitmap_digest,
+                  'gameasync/bitmap-map.js?v=v4.16&h='
+                  + bitmap_digest,
+                  2
+              ),
+              (
+                  'js/sl-assets-v229r115.js?v=v4.15&h='
+                  + old_loader_digest,
+                  'js/sl-assets-v229r115.js?v=v4.16&h='
+                  + loader_digest,
+                  1
+              )
+          ]
+
+          for old,new,count in references:
+              assert s.count(old) == count, old
+
+              s = s.replace(old,new)
+
+              assert s.count(new) == count, new
+
+          assert 'V4.15' in s
+
+          s = s.replace(
+              'V4.15','V4.16'
+          ).replace(
+              'v4.15','v4.16'
           )
-
-          new = (
-              'gameasync/mapping.js?v=v4.15&h='
-              + mapping_digest
-          )
-
-          assert s.count(old) == 1
-
-          s = s.replace(old,new)
-
-          assert s.count(new) == 1
 
           page.write_text(s,'utf8')
 
-          print('PASS updated script reference',script_digest)
-          print('PASS updated mapping reference',mapping_digest)
+          index_page = root/'index.html'
+
+          s = index_page.read_text('utf8')
+
+          assert 'V4.15' in s
+
+          index_page.write_text(
+              s.replace(
+                  'V4.15','V4.16'
+              ).replace(
+                  'v4.15','v4.16'
+              ),
+              'utf8'
+          )
+
+          print('PASS updated mapping reference')
+          print('PASS updated version references')
           PYTHON
 
       - name: Verify exact modification scope
@@ -747,18 +693,22 @@ jobs:
 
           root = Path('site')
 
+          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
           before = json.loads(
-              Path('/tmp/sl415-before.json').read_text('utf8')
+              Path('/tmp/sl416-before.json').read_text('utf8')
           )
 
           after = {
               p.relative_to(root).as_posix():
-                  hashlib.sha256(p.read_bytes()).hexdigest()
+                  hashlib.sha256(
+                      p.read_bytes()
+                  ).hexdigest()
               for p in root.rglob('*')
               if p.is_file()
           }
 
-          assert len(after) == 6086
+          assert len(after) == 6086, len(after)
 
           assert set(before) == set(after)
 
@@ -768,12 +718,15 @@ jobs:
           }
 
           expected = {
-              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/Data/'+pre+'System.rxdata',
+              'knight/gameasync/Data/'+pre+'Map007.rxdata',
               'knight/gameasync/mapping.js',
-              'knight/index.html'
+              'knight/js/sl-assets-v229r115.js',
+              'knight/index.html',
+              'index.html'
           }
 
-          assert changed == expected, changed ^ expected
+          assert changed == expected, sorted(changed ^ expected)
 
           assert all(
               before[k] == after[k]
@@ -781,13 +734,34 @@ jobs:
               if k not in expected
           )
 
-          print('PASS three modified files')
-          print('PASS 6083 original files unchanged')
-          print('PASS existing inventory skin unchanged')
-          print('PASS original graphics unchanged')
+          protected = [
+              'knight/gameasync/Data/Scripts.rxdata',
+              'knight/gameasync/Data/'+pre+'Map029.rxdata',
+              'knight/gameasync/Data/'+pre+'Map047.rxdata',
+              'knight/gameasync/bitmap-map.js',
+              'knight/js/drive.js',
+              'knight/js/dpad.js',
+              'knight/mkxp.js',
+              'knight/mkxp.wasm'
+          ]
+
+          for name in protected:
+              assert name in before, name
+              assert before[name] == after[name], name
+
+          print('PASS six approved files modified')
+          print('PASS 6080 original files unchanged')
+          print('PASS all original game scripts unchanged')
+          print('PASS existing character creation commands preserved')
+          print('PASS Talking Island map unchanged')
+          print('PASS companion system unchanged')
+          print('PASS combat calculations unchanged')
+          print('PASS inventory and menu unchanged')
+          print('PASS HUD and mobile controls unchanged')
+          print('PASS original save implementation unchanged')
           print('PASS original resource packs unchanged')
           print('PASS original engine unchanged')
-          print('PASS mobile controls unchanged')
+          print('PASS V4.16')
           PYTHON
 
           node --check site/knight/gameasync/mapping.js
@@ -796,7 +770,7 @@ jobs:
           node --check site/knight/js/drive.js
           node --check site/knight/js/dpad.js
 
-      - name: Upload V4.15
+      - name: Upload V4.16
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
