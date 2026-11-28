@@ -92,45 +92,51 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Restore pinned creation source
+      - name: Restore existing V4.17 implementation
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          SOURCE_SHA=f04f7ad307aa8fffb591c90617cc6b6627c671fa
-          BLOB_SHA=ff897b15a4f299c57e4ee1c69abdb6c335157cc6
+          SOURCE_SHA=9d888aa37a7f8daba370841a674966516f0863a7
+          BLOB_SHA=f96ebb769414cc534adf968a32729715265e1c34
 
           gh api --method GET \
             "repos/$GITHUB_REPOSITORY/contents/.github/workflows/build-slknight-web.yml" \
             -f ref="$SOURCE_SHA" \
             --jq '.content' \
             | base64 --decode \
-            > /tmp/sl417-current.yml
+            > /tmp/sl417-existing.yml
 
-          test "$(git hash-object /tmp/sl417-current.yml)" = "$BLOB_SHA"
+          test "$(git hash-object /tmp/sl417-existing.yml)" = "$BLOB_SHA"
 
           python3 - <<'PYTHON'
           from pathlib import Path
 
-          src=Path('/tmp/sl417-current.yml').read_text('utf8')
+          src=Path('/tmp/sl417-existing.yml').read_text('utf8')
 
           scripts={
-              'Restore verified V4.17 source':
-                  '/tmp/sl417-restore-source.sh',
+              'Restore pinned creation source':
+                  '/tmp/sl417-load-existing.sh',
 
               'Verify original game':
-                  '/tmp/sl417-run-verify.sh',
+                  '/tmp/sl417-existing-verify.sh',
 
-              'Rebuild name-first creation screen':
-                  '/tmp/sl417-run-creation.sh',
+              'Restore character creation scene':
+                  '/tmp/sl417-existing-creation.sh',
 
               'Verify all 22 name-first creation paths':
-                  '/tmp/sl417-run-test.sh',
+                  '/tmp/sl417-existing-test.sh',
+
+              'Separate name input from engine callbacks':
+                  '/tmp/sl417-existing-bridge.sh',
 
               'Update V4.17 data references':
-                  '/tmp/sl417-run-mapping.sh'
+                  '/tmp/sl417-existing-mapping.sh',
+
+              'Verify exact modification scope':
+                  '/tmp/sl417-existing-scope.sh'
           }
 
           for name,path in scripts.items():
@@ -162,29 +168,35 @@ jobs:
                   else:
                       break
 
-              text='\n'.join(out).rstrip()+'\n'
+              result='\n'.join(out).rstrip()+'\n'
 
-              assert text.startswith(
+              assert result.startswith(
                   'set -euo pipefail\n'
               ),name
 
-              Path(path).write_text(text,'utf8')
+              Path(path).write_text(
+                  result,'utf8'
+              )
 
-          print('PASS pinned creation source')
+              print('PASS original step:',name)
+
+          print('PASS existing V4.17 source')
           PYTHON
 
           for script in \
-            /tmp/sl417-restore-source.sh \
-            /tmp/sl417-run-verify.sh \
-            /tmp/sl417-run-creation.sh \
-            /tmp/sl417-run-test.sh \
-            /tmp/sl417-run-mapping.sh
+            /tmp/sl417-load-existing.sh \
+            /tmp/sl417-existing-verify.sh \
+            /tmp/sl417-existing-creation.sh \
+            /tmp/sl417-existing-test.sh \
+            /tmp/sl417-existing-bridge.sh \
+            /tmp/sl417-existing-mapping.sh \
+            /tmp/sl417-existing-scope.sh
           do
             bash -n "$script"
           done
 
           bash -euo pipefail \
-            /tmp/sl417-restore-source.sh
+            /tmp/sl417-load-existing.sh
 
       - name: Verify original game
         shell: bash
@@ -192,15 +204,172 @@ jobs:
           set -euo pipefail
 
           bash -euo pipefail \
-            /tmp/sl417-run-verify.sh
+            /tmp/sl417-existing-verify.sh
 
-      - name: Restore character creation scene
+      - name: Fix native name reading and decision position
         shell: bash
         run: |
           set -euo pipefail
 
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          patch=Path('/tmp/sl417-run-creation.sh')
+          test=Path('/tmp/sl417-run-test.sh')
+
+          original=patch.read_text('utf8')
+          updated=original
+
+          changes=[
+              (
+                  'w.y=112',
+                  'w.y=80'
+              ),
+              (
+                  '@sl417_header.y=64',
+                  '@sl417_header.y=48'
+              ),
+              (
+                  '@sl417_decision.y=496',
+                  '@sl417_decision.y=432'
+              ),
+              (
+                  "      raw=File.open('SL417Name.tmp','rb'){\n"
+                  "        |f|f.read\n"
+                  "      }",
+
+                  "      n=File.size('SL417Name.tmp')\n"
+                  "      return if n<=2\n"
+                  "\n"
+                  "      raw=File.open('SL417Name.tmp','rb'){\n"
+                  "        |f|f.read(n)\n"
+                  "      }"
+              ),
+              (
+                  "name=(name||'').force_encoding('UTF-8')",
+                  "name=(name||'').strip"
+              ),
+              (
+                  '|f|f.write("0\\n"+name)',
+                  '|f|f.write("0\\n")'
+              ),
+              (
+                  "      if !name.valid_encoding? ||\n"
+                  "         name.strip.empty? ||\n"
+                  "         name.split(//).size>$game_temp.name_max_char ||",
+
+                  "      if name.empty? ||\n"
+                  "         name.unpack('U*').size>$game_temp.name_max_char ||"
+              )
+          ]
+
+          for old,new in changes:
+
+              assert updated.count(old)==1,old
+
+              updated=updated.replace(old,new,1)
+
+          assert len(changes)==7
+
+          reverse=updated
+
+          for old,new in reversed(changes):
+
+              assert reverse.count(new)==1,new
+
+              reverse=reverse.replace(new,old,1)
+
+          assert reverse==original
+
+          patch.write_text(updated,'utf8')
+
+          original_test=test.read_text('utf8')
+
+          assert original_test.count(
+              'decision.y==496'
+          )==1
+
+          updated_test=original_test.replace(
+              'decision.y==496',
+              'decision.y==432',
+              1
+          )
+
+          assert updated_test.replace(
+              'decision.y==432',
+              'decision.y==496',
+              1
+          )==original_test
+
+          test.write_text(updated_test,'utf8')
+
+          print('PASS exact seven runtime replacements')
+          print('PASS original character profiles retained')
+          print('PASS original direction handling retained')
+          print('PASS original confirmation handling retained')
+          print('PASS original equipment handling retained')
+          print('PASS native file length reading')
+          print('PASS native UTF-8 character counting')
+          print('PASS decision within visible screen')
+          PYTHON
+
+          bash -n /tmp/sl417-run-creation.sh
+
+          bash -n /tmp/sl417-run-test.sh
+
           bash -euo pipefail \
-            /tmp/sl417-run-creation.sh
+            /tmp/sl417-existing-creation.sh
+
+          ruby - <<'RUBY'
+          require 'zlib'
+
+          path='site/knight/gameasync/Data/Scripts.rxdata'
+
+          rows=Marshal.load(File.binread(path))
+
+          raise 'Script count' unless rows.size==137
+
+          s=Zlib::Inflate.inflate(
+            rows.fetch(94)[2]
+          ).force_encoding('UTF-8')
+
+          RubyVM::InstructionSequence.compile(s)
+
+          raise 'Unbounded name read' if
+            s.include?('|f|f.read'+"\n")
+
+          raise 'Unsupported name encoding' if
+            s.include?("name=(name||'').force_encoding")
+
+          raise 'Unsupported encoding validation' if
+            s.include?('!name.valid_encoding?')
+
+          raise 'Missing native length' unless
+            s.include?("n=File.size('SL417Name.tmp')")
+
+          raise 'Missing idle guard' unless
+            s.include?('return if n<=2')
+
+          raise 'Missing bounded read' unless
+            s.include?('|f|f.read(n)')
+
+          raise 'Missing UTF-8 count' unless
+            s.include?("name.unpack('U*').size")
+
+          raise 'Old payload retained' if
+            s.include?('|f|f.write("0\n"+name)')
+
+          raise 'List position' unless
+            s.include?('w.y=80')
+
+          raise 'Header position' unless
+            s.include?('@sl417_header.y=48')
+
+          raise 'Decision position' unless
+            s.include?('@sl417_decision.y=432')
+
+          puts 'PASS compiled native creation script'
+          RUBY
 
       - name: Verify all 22 name-first creation paths
         shell: bash
@@ -208,480 +377,15 @@ jobs:
           set -euo pipefail
 
           bash -euo pipefail \
-            /tmp/sl417-run-test.sh
+            /tmp/sl417-existing-test.sh
 
-      - name: Separate name input from engine callbacks
+      - name: Restore unchanged name input bridge
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl417-name.js <<'JAVASCRIPT'
-          (function(){
-            'use strict';
-
-            const ui=SL417_UI;
-
-            let form=null;
-            let field=null;
-            let status=null;
-            let file=null;
-            let rect=null;
-
-            let composing=false;
-            let submitted=false;
-            let finished=false;
-
-            function layout(){
-
-              if(!form||!form.isConnected)return;
-
-              const c=document.getElementById(
-                'canvas'
-              ).getBoundingClientRect();
-
-              const [x,y,w,h]=rect;
-
-              const sx=c.width/800;
-              const sy=c.height/600;
-
-              Object.assign(form.style,{
-                left:(c.left+x*sx)+'px',
-                top:(c.top+y*sy)+'px',
-                width:(w*sx)+'px',
-                height:(h*sy)+'px',
-                fontSize:Math.max(12,24*sy)+'px'
-              });
-
-              field.style.fontSize=
-                Math.max(16,24*sy)+'px';
-            }
-
-            function submit(){
-
-              if(
-                !field ||
-                submitted ||
-                composing ||
-                finished
-              )return;
-
-              const name=field.value.trim();
-
-              if(!name){
-
-                status.textContent=ui.error;
-
-                return;
-              }
-
-              try{
-
-                FS.writeFile(
-                  file,
-                  new TextEncoder().encode(
-                    '1\n'+name
-                  )
-                );
-
-              }catch(e){
-
-                status.textContent=String(e.message);
-
-                return;
-              }
-
-              submitted=true;
-
-              field.inputMode='none';
-
-              field.disabled=true;
-
-              form.remove();
-            }
-
-            function close(){
-
-              if(form)form.remove();
-
-              form=field=status=file=rect=null;
-
-              composing=submitted=false;
-            }
-
-            function open(p){
-
-              if(form||finished)return;
-
-              rect=p.slice(2,6).map(Number);
-
-              file=p.slice(7).join('|');
-
-              if(
-                rect.some(v=>!Number.isFinite(v)) ||
-                !file
-              ){
-                throw Error(
-                  'Name input initialization'
-                );
-              }
-
-              form=document.createElement('form');
-
-              form.id='sl417-name-form';
-
-              const label=document.createElement(
-                'label'
-              );
-
-              label.htmlFor='sl417-name';
-
-              label.textContent=ui.prompt;
-
-              field=document.createElement('input');
-
-              field.id='sl417-name';
-
-              field.type='text';
-
-              field.inputMode='text';
-
-              field.enterKeyHint='done';
-
-              field.maxLength=Number(p[6]);
-
-              field.autocomplete='off';
-
-              field.spellcheck=false;
-
-              field.setAttribute(
-                'autocapitalize',
-                'off'
-              );
-
-              field.setAttribute(
-                'aria-label',
-                ui.prompt
-              );
-
-              field.placeholder='이름 입력 후 Enter';
-
-              status=document.createElement('div');
-
-              status.setAttribute(
-                'role',
-                'status'
-              );
-
-              status.style.cssText=
-                'color:#ffff80;';
-
-              form.style.cssText=
-                'position:fixed;'+
-                'z-index:4999;'+
-                'margin:0;padding:0;border:0;'+
-                'background:transparent;'+
-                'color:white;'+
-                'font-family:SL417Nanum,sans-serif;'+
-                'display:flex;'+
-                'flex-direction:column;'+
-                'justify-content:center;'+
-                'gap:1px;'+
-                'pointer-events:none;'+
-                'box-sizing:border-box;'+
-                'text-align:center;'+
-                'line-height:1.1;';
-
-              field.style.cssText=
-                'display:block;'+
-                'width:100%;height:32px;'+
-                'min-height:24px;'+
-                'box-sizing:border-box;'+
-                'border:0;'+
-                'border-radius:0;'+
-                'background:transparent;'+
-                'color:white;'+
-                'caret-color:white;'+
-                'outline:0;'+
-                'text-align:center;'+
-                'font-family:inherit;'+
-                'padding:0 4px;'+
-                'pointer-events:auto;'+
-                'user-select:text;'+
-                '-webkit-user-select:text;'+
-                'touch-action:manipulation;';
-
-              form.append(
-                label,
-                field,
-                status
-              );
-
-              document.getElementById(
-                'main'
-              ).append(form);
-
-              field.addEventListener(
-                'compositionstart',
-                ()=>composing=true
-              );
-
-              field.addEventListener(
-                'compositionend',
-                ()=>composing=false
-              );
-
-              form.addEventListener(
-                'submit',
-                e=>{
-
-                  e.preventDefault();
-
-                  submit();
-                }
-              );
-
-              [
-                'pointerdown',
-                'pointerup',
-                'mousedown',
-                'mouseup',
-                'click',
-                'touchstart',
-                'touchend'
-              ].forEach(t=>{
-
-                field.addEventListener(
-                  t,
-                  e=>e.stopPropagation()
-                );
-              });
-
-              layout();
-            }
-
-            [
-              'keydown',
-              'keyup',
-              'keypress'
-            ].forEach(t=>{
-
-              window.addEventListener(t,e=>{
-
-                if(
-                  !field ||
-                  e.target!==field ||
-                  submitted
-                )return;
-
-                if(
-                  t==='keydown' &&
-                  e.key==='Enter' &&
-                  !composing &&
-                  !e.isComposing &&
-                  e.keyCode!==229
-                ){
-
-                  e.preventDefault();
-
-                  e.stopImmediatePropagation();
-
-                  submit();
-
-                  return;
-                }
-
-                e.stopImmediatePropagation();
-
-              },true);
-            });
-
-            const resize=
-              ()=>requestAnimationFrame(layout);
-
-            window.addEventListener(
-              'resize',
-              resize
-            );
-
-            document.addEventListener(
-              'fullscreenchange',
-              resize
-            );
-
-            if(window.visualViewport){
-
-              visualViewport.addEventListener(
-                'resize',
-                resize
-              );
-
-              visualViewport.addEventListener(
-                'scroll',
-                resize
-              );
-            }
-
-            function message(s){
-
-              if(s.startsWith('SL417|NAME|')){
-
-                if(finished)return;
-
-                document.documentElement.classList.add(
-                  'sl417-creation'
-                );
-
-                open(s.split('|'));
-
-              }else if(s==='SL417|NAME_READY'){
-
-                finished=true;
-
-                close();
-
-              }else if(s==='SL417|NAME_CLOSE'){
-
-                close();
-
-                finished=false;
-
-                document.documentElement.classList.remove(
-                  'sl417-creation'
-                );
-
-              }else if(
-                s==='SL417|NAME_RETRY' &&
-                form &&
-                submitted &&
-                !finished
-              ){
-
-                submitted=composing=false;
-
-                status.textContent=ui.error;
-
-                field.disabled=false;
-
-                field.inputMode='text';
-
-                document.getElementById(
-                  'main'
-                ).append(form);
-
-                layout();
-
-              }else if(
-                s.startsWith('SL417|FAIL|')
-              ){
-
-                if(
-                  status &&
-                  form &&
-                  form.isConnected
-                ){
-
-                  status.textContent=
-                    s.split('|').slice(2).join(' | ');
-                }
-              }
-            }
-
-            window.sl417NameMessage=function(text){
-
-              const s=String(text).trim();
-
-              if(!s.startsWith('SL417|'))return;
-
-              queueMicrotask(()=>{
-
-                try{
-
-                  message(s);
-
-                }catch(e){
-
-                  console.error(
-                    'SL417_NAME',
-                    e
-                  );
-                }
-              });
-            };
-          })();
-          JAVASCRIPT
-
-          node --check /tmp/sl417-name.js
-
-          python3 - <<'PYTHON'
-          from pathlib import Path
-
-          js=Path('/tmp/sl417-name.js').read_text('utf8')
-
-          assert '.focus(' not in js
-          assert '.blur(' not in js
-          assert 'autofocus' not in js
-
-          assert 'simulateKeyEvent' not in js
-
-          assert 'FS.unlink' not in js
-
-          assert js.count('FS.writeFile(')==1
-
-          assert 'queueMicrotask(' in js
-
-          assert "field.inputMode='none';" in js
-
-          assert 'field.disabled=true;' in js
-
-          assert 'form.remove();' in js
-
-          assert "document.createElement('button')" not in js
-
-          assert "document.createElement('dialog')" not in js
-
-          assert "getElementById('sl-pad')" not in js
-
-          assert 'z-index:4999;' in js
-
-          print('PASS no forced focus changes')
-          print('PASS one name write on Enter')
-          print('PASS deferred engine output')
-          print('PASS immediate input removal')
-          PYTHON
-
           bash -euo pipefail \
-            /tmp/sl417-install-name.sh
-
-          python3 - <<'PYTHON'
-          from pathlib import Path
-
-          page=Path('site/knight/index.html')
-
-          html=page.read_text('utf8')
-
-          assert html.count('</head>')==1
-
-          css=(
-              '<style>'
-              'html.sl417-creation #canvas'
-              '{outline:none!important;}'
-              '</style>\n'
-          )
-
-          assert css not in html
-
-          html=html.replace(
-              '</head>',
-              css+'</head>',
-              1
-          )
-
-          page.write_text(html,'utf8')
-
-          print('PASS creation canvas outline removed')
-          PYTHON
-
-          node --check /tmp/sl417-name-resolved.js
+            /tmp/sl417-existing-bridge.sh
 
       - name: Update V4.17 data references
         shell: bash
@@ -689,7 +393,7 @@ jobs:
           set -euo pipefail
 
           bash -euo pipefail \
-            /tmp/sl417-run-mapping.sh
+            /tmp/sl417-existing-mapping.sh
 
       - name: Verify exact modification scope
         shell: bash
@@ -697,7 +401,7 @@ jobs:
           set -euo pipefail
 
           bash -euo pipefail \
-            /tmp/sl417-scope.sh
+            /tmp/sl417-existing-scope.sh
 
           python3 - <<'PYTHON'
           from pathlib import Path
@@ -721,15 +425,9 @@ jobs:
 
           assert len(after)==6086
 
-          assert set(after)==set(before)
+          assert set(before)==set(after)
 
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          changed={
-              name
-              for name in before
-              if before[name]!=after[name]
-          }
 
           expected={
               'knight/gameasync/Data/Scripts.rxdata',
@@ -740,6 +438,12 @@ jobs:
               'index.html'
           }
 
+          changed={
+              name
+              for name in before
+              if before[name]!=after[name]
+          }
+
           assert changed==expected,sorted(changed^expected)
 
           protected=[
@@ -747,7 +451,15 @@ jobs:
               'knight/js/drive.js',
               'knight/mkxp.js',
               'knight/mkxp.wasm',
-              'knight/gameasync/bitmap-map.js'
+              'knight/gameasync/bitmap-map.js',
+              'knight/gameasync/Data/'+pre+'System.rxdata',
+              'knight/gameasync/Data/'+pre+'Map047.rxdata',
+              'knight/gameasync/Data/'+pre+'Actors.rxdata',
+              'knight/gameasync/Data/'+pre+'Classes.rxdata',
+              'knight/gameasync/Data/'+pre+'Weapons.rxdata',
+              'knight/gameasync/Data/'+pre+'Armors.rxdata',
+              'knight/gameasync/Data/'+pre+'Items.rxdata',
+              'knight/gameasync/Data/'+pre+'CommonEvents.rxdata'
           ]
 
           for name in protected:
@@ -756,30 +468,11 @@ jobs:
 
               assert before[name]==after[name],name
 
-          html=(root/'knight/index.html').read_text('utf8')
-
-          assert 'SL417|NAME_READY' in html
-
-          assert 'queueMicrotask(' in html
-
-          assert 'html.sl417-creation #canvas' in html
-
-          assert "field.inputMode='none';" in html
-
-          assert 'field.disabled=true;' in html
-
-          assert 'sl417-create' not in html
-
-          print('PASS original direction controls unchanged')
-
-          print('PASS original ATK controls unchanged')
-
-          print('PASS original character creation scene retained')
-
-          print('PASS original engine unchanged')
-
+          print('PASS existing game controls unchanged')
+          print('PASS existing engine unchanged')
+          print('PASS existing equipment data unchanged')
+          print('PASS existing map data unchanged')
           print('PASS 6080 original files unchanged')
-
           print('PASS V4.17')
           PYTHON
 
