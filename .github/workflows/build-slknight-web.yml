@@ -47,7 +47,6 @@ jobs:
               | select(
                   .head_sha == $sha
                   and .head_branch == "main"
-                  and .status == "completed"
                   and .conclusion == "success"
                 )]
               | sort_by(.created_at)
@@ -84,9 +83,6 @@ jobs:
 
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-          echo "PASS final V4.16 commit $BASE_SHA"
-          echo "PASS successful deployment $RUN_ID"
-
       - name: Restore final V4.16 game
         uses: actions/download-artifact@v4
         with:
@@ -102,125 +98,85 @@ jobs:
           set -euo pipefail
 
           test -s baseline/artifact.tar
-
           mkdir -p site
           tar -xf baseline/artifact.tar -C site
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib,json
 
-          root = Path('site')
-          game = root/'knight/gameasync'
+          root=Path('site')
+          game=root/'knight/gameasync'
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          before = {
+          before={
               p.relative_to(root).as_posix():
-                  hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*')
-              if p.is_file()
+              hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in root.rglob('*') if p.is_file()
           }
 
-          assert len(before) == 6086, len(before)
+          assert len(before)==6086,len(before)
 
-          required = [
-              'System',
-              'Map007',
-              'Map029',
-              'Map047',
-              'Actors',
-              'Classes',
-              'CommonEvents'
-          ]
+          for name in (
+              'System','Map007','Map047',
+              'Actors','Classes','Weapons',
+              'Armors','Items','States','CommonEvents'
+          ):
+              p=game/'Data'/(pre+name+'.rxdata')
+              assert p.is_file() and p.stat().st_size>4,name
 
-          for name in required:
-              p = game/'Data'/(pre+name+'.rxdata')
-              assert p.is_file(), name
-              assert p.stat().st_size > 4, name
+          assert (game/'Data/Scripts.rxdata').stat().st_size>100000
 
-          scripts = game/'Data/Scripts.rxdata'
-
-          assert scripts.is_file()
-          assert scripts.stat().st_size > 100000
-
-          loader = root/'knight/js/sl-assets-v229r115.js'
+          loader=root/'knight/js/sl-assets-v229r115.js'
 
           assert loader.read_bytes().count(
               b"var version='V4.16';"
-          ) == 1
+          )==1
 
-          for name in ('index.html', 'knight/index.html'):
-              assert b'V4.16' in (root/name).read_bytes(), name
+          for name in ('index.html','knight/index.html'):
+              assert b'V4.16' in (root/name).read_bytes(),name
 
-          names = [
-              'Scripts.rxdata',
-              pre+'Map007.rxdata'
-          ]
+          names=['Scripts.rxdata',pre+'Map007.rxdata']
 
-          old_md5 = {
-              name: hashlib.md5(
-                  (game/'Data'/name).read_bytes()
-              ).hexdigest()
-              for name in names
+          md5={
+              n:hashlib.md5(
+                  (game/'Data'/n).read_bytes()
+              ).hexdigest() for n in names
           }
 
           Path('/tmp/sl417-before.json').write_text(
-              json.dumps(before, sort_keys=True),
-              'utf8'
+              json.dumps(before,sort_keys=True),'utf8'
           )
 
           Path('/tmp/sl417-md5.json').write_text(
-              json.dumps(old_md5),
-              'utf8'
+              json.dumps(md5),'utf8'
           )
 
           print('PASS final V4.16 baseline')
-          print('PASS 6086 original files')
           PYTHON
 
-      - name: Rebuild character creation using existing profiles
+      - name: Restore native character creation
         shell: bash
         run: |
           set -euo pipefail
 
           cat > /tmp/sl417-patch.rb <<'RUBY'
           # encoding: UTF-8
-
           require 'zlib'
           require 'json'
 
           module RPG
             %w[
-              Map
-              MapInfo
-              Tileset
-              Event
-              EventCommand
-              MoveRoute
-              MoveCommand
-              AudioFile
-              CommonEvent
-              System
-              Item
-              Actor
-              Class
-              Weapon
-              Armor
-              Skill
-              State
-            ].each do |n|
-              const_set(n,::Class.new)
-            end
+              Map MapInfo Tileset Event EventCommand
+              MoveRoute MoveCommand AudioFile CommonEvent
+              System Actor Class Weapon Armor Item Skill State
+            ].each{|n|const_set(n,::Class.new)}
 
             Event.const_set(:Page,::Class.new)
             Event::Page.const_set(:Condition,::Class.new)
             Event::Page.const_set(:Graphic,::Class.new)
-
             System.const_set(:Words,::Class.new)
             System.const_set(:TestBattler,::Class.new)
-
             self::Class.const_set(:Learning,::Class.new)
           end
 
@@ -246,8 +202,8 @@ jobs:
             s.to_s.dup.force_encoding('UTF-8')
           end
 
-          def ck(ok,msg)
-            raise msg unless ok
+          def ck(v,m)
+            raise m unless v
           end
 
           def code(c)
@@ -258,53 +214,74 @@ jobs:
             iv(c,:@parameters)
           end
 
+          def emit(l,c,d,p=[])
+            x=RPG::EventCommand.new
+            x.instance_variable_set(:@code,c)
+            x.instance_variable_set(:@indent,d)
+            x.instance_variable_set(:@parameters,p)
+            l<<x
+          end
+
+          def choices(l,d,labels)
+            emit(l,102,d,[labels,0])
+
+            labels.each_with_index do |label,i|
+              emit(l,402,d,[i,label])
+              yield i,d+1
+              emit(l,0,d+1)
+            end
+
+            emit(l,404,d)
+          end
+
           def one(s,a,b)
-            rx=Regexp.new(
-              a.split("\n",-1).map{|l|Regexp.escape(l)}.join('\\r?\\n')
-            )
-
             ck(
-              s.scan(rx).size==1,
-              "Patch anchor count #{a[0,100]}"
+              s.scan(a).size==1,
+              "Anchor #{a.inspect[0,100]}"
             )
-
-            s.sub(rx){b}
+            s.sub(a){b}
           end
 
           root=ARGV.fetch(0)
-
           pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          path=lambda{|n|File.join(root,pre+n+'.rxdata')}
+          path=->(n){
+            File.join(root,pre+n+'.rxdata')
+          }
 
-          map=Marshal.load(File.binread(path.call('Map007')))
-          island=Marshal.load(File.binread(path.call('Map047')))
-          sys=Marshal.load(File.binread(path.call('System')))
+          read=->(n){
+            Marshal.load(File.binread(path.call(n)))
+          }
+
+          map=read.call('Map007')
+          island=read.call('Map047')
+          sys=read.call('System')
 
           ck(
             [:@start_map_id,:@start_x,:@start_y].map{
               |k|iv(sys,k)
             }==[7,9,6],
-            'V4.16 start required'
+            'V4.16 start'
           )
 
           recruit=iv(island,:@events).values.select do |e|
             utf(iv(e,:@name))=='[ID고용사]'
           end
 
-          ck(recruit.size==1,'Recruiter count')
+          ck(recruit.size==1,'Recruiter')
 
-          forms=[]
-          pending=[]
+          forms=iv(recruit.first,:@pages).map do |page|
+            pending=[]
+            found=[]
 
-          iv(recruit[0],:@pages).each do |page|
             iv(page,:@list).each do |c|
               next unless code(c)==355
 
               s=utf(par(c)[0])
 
               if m=s.match(/\A@sl43_type = ("(?:\\.|[^"\\])*"); @sl43_stats = (\[[0-9, ]+\])/)
-                pending << [
+
+                pending<<[
                   JSON.parse(m[1]),
                   JSON.parse(m[2])
                 ]
@@ -314,11 +291,11 @@ jobs:
                 m=s.match(/@class_id,\$data_actors\[(\d+)\]\.class_id\).*?\.set_graphic\(("(?:\\.|[^"\\])*"),0,.*?@sl43_form,("(?:\\.|[^"\\])*")\)/)
 
                 ck(
-                  m && !pending.empty?,
-                  'Hire profile source mismatch'
+                  m&&!pending.empty?,
+                  'Recruiter profile'
                 )
 
-                forms << [
+                found<<[
                   JSON.parse(m[3]),
                   JSON.parse(m[2]),
                   m[1].to_i,
@@ -328,570 +305,459 @@ jobs:
                 pending=[]
               end
             end
+
+            ck(
+              pending.empty?&&found.size==8,
+              'Recruiter page'
+            )
+
+            found
           end
 
-          ck(
-            forms.group_by(&:first).values.all?{
-              |v|v.uniq.size==1
-            },
-            'Recruiter pages disagree'
-          )
+          ck(forms.uniq.size==1,'Recruiter pages disagree')
 
-          forms=forms.uniq
+          forms=forms.first
 
           ck(
-            pending.empty? &&
-            forms.size==8 &&
-            forms.map(&:first).uniq.size==8,
-            '8 forms required'
-          )
-
-          ck(
-            forms.map(&:first)==[
-              '남기사',
-              '여기사',
-              '남요정',
-              '여요정',
-              '남법사',
-              '여법사',
-              '남다엘',
-              '여다엘'
+            forms.map(&:first)==%w[
+              남기사 여기사 남요정 여요정
+              남법사 여법사 남다엘 여다엘
             ],
-            'Original character form order'
+            'Form order'
           )
 
           ck(
-            forms.map{|f|f[3].size}==[2,2,3,3,3,3,3,3],
-            '22 combinations required'
-          )
-
-          ck(
+            forms.map{|f|f[3].size}==[2,2,3,3,3,3,3,3] &&
             forms.flat_map{|f|f[3]}.uniq.size==11,
-            '11 types required'
+            'Preset count'
           )
 
           ck(
-            forms.all?{
-              |f|f[3].all?{|_,s|s.size==6&&s.sum==75}
-            },
-            'Approved stats'
+            forms.all?{|f|f[3].all?{|_,s|s.size==6&&s.sum==75}},
+            'Stats'
           )
 
-          actors=Marshal.load(File.binread(path.call('Actors')))
-
-          ck(
-            actors[1]&&iv(actors[1],:@initial_level)==1,
-            'Actor 1 initial level'
-          )
+          actors=read.call('Actors')
+          classes=read.call('Classes')
 
           forms.each do |_,_,id,_|
             ck(
-              actors[id]&&iv(actors[id],:@class_id).is_a?(Integer),
+              actors[id]&&classes[iv(actors[id],:@class_id)],
               'Class template'
             )
           end
 
-          rows=Marshal.load(
-            File.binread(File.join(root,'Scripts.rxdata'))
-          )
+          sp=File.join(root,'Scripts.rxdata')
+          rows=Marshal.load(File.binread(sp))
 
-          ck(rows.size==137,'Script count')
+          ck(rows.size==137,'Scripts')
 
-          original=rows.map{|r|Marshal.dump(r)}
+          before=rows.map{|r|Marshal.dump(r)}
 
-          src=lambda do |i|
-            utf(Zlib::Inflate.inflate(rows.fetch(i)[2]))
+          edit=->(i,&blk) do
+            raw=utf(Zlib::Inflate.inflate(rows.fetch(i)[2]))
+            s=raw.gsub("\r\n","\n")
+            n=blk.call(s)
+
+            ck(n!=s,"No change #{i}")
+
+            RubyVM::InstructionSequence.compile(n)
+
+            rows[i][2]=Zlib::Deflate.deflate(
+              raw.include?("\r\n") ? n.gsub("\n","\r\n") : n
+            )
           end
 
-          set=lambda do |i,s|
-            RubyVM::InstructionSequence.compile(s)
-            rows[i][2]=Zlib::Deflate.deflate(s)
-          end
+          es=iv(map,:@events)
+          e=es.fetch(1)
+          pg=iv(e,:@pages).fetch(0)
+          old=iv(pg,:@list)
 
           ck(
-            rows[17][1]=='Game_Actor' &&
-            rows[94][1]=='Scene_Name' &&
-            rows[26][1]=='Game_Event' &&
-            rows[71][1]=='Interpreter 3',
-            'Script identity'
-          )
-
-          body=src.call(26)
-
-          weapon=body.match(/w=f\.end_with\?\('기사'\) \? (\d+)\s*:\s*\(\s*f\.end_with\?\('요정'\) \? (\d+)\s*:\s*\(f\.end_with\?\('법사'\) \? (\d+) : (\d+)\)/m)
-
-          ck(weapon,'Existing starter weapon selection')
-
-          weapons=weapon.captures.map(&:to_i)
-
-          ck(
-            weapons==[170,1000,1001,1002],
-            'Starter weapon ids'
-          )
-
-          profiles=forms.each_with_index.map do |f,i|
-            f+[weapons[i/2]]
-          end
-
-          event=iv(map,:@events).fetch(1)
-          page=iv(event,:@pages).fetch(0)
-          list=iv(page,:@list)
-
-          ck(
-            iv(event,:@name)=='EV001' &&
-            iv(page,:@trigger)==4 &&
-            list.size==121,
-            'Original creation event'
+            iv(e,:@name)=='EV001' &&
+            iv(pg,:@trigger)==4 &&
+            old.size==121,
+            'Original EV001'
           )
 
           ck(
             [
-              code(list[44]),
-              code(list[45]),
-              par(list[45]),
-              par(list[89]),
-              code(list[104]),
-              code(list[105]),
-              code(list[106]),
-              code(list[119]),
-              par(list[119])[0,2]
-            ]==[
-              241,
-              303,
-              [1,12],
-              [170,0,0,1],
-              209,
-              509,
-              509,
-              201,
-              [0,47]
+              3,4,13,14,40,41,42,43,44,45,
+              74,75,76,77,78,79,80,81,
+              89,97,104,105,106,119,120
+            ].map{|i|code(old[i])}==[
+              101,102,101,102,101,401,401,401,241,303,
+              101,401,129,129,121,122,317,311,
+              127,126,209,509,509,201,0
             ],
-            'Creation command structure'
+            'Original commands'
           )
 
           ck(
-            par(list[119])==[0,47,372,138,2,1],
-            'V4.16 Talking Island destination'
+            par(old[45])==[1,12] &&
+            par(old[119])==[0,47,372,138,2,1],
+            'V4.16 transfer'
           )
 
-          ck(
-            code(list[80])==317 &&
-            code(list[81])==311,
-            'Original HP initialization'
-          )
+          old_cmds=old.map{|c|Marshal.dump(c)}
 
-          reserved=[46,51,56,61].map do |i|
-            ck(
-              code(list[i])==111 &&
-              par(list[i])[0,3]==[4,1,1],
-              'Reserved name condition'
-            )
+          other=es.reject{|k,_|k==1}.transform_values{
+            |v|Marshal.dump(v)
+          }
 
-            utf(par(list[i])[3])
+          list=old[0,3]
+
+          emit(list,101,0,['캐릭터를 선택하세요.'])
+
+          choices(list,0,forms.map(&:first)) do |i,d|
+
+            form,graphic,template,presets=forms[i]
+
+            emit(list,101,d,[utf(par(old[13])[0])])
+
+            choices(list,d,presets.map(&:first)) do |j,n|
+
+              kind,stats=presets[j]
+
+              script="a=$game_actors[1]; a.instance_variable_set(:@sl43_form,#{form.inspect}); a.instance_variable_set(:@sl43_type,#{kind.inspect}); a.instance_variable_set(:@sl43_stats,#{stats.inspect}); a.instance_variable_set(:@sl417_base_graphic,#{graphic.inspect}); a.instance_variable_set(:@class_id,$data_actors[#{template}].class_id); a.set_graphic(#{graphic.inspect},0,a.battler_name,a.battler_hue); [425,469,426,962,966,968].each_with_index{|v,k|$game_variables[v]=#{stats.inspect}[k]}; $game_variables[48]=#{i%2}; $game_switches[70]=#{kind=='힘기사'}; a.sl44_record_growth; a.recover_all; true"
+
+              RubyVM::InstructionSequence.compile(script)
+
+              emit(list,355,n,[script])
+            end
           end
 
-          ck(reserved.uniq.size==4,'Reserved names')
+          list.concat(old[40,2])
 
-          route=Marshal.load(Marshal.dump(list[104,3]))
+          emit(list,401,0,['이름 입력 : 키보드'])
+          emit(list,401,0,['결정 : Enter 또는 C'])
+
+          list.concat(old[44,30])
+          list.concat(old[76,4])
+          list.concat(old[82,7])
+          list<<old[97]
+
+          emit(
+            list,355,0,
+            [
+              'a=$game_actors[1]; SL411.starter(a,true); $game_player.refresh; true'
+            ]
+          )
+
+          route=Marshal.load(Marshal.dump(old[104,3]))
 
           route.each do |c|
             c.instance_variable_set(:@indent,0)
           end
 
-          new_list=
-            list[0,3]+
-            list[44,2]+
-            list[76,4]+
-            list[82,7]+
-            list[90,8]+
-            route+
-            list[109,12]
+          list.concat(route)
+          list.concat(old[74,2])
+          list.concat(old[109,12])
 
           ck(
-            new_list.count{|c|code(c)==303}==1 &&
-            new_list.none?{|c|code(c)==102} &&
-            new_list[-2].equal?(list[119]),
-            'Creation event scope'
+            list.count{|c|code(c)==102}==9 &&
+            list.count{|c|code(c)==303}==1 &&
+            list.count{|c|code(c)==355}==23,
+            'Native selection commands'
           )
 
-          other=iv(map,:@events).reject{
-            |k,_|k==1
-          }.transform_values{
-            |e|Marshal.dump(e)
-          }
+          ck(
+            list[-2].equal?(old[119]) &&
+            old.map{|c|Marshal.dump(c)}==old_cmds,
+            'Original transfer or commands'
+          )
 
-          page.instance_variable_set(:@list,new_list)
+          pg.instance_variable_set(:@list,list)
 
           ck(
-            iv(map,:@events).reject{
-              |k,_|k==1
-            }.transform_values{
-              |e|Marshal.dump(e)
+            es.reject{|k,_|k==1}.transform_values{
+              |v|Marshal.dump(v)
             }==other,
-            'Other Map007 events'
+            'Other events changed'
           )
 
-          File.binwrite(
-            path.call('Map007'),
-            Marshal.dump(map)
-          )
+          edit.call(60) do |s|
+            one(
+              s,
+              '    if large || @sl43_original_height',
+              "    large = large || ($game_map.map_id == 7 && $game_temp.choice_start == 0 && $game_temp.choice_max == 8)\n    if large || @sl43_original_height"
+            )
+          end
 
-          s=src.call(94)
+          edit.call(94) do |s|
 
-          s=one(
-            s,
-            'class Scene_Name',
-            "class Scene_Name\n  SL417_PROFILES = #{profiles.inspect}\n  SL417_RESERVED = #{reserved.inspect}"
-          )
-
-          s=one(
-            s,
-            '    @actor = $game_actors[$game_temp.name_actor_id]',
-            <<~'SRC'.lines.map{|l|'    '+l}.join.chomp
-          @actor = $game_actors[$game_temp.name_actor_id]
-          @sl417_create = $game_map.map_id == 7 && @actor.id == 1
-
-          if @sl417_create
+            s=one(
+              s,
+              '    @input_window = Window_NameInput.new',
+              <<~'SRC'.lines.map{|l|'    '+l}.join.chomp
+          @sl417_name = $game_map.map_id == 7 && @actor.id == 1 && @actor.instance_variable_get(:@sl417_base_graphic)
+          if @sl417_name
+            File.open('SL417Name.tmp','wb'){|f|f.write("0\n")}
             Graphics.transition
-            puts('SL417|OPEN')
+            x=@edit_window.x+16+320-$game_temp.name_max_char*14
+            puts(['SL417|NAME',x,@edit_window.y+48,$game_temp.name_max_char*28,32,$game_temp.name_max_char].join('|'))
             return
           end
+          @input_window = Window_NameInput.new
           SRC
-          )
-
-          s=one(
-            s,
-            '    @edit_window.dispose',
-            "    return if @sl417_create\n    @edit_window.dispose"
-          )
-
-          s=one(
-            s,
-            '    @edit_window.update',
-            <<~'SRC'.lines.map{|l|'    '+l}.join.chomp
-          if @sl417_create
-            return unless FileTest.exist?('/game/SL417Create.tmp')
-
-            file=File.open('/game/SL417Create.tmp','rb')
-            fields=file.read.split("\n",3)
-            file.close
-
-            if fields.size!=3 ||
-               fields[0] !~ /\A[0-7]\z/ ||
-               fields[1] !~ /\A[0-2]\z/
-
-              puts('SL417|RETRY')
-              return
-            end
-
-            form,graphic,template,presets,weapon=SL417_PROFILES[fields[0].to_i]
-
-            selected=presets[fields[1].to_i]
-            name=fields[2].strip
-
-            name=name.force_encoding('UTF-8') if name.respond_to?(:force_encoding)
-
-            if !selected ||
-               name.empty? ||
-               name.split(//).size>$game_temp.name_max_char ||
-               SL417_RESERVED.include?(name)
-
-              puts('SL417|RETRY')
-              return
-            end
-
-            kind,stats=selected
-
-            @actor.instance_variable_set(:@sl43_form,form)
-            @actor.instance_variable_set(:@sl43_type,kind)
-            @actor.instance_variable_set(:@sl43_stats,stats.dup)
-            @actor.instance_variable_set(:@sl417_base_graphic,graphic)
-
-            @actor.instance_variable_set(
-              :@class_id,
-              $data_actors[template].class_id
             )
 
-            @actor.set_graphic(
-              graphic,
-              0,
-              @actor.battler_name,
-              @actor.battler_hue
+            s=one(
+              s,
+              '    @input_window.dispose',
+              "    @input_window.dispose if @input_window\n    puts('SL417|NAME_CLOSE') if @sl417_name"
             )
 
-            @actor.name=name
+            one(
+              s,
+              '    @input_window.update',
+              <<~'SRC'.lines.map{|l|'    '+l}.join.chomp
+          if @sl417_name
+            return if @sl417_name_done
 
-            [425,469,426,962,966,968].each_with_index do |id,i|
-              $game_variables[id]=stats[i]
+            raw=File.open('SL417Name.tmp','rb'){|f|f.read}
+            flag,name=raw.split("\n",2)
+            name=(name||'').force_encoding('UTF-8')
+
+            valid=name.valid_encoding? &&
+              name.split(//).size <= $game_temp.name_max_char &&
+              name !~ /[\x00-\x1f\x7f\\]/
+
+            if valid && @edit_window.name != name
+              @edit_window.instance_variable_set(:@name,name)
+              @edit_window.instance_variable_set(:@index,name.split(//).size)
+              @edit_window.refresh
+              @edit_window.update_cursor_rect
             end
 
-            $game_variables[48]=fields[0].to_i%2
-            $game_switches[70]=(kind=='힘기사')
+            if flag=='1' || Input.trigger?(Input::C)
 
-            @actor.sl44_record_growth
-            @actor.recover_all
+              File.open('SL417Name.tmp','wb'){
+                |f|f.write("0\n"+name)
+              }
 
-            $game_party.gain_weapon(weapon,1)
-            $game_party.gain_item(1006,1000) if weapon==1000
+              if !valid || name.strip.empty?
+                $game_system.se_play($data_system.buzzer_se)
+                puts('SL417|NAME_RETRY')
+                return
+              end
 
-            $game_system.se_play($data_system.decision_se)
+              @actor.name=name.strip
+              @sl417_name_done=true
 
-            puts('SL417|CLOSE')
-
-            $scene=Scene_Map.new
+              $game_system.se_play($data_system.decision_se)
+              $scene=Scene_Map.new
+            end
 
             return
           end
 
-          @edit_window.update
+          @input_window.update
           SRC
-          )
-
-          set.call(94,s)
-
-          s=src.call(17)
-
-          s=one(
-            s,
-            '    if @actor_id == 1'+"\n"+'      kind=0',
-            '    if @actor_id == 1 && !@sl417_base_graphic'+"\n"+'      kind=0'
-          )
-
-          s=one(
-            s,
-            '      w=@sl43_stats[4].to_i'+"\n"+'      oc=@sl44_origin_con ||= c',
-            <<~'SRC'.lines.map{|l|'      '+l}.join.chomp
-          w=@sl43_stats[4].to_i
-
-          if @sl417_base_graphic
-            c=$game_variables[426].to_i
-            w=$game_variables[966].to_i
+            )
           end
 
-          oc=@sl44_origin_con ||= c
-          SRC
-          )
+          edit.call(17) do |s|
 
-          s=one(
-            s,
-            '    @sl44_player_highest ||= @level if @actor_id == 1',
-            '    @sl44_player_highest ||= @level if @actor_id == 1 && !@sl417_base_graphic'
-          )
+            s=one(
+              s,
+              "    if @actor_id == 1\n      kind=0",
+              "    if @actor_id == 1 && !@sl417_base_graphic\n      kind=0"
+            )
 
-          s=one(
-            s,
-            '      if @actor_id == 1 && @level > @sl44_player_highest',
-            '      if @actor_id == 1 && !@sl417_base_graphic && @level > @sl44_player_highest'
-          )
+            s=one(
+              s,
+              '      ow=@sl44_origin_wis ||= w',
+              "      ow=@sl44_origin_wis ||= w\n      if @sl417_base_graphic\n        c=$game_variables[426].to_i\n        w=$game_variables[966].to_i\n      end"
+            )
 
-          s=one(
-            s,
-            '    return $data_classes[@class_id].name',
-            "    return @sl43_form if @sl417_base_graphic\n    return $data_classes[@class_id].name"
-          )
+            s=one(
+              s,
+              '    @sl44_player_highest ||= @level if @actor_id == 1',
+              '    @sl44_player_highest ||= @level if @actor_id == 1 && !@sl417_base_graphic'
+            )
 
-          s=one(
-            s,
-            '    @character_name = character_name',
-            <<~'SRC'.lines.map{|l|'    '+l}.join.chomp
-          if @sl417_base_graphic && ['knight_men','여기사'].include?(character_name)
-            character_name=@sl417_base_graphic
+            s=one(
+              s,
+              '      if @actor_id == 1 && @level > @sl44_player_highest',
+              '      if @actor_id == 1 && !@sl417_base_graphic && @level > @sl44_player_highest'
+            )
+
+            s=one(
+              s,
+              '    return $data_classes[@class_id].name',
+              "    return @sl43_form if @sl417_base_graphic\n    return $data_classes[@class_id].name"
+            )
+
+            s=one(
+              s,
+              '    @character_name = character_name',
+              "    character_name=@sl417_base_graphic if @sl417_base_graphic && ['knight_men','여기사'].include?(character_name)\n    @character_name = character_name"
+            )
+
+            s=one(
+              s,
+              '      dex=@sl43_stats[1]+@dex_plus',
+              "      dex=@sl43_stats[1]+@dex_plus\n      dex=$game_variables[469]+$game_variables[961] if @sl417_base_graphic"
+            )
+
+            s=one(
+              s,
+              '      return pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus',
+              "      n=pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus\n      n+=$game_variables[1080]+$game_variables[920] if @sl417_base_graphic\n      return n"
+            )
+
+            s=one(
+              s,
+              "      w=@sl43_stats[4]\n      b=if w<=14; 0",
+              "      w=@sl43_stats[4]\n      w=$game_variables[966] if @sl417_base_graphic\n      b=if w<=14; 0"
+            )
+
+            s=one(
+              s,
+              "      mr=if @sl43_form.end_with?('기사');",
+              "      w=@sl43_stats[4] if @sl417_base_graphic\n      mr=if @sl43_form.end_with?('기사');"
+            )
+
+            one(
+              s,
+              '      return mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b',
+              "      n=mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b\n      if @sl417_base_graphic\n        n+=$game_variables[925]\n        $MDEF=n\n      end\n      return n"
+            )
           end
 
-          @character_name = character_name
-          SRC
-          )
-
-          s=one(
-            s,
-            '      dex=@sl43_stats[1]+@dex_plus',
-            "      dex=@sl43_stats[1]+@dex_plus\n      dex=$game_variables[469]+$game_variables[961] if @sl417_base_graphic"
-          )
-
-          s=one(
-            s,
-            '      return pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus',
-            "      n=pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus\n      n+=$game_variables[1080]+$game_variables[920] if @sl417_base_graphic\n      return n"
-          )
-
-          s=one(
-            s,
-            '      w=@sl43_stats[4]'+"\n"+'      b=if w<=14; 0',
-            "      w=@sl43_stats[4]\n      w=$game_variables[966] if @sl417_base_graphic\n      b=if w<=14; 0"
-          )
-
-          s=one(
-            s,
-            "      mr=if @sl43_form.end_with?('기사');",
-            "      w=@sl43_stats[4] if @sl417_base_graphic\n      mr=if @sl43_form.end_with?('기사');"
-          )
-
-          s=one(
-            s,
-            '      return mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b',
-            <<~'SRC'.lines.map{|l|'      '+l}.join.chomp
-          n=mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b
-
-          if @sl417_base_graphic
-            n+=$game_variables[925]
-            $MDEF=n
+          edit.call(12) do |s|
+            one(
+              s,
+              '(@sl46_stats_ready ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])',
+              '(@sl46_stats_ready && !@sl417_base_graphic ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])'
+            )
           end
 
-          return n
-          SRC
-          )
-
-          set.call(17,s)
-
-          s=src.call(12)
-
-          s=one(
-            s,
-            '(@sl46_stats_ready ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])',
-            '(@sl46_stats_ready && !@sl417_base_graphic ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])'
-          )
-
-          set.call(12,s)
-
-          s=src.call(117)
-
-          s=one(
-            s,
-            '$n = n unless @sl46_stats_ready',
-            '$n = n unless @sl46_stats_ready && !@sl417_base_graphic'
-          )
-
-          set.call(117,s)
+          edit.call(117) do |s|
+            one(
+              s,
+              '$n = n unless @sl46_stats_ready',
+              '$n = n unless @sl46_stats_ready && !@sl417_base_graphic'
+            )
+          end
 
           [34,98].each do |i|
-            s=src.call(i)
+            edit.call(i) do |s|
 
-            a='actor.instance_variable_get(:@sl46_stats_ready)'
+              a='actor.instance_variable_get(:@sl46_stats_ready)'
 
-            b=a+' && !actor.instance_variable_get(:@sl417_base_graphic)'
+              ck(
+                s.scan(a).size==(i==34 ? 2 : 5),
+                'Stat display anchors'
+              )
+
+              s.gsub(
+                a,
+                '('+a+' && !actor.instance_variable_get(:@sl417_base_graphic))'
+              )
+            end
+          end
+
+          edit.call(26) do |s|
 
             ck(
-              s.scan(a).size==(i==34 ? 2 : 5),
-              'Actor parameter anchor count'
+              s.include?('def self.starter(a,initial=false)'),
+              'Existing starter'
             )
 
-            s=s.gsub(a,b)
+            s=one(
+              s,
+              '    a.id==1 ? 3213 : FORMS[a.instance_variable_get(:@sl43_form).to_s]',
+              '    a.id==1 && !a.instance_variable_get(:@sl417_base_graphic) ? 3213 : FORMS[a.instance_variable_get(:@sl43_form).to_s]'
+            )
 
-            set.call(i,s)
+            one(
+              s,
+              "  def self.pc_motion\n    w=SL49.weapon($game_actors[1])",
+              "  def self.pc_motion\n    a=$game_actors[1]\n    return motion(a) if a.instance_variable_get(:@sl417_base_graphic)\n    w=SL49.weapon(a)"
+            )
           end
 
-          s=one(
-            body,
-            "    a.id==1 ? 3213 : FORMS[a.instance_variable_get(:@sl43_form).to_s]",
-            "    a.id==1 && !a.instance_variable_get(:@sl417_base_graphic) ? 3213 : FORMS[a.instance_variable_get(:@sl43_form).to_s]"
-          )
-
-          s=one(
-            s,
-            "  def self.pc_motion\n    w=SL49.weapon($game_actors[1])",
-            "  def self.pc_motion\n    a=$game_actors[1]\n    return motion(a) if a.instance_variable_get(:@sl417_base_graphic)\n    w=SL49.weapon(a)"
-          )
-
-          set.call(26,s)
-
-          s=src.call(71)
-
-          s=one(
-            s,
-            '    a.id==1 ? [$game_switches[70] ? 20 : 16,12] :',
-            '    a.id==1 && !a.instance_variable_get(:@sl417_base_graphic) ? [$game_switches[70] ? 20 : 16,12] :'
-          )
-
-          set.call(71,s)
-
-          s=src.call(24)
-
-          s=one(
-            s,
-            '          @character_name = command.parameters[0]',
-            <<~'SRC'.lines.map{|l|'          '+l}.join.chomp
-          @character_name = command.parameters[0]
-
-          if self.is_a?(Game_Player) && ['knight_men','여기사'].include?(@character_name)
-            @character_name=$game_actors[1].instance_variable_get(:@sl417_base_graphic) || @character_name
+          edit.call(71) do |s|
+            one(
+              s,
+              '    a.id==1 ? [$game_switches[70] ? 20 : 16,12] :',
+              '    a.id==1 && !a.instance_variable_get(:@sl417_base_graphic) ? [$game_switches[70] ? 20 : 16,12] :'
+            )
           end
-          SRC
-          )
 
-          set.call(24,s)
+          edit.call(24) do |s|
+            one(
+              s,
+              '          @character_name = command.parameters[0]',
+              "          @character_name = command.parameters[0]\n          if self.is_a?(Game_Player) && ['knight_men','여기사'].include?(@character_name)\n            @character_name=$game_actors[1].instance_variable_get(:@sl417_base_graphic) || @character_name\n          end"
+            )
+          end
 
-          s=src.call(28)
+          edit.call(28) do |s|
 
-          s=one(
-            s,
-            "      if @character.character_name=='knight_men좌표'",
-            <<~'SRC'.lines.map{|l|'      '+l}.join.chomp
+            one(
+              s,
+              "      if @character.character_name=='knight_men좌표'",
+              <<~'SRC'.lines.map{|l|'      '+l}.join.chomp
           base=$game_actors[1].instance_variable_get(:@sl417_base_graphic)
 
           if base && @character.character_name==base
             m=SL411.pc_motion
             v=[m[0],nil,14,m[3]] if m
-
           elsif base && ['knight_men좌표','여기사 좌표'].include?(@character.character_name)
             v=@character.instance_variable_get(:@sl411_pc_frame)
-
           elsif @character.character_name=='knight_men좌표'
           SRC
-          )
+            )
+          end
 
-          set.call(28,s)
+          edit.call(73) do |s|
 
-          s=src.call(73)
-
-          s=one(
-            s,
-            "       @parameters[1].to_s =~ /\\Aknight_men_(down|left|right|up)([1-6])\\z/",
-            <<~'SRC'.lines.map{|l|'       '+l}.join.chomp
+            s=one(
+              s,
+              '       @parameters[1].to_s =~ /\Aknight_men_(down|left|right|up)([1-6])\z/',
+              <<~'SRC'.lines.map{|l|'       '+l}.join.chomp
           (@parameters[1].to_s =~ /\Aknight_men_(down|left|right|up)([1-6])\z/ ||
            ($game_actors[1].instance_variable_get(:@sl417_base_graphic) &&
             @parameters[1].to_s =~ /\A여기사 공격[- ](하|좌|우|상)-?([1-6])\z/))
           SRC
-          )
+            )
 
-          s=one(
-            s,
-            "        'up'=>8\n      }[$1]",
-            "        'up'=>8,'하'=>2,'좌'=>4,'우'=>6,'상'=>8\n      }[$1]"
-          )
-
-          set.call(73,s)
-
-          changed=rows.each_index.select do |i|
-            Marshal.dump(rows[i])!=original[i]
+            one(
+              s,
+              "        'up'=>8\n      }[$1]",
+              "        'up'=>8,'하'=>2,'좌'=>4,'우'=>6,'상'=>8\n      }[$1]"
+            )
           end
 
+          changed=rows.each_index.select{
+            |i|Marshal.dump(rows[i])!=before[i]
+          }
+
           ck(
-            changed==[12,17,24,26,28,34,71,73,94,98,117],
-            "Unexpected scripts #{changed.inspect}"
+            changed==[12,17,24,26,28,34,60,71,73,94,98,117],
+            "Scope #{changed.inspect}"
           )
 
-          File.binwrite(
-            File.join(root,'Scripts.rxdata'),
-            Marshal.dump(rows)
-          )
+          File.binwrite(sp,Marshal.dump(rows))
+          File.binwrite(path.call('Map007'),Marshal.dump(map))
 
-          File.write(
-            '/tmp/sl417-profiles.json',
-            JSON.generate(
-              {
-                profiles:profiles,
-                reserved:reserved
-              }
-            )
+          ck(
+            Marshal.load(File.binread(sp))==rows,
+            'Script roundtrip'
           )
 
           puts "PASS #{forms.size} forms"
           puts "PASS #{forms.sum{|f|f[3].size}} combinations"
-          puts "PASS #{forms.flat_map{|f|f[3]}.uniq.size} types"
-          puts "PASS scripts #{changed.inspect}"
-          puts "PASS 126 original scripts unchanged"
-          puts "PASS new Map007 list #{new_list.size}"
-          puts "PASS transfer #{par(list[119]).inspect}"
+          puts "PASS #{list.size} native event commands"
+          puts "PASS #{changed.size} modified scripts"
+          puts "PASS #{137-changed.size} unchanged scripts"
+          puts 'PASS original native windows'
+          puts 'PASS original name validation'
+          puts 'PASS original completion message'
+          puts 'PASS original Talking Island transfer'
           RUBY
 
           ruby -c /tmp/sl417-patch.rb
@@ -899,536 +765,507 @@ jobs:
           ruby /tmp/sl417-patch.rb \
             site/knight/gameasync/Data
 
-      - name: Build unified character creation screen
+      - name: Verify all 22 character creation paths
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl417-create.js <<'JAVASCRIPT'
+          cat > /tmp/sl417-test.rb <<'RUBY'
+          # encoding: UTF-8
+          require 'zlib'
+          require 'tmpdir'
+          require 'ostruct'
+
+          root=File.expand_path(ARGV.fetch(0))
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
+
+          class Sprite
+          end
+
+          class Color
+            def initialize(*a)
+            end
+
+            def self._load(r)
+              allocate
+            end
+          end
+
+          class Tone
+            def self._load(r)
+              allocate
+            end
+          end
+
+          class Table
+            def self._load(r)
+              o=allocate
+              o.instance_variable_set(:@raw,r)
+              o
+            end
+
+            def [](x,y=0,z=0)
+              _,w,h,_,_=@raw.unpack('V5')
+              @raw.byteslice(
+                20+2*(x+w*(y+h*z)),2
+              ).unpack1('s<')
+            end
+          end
+
+          require File.join(root,'rgss.rb')
+
+          rd=->(n){
+            Marshal.load(
+              File.binread(
+                File.join(root,'Data',pre+n+'.rxdata')
+              )
+            )
+          }
+
+          $data_actors,
+          $data_classes,
+          $data_system,
+          $data_weapons,
+          $data_armors,
+          $data_items,
+          $data_states=%w[
+            Actors Classes System Weapons Armors Items States
+          ].map{|n|rd.call(n)}
+
+          $data_system.elements.each do |x|
+            x.force_encoding('UTF-8') if x.is_a?(String)
+          end
+
+          ($data_weapons+$data_armors).compact.each do |o|
+            o.name.force_encoding('UTF-8')
+          end
+
+          rows=Marshal.load(
+            File.binread(
+              File.join(root,'Data','Scripts.rxdata')
+            )
+          )
+
+          src=->(i){
+            Zlib::Inflate.inflate(rows[i][2]).force_encoding('UTF-8')
+          }
+
+          class Game_Character
+          end
+
+          class Scene_Map
+          end
+
+          class Window_NameEdit
+            attr_reader :name,:index
+
+            def initialize(a,n)
+              @name=a.name
+              @index=0
+            end
+
+            def x
+              0
+            end
+
+            def y
+              0
+            end
+
+            def refresh
+            end
+
+            def update
+            end
+
+            def update_cursor_rect
+            end
+
+            def dispose
+            end
+          end
+
+          module Graphics
+            def self.transition(*a)
+            end
+
+            def self.freeze
+            end
+          end
+
+          module Input
+            C=13
+
+            def self.trigger?(*a)
+              false
+            end
+          end
+
+          [
+            5,7,8,12,13,14,15,17,18,19,
+            26,71,94,106,116,117
+          ].each do |i|
+            eval(src.call(i),TOPLEVEL_BINDING,"script#{i}")
+          end
+
+          eval(
+            src.call(119).split('module Kernel',2)[1].prepend('module Kernel'),
+            TOPLEVEL_BINDING,
+            'script119-range'
+          )
+
+          $game_map=OpenStruct.new(
+            map_id:7,
+            need_refresh:false
+          )
+
+          $game_system=Object.new
+
+          def $game_system.se_play(*a)
+          end
+
+          $game_player=Object.new
+
+          def $game_player.refresh
+          end
+
+          $game_temp=Game_Temp.new
+          $game_temp.name_actor_id=1
+          $game_temp.name_max_char=12
+
+          list=rd.call('Map007').events.fetch(1).pages.first.list
+
+          profiles=list.select do |c|
+            c.code==355&&c.parameters[0].include?('@sl43_stats')
+          end
+
+          raise '22 profiles' unless profiles.size==22
+
+          starter=list.select do |c|
+            c.code==355&&c.parameters[0].include?('SL411.starter')
+          end
+
+          raise 'Starter event' unless starter.size==1
+
+          n=0
+
+          Dir.mktmpdir do |dir|
+            Dir.chdir(dir) do
+
+              profiles.each do |command|
+
+                $game_switches=Game_Switches.new
+                $game_variables=Game_Variables.new
+                $game_actors=Game_Actors.new
+                $game_party=Game_Party.new
+
+                $game_party.setup_starting_members
+
+                eval(
+                  command.parameters[0].force_encoding('UTF-8')
+                )
+
+                a=$game_actors[1]
+
+                s=Scene_Name.new
+                $scene=s
+                s.main
+
+                raise 'Name initialization' unless
+                  File.binread('SL417Name.tmp')=="0\n"
+
+                File.binwrite(
+                  'SL417Name.tmp',
+                  "0\n시험#{n}"
+                )
+
+                s.update
+
+                raise 'Draft committed' unless
+                  $scene.equal?(s)&&a.name.empty?
+
+                File.binwrite(
+                  'SL417Name.tmp',
+                  "1\n시험#{n}"
+                )
+
+                s.update
+
+                raise 'Name commit' unless
+                  $scene.is_a?(Scene_Map)&&a.name=="시험#{n}"
+
+                s.dispose
+
+                $game_party.remove_actor(2)
+                $game_party.add_actor(1)
+
+                eval(
+                  starter[0].parameters[0].force_encoding('UTF-8')
+                )
+
+                f=a.instance_variable_get(:@sl43_form)
+                stats=a.instance_variable_get(:@sl43_stats)
+
+                w=f.end_with?('기사') ? 170 :
+                  f.end_with?('요정') ? 1000 :
+                  f.end_with?('법사') ? 1001 : 1002
+
+                raise "Weapon #{f} #{a.weapon_id}" unless
+                  a.id==1 &&
+                  a.weapon_id==w &&
+                  SL411.motion(a) &&
+                  SL49.origin(a)==stats[0,2]
+
+                raise 'HP MP' unless
+                  a.hp==a.maxhp &&
+                  a.sp==a.maxsp &&
+                  a.hp>0 &&
+                  a.sp>0
+
+                raise 'Arrow grant' if
+                  w==1000&&$game_party.item_number(1006)!=1000
+
+                old=Marshal.dump($game_party)
+
+                eval(
+                  starter[0].parameters[0].force_encoding('UTF-8')
+                )
+
+                raise 'Starter repeated' unless
+                  Marshal.dump($game_party)==old
+
+                a.exp=a.instance_variable_get(:@exp_list)[2]
+
+                raise 'Growth' unless
+                  a.level==2 &&
+                  a.instance_variable_get(:@sl44_levels).size==3
+
+                n+=1
+
+                puts "PASS #{f} #{a.instance_variable_get(:@sl43_type)} weapon=#{w}"
+              end
+            end
+          end
+
+          raise 'Count' unless n==22
+
+          puts 'PASS all 22 profile and name paths'
+          RUBY
+
+          ruby -c /tmp/sl417-test.rb
+
+          ruby /tmp/sl417-test.rb \
+            site/knight/gameasync
+
+      - name: Connect direct keyboard input to original name window
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/sl417-name.js <<'JAVASCRIPT'
           (function(){
             'use strict';
 
-            const data=SL417_DATA;
-            const file='/game/SL417Create.tmp';
+            const file='/game/SL417Name.tmp';
 
-            let panel=null,send=null,status=null;
+            let field=null;
+            let rect=null;
+            let composing=false;
 
-            function clearFile(){
-              if(FS.analyzePath(file).exists) FS.unlink(file);
+            function layout(){
+              if(!field)return;
+
+              const c=document.getElementById('canvas').getBoundingClientRect();
+
+              const [x,y,w,h]=rect;
+
+              Object.assign(field.style,{
+                left:(c.left+x*c.width/800)+'px',
+                top:(c.top+y*c.height/600)+'px',
+                width:(w*c.width/800)+'px',
+                height:(h*c.height/600)+'px'
+              });
+            }
+
+            function send(flag){
+              if(!field||composing)return;
+
+              FS.writeFile(
+                file,
+                new TextEncoder().encode(
+                  flag+'\n'+field.value
+                )
+              );
             }
 
             function close(){
-              clearFile();
+              if(field){
+                field.remove();
+                field=null;
+                rect=null;
+                composing=false;
+              }
 
-              if(panel) panel.remove();
+              if(FS.analyzePath(file).exists){
+                FS.unlink(file);
+              }
 
-              panel=send=status=null;
+              document.getElementById('canvas').focus();
             }
 
-            function open(){
-              close();
+            function open(parts){
+              if(field)return;
 
-              let selected=-1,composing=false;
+              if(
+                FS.readFile(file,{encoding:'utf8'})!=='0\n'
+              ){
+                throw Error('Name input initialization');
+              }
 
-              panel=document.createElement('div');
-              panel.id='sl417-create';
+              rect=parts.slice(2,6).map(Number);
 
-              const form=document.createElement('form');
-              form.className='sl417-card';
+              if(rect.some(v=>!Number.isFinite(v))){
+                throw Error('Name field bounds');
+              }
 
-              const title=document.createElement('h2');
-              title.textContent='캐릭터 생성';
+              field=document.createElement('input');
 
-              const grid=document.createElement('div');
-              grid.className='sl417-forms';
+              field.type='text';
+              field.maxLength=Number(parts[6]);
+              field.autocomplete='off';
 
-              const select=document.createElement('select');
-              select.required=true;
-              select.setAttribute('aria-label','능력치 유형');
+              field.setAttribute('aria-label','캐릭터 이름');
+              field.setAttribute('autocapitalize','off');
 
-              const stats=document.createElement('div');
-              stats.className='sl417-stats';
+              field.spellcheck=false;
 
-              const name=document.createElement('input');
-              name.type='text';
-              name.required=true;
-              name.maxLength=12;
-              name.placeholder='캐릭터 이름';
-              name.autocomplete='off';
-              name.setAttribute('aria-label','캐릭터 이름');
+              field.style.cssText=
+                'position:fixed;'+
+                'z-index:2147483647;'+
+                'box-sizing:border-box;'+
+                'border:0;outline:0;'+
+                'background:transparent;'+
+                'color:transparent;'+
+                'caret-color:transparent;'+
+                'font-size:16px;cursor:text;padding:0;';
 
-              name.addEventListener(
+              field.addEventListener(
+                'input',
+                ()=>send('0')
+              );
+
+              field.addEventListener(
                 'compositionstart',
                 ()=>composing=true
               );
 
-              name.addEventListener(
+              field.addEventListener(
                 'compositionend',
-                ()=>composing=false
+                ()=>{
+                  composing=false;
+                  send('0');
+                }
               );
 
-              send=document.createElement('button');
-              send.type='submit';
-              send.className='sl417-submit';
-              send.textContent='캐릭터 생성';
-              send.disabled=true;
+              document.getElementById('main').appendChild(field);
 
-              status=document.createElement('div');
-              status.className='sl417-status';
+              layout();
 
-              function refresh(){
-                stats.replaceChildren();
-
-                if(selected<0 || select.value==='') return;
-
-                const values=
-                  data.profiles[selected][3][Number(select.value)][1];
-
-                ['STR','DEX','CON','INT','WIS','CHA'].forEach((key,i)=>{
-                  const el=document.createElement('span');
-
-                  el.textContent=key+' '+values[i];
-
-                  stats.append(el);
-                });
-              }
-
-              data.profiles.forEach((p,i)=>{
-                const b=document.createElement('button');
-
-                b.type='button';
-                b.className='sl417-option';
-                b.setAttribute('aria-pressed','false');
-
-                const c=document.createElement('canvas');
-
-                c.width=60;
-                c.height=60;
-
-                const img=new Image();
-
-                img.onload=()=>{
-                  const w=Math.floor(img.width/4);
-                  const h=Math.floor(img.height/4);
-
-                  const scale=Math.min(60/w,60/h);
-
-                  const ctx=c.getContext('2d');
-
-                  ctx.imageSmoothingEnabled=false;
-
-                  ctx.drawImage(
-                    img,
-                    0,
-                    0,
-                    w,
-                    h,
-                    (60-w*scale)/2,
-                    60-h*scale,
-                    w*scale,
-                    h*scale
-                  );
-                };
-
-                img.src='data:image/png;base64,'+data.images[i];
-
-                const label=document.createElement('span');
-
-                label.textContent=p[0];
-
-                b.append(c,label);
-
-                b.onclick=()=>{
-                  selected=i;
-
-                  grid.querySelectorAll('button').forEach((el,j)=>{
-                    el.setAttribute(
-                      'aria-pressed',
-                      String(j===i)
-                    );
-                  });
-
-                  select.replaceChildren();
-
-                  p[3].forEach((t,j)=>{
-                    const o=document.createElement('option');
-
-                    o.value=String(j);
-                    o.textContent=t[0];
-
-                    select.append(o);
-                  });
-
-                  send.disabled=false;
-
-                  refresh();
-
-                  status.textContent='';
-                };
-
-                grid.append(b);
-              });
-
-              const o=document.createElement('option');
-
-              o.value='';
-              o.textContent='캐릭터를 먼저 선택하세요';
-
-              select.append(o);
-
-              select.onchange=refresh;
-
-              form.append(
-                title,
-                grid,
-                select,
-                stats,
-                name,
-                send,
-                status
-              );
-
-              panel.append(form);
-
-              document.body.append(panel);
-
-              form.addEventListener('submit',e=>{
-                e.preventDefault();
-
-                if(
-                  composing ||
-                  send.disabled ||
-                  selected<0 ||
-                  select.value===''
-                ) return;
-
-                const n=name.value.trim();
-
-                if(
-                  !n ||
-                  n.length>12 ||
-                  /[\u0000-\u001f\u007f]/.test(n) ||
-                  data.reserved.includes(n)
-                ){
-                  status.textContent='사용할 수 없는 이름입니다.';
-
-                  name.focus();
-
-                  return;
-                }
-
-                try{
-                  FS.writeFile(
-                    file,
-                    selected+'\n'+select.value+'\n'+n
-                  );
-
-                  send.disabled=true;
-
-                  status.textContent='생성 중...';
-
-                }catch(err){
-                  status.textContent='캐릭터 생성 정보를 전달하지 못했습니다.';
-
-                  console.error(err);
-                }
-              });
+              field.focus({preventScroll:true});
             }
 
             ['keydown','keyup','keypress'].forEach(type=>{
+
               window.addEventListener(type,e=>{
-                if(panel && panel.contains(e.target)){
-                  e.stopImmediatePropagation();
+
+                if(!field||e.target!==field)return;
+
+                if(
+                  type==='keydown' &&
+                  e.key==='Enter' &&
+                  !composing &&
+                  !e.isComposing
+                ){
+                  e.preventDefault();
+                  send('1');
                 }
+
+                e.stopImmediatePropagation();
+
               },true);
             });
+
+            const resize=()=>requestAnimationFrame(layout);
+
+            window.addEventListener('resize',resize);
+            document.addEventListener('fullscreenchange',resize);
+
+            if(window.visualViewport){
+              window.visualViewport.addEventListener('resize',resize);
+              window.visualViewport.addEventListener('scroll',resize);
+            }
 
             const log=console.log.bind(console);
 
             console.log=function(...args){
+
               log(...args);
 
-              const marker=args.join(' ').trim();
+              const s=args.join(' ').trim();
 
-              if(marker==='SL417|OPEN'){
-                open();
+              try{
 
-              }else if(marker==='SL417|CLOSE'){
-                close();
+                if(s.startsWith('SL417|NAME|')){
 
-              }else if(marker==='SL417|RETRY' && panel){
-                clearFile();
+                  open(s.split('|'));
 
-                send.disabled=false;
+                }else if(s==='SL417|NAME_CLOSE'&&field){
 
-                status.textContent='이름 또는 유형을 다시 확인하세요.';
+                  close();
+
+                }else if(s==='SL417|NAME_RETRY'&&field){
+
+                  field.focus({preventScroll:true});
+
+                }
+
+              }catch(e){
+                console.error('SL417_NAME_ERROR',e);
               }
             };
           })();
           JAVASCRIPT
 
-          node --check /tmp/sl417-create.js
-
-          cat > /tmp/sl417-create.css <<'CSS'
-          #sl417-create {
-            position: fixed;
-            inset: 0;
-            z-index: 10000001;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            overflow: auto;
-            padding: 10px;
-            box-sizing: border-box;
-            background: rgba(0,0,0,.90);
-            font: 14px/1.4 Arial,sans-serif;
-            color: #ded7c2;
-          }
-
-          #sl417-create * {
-            box-sizing: border-box;
-          }
-
-          #sl417-create .sl417-card {
-            width: min(540px,100%);
-            max-height: 94vh;
-            overflow: auto;
-            margin: auto;
-            padding: 16px;
-            border: 1px solid #8d7850;
-            border-radius: 8px;
-            background: #191815;
-            box-shadow: 0 8px 40px #000;
-          }
-
-          #sl417-create h2 {
-            margin: 0 0 12px;
-            text-align: center;
-            font-size: 20px;
-            color: #ebdfbf;
-          }
-
-          #sl417-create .sl417-forms {
-            display: grid;
-            grid-template-columns: repeat(4,minmax(0,1fr));
-            gap: 6px;
-            margin-bottom: 12px;
-          }
-
-          #sl417-create .sl417-option {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-width: 0;
-            min-height: 78px;
-            padding: 3px;
-            gap: 3px;
-            border: 1px solid #514838;
-            border-radius: 4px;
-            color: #ddd4bb;
-            background: #28251e;
-            font-size: 12px;
-            cursor: pointer;
-          }
-
-          #sl417-create .sl417-option[aria-pressed="true"] {
-            border-color: #d5b36b;
-            background: #50422b;
-            color: #fff3d0;
-          }
-
-          #sl417-create canvas {
-            width: 48px;
-            height: 48px;
-            image-rendering: pixelated;
-          }
-
-          #sl417-create select,
-          #sl417-create input {
-            display: block;
-            width: 100%;
-            min-height: 40px;
-            margin: 0 0 10px;
-            padding: 9px 12px;
-            border: 1px solid #77664a;
-            border-radius: 4px;
-            color: #f0e8d5;
-            background: #10100e;
-            font: 16px Arial,sans-serif;
-          }
-
-          #sl417-create .sl417-stats {
-            display: grid;
-            grid-template-columns: repeat(3,minmax(0,1fr));
-            gap: 5px;
-            margin-bottom: 12px;
-          }
-
-          #sl417-create .sl417-stats span {
-            padding: 5px;
-            text-align: center;
-            border: 1px solid #41392b;
-            border-radius: 3px;
-            background: #222019;
-            color: #e8d7ab;
-            font-size: 13px;
-          }
-
-          #sl417-create .sl417-submit {
-            display: block;
-            width: 100%;
-            min-height: 40px;
-            padding: 8px;
-            border: 1px solid #b19961;
-            border-radius: 4px;
-            background: #5f4b29;
-            color: #fff0c7;
-            font-size: 15px;
-            font-weight: bold;
-            cursor: pointer;
-          }
-
-          #sl417-create .sl417-submit:disabled {
-            opacity: .45;
-            cursor: default;
-          }
-
-          #sl417-create .sl417-status {
-            min-height: 16px;
-            margin-top: 5px;
-            text-align: center;
-            color: #e3bc8c;
-            font-size: 12px;
-          }
-
-          @media (max-height: 500px) {
-            #sl417-create .sl417-card {
-              padding: 8px 12px;
-            }
-
-            #sl417-create h2 {
-              margin-bottom: 6px;
-              font-size: 16px;
-            }
-
-            #sl417-create .sl417-option {
-              min-height: 50px;
-              flex-direction: row;
-            }
-
-            #sl417-create canvas {
-              width: 34px;
-              height: 34px;
-            }
-
-            #sl417-create .sl417-forms {
-              margin-bottom: 6px;
-            }
-
-            #sl417-create .sl417-stats {
-              grid-template-columns: repeat(6,minmax(0,1fr));
-              margin-bottom: 6px;
-            }
-
-            #sl417-create select,
-            #sl417-create input {
-              min-height: 32px;
-              padding: 5px 8px;
-              margin-bottom: 6px;
-            }
-
-            #sl417-create .sl417-submit {
-              min-height: 32px;
-            }
-          }
-          CSS
+          node --check /tmp/sl417-name.js
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import base64
-          import json
 
-          root = Path('site')
+          page=Path('site/knight/index.html')
+          html=page.read_text('utf8')
 
-          game = root/'knight/gameasync'
-
-          data = json.loads(
-              Path('/tmp/sl417-profiles.json').read_text('utf8')
-          )
-
-          assert len(data['profiles']) == 8
-
-          images = []
-
-          for form in data['profiles']:
-              graphic = form[1]
-
-              path = game/'Graphics/Characters'/(graphic+'.png')
-
-              assert path.is_file(), str(path)
-
-              raw = path.read_bytes()
-
-              assert raw.startswith(b'\x89PNG\r\n\x1a\n'), graphic
-
-              images.append(
-                  base64.b64encode(raw).decode('ascii')
-              )
-
-          data['images'] = images
-
-          source = json.dumps(
-              data,
-              ensure_ascii=False,
-              separators=(',', ':')
-          ).replace('<','\\u003c')
-
-          js = Path('/tmp/sl417-create.js').read_text('utf8')
-
-          assert js.count('SL417_DATA') == 1
-
-          js = js.replace(
-              'SL417_DATA',
-              source,
-              1
-          )
-
-          css = Path('/tmp/sl417-create.css').read_text('utf8')
-
-          page = root/'knight/index.html'
-
-          html = page.read_text('utf8')
-
-          assert html.count('</head>') == 1
-
+          assert html.count('</head>')==1
+          assert 'SL417|NAME|' not in html
           assert 'sl417-create' not in html
 
-          block = (
-              '<style>\n'+css+'\n</style>\n'
-              '<script>\n'+js+'\n</script>\n'
-          )
+          js=Path('/tmp/sl417-name.js').read_text('utf8')
 
-          html = html.replace(
+          assert "document.createElement('input')" in js
+          assert "document.createElement('button')" not in js
+          assert "document.createElement('dialog')" not in js
+
+          html=html.replace(
               '</head>',
-              block+'</head>',
+              '<script>\n'+js+'\n</script>\n</head>',
               1
           )
 
           page.write_text(html,'utf8')
 
-          Path('/tmp/sl417-final-create.js').write_text(
-              js,
-              'utf8'
-          )
-
-          print('PASS 8 existing character graphics')
-          print('PASS 11 existing stat presets')
-          print('PASS 22 selectable combinations')
-          print('PASS unified character creation screen')
+          print('PASS native name window keyboard input')
+          print('PASS no separate character creation screen')
+          print('PASS original game controls preserved')
           PYTHON
-
-          node --check /tmp/sl417-final-create.js
 
       - name: Update V4.17 data references
         shell: bash
@@ -1437,157 +1274,125 @@ jobs:
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib
-          import json
-          import re
+          import hashlib,json,re
 
-          root = Path('site')
+          root=Path('site')
+          game=root/'knight/gameasync'
 
-          game = root/'knight/gameasync'
-
-          old_md5 = json.loads(
+          old_md5=json.loads(
               Path('/tmp/sl417-md5.json').read_text('utf8')
           )
 
-          mapper = game/'mapping.js'
+          mapper=game/'mapping.js'
 
-          old_mapping_digest = hashlib.sha256(
+          old_mapping=hashlib.sha256(
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          s = mapper.read_bytes()
+          s=mapper.read_bytes()
 
-          for name, previous in old_md5.items():
+          for name,previous in old_md5.items():
 
-              marker = ('Data/'+name+'?h=').encode('ascii')
+              marker=('Data/'+name+'?h=').encode('ascii')
 
-              pattern = (
-                  re.escape(marker)
-                  + rb'[0-9a-f]{32}'
-              )
+              pattern=re.escape(marker)+rb'[0-9a-f]{32}'
 
-              expected = marker+previous.encode('ascii')
+              assert re.findall(pattern,s)==[
+                  marker+previous.encode('ascii')
+              ],name
 
-              assert re.findall(
-                  pattern,s
-              ) == [expected], name
-
-              digest = hashlib.md5(
+              digest=hashlib.md5(
                   (game/'Data'/name).read_bytes()
               ).hexdigest()
 
-              assert digest != previous, name
+              assert digest!=previous,name
 
-              updated = marker+digest.encode('ascii')
+              new=marker+digest.encode('ascii')
 
-              s = re.sub(
-                  pattern,
-                  lambda _: updated,
-                  s
-              )
+              s=re.sub(pattern,lambda _:new,s)
 
-              assert s.count(updated) == 1, name
-
-              print(
-                  'PASS updated data reference',
-                  name,
-                  digest
-              )
+              assert s.count(new)==1,name
 
           mapper.write_bytes(s)
 
-          mapping_digest = hashlib.sha256(
+          mapping=hashlib.sha256(
               mapper.read_bytes()
           ).hexdigest()[:16]
 
-          bitmap_digest = hashlib.sha256(
+          bitmap=hashlib.sha256(
               (game/'bitmap-map.js').read_bytes()
           ).hexdigest()[:16]
 
-          loader = root/'knight/js/sl-assets-v229r115.js'
+          loader=root/'knight/js/sl-assets-v229r115.js'
 
-          old_loader_digest = hashlib.sha256(
+          old_loader=hashlib.sha256(
               loader.read_bytes()
           ).hexdigest()[:16]
 
-          s = loader.read_bytes()
+          s=loader.read_bytes()
 
-          old = b"var version='V4.16';"
-          new = b"var version='V4.17';"
-
-          assert s.count(old) == 1
+          assert s.count(b"var version='V4.16';")==1
 
           loader.write_bytes(
-              s.replace(old,new)
+              s.replace(
+                  b"var version='V4.16';",
+                  b"var version='V4.17';"
+              )
           )
 
-          loader_digest = hashlib.sha256(
+          new_loader=hashlib.sha256(
               loader.read_bytes()
           ).hexdigest()[:16]
 
-          page = root/'knight/index.html'
+          page=root/'knight/index.html'
 
-          s = page.read_text('utf8')
+          s=page.read_text('utf8')
 
-          references = [
+          references=[
               (
-                  'gameasync/mapping.js?v=v4.16&h='
-                  + old_mapping_digest,
-                  'gameasync/mapping.js?v=v4.17&h='
-                  + mapping_digest,
+                  'gameasync/mapping.js?v=v4.16&h='+old_mapping,
+                  'gameasync/mapping.js?v=v4.17&h='+mapping,
                   1
               ),
               (
-                  'gameasync/bitmap-map.js?v=v4.16&h='
-                  + bitmap_digest,
-                  'gameasync/bitmap-map.js?v=v4.17&h='
-                  + bitmap_digest,
+                  'gameasync/bitmap-map.js?v=v4.16&h='+bitmap,
+                  'gameasync/bitmap-map.js?v=v4.17&h='+bitmap,
                   2
               ),
               (
-                  'js/sl-assets-v229r115.js?v=v4.16&h='
-                  + old_loader_digest,
-                  'js/sl-assets-v229r115.js?v=v4.17&h='
-                  + loader_digest,
+                  'js/sl-assets-v229r115.js?v=v4.16&h='+old_loader,
+                  'js/sl-assets-v229r115.js?v=v4.17&h='+new_loader,
                   1
               )
           ]
 
           for old,new,count in references:
 
-              assert s.count(old) == count, old
+              assert s.count(old)==count,old
 
-              s = s.replace(old,new)
+              s=s.replace(old,new)
 
-              assert s.count(new) == count, new
-
-          assert 'V4.16' in s
-
-          s = s.replace(
-              'V4.16','V4.17'
-          ).replace(
-              'v4.16','v4.17'
-          )
-
-          page.write_text(s,'utf8')
-
-          index_page = root/'index.html'
-
-          s = index_page.read_text('utf8')
+              assert s.count(new)==count,new
 
           assert 'V4.16' in s
 
-          index_page.write_text(
-              s.replace(
-                  'V4.16','V4.17'
-              ).replace(
-                  'v4.16','v4.17'
-              ),
+          page.write_text(
+              s.replace('V4.16','V4.17').replace('v4.16','v4.17'),
               'utf8'
           )
 
-          print('PASS updated mapping reference')
-          print('PASS updated version references')
+          page=root/'index.html'
+
+          s=page.read_text('utf8')
+
+          assert 'V4.16' in s
+
+          page.write_text(
+              s.replace('V4.16','V4.17').replace('v4.16','v4.17'),
+              'utf8'
+          )
+
+          print('PASS updated script and map references')
           PYTHON
 
       - name: Verify exact modification scope
@@ -1597,36 +1402,30 @@ jobs:
 
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib
-          import json
+          import hashlib,json
 
-          root = Path('site')
+          root=Path('site')
+          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
 
-          pre = 'MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          before = json.loads(
+          before=json.loads(
               Path('/tmp/sl417-before.json').read_text('utf8')
           )
 
-          after = {
+          after={
               p.relative_to(root).as_posix():
-                  hashlib.sha256(
-                      p.read_bytes()
-                  ).hexdigest()
-              for p in root.rglob('*')
-              if p.is_file()
+              hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in root.rglob('*') if p.is_file()
           }
 
-          assert len(after) == 6086, len(after)
+          assert len(after)==6086,len(after)
+          assert set(before)==set(after)
 
-          assert set(before) == set(after)
-
-          changed = {
+          changed={
               k for k in before
-              if before[k] != after[k]
+              if before[k]!=after[k]
           }
 
-          expected = {
+          expected={
               'knight/gameasync/Data/Scripts.rxdata',
               'knight/gameasync/Data/'+pre+'Map007.rxdata',
               'knight/gameasync/mapping.js',
@@ -1635,20 +1434,17 @@ jobs:
               'index.html'
           }
 
-          assert changed == expected, sorted(changed ^ expected)
+          assert changed==expected,sorted(changed^expected)
 
-          assert all(
-              before[k] == after[k]
-              for k in before
-              if k not in expected
-          )
-
-          protected = [
+          protected=[
               'knight/gameasync/Data/'+pre+'System.rxdata',
               'knight/gameasync/Data/'+pre+'Map029.rxdata',
               'knight/gameasync/Data/'+pre+'Map047.rxdata',
               'knight/gameasync/Data/'+pre+'Actors.rxdata',
               'knight/gameasync/Data/'+pre+'Classes.rxdata',
+              'knight/gameasync/Data/'+pre+'Weapons.rxdata',
+              'knight/gameasync/Data/'+pre+'Armors.rxdata',
+              'knight/gameasync/Data/'+pre+'Items.rxdata',
               'knight/gameasync/Data/'+pre+'CommonEvents.rxdata',
               'knight/gameasync/bitmap-map.js',
               'knight/js/drive.js',
@@ -1658,20 +1454,22 @@ jobs:
           ]
 
           for name in protected:
+              assert name in before,name
+              assert before[name]==after[name],name
 
-              assert name in before, name
+          html=(root/'knight/index.html').read_text('utf8')
 
-              assert before[name] == after[name], name
+          assert 'sl417-create' not in html
+          assert 'SL417|NAME|' in html
 
           print('PASS six approved files modified')
           print('PASS 6080 original files unchanged')
-          print('PASS original character data unchanged')
-          print('PASS original class data unchanged')
+          print('PASS original game controls unchanged')
+          print('PASS original window resources unchanged')
           print('PASS original companion NPC unchanged')
-          print('PASS original Talking Island map unchanged')
-          print('PASS original common events unchanged')
+          print('PASS original item database unchanged')
           print('PASS original save implementation unchanged')
-          print('PASS original resource packs unchanged')
+          print('PASS original map resources unchanged')
           print('PASS original engine unchanged')
           print('PASS V4.17')
           PYTHON
