@@ -33,17 +33,53 @@ jobs:
 
           BASE_SHA=9cab02b37866199fa1236481d1beb380ea3eccfb
 
-          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/build-slknight-web.yml/runs" -f head_sha="$BASE_SHA" -f status=success -f per_page=100 > /tmp/sl417-runs.json
+          gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/build-slknight-web.yml/runs" \
+            -f head_sha="$BASE_SHA" \
+            -f status=success \
+            -f per_page=100 \
+            > /tmp/sl417-runs.json
 
-          RUN_ID=$(jq -er --arg sha "$BASE_SHA" '[.workflow_runs[] | select(.head_sha==$sha and .head_branch=="main" and .status=="completed" and .conclusion=="success")] | sort_by(.created_at) | last | .id // empty' /tmp/sl417-runs.json)
+          RUN_ID=$(jq -er \
+            --arg sha "$BASE_SHA" \
+            '[.workflow_runs[]
+              | select(
+                  .head_sha==$sha
+                  and .head_branch=="main"
+                  and .status=="completed"
+                  and .conclusion=="success"
+                )]
+              | sort_by(.created_at)
+              | last
+              | .id // empty' \
+            /tmp/sl417-runs.json)
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" > /tmp/sl417-jobs.json
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            > /tmp/sl417-jobs.json
 
-          jq -e '[.jobs[] | select(.name=="deploy" and .conclusion=="success")] | length==1' /tmp/sl417-jobs.json
+          jq -e \
+            '[.jobs[]
+              | select(
+                  .name=="deploy"
+                  and .conclusion=="success"
+                )]
+              | length==1' \
+            /tmp/sl417-jobs.json
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" > /tmp/sl417-artifacts.json
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+            > /tmp/sl417-artifacts.json
 
-          jq -e '[.artifacts[] | select(.name=="github-pages" and .expired==false and .size_in_bytes>0)] | length==1' /tmp/sl417-artifacts.json
+          jq -e \
+            '[.artifacts[]
+              | select(
+                  .name=="github-pages"
+                  and .expired==false
+                  and .size_in_bytes>0
+                )]
+              | length==1' \
+            /tmp/sl417-artifacts.json
 
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
@@ -56,357 +92,140 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
+      - name: Restore verified V4.17 source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_SHA=e2c435b252ae9b2ab0e69847bc03516af4fdbcb6
+          BLOB_SHA=efedca31f383468662c111a88296b2b2437f6702
+
+          gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/build-slknight-web.yml" \
+            -f ref="$SOURCE_SHA" \
+            --jq '.content' \
+            | base64 --decode \
+            > /tmp/sl417-previous.yml
+
+          test "$(git hash-object /tmp/sl417-previous.yml)" = "$BLOB_SHA"
+
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          src=Path('/tmp/sl417-previous.yml').read_text('utf8')
+
+          def body(name):
+              marker=(
+                  '      - name: '+name+'\n'
+                  '        shell: bash\n'
+                  '        run: |\n'
+              )
+
+              assert src.count(marker)==1,name
+
+              lines=src.split(marker,1)[1].split('\n')
+              out=[]
+
+              for line in lines:
+                  if line.startswith('          '):
+                      out.append(line[10:])
+                  elif line=='':
+                      out.append(line)
+                  else:
+                      break
+
+              return '\n'.join(out)+'\n'
+
+          def heredoc(source,path,tag):
+              marker=f"cat > {path} <<'{tag}'\n"
+              end='\n'+tag+'\n'
+
+              assert source.count(marker)==1,path
+
+              text=source.split(marker,1)[1]
+
+              assert text.count(end)==1,path
+
+              return text.split(end,1)[0]+'\n'
+
+          patch=heredoc(
+              body('Rebuild single native character creation'),
+              '/tmp/sl417-patch.rb',
+              'RUBY'
+          )
+
+          test=heredoc(
+              body('Verify all 22 character creation paths'),
+              '/tmp/sl417-test.rb',
+              'RUBY'
+          )
+
+          assert patch.count(
+              'edit.call(94) do |s|\n'
+          )==1
+
+          assert patch.count(
+              "File.write(\n  '/tmp/sl417-ui.json',"
+          )==1
+
+          Path('/tmp/sl417-patch-original.rb').write_text(
+              patch,'utf8'
+          )
+
+          Path('/tmp/sl417-test-original.rb').write_text(
+              test,'utf8'
+          )
+
+          scripts={
+              '/tmp/sl417-verify-original.sh':
+                  'Verify original game',
+              '/tmp/sl417-mapping.sh':
+                  'Update V4.17 data references',
+              '/tmp/sl417-scope.sh':
+                  'Verify exact modification scope'
+          }
+
+          for path,name in scripts.items():
+              Path(path).write_text(
+                  body(name),'utf8'
+              )
+
+          bridge=body(
+              'Connect keyboard input to creation scene'
+          )
+
+          assert bridge.count('\nJAVASCRIPT\n')==1
+
+          Path('/tmp/sl417-install-name.sh').write_text(
+              bridge.split('\nJAVASCRIPT\n',1)[1],
+              'utf8'
+          )
+
+          print('PASS pinned V4.17 source')
+          print('PASS original non-UI code retained')
+          PYTHON
+
       - name: Verify original game
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s baseline/artifact.tar
-          mkdir -p site
-          tar -xf baseline/artifact.tar -C site
+          bash -euo pipefail \
+            /tmp/sl417-verify-original.sh
 
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import hashlib,json
-
-          root=Path('site')
-          game=root/'knight/gameasync'
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          before={
-              p.relative_to(root).as_posix():
-              hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
-
-          assert len(before)==6086,len(before)
-
-          for name in (
-              'System','Map007','Map047','Actors',
-              'Classes','Weapons','Armors','Items',
-              'States','CommonEvents'
-          ):
-              q=game/'Data'/(pre+name+'.rxdata')
-              assert q.is_file() and q.stat().st_size>4,name
-
-          assert (game/'Data/Scripts.rxdata').stat().st_size>100000
-
-          assert (root/'knight/js/sl-assets-v229r115.js').read_bytes().count(
-              b"var version='V4.16';"
-          )==1
-
-          for name in ('index.html','knight/index.html'):
-              assert b'V4.16' in (root/name).read_bytes(),name
-
-          names=['Scripts.rxdata',pre+'Map007.rxdata']
-
-          Path('/tmp/sl417-before.json').write_text(
-              json.dumps(before,sort_keys=True),'utf8'
-          )
-
-          Path('/tmp/sl417-md5.json').write_text(
-              json.dumps({
-                  n:hashlib.md5(
-                      (game/'Data'/n).read_bytes()
-                  ).hexdigest()
-                  for n in names
-              }),'utf8'
-          )
-
-          print('PASS final V4.16 baseline')
-          PYTHON
-
-      - name: Rebuild single native character creation
+      - name: Rebuild name-first creation screen
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl417-patch.rb <<'RUBY'
-          # encoding: UTF-8
-
-          require 'zlib'
-          require 'json'
-
-          module RPG
-            %w[Map MapInfo Tileset Event EventCommand MoveRoute MoveCommand AudioFile CommonEvent System Actor Class Weapon Armor Item Skill State].each{|n|const_set(n,::Class.new)}
-
-            Event.const_set(:Page,::Class.new)
-            Event::Page.const_set(:Condition,::Class.new)
-            Event::Page.const_set(:Graphic,::Class.new)
-            System.const_set(:Words,::Class.new)
-            System.const_set(:TestBattler,::Class.new)
-            self::Class.const_set(:Learning,::Class.new)
-          end
-
-          %w[Table Tone Color].each do |n|
-            Object.const_set(n,Class.new do
-              def self._load(raw)
-                o=allocate
-                o.instance_variable_set(:@raw,raw)
-                o
-              end
-
-              def _dump(depth)
-                @raw
-              end
-            end)
-          end
-
-          def iv(o,k);o.instance_variable_get(k);end
-          def utf(s);s.to_s.dup.force_encoding('UTF-8');end
-          def ck(v,m);raise m unless v;end
-          def code(c);iv(c,:@code);end
-          def par(c);iv(c,:@parameters);end
-
-          def emit(l,c,d,p=[])
-            x=RPG::EventCommand.new
-            {code:c,indent:d,parameters:p}.each{
-              |k,v|x.instance_variable_set("@#{k}",v)
-            }
-            l<<x
-          end
-
-          def one(s,a,b)
-            ck(s.scan(a).size==1,"Anchor: #{a.inspect[0,120]}")
-            s.sub(a){b}
-          end
-
-          root=ARGV.fetch(0)
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          path=->(n){File.join(root,pre+n+'.rxdata')}
-          read=->(n){Marshal.load(File.binread(path.call(n)))}
-
-          sys=read.call('System')
-          map=read.call('Map007')
-          island=read.call('Map047')
-
-          ck(
-            [:@start_map_id,:@start_x,:@start_y].map{
-              |k|iv(sys,k)
-            }==[7,9,6],
-            'V4.16 start'
-          )
-
-          recruit=iv(island,:@events).values.select{
-            |e|utf(iv(e,:@name))=='[ID고용사]'
-          }
-
-          ck(recruit.size==1,'Recruiter')
-
-          forms=iv(recruit.first,:@pages).map do |page|
-
-            pending=[]
-            found=[]
-
-            iv(page,:@list).each do |c|
-
-              next unless code(c)==355
-
-              s=utf(par(c)[0])
-
-              if m=s.match(/\A@sl43_type = ("(?:\\.|[^"\\])*"); @sl43_stats = (\[[0-9, ]+\])/)
-
-                pending<<[
-                  JSON.parse(m[1]),
-                  JSON.parse(m[2])
-                ]
-
-              elsif s.include?('@sl43_actor = Game_Actor.new(@sl43_slot)')
-
-                m=s.match(/@class_id,\$data_actors\[(\d+)\]\.class_id\).*?\.set_graphic\(("(?:\\.|[^"\\])*"),0,.*?@sl43_form,("(?:\\.|[^"\\])*")\)/)
-
-                ck(m&&!pending.empty?,'Recruiter profile')
-
-                found<<[
-                  JSON.parse(m[3]),
-                  JSON.parse(m[2]),
-                  m[1].to_i,
-                  pending
-                ]
-
-                pending=[]
-              end
-            end
-
-            ck(
-              pending.empty?&&found.size==8,
-              'Recruiter page'
-            )
-
-            found
-          end
-
-          ck(forms.uniq.size==1,'Recruiter pages disagree')
-
-          forms=forms.first
-
-          ck(
-            forms.map(&:first)==%w[
-              남기사 여기사 남요정 여요정
-              남법사 여법사 남다엘 여다엘
-            ],
-            'Form order'
-          )
-
-          ck(
-            forms.map{|f|f[3].size}==[2,2,3,3,3,3,3,3] &&
-            forms.flat_map{|f|f[3]}.uniq.size==11,
-            'Preset count'
-          )
-
-          ck(
-            forms.all?{|f|f[3].all?{|_,s|s.size==6&&s.sum==75}},
-            'Stats'
-          )
-
-          actors=read.call('Actors')
-          classes=read.call('Classes')
-
-          forms.each do |_,_,id,_|
-            ck(
-              actors[id]&&classes[iv(actors[id],:@class_id)],
-              'Class template'
-            )
-          end
-
-          sp=File.join(root,'Scripts.rxdata')
-          rows=Marshal.load(File.binread(sp))
-
-          ck(rows.size==137,'Scripts')
-
-          before=rows.map{|r|Marshal.dump(r)}
-
-          edit=->(i,&blk) do
-
-            raw=utf(Zlib::Inflate.inflate(rows.fetch(i)[2]))
-            s=raw.gsub("\r\n","\n")
-            n=blk.call(s)
-
-            ck(n!=s,"No change #{i}")
-
-            RubyVM::InstructionSequence.compile(n)
-
-            rows[i][2]=Zlib::Deflate.deflate(
-              raw.include?("\r\n") ? n.gsub("\n","\r\n") : n
-            )
-          end
-
-          es=iv(map,:@events)
-          e=es.fetch(1)
-          pg=iv(e,:@pages).fetch(0)
-          old=iv(pg,:@list)
-
-          ck(
-            iv(e,:@name)=='EV001' &&
-            iv(pg,:@trigger)==4 &&
-            old.size==121,
-            'Original EV001'
-          )
-
-          ck(
-            [3,4,13,14,40,44,45,74,75,76,77,78,79,80,81,89,97,104,105,106,119,120].map{|i|code(old[i])}==
-            [101,102,101,102,101,241,303,101,401,129,129,121,122,317,311,127,126,209,509,509,201,0],
-            'Original commands'
-          )
-
-          ck(
-            par(old[45])==[1,12] &&
-            par(old[119])[0,2]==[0,47],
-            'V4.16 transfer'
-          )
-
-          old_cmds=old.map{|c|Marshal.dump(c)}
-
-          other=es.reject{|k,_|k==1}.transform_values{
-            |v|Marshal.dump(v)
-          }
-
-          name_prompt=utf(par(old[40])[0])
-          name_error=utf(par(old[47])[0])
-
-          reserved=[46,51,56,61].map{
-            |i|utf(par(old[i])[3])
-          }
-
-          ck(reserved.uniq.size==4,'Reserved names')
-
-          profiles=[0,1].map do |sex|
-
-            forms.each_with_index.select{
-              |_,i|i%2==sex
-            }.flat_map do |(form,graphic,template,presets),i|
-
-              presets.map{
-                |kind,stats|[form,graphic,template,kind,stats,i%2]
-              }
-            end
-          end
-
-          ck(
-            profiles.map(&:size)==[11,11],
-            'Two complete columns'
-          )
-
-          ck(
-            profiles[0].map{|p|p[3]}==profiles[1].map{|p|p[3]},
-            'Paired types'
-          )
-
-          list=old[0,3]+old[44,2]+old[76,4]+old[82,7]+[old[97]]
-
-          route=Marshal.load(Marshal.dump(old[104]))
-
-          route.instance_variable_set(:@indent,0)
-
-          move=par(route)[1]
-          steps=iv(move,:@list)
-
-          ck(
-            steps.map{|c|code(c)}==[41,29,0],
-            'Original route'
-          )
-
-          steps.shift
-
-          step=Marshal.load(Marshal.dump(old[106]))
-
-          step.instance_variable_set(:@indent,0)
-
-          step.instance_variable_set(
-            :@parameters,[steps.first]
-          )
-
-          list.concat([route,step])
-          list.concat(old[109,12])
-
-          ck(
-            list.none?{|c|[101,102,401].include?(code(c))} &&
-            list.count{|c|code(c)==303}==1,
-            'One creation screen'
-          )
-
-          ck(
-            list[-2].equal?(old[119]) &&
-            old.map{|c|Marshal.dump(c)}==old_cmds,
-            'Original transfer'
-          )
-
-          pg.instance_variable_set(:@list,list)
-
-          ck(
-            es.reject{|k,_|k==1}.transform_values{
-              |v|Marshal.dump(v)
-            }==other,
-            'Other events changed'
-          )
-
+          cat > /tmp/sl417-scene-edit.rb <<'EDIT'
           edit.call(94) do |s|
-
             s=one(
               s,
               'class Scene_Name',
-              "class Scene_Name\n  SL417_PROFILES = #{profiles.inspect}\n  SL417_RESERVED = #{reserved.inspect}\n  SL417_TITLE = #{utf(par(old[13])[0]).inspect}"
+              "class Scene_Name\n  SL417_PROFILES = #{profiles.inspect}\n  SL417_RESERVED = #{reserved.inspect}"
             )
 
             s=one(
@@ -425,17 +244,18 @@ jobs:
             begin
 
               @sl417_col=0
+              @sl417_row=0
 
               SL417_PROFILES.each_with_index do |col,i|
 
                 labels=col.map do |p|
 
-                  kind=p[3]
+                  kind=p[3].dup
 
                   kind += '법사' if p[0].end_with?('법사')
                   kind += '다엘' if p[0].end_with?('다엘')
 
-                  p[0][0,1]+' '+kind
+                  kind
                 end
 
                 w=Window_Command.new(320,labels)
@@ -443,28 +263,66 @@ jobs:
                 @sl417_windows << w
 
                 w.x=80+i*320
-                w.y=64
+                w.y=112
                 w.opacity=0
                 w.back_opacity=0
                 w.contents_opacity=255
-                w.active=(i==0)
-                w.index=i==0 ? 0 : -1
+
+                w.active=false
+                w.index=-1
+
+                w.contents.font.name='NanumGothic'
+                w.contents.font.size=24
+
+                w.refresh
+                w.cursor_rect.empty
               end
 
               @sl417_header=Window_Help.new
 
               @sl417_header.x=80
-              @sl417_header.y=0
+              @sl417_header.y=64
               @sl417_header.opacity=0
               @sl417_header.back_opacity=0
               @sl417_header.contents_opacity=255
 
-              @sl417_header.set_text(SL417_TITLE,1)
+              @sl417_header.contents.font.name='NanumGothic'
+              @sl417_header.contents.font.size=24
+              @sl417_header.contents.font.color=@sl417_header.normal_color
 
-              @sl417_windows[0].draw_item(
-                0,
-                @sl417_windows[0].text_color(6)
+              @sl417_header.contents.draw_text(
+                4,0,300,32,'남자'
               )
+
+              @sl417_header.contents.draw_text(
+                324,0,280,32,'여자'
+              )
+
+              @sl417_name_display=Window_Help.new
+
+              @sl417_name_display.x=80
+              @sl417_name_display.y=8
+              @sl417_name_display.opacity=0
+              @sl417_name_display.back_opacity=0
+              @sl417_name_display.contents_opacity=255
+
+              @sl417_name_display.contents.font.name='NanumGothic'
+              @sl417_name_display.contents.font.size=24
+
+              @sl417_name_display.visible=false
+
+              @sl417_decision=Window_Help.new
+
+              @sl417_decision.x=80
+              @sl417_decision.y=496
+              @sl417_decision.opacity=0
+              @sl417_decision.back_opacity=0
+              @sl417_decision.contents_opacity=255
+
+              @sl417_decision.contents.font.name='NanumGothic'
+              @sl417_decision.contents.font.size=24
+
+              @sl417_decision.set_text('결정',1)
 
               File.open('SL417Name.tmp','wb'){
                 |f|f.write("0\n")
@@ -472,11 +330,11 @@ jobs:
 
               Graphics.transition
 
-              @sl417_phase=:waiting
+              @sl417_phase=:name
 
               puts([
                 'SL417|NAME',
-                80,432,640,168,
+                80,0,640,80,
                 $game_temp.name_max_char,
                 File.expand_path('SL417Name.tmp')
               ].join('|'))
@@ -507,7 +365,11 @@ jobs:
 
             @sl417_windows.each{|w|w.dispose}
 
-            @sl417_header.dispose if @sl417_header
+            [
+              @sl417_header,
+              @sl417_name_display,
+              @sl417_decision
+            ].compact.each{|w|w.dispose}
 
             puts('SL417|NAME_CLOSE')
 
@@ -524,78 +386,169 @@ jobs:
               <<~'SRC'.lines.map{|l|'    '+l}.join.chomp
           if @sl417_create
 
-            return unless @sl417_phase==:waiting
-
             stage='INPUT'
 
             begin
 
-              col=@sl417_col
+              case @sl417_phase
 
-              w=@sl417_windows[col]
+              when :name
 
-              row=w.index
+                return unless File.exist?('SL417Name.tmp')
 
-              w.update
+                raw=File.open('SL417Name.tmp','rb'){
+                  |f|f.read
+                }
 
-              if w.index!=row
+                flag,name=raw.split("\n",2)
 
-                w.draw_item(row,w.normal_color)
+                return unless flag=='1'
 
-                w.draw_item(w.index,w.text_color(6))
-              end
+                name=(name||'').force_encoding('UTF-8')
 
-              to=col
+                File.open('SL417Name.tmp','wb'){
+                  |f|f.write("0\n"+name)
+                }
 
-              to=0 if Input.trigger?(Input::LEFT)
-              to=1 if Input.trigger?(Input::RIGHT)
+                if !name.valid_encoding? ||
+                   name.strip.empty? ||
+                   name.split(//).size>$game_temp.name_max_char ||
+                   name =~ /[\x00-\x1f\x7f\\]/ ||
+                   SL417_RESERVED.include?(name.strip)
 
-              if to!=col
+                  $game_system.se_play(
+                    $data_system.buzzer_se
+                  )
 
-                row=w.index
+                  puts('SL417|NAME_RETRY')
 
-                w.draw_item(row,w.normal_color)
+                  return
+                end
 
-                w.active=false
-                w.index=-1
+                @sl417_name=name.strip
 
-                @sl417_col=to
+                @sl417_name_display.set_text(
+                  '이름 : '+@sl417_name,
+                  1
+                )
 
-                w=@sl417_windows[to]
+                @sl417_name_display.visible=true
 
-                w.active=true
-                w.index=row
+                @sl417_windows[0].draw_item(
+                  0,
+                  @sl417_windows[0].text_color(6)
+                )
 
-                w.draw_item(row,w.text_color(6))
+                @sl417_phase=:select
 
-                $game_system.se_play($data_system.cursor_se)
-              end
+                puts('SL417|NAME_READY')
 
-              raw=File.open('SL417Name.tmp','rb'){
-                |f|f.read
-              }
+                $game_system.se_play(
+                  $data_system.decision_se
+                )
 
-              flag,name=raw.split("\n",2)
+                return
 
-              return if flag=='2'
+              when :select
 
-              return unless flag=='1' || Input.trigger?(Input::C)
+                col=@sl417_col
+                row=@sl417_row
 
-              name=(name||'').force_encoding('UTF-8')
+                if Input.repeat?(Input::LEFT)
 
-              File.open('SL417Name.tmp','wb'){
-                |f|f.write("0\n"+name)
-              }
+                  col=0
 
-              if !name.valid_encoding? ||
-                 name.strip.empty? ||
-                 name.split(//).size>$game_temp.name_max_char ||
-                 name =~ /[\x00-\x1f\x7f\\]/ ||
-                 SL417_RESERVED.include?(name.strip)
+                elsif Input.repeat?(Input::RIGHT)
 
-                $game_system.se_play($data_system.buzzer_se)
+                  col=1
 
-                puts('SL417|NAME_RETRY')
+                elsif Input.repeat?(Input::UP)
+
+                  row=[row-1,0].max
+
+                elsif Input.repeat?(Input::DOWN)
+
+                  if row==10 && Input.trigger?(Input::DOWN)
+
+                    @sl417_phase=:confirm
+
+                  else
+
+                    row=[row+1,10].min
+                  end
+                end
+
+                if col!=@sl417_col || row!=@sl417_row
+
+                  w=@sl417_windows[@sl417_col]
+
+                  w.draw_item(
+                    @sl417_row,
+                    w.normal_color
+                  )
+
+                  @sl417_col,@sl417_row=col,row
+
+                  w=@sl417_windows[col]
+
+                  w.draw_item(
+                    row,
+                    w.text_color(6)
+                  )
+
+                  $game_system.se_play(
+                    $data_system.cursor_se
+                  )
+                end
+
+                @sl417_phase=:confirm if Input.trigger?(Input::C)
+
+                if @sl417_phase==:confirm
+
+                  b=@sl417_decision.contents
+
+                  b.clear
+
+                  b.font.color=@sl417_decision.text_color(6)
+
+                  b.draw_text(
+                    4,0,b.width-8,32,'결정',1
+                  )
+
+                  $game_system.se_play(
+                    $data_system.cursor_se
+                  )
+                end
+
+                return
+
+              when :confirm
+
+                if Input.trigger?(Input::UP) ||
+                   Input.trigger?(Input::B)
+
+                  b=@sl417_decision.contents
+
+                  b.clear
+
+                  b.font.color=@sl417_decision.normal_color
+
+                  b.draw_text(
+                    4,0,b.width-8,32,'결정',1
+                  )
+
+                  @sl417_phase=:select
+
+                  $game_system.se_play(
+                    $data_system.cursor_se
+                  )
+
+                  return
+                end
+
+                return unless Input.trigger?(Input::C)
+
+              else
 
                 return
               end
@@ -605,17 +558,22 @@ jobs:
               stage='PROFILE'
 
               form,graphic,template,kind,stats,sex=
-                SL417_PROFILES[@sl417_col][w.index]
-
-              @actor.instance_variable_set(:@sl43_form,form)
-
-              @actor.instance_variable_set(:@sl43_type,kind)
-
-              @actor.instance_variable_set(:@sl43_stats,stats.dup)
+                SL417_PROFILES[@sl417_col][@sl417_row]
 
               @actor.instance_variable_set(
-                :@sl417_base_graphic,
-                graphic
+                :@sl43_form,form
+              )
+
+              @actor.instance_variable_set(
+                :@sl43_type,kind
+              )
+
+              @actor.instance_variable_set(
+                :@sl43_stats,stats.dup
+              )
+
+              @actor.instance_variable_set(
+                :@sl417_base_graphic,graphic
               )
 
               @actor.instance_variable_set(
@@ -624,14 +582,16 @@ jobs:
               )
 
               @actor.set_graphic(
-                graphic,0,
+                graphic,
+                0,
                 @actor.battler_name,
                 @actor.battler_hue
               )
 
-              @actor.name=name.strip
+              @actor.name=@sl417_name
 
               [425,469,426,962,966,968].each_with_index do |v,i|
+
                 $game_variables[v]=stats[i]
               end
 
@@ -650,7 +610,9 @@ jobs:
               expected=form.end_with?('기사') ? 170 :
                 (
                   form.end_with?('요정') ? 1000 :
-                  (form.end_with?('법사') ? 1001 : 1002)
+                  (
+                    form.end_with?('법사') ? 1001 : 1002
+                  )
                 )
 
               raise 'Starter weapon not equipped' unless
@@ -658,7 +620,9 @@ jobs:
 
               @sl417_phase=:done
 
-              $game_system.se_play($data_system.decision_se)
+              $game_system.se_play(
+                $data_system.decision_se
+              )
 
               $scene=Scene_Map.new
 
@@ -684,500 +648,111 @@ jobs:
           SRC
             )
           end
+          EDIT
 
-          File.write(
-            '/tmp/sl417-ui.json',
-            JSON.generate({
-              prompt:name_prompt,
-              error:name_error
-            })
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          source=Path(
+              '/tmp/sl417-patch-original.rb'
+          ).read_text('utf8')
+
+          replacement=Path(
+              '/tmp/sl417-scene-edit.rb'
+          ).read_text('utf8')
+
+          start='edit.call(94) do |s|\n'
+
+          end="File.write(\n  '/tmp/sl417-ui.json',"
+
+          assert source.count(start)==1
+          assert source.count(end)==1
+
+          a=source.index(start)
+          b=source.index(end,a)
+
+          updated=(
+              source[:a]+
+              replacement.rstrip()+
+              '\n\n'+
+              source[b:]
           )
 
-          edit.call(17) do |s|
+          assert updated[:a]==source[:a]
 
-            s=one(
-              s,
-              "    if @actor_id == 1\n      kind=0",
-              "    if @actor_id == 1 && !@sl417_base_graphic\n      kind=0"
-            )
+          assert updated.endswith(source[b:])
 
-            s=one(
-              s,
-              '      ow=@sl44_origin_wis ||= w',
-              "      ow=@sl44_origin_wis ||= w\n      if @sl417_base_graphic\n        c=$game_variables[426].to_i\n        w=$game_variables[966].to_i\n      end"
-            )
+          assert updated.count(
+              'edit.call(94) do |s|'
+          )==1
 
-            s=one(
-              s,
-              '    @sl44_player_highest ||= @level if @actor_id == 1',
-              '    @sl44_player_highest ||= @level if @actor_id == 1 && !@sl417_base_graphic'
-            )
+          assert 'SL417|NAME_READY' in updated
 
-            s=one(
-              s,
-              '      if @actor_id == 1 && @level > @sl44_player_highest',
-              '      if @actor_id == 1 && !@sl417_base_graphic && @level > @sl44_player_highest'
-            )
+          assert 'p[0][0,1]' not in updated
 
-            s=one(
-              s,
-              '    return $data_classes[@class_id].name',
-              "    return @sl43_form if @sl417_base_graphic\n    return $data_classes[@class_id].name"
-            )
+          assert 'w.cursor_rect.empty' in updated
 
-            s=one(
-              s,
-              '    @character_name = character_name',
-              "    character_name=@sl417_base_graphic if @sl417_base_graphic && ['knight_men','여기사'].include?(character_name)\n    @character_name = character_name"
-            )
-
-            s=one(
-              s,
-              '      dex=@sl43_stats[1]+@dex_plus',
-              "      dex=@sl43_stats[1]+@dex_plus\n      dex=$game_variables[469]+$game_variables[961] if @sl417_base_graphic"
-            )
-
-            s=one(
-              s,
-              '      return pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus',
-              "      n=pdef1+pdef2+pdef3+pdef4+pdef5+@level/div+bonus\n      n+=$game_variables[1080]+$game_variables[920] if @sl417_base_graphic\n      return n"
-            )
-
-            s=one(
-              s,
-              "      w=@sl43_stats[4]\n      b=if w<=14; 0",
-              "      w=@sl43_stats[4]\n      w=$game_variables[966] if @sl417_base_graphic\n      b=if w<=14; 0"
-            )
-
-            s=one(
-              s,
-              "      mr=if @sl43_form.end_with?('기사');",
-              "      w=@sl43_stats[4] if @sl417_base_graphic\n      mr=if @sl43_form.end_with?('기사');"
-            )
-
-            one(
-              s,
-              '      return mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b',
-              "      n=mdef1+mdef2+mdef3+mdef4+mdef5+@level/2+mr+b\n      if @sl417_base_graphic\n        n+=$game_variables[925]\n        $MDEF=n\n      end\n      return n"
-            )
-          end
-
-          edit.call(12) do |s|
-
-            one(
-              s,
-              '(@sl46_stats_ready ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])',
-              '(@sl46_stats_ready && !@sl417_base_graphic ? 0 : $game_variables[169] + $game_variables[170] + $game_variables[171])'
-            )
-          end
-
-          edit.call(117) do |s|
-
-            one(
-              s,
-              '$n = n unless @sl46_stats_ready',
-              '$n = n unless @sl46_stats_ready && !@sl417_base_graphic'
-            )
-          end
-
-          [34,98].each do |i|
-
-            edit.call(i) do |s|
-
-              a='actor.instance_variable_get(:@sl46_stats_ready)'
-
-              ck(
-                s.scan(a).size==(i==34 ? 2 : 5),
-                'Stat display anchors'
-              )
-
-              s.gsub(
-                a,
-                '('+a+' && !actor.instance_variable_get(:@sl417_base_graphic))'
-              )
-            end
-          end
-
-          edit.call(26) do |s|
-
-            ck(
-              s.include?('def self.starter(a,initial=false)'),
-              'Existing starter'
-            )
-
-            s=one(
-              s,
-              '    a.id==1 ? 3213 : FORMS[a.instance_variable_get(:@sl43_form).to_s]',
-              '    a.id==1 && !a.instance_variable_get(:@sl417_base_graphic) ? 3213 : FORMS[a.instance_variable_get(:@sl43_form).to_s]'
-            )
-
-            one(
-              s,
-              "  def self.pc_motion\n    w=SL49.weapon($game_actors[1])",
-              "  def self.pc_motion\n    a=$game_actors[1]\n    return motion(a) if a.instance_variable_get(:@sl417_base_graphic)\n    w=SL49.weapon(a)"
-            )
-          end
-
-          edit.call(71) do |s|
-
-            one(
-              s,
-              '    a.id==1 ? [$game_switches[70] ? 20 : 16,12] :',
-              '    a.id==1 && !a.instance_variable_get(:@sl417_base_graphic) ? [$game_switches[70] ? 20 : 16,12] :'
-            )
-          end
-
-          edit.call(24) do |s|
-
-            one(
-              s,
-              '          @character_name = command.parameters[0]',
-              "          @character_name = command.parameters[0]\n          if self.is_a?(Game_Player) && ['knight_men','여기사'].include?(@character_name)\n            @character_name=$game_actors[1].instance_variable_get(:@sl417_base_graphic) || @character_name\n          end"
-            )
-          end
-
-          edit.call(28) do |s|
-
-            one(
-              s,
-              "      if @character.character_name=='knight_men좌표'",
-              <<~'SRC'.lines.map{|l|'      '+l}.join.chomp
-          leader=$game_party.actors[0]
-
-          base=leader && leader.id==1 ?
-            leader.instance_variable_get(:@sl417_base_graphic) :
-            nil
-
-          if base && @character.character_name==base
-
-            m=SL411.pc_motion
-
-            v=[m[0],nil,14,m[3]] if m
-
-          elsif base && ['knight_men좌표','여기사 좌표'].include?(@character.character_name)
-
-            v=@character.instance_variable_get(:@sl411_pc_frame)
-
-          elsif @character.character_name=='knight_men좌표'
-          SRC
-            )
-          end
-
-          edit.call(73) do |s|
-
-            s=one(
-              s,
-              '       @parameters[1].to_s =~ /\Aknight_men_(down|left|right|up)([1-6])\z/',
-              <<~'SRC'.lines.map{|l|'       '+l}.join.chomp
-          (@parameters[1].to_s =~ /\Aknight_men_(down|left|right|up)([1-6])\z/ ||
-           ($game_actors[1].instance_variable_get(:@sl417_base_graphic) &&
-            @parameters[1].to_s =~ /\A여기사 공격[- ](하|좌|우|상)-?([1-6])\z/))
-          SRC
-            )
-
-            one(
-              s,
-              "        'up'=>8\n      }[$1]",
-              "        'up'=>8,'하'=>2,'좌'=>4,'우'=>6,'상'=>8\n      }[$1]"
-            )
-          end
-
-          changed=rows.each_index.select{
-            |i|Marshal.dump(rows[i])!=before[i]
-          }
-
-          ck(
-            changed==[12,17,24,26,28,34,71,73,94,98,117],
-            "Scope #{changed.inspect}"
+          Path('/tmp/sl417-patch.rb').write_text(
+              updated,'utf8'
           )
 
-          File.binwrite(sp,Marshal.dump(rows))
-
-          File.binwrite(
-            path.call('Map007'),
-            Marshal.dump(map)
-          )
-
-          ck(
-            Marshal.load(File.binread(sp))==rows,
-            'Script roundtrip'
-          )
-
-          puts "PASS #{forms.size} forms, #{profiles.flatten(1).size} combinations, #{list.size} native commands"
-
-          puts "PASS #{changed.size} modified scripts, #{137-changed.size} unchanged"
-          RUBY
+          print('PASS only creation scene replaced')
+          PYTHON
 
           ruby -c /tmp/sl417-patch.rb
 
           ruby /tmp/sl417-patch.rb \
             site/knight/gameasync/Data
 
-      - name: Verify all 22 character creation paths
+      - name: Verify all 22 name-first creation paths
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/sl417-test.rb <<'RUBY'
-          # encoding: UTF-8
-
-          require 'zlib'
-          require 'tmpdir'
-          require 'ostruct'
-
-          root=File.expand_path(ARGV.fetch(0))
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
-          class Sprite;end
-
-          class Color
-            def initialize(*a);end
-            def self._load(r);allocate;end
-          end
-
-          class Tone
-            def self._load(r);allocate;end
-          end
-
-          class Table
-            def self._load(r)
-              o=allocate
-              o.instance_variable_set(:@raw,r)
-              o
-            end
-
-            def [](x,y=0,z=0)
-              _,w,h,_,_=@raw.unpack('V5')
-
-              @raw.byteslice(
-                20+2*(x+w*(y+h*z)),2
-              ).unpack1('s<')
-            end
-          end
-
-          require File.join(root,'rgss.rb')
-
-          rd=->(n){
-            Marshal.load(
-              File.binread(
-                File.join(root,'Data',pre+n+'.rxdata')
-              )
-            )
-          }
-
-          $data_actors,
-          $data_classes,
-          $data_system,
-          $data_weapons,
-          $data_armors,
-          $data_items,
-          $data_states=%w[
-            Actors Classes System Weapons Armors Items States
-          ].map{|n|rd.call(n)}
-
-          $data_system.elements.each{
-            |x|x.force_encoding('UTF-8') if x.is_a?(String)
-          }
-
-          ($data_weapons+$data_armors).compact.each{
-            |o|o.name.force_encoding('UTF-8')
-          }
-
-          rows=Marshal.load(
-            File.binread(
-              File.join(root,'Data','Scripts.rxdata')
-            )
-          )
-
-          src=->(i){
-            Zlib::Inflate.inflate(rows[i][2]).force_encoding('UTF-8')
-          }
-
-          class Game_Character;end
-
-          class Rect
-            attr_reader :x,:y,:width,:height
-
-            def initialize(*a)
-              set(*a) unless a.empty?
-            end
-
-            def set(x,y,w,h)
-              @x,@y,@width,@height=x,y,w,h
-            end
-
-            def empty
-              set(0,0,0,0)
-            end
-          end
-
-          class Bitmap
-            attr_reader :width,:height,:font
-
-            def initialize(w,h)
-              @width=w
-              @height=h
-              @font=OpenStruct.new
-            end
-
-            def clear;end
-            def fill_rect(*a);end
-
-            def draw_text(*a)
-
-              r=a.first
-
-              r=Rect.new(*a[0,4]) if r.is_a?(Integer)
-
-              raise 'Bitmap bounds' unless
-                r.x>=0 &&
-                r.y>=0 &&
-                r.x+r.width<=@width &&
-                r.y+r.height<=@height
-            end
-
-            def dispose;end
-          end
-
-          class Window_Base
-
-            attr_accessor :x,:y,:width,:height,:contents,:visible,:z,:active,:opacity,:back_opacity,:contents_opacity,:oy
-
-            attr_reader :cursor_rect
-
-            def initialize(x,y,w,h)
-              @x,@y,@width,@height=x,y,w,h
-              @oy=0
-              @cursor_rect=Rect.new
-              @active=true
-            end
-
-            def normal_color;nil;end
-            def text_color(i);nil;end
-            def update;end
-            def dispose;end
-          end
-
-          class Scene_Map;end
-
-          module Graphics
-            def self.transition(*a);end
-            def self.freeze;end
-          end
-
-          module Input
-
-            C=13
-            B=12
-            DOWN=2
-            UP=8
-            LEFT=4
-            RIGHT=6
-            L=17
-            R=18
-
-            def self.trigger?(k);@key==k;end
-            def self.repeat?(k);@key==k;end
-            def self.key=(k);@key=k;end
-          end
-
-          [
-            5,7,8,12,13,14,15,17,18,19,
-            26,35,36,37,71,94,116,117
-          ].each do |i|
-
-            eval(
-              src.call(i),
-              TOPLEVEL_BINDING,
-              "script#{i}"
-            )
-          end
-
-          eval(
-            src.call(119).split('module Kernel',2)[1].prepend('module Kernel'),
-            TOPLEVEL_BINDING,
-            'script119-range'
-          )
-
-          $game_map=OpenStruct.new(
-            map_id:7,
-            need_refresh:false
-          )
-
-          $game_system=Object.new
-
-          def $game_system.se_play(*a);end
-
-          $game_player=Object.new
-
-          def $game_player.refresh;end
-
-          $game_temp=Game_Temp.new
-          $game_temp.name_actor_id=1
-          $game_temp.name_max_char=12
-
-          n=0
-
-          Dir.mktmpdir do |dir|
-
-            Dir.chdir(dir) do
-
-              Scene_Name::SL417_PROFILES.each_with_index do |col,i|
-
-                col.each_with_index do |(form,graphic,template,kind,stats,sex),j|
-
-                  $game_switches=Game_Switches.new
-                  $game_variables=Game_Variables.new
-                  $game_actors=Game_Actors.new
-                  $game_party=Game_Party.new
-
-                  $game_party.setup_starting_members
-
-                  a=$game_actors[1]
-
-                  s=Scene_Name.new
-
-                  $scene=s
-
-                  s.main
-
-                  windows=s.instance_variable_get(:@sl417_windows)
-
-                  raise 'Window geometry' unless
-                    windows.size==2 &&
-                    windows.all?{
-                      |w|
-                      w.opacity==0 &&
-                      w.width==320 &&
-                      w.height==384 &&
-                      w.contents.height==352
-                    }
-
+          cat > /tmp/sl417-test-input.rb <<'RUBY'
                   raise 'Name open' unless
                     File.binread('SL417Name.tmp')=="0\n"
 
-                  if i==1
+                  raise 'Initial phase' unless
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:name
 
-                    Input.key=Input::RIGHT
+                  raise 'Decorative cursor' unless
+                    windows.all?{
+                      |w|
+                      w.index==-1 &&
+                      w.cursor_rect.width==0 &&
+                      w.cursor_rect.height==0 &&
+                      w.contents.font.size==24
+                    }
 
-                    s.update
+                  decision=s.instance_variable_get(
+                    :@sl417_decision
+                  )
 
-                    Input.key=nil
-                  end
+                  raise 'Bottom decision' unless
+                    decision.y==496 &&
+                    decision.opacity==0
 
-                  j.times do
+                  initial_name=a.name.dup
 
-                    Input.key=Input::DOWN
+                  Input.key=Input::DOWN
+                  s.update
+                  Input.key=nil
 
-                    s.update
+                  Input.key=Input::C
+                  s.update
+                  Input.key=nil
 
-                    Input.key=nil
-                  end
-
-                  raise 'Selection' unless
-                    s.instance_variable_get(:@sl417_col)==i &&
-                    windows[i].index==j &&
-                    windows[1-i].index==-1
+                  raise 'Name-first order' unless
+                    s.instance_variable_get(
+                      :@sl417_row
+                    )==0 &&
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:name &&
+                    $scene.equal?(s)
 
                   File.binwrite(
                     'SL417Name.tmp',
@@ -1187,7 +762,8 @@ jobs:
                   s.update
 
                   raise 'Draft committed' unless
-                    $scene.equal?(s)
+                    $scene.equal?(s) &&
+                    a.name==initial_name
 
                   File.binwrite(
                     'SL417Name.tmp',
@@ -1197,7 +773,10 @@ jobs:
                   s.update
 
                   raise 'Reserved name accepted' unless
-                    $scene.equal?(s)
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:name &&
+                    a.name==initial_name
 
                   File.binwrite(
                     'SL417Name.tmp',
@@ -1206,69 +785,129 @@ jobs:
 
                   s.update
 
-                  raise 'Scene transition' unless
-                    $scene.is_a?(Scene_Map)
+                  raise 'Enter created character' unless
+                    $scene.equal?(s) &&
+                    a.name==initial_name &&
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:select
 
-                  weapon=form.end_with?('기사') ? 170 :
-                    (
-                      form.end_with?('요정') ? 1000 :
-                      (form.end_with?('법사') ? 1001 : 1002)
-                    )
+                  File.unlink('SL417Name.tmp')
 
-                  raise 'Profile' unless
-                    a.id==1 &&
-                    a.name=="시험#{n}" &&
-                    a.character_name==graphic &&
-                    a.weapon_id==weapon &&
-                    a.instance_variable_get(:@sl43_stats)==stats
+                  if i==1
 
-                  raise 'HP MP' unless
-                    a.hp==a.maxhp &&
-                    a.sp==a.maxsp &&
-                    a.hp>0 &&
-                    a.sp>0
+                    Input.key=Input::RIGHT
+                    s.update
+                    Input.key=nil
+                  end
 
-                  raise 'Combat' unless
-                    SL411.motion(a) &&
-                    SL49.origin(a)==stats[0,2]
+                  j.times do
 
-                  old=Marshal.dump($game_party)
+                    Input.key=Input::DOWN
+                    s.update
+                    Input.key=nil
+                  end
 
+                  raise 'Direction selection' unless
+                    s.instance_variable_get(
+                      :@sl417_col
+                    )==i &&
+                    s.instance_variable_get(
+                      :@sl417_row
+                    )==j
+
+                  Input.key=Input::C
                   s.update
+                  Input.key=nil
 
-                  raise 'Repeat' unless
-                    old==Marshal.dump($game_party)
+                  raise 'Premature creation' unless
+                    $scene.equal?(s) &&
+                    a.name==initial_name &&
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:confirm
 
-                  $game_party.remove_actor(2)
-                  $game_party.add_actor(1)
+                  Input.key=Input::UP
+                  s.update
+                  Input.key=nil
 
-                  a.exp=a.instance_variable_get(:@exp_list)[2]
+                  raise 'Return to selected character' unless
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:select &&
+                    s.instance_variable_get(
+                      :@sl417_col
+                    )==i &&
+                    s.instance_variable_get(
+                      :@sl417_row
+                    )==j
 
-                  raise 'Growth' unless
-                    a.level==2 &&
-                    a.instance_variable_get(:@sl44_levels).size==3
+                  Input.key=Input::C
+                  s.update
+                  Input.key=nil
 
-                  s.dispose
+                  raise 'Decision focus' unless
+                    s.instance_variable_get(
+                      :@sl417_phase
+                    )==:confirm
 
-                  n+=1
+                  Input.key=Input::C
+                  s.update
+                  Input.key=nil
 
-                  puts "PASS #{form} #{kind} weapon=#{weapon}"
-                end
-              end
-            end
-          end
-
-          raise 'Count' unless n==22
-
-          puts 'PASS 22 creation paths (Ruby fixture, mock graphics)'
           RUBY
+
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import textwrap
+
+          source=Path(
+              '/tmp/sl417-test-original.rb'
+          ).read_text('utf8')
+
+          replacement=Path(
+              '/tmp/sl417-test-input.rb'
+          ).read_text('utf8')
+
+          start="        raise 'Name open' unless"
+
+          end="        raise 'Scene transition' unless"
+
+          assert source.count(start)==1
+          assert source.count(end)==1
+
+          a=source.index(start)
+          b=source.index(end,a)
+
+          replacement=textwrap.indent(
+              textwrap.dedent(replacement).rstrip(),
+              '        '
+          )
+
+          updated=(
+              source[:a]+
+              replacement+
+              '\n\n'+
+              source[b:]
+          )
+
+          assert updated[:a]==source[:a]
+
+          assert updated.endswith(source[b:])
+
+          Path('/tmp/sl417-test.rb').write_text(
+              updated,'utf8'
+          )
+
+          print('PASS updated name-first tests')
+          PYTHON
 
           ruby -c /tmp/sl417-test.rb
 
           ruby /tmp/sl417-test.rb \
             site/knight/gameasync
 
-      - name: Connect keyboard input to creation scene
+      - name: Connect name input and restore game keyboard
         shell: bash
         run: |
           set -euo pipefail
@@ -1288,18 +927,13 @@ jobs:
             let composing=false;
             let submitted=false;
 
-            const arrows={
-              ArrowLeft:37,
-              ArrowUp:38,
-              ArrowRight:39,
-              ArrowDown:40
-            };
-
             function layout(){
 
               if(!form)return;
 
-              const c=document.getElementById('canvas').getBoundingClientRect();
+              const c=document.getElementById(
+                'canvas'
+              ).getBoundingClientRect();
 
               const [x,y,w,h]=rect;
 
@@ -1307,22 +941,30 @@ jobs:
               const sy=c.height/600;
 
               Object.assign(form.style,{
+
                 left:(c.left+x*sx)+'px',
+
                 top:(c.top+y*sy)+'px',
+
                 width:(w*sx)+'px',
+
                 height:(h*sy)+'px',
-                fontSize:Math.max(11,12*sy)+'px'
+
+                fontSize:Math.max(12,24*sy)+'px'
               });
 
               field.style.fontSize=
-                Math.max(16,12*sy)+'px';
+                Math.max(16,24*sy)+'px';
             }
 
             function write(flag){
 
-              if(!field||submitted||!file)return false;
-
-              if(composing&&flag!=='2')return false;
+              if(
+                !field ||
+                !file ||
+                submitted ||
+                (composing&&flag!=='2')
+              )return;
 
               try{
 
@@ -1346,23 +988,28 @@ jobs:
 
                 status.textContent='';
 
-                return true;
-
               }catch(e){
 
-                status.textContent=String(e.message);
-
-                return false;
+                status.textContent=String(
+                  e.message
+                );
               }
             }
 
             function close(){
 
-              if(form)form.remove();
+              if(!form)return;
+
+              field.blur();
+
+              form.remove();
 
               try{
 
-                if(file&&FS.analyzePath(file).exists){
+                if(
+                  file &&
+                  FS.analyzePath(file).exists
+                ){
                   FS.unlink(file);
                 }
 
@@ -1375,14 +1022,11 @@ jobs:
 
               composing=submitted=false;
 
-              const canvas=
-                document.getElementById('canvas');
-
-              if(canvas){
-                canvas.focus({
-                  preventScroll:true
-                });
-              }
+              document.getElementById(
+                'canvas'
+              ).focus({
+                preventScroll:true
+              });
             }
 
             function open(p){
@@ -1395,16 +1039,24 @@ jobs:
 
               if(
                 rect.some(v=>!Number.isFinite(v)) ||
-                !file
+                !file ||
+                FS.readFile(
+                  file,
+                  {encoding:'utf8'}
+                )!=='0\n'
               ){
-                throw Error('Name field geometry');
+                throw Error(
+                  'Name input initialization'
+                );
               }
 
               form=document.createElement('form');
 
               form.id='sl417-name-form';
 
-              const label=document.createElement('label');
+              const label=document.createElement(
+                'label'
+              );
 
               label.htmlFor='sl417-name';
 
@@ -1413,11 +1065,17 @@ jobs:
               field=document.createElement('input');
 
               field.id='sl417-name';
+
               field.type='text';
+
               field.inputMode='text';
+
               field.enterKeyHint='done';
-              field.autocomplete='off';
+
               field.maxLength=Number(p[6]);
+
+              field.autocomplete='off';
+
               field.spellcheck=false;
 
               field.setAttribute(
@@ -1430,9 +1088,7 @@ jobs:
                 ui.prompt
               );
 
-              const hint=document.createElement('div');
-
-              hint.textContent='선택 : Enter / C';
+              field.placeholder='이름 입력 후 Enter';
 
               status=document.createElement('div');
 
@@ -1441,21 +1097,24 @@ jobs:
                 'status'
               );
 
+              status.style.cssText=
+                'color:#ffff80;';
+
               form.style.cssText=
                 'position:fixed;'+
                 'z-index:2147483647;'+
                 'margin:0;padding:0;border:0;'+
                 'background:transparent;'+
-                'color:#fff;'+
+                'color:white;'+
                 'font-family:SL417Nanum,sans-serif;'+
                 'display:flex;'+
                 'flex-direction:column;'+
                 'justify-content:center;'+
-                'gap:2px;'+
+                'gap:1px;'+
                 'pointer-events:none;'+
                 'box-sizing:border-box;'+
                 'text-align:center;'+
-                'line-height:1.2;';
+                'line-height:1.1;';
 
               field.style.cssText=
                 'display:block;'+
@@ -1463,11 +1122,10 @@ jobs:
                 'min-height:24px;'+
                 'box-sizing:border-box;'+
                 'border:0;'+
-                'border-bottom:1px solid #aaa;'+
                 'border-radius:0;'+
-                'background:#000;'+
-                'color:#fff;'+
-                'caret-color:#fff;'+
+                'background:transparent;'+
+                'color:white;'+
+                'caret-color:white;'+
                 'outline:0;'+
                 'text-align:center;'+
                 'font-family:inherit;'+
@@ -1477,18 +1135,15 @@ jobs:
                 '-webkit-user-select:text;'+
                 'touch-action:manipulation;';
 
-              status.style.cssText='color:#ffff80;';
-
               form.append(
                 label,
                 field,
-                hint,
                 status
               );
 
-              document.getElementById('main').append(form);
-
-              layout();
+              document.getElementById(
+                'main'
+              ).append(form);
 
               field.addEventListener(
                 'input',
@@ -1500,6 +1155,7 @@ jobs:
               field.addEventListener(
                 'compositionstart',
                 ()=>{
+
                   composing=true;
 
                   write('2');
@@ -1509,6 +1165,7 @@ jobs:
               field.addEventListener(
                 'compositionend',
                 ()=>{
+
                   composing=false;
 
                   write('0');
@@ -1518,6 +1175,7 @@ jobs:
               form.addEventListener(
                 'submit',
                 e=>{
+
                   e.preventDefault();
 
                   write('1');
@@ -1540,14 +1198,7 @@ jobs:
                 );
               });
 
-              if(
-                FS.readFile(
-                  file,
-                  {encoding:'utf8'}
-                )!=='0\n'
-              ){
-                throw Error('Name input initialization');
-              }
+              layout();
 
               field.focus({
                 preventScroll:true
@@ -1562,30 +1213,10 @@ jobs:
 
               window.addEventListener(t,e=>{
 
-                if(!field||e.target!==field)return;
-
                 if(
-                  !composing &&
-                  !e.isComposing &&
-                  arrows[e.key] &&
-                  t!=='keypress'
-                ){
-
-                  e.preventDefault();
-
-                  e.stopImmediatePropagation();
-
-                  if(typeof simulateKeyEvent==='function'){
-
-                    simulateKeyEvent(
-                      t,
-                      arrows[e.key],
-                      0
-                    );
-                  }
-
-                  return;
-                }
+                  !field ||
+                  e.target!==field
+                )return;
 
                 if(
                   t==='keydown' &&
@@ -1641,7 +1272,10 @@ jobs:
 
                   open(s.split('|'));
 
-                }else if(s==='SL417|NAME_CLOSE'){
+                }else if(
+                  s==='SL417|NAME_READY' ||
+                  s==='SL417|NAME_CLOSE'
+                ){
 
                   close();
 
@@ -1658,7 +1292,9 @@ jobs:
                     preventScroll:true
                   });
 
-                }else if(s.startsWith('SL417|FAIL|')){
+                }else if(
+                  s.startsWith('SL417|FAIL|')
+                ){
 
                   const m=s.split('|').slice(2).join(' | ');
 
@@ -1676,10 +1312,15 @@ jobs:
 
                 if(status){
 
-                  status.textContent=String(e.message);
+                  status.textContent=String(
+                    e.message
+                  );
                 }
 
-                console.error('SL417_NAME',e);
+                console.error(
+                  'SL417_NAME',
+                  e
+                );
               }
             };
           })();
@@ -1687,272 +1328,87 @@ jobs:
 
           node --check /tmp/sl417-name.js
 
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import json
-
-          page=Path('site/knight/index.html')
-
-          game=Path('site/knight/gameasync')
-
-          html=page.read_text('utf8')
-
-          js=Path('/tmp/sl417-name.js').read_text('utf8')
-
-          assert html.count('</head>')==1
-
-          assert html.count('console.log(text);')==1
-
-          assert js.count('SL417_UI')==1
-
-          js=js.replace(
-              'SL417_UI',
-              json.dumps(
-                  json.loads(
-                      Path('/tmp/sl417-ui.json').read_text('utf8')
-                  ),
-                  ensure_ascii=False
-              ).replace('<','\\u003c'),
-              1
-          )
-
-          Path('/tmp/sl417-name-resolved.js').write_text(
-              js,'utf8'
-          )
-
-          assert 'SL417|NAME|' not in html
-
-          assert 'sl417-create' not in html
-
-          assert (game/'Fonts/NanumGothic.ttf').is_file()
-
-          assert "document.createElement('input')" in js
-
-          assert "document.createElement('button')" not in js
-
-          assert "document.createElement('dialog')" not in js
-
-          css="@font-face{font-family:SL417Nanum;src:url('gameasync/Fonts/NanumGothic.ttf?v=v143z100') format('truetype');font-display:swap;}"
-
-          html=html.replace(
-              '</head>',
-              '<style>'+css+'</style>\n<script>\n'+js+'\n</script>\n</head>',
-              1
-          )
-
-          html=html.replace(
-              'console.log(text);',
-              'console.log(text);\n                    window.sl417NameMessage(text);',
-              1
-          )
-
-          page.write_text(html,'utf8')
-
-          print('PASS native name input bridge')
-          PYTHON
-
-          node --check /tmp/sl417-name-resolved.js
+          bash -euo pipefail \
+            /tmp/sl417-install-name.sh
 
       - name: Update V4.17 data references
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import hashlib,json,re
-
-          root=Path('site')
-
-          game=root/'knight/gameasync'
-
-          old_md5=json.loads(
-              Path('/tmp/sl417-md5.json').read_text('utf8')
-          )
-
-          mapper=game/'mapping.js'
-
-          old_mapping=hashlib.sha256(
-              mapper.read_bytes()
-          ).hexdigest()[:16]
-
-          s=mapper.read_bytes()
-
-          for name,previous in old_md5.items():
-
-              marker=('Data/'+name+'?h=').encode('ascii')
-
-              pattern=re.escape(marker)+rb'[0-9a-f]{32}'
-
-              assert re.findall(pattern,s)==[
-                  marker+previous.encode('ascii')
-              ],name
-
-              digest=hashlib.md5(
-                  (game/'Data'/name).read_bytes()
-              ).hexdigest()
-
-              assert digest!=previous,name
-
-              new=marker+digest.encode('ascii')
-
-              s=re.sub(
-                  pattern,
-                  lambda _:new,
-                  s
-              )
-
-              assert s.count(new)==1,name
-
-          mapper.write_bytes(s)
-
-          mapping=hashlib.sha256(
-              mapper.read_bytes()
-          ).hexdigest()[:16]
-
-          bitmap=hashlib.sha256(
-              (game/'bitmap-map.js').read_bytes()
-          ).hexdigest()[:16]
-
-          loader=root/'knight/js/sl-assets-v229r115.js'
-
-          old_loader=hashlib.sha256(
-              loader.read_bytes()
-          ).hexdigest()[:16]
-
-          s=loader.read_bytes()
-
-          assert s.count(b"var version='V4.16';")==1
-
-          loader.write_bytes(
-              s.replace(
-                  b"var version='V4.16';",
-                  b"var version='V4.17';"
-              )
-          )
-
-          new_loader=hashlib.sha256(
-              loader.read_bytes()
-          ).hexdigest()[:16]
-
-          page=root/'knight/index.html'
-
-          s=page.read_text('utf8')
-
-          refs=[
-              (
-                  'gameasync/mapping.js?v=v4.16&h='+old_mapping,
-                  'gameasync/mapping.js?v=v4.17&h='+mapping,
-                  1
-              ),
-              (
-                  'gameasync/bitmap-map.js?v=v4.16&h='+bitmap,
-                  'gameasync/bitmap-map.js?v=v4.17&h='+bitmap,
-                  2
-              ),
-              (
-                  'js/sl-assets-v229r115.js?v=v4.16&h='+old_loader,
-                  'js/sl-assets-v229r115.js?v=v4.17&h='+new_loader,
-                  1
-              )
-          ]
-
-          for old,new,count in refs:
-
-              assert s.count(old)==count,old
-
-              s=s.replace(old,new)
-
-              assert s.count(new)==count,new
-
-          assert 'V4.16' in s
-
-          page.write_text(
-              s.replace(
-                  'V4.16','V4.17'
-              ).replace(
-                  'v4.16','v4.17'
-              ),
-              'utf8'
-          )
-
-          page=root/'index.html'
-
-          s=page.read_text('utf8')
-
-          assert 'V4.16' in s
-
-          page.write_text(
-              s.replace(
-                  'V4.16','V4.17'
-              ).replace(
-                  'v4.16','v4.17'
-              ),
-              'utf8'
-          )
-
-          print('PASS updated mapping and version references')
-          PYTHON
+          bash -euo pipefail \
+            /tmp/sl417-mapping.sh
 
       - name: Verify exact modification scope
         shell: bash
         run: |
           set -euo pipefail
 
+          bash -euo pipefail \
+            /tmp/sl417-scope.sh
+
           python3 - <<'PYTHON'
           from pathlib import Path
-          import hashlib,json
+          import hashlib
+          import json
 
           root=Path('site')
 
-          pre='MMUQTFCAEUWWMMVPHJPLWSKVJOHMECOINFTBCWIO'
-
           before=json.loads(
-              Path('/tmp/sl417-before.json').read_text('utf8')
+              Path(
+                  '/tmp/sl417-before.json'
+              ).read_text('utf8')
           )
 
-          after={
-              p.relative_to(root).as_posix():
-              hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob('*') if p.is_file()
-          }
+          protected=[
+              'knight/js/dpad.js',
+              'knight/js/drive.js',
+              'knight/mkxp.js',
+              'knight/mkxp.wasm',
+              'knight/gameasync/bitmap-map.js'
+          ]
 
-          assert len(after)==6086
+          for name in protected:
 
-          assert set(after)==set(before)
+              assert name in before,name
 
-          changed={
-              k for k in before
-              if before[k]!=after[k]
-          }
+              digest=hashlib.sha256(
+                  (root/name).read_bytes()
+              ).hexdigest()
 
-          expected={
-              'knight/gameasync/Data/Scripts.rxdata',
-              'knight/gameasync/Data/'+pre+'Map007.rxdata',
-              'knight/gameasync/mapping.js',
-              'knight/js/sl-assets-v229r115.js',
-              'knight/index.html',
-              'index.html'
-          }
+              assert digest==before[name],name
 
-          assert changed==expected,sorted(changed^expected)
+          html=(
+              root/'knight/index.html'
+          ).read_text('utf8')
 
-          html=(root/'knight/index.html').read_text('utf8')
+          assert 'SL417|NAME_READY' in html
 
-          assert 'sl417-create' not in html
+          assert "field.blur()" in html
 
-          assert 'SL417|NAME|' in html
+          assert 'form.remove()' in html
 
-          print('PASS six approved files modified')
+          js=Path(
+              '/tmp/sl417-name.js'
+          ).read_text('utf8')
 
-          print('PASS 6080 original files unchanged')
+          assert 'simulateKeyEvent' not in js
+
+          assert "document.createElement('button')" not in js
+
+          assert "document.createElement('dialog')" not in js
+
+          assert "getElementById('sl-pad')" not in js
+
+          assert 'border-bottom:' not in js
+
+          print('PASS original direction controls unchanged')
+          print('PASS original ATK and cancel controls unchanged')
+          print('PASS keyboard released after name entry')
+          print('PASS no decorative input border')
+          print('PASS original engine unchanged')
+          print('PASS V4.17')
           PYTHON
-
-          node --check site/knight/gameasync/mapping.js
-          node --check site/knight/gameasync/bitmap-map.js
-          node --check site/knight/js/sl-assets-v229r115.js
-          node --check site/knight/js/drive.js
-          node --check site/knight/js/dpad.js
 
       - name: Upload V4.17
         uses: actions/upload-pages-artifact@v5
